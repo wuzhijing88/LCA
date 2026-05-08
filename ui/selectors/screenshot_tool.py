@@ -99,7 +99,7 @@ class ScreenshotOverlay(QWidget):
 
         self.target_hwnd = target_hwnd
         raw_save_dir = str(save_dir or "").strip()
-        if (not raw_save_dir) or raw_save_dir.replace("/", "\\").lower() in {"images", ".\\images"}:
+        if (not raw_save_dir) or raw_save_dir.replace("/", "\\").lower() in {"images", ".\images"}:
             self.save_dir = _get_default_images_dir()
         else:
             if os.path.isabs(raw_save_dir):

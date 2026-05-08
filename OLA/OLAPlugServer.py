@@ -13878,7 +13878,7 @@ class OLAPlugServer:
                 0: 标题
                 1: 程序名字（如notepad）
                 2: 类名
-                3: 程序路径（不含盘符，如\\windows\\system32）
+                3: 程序路径（不含盘符，如\windows\system32）
                 4: 父句柄（十进制字符串）
                 5: 父窗口标题
                 6: 父窗口类名
@@ -13893,7 +13893,7 @@ class OLAPlugServer:
                 0: 标题
                 1: 程序名字（如notepad）
                 2: 类名
-                3: 程序路径（不含盘符，如\\windows\\system32）
+                3: 程序路径（不含盘符，如\windows\system32）
                 4: 父句柄（十进制字符串）
                 5: 父窗口标题
                 6: 父窗口类名
@@ -14020,7 +14020,7 @@ class OLAPlugServer:
                 0: 标题
                 1: 程序名字（如notepad）
                 2: 类名
-                3: 程序路径（不含盘符，如\\windows\\system32）
+                3: 程序路径（不含盘符，如\windows\system32）
                 4: 父句柄（十进制字符串）
                 5: 父窗口标题
                 6: 父窗口类名
@@ -14035,7 +14035,7 @@ class OLAPlugServer:
                 0: 标题
                 1: 程序名字（如notepad）
                 2: 类名
-                3: 程序路径（不含盘符，如\\windows\\system32）
+                3: 程序路径（不含盘符，如\windows\system32）
                 4: 父句柄（十进制字符串）
                 5: 父窗口标题
                 6: 父窗口类名
@@ -14311,7 +14311,7 @@ class OLAPlugServer:
         """创建子进程
 
         Args:
-            applicationName: 进程路径，如C:\\windows\\system32\\notepad.exe
+            applicationName: 进程路径，如C:\windows\system32\notepad.exe
             commandLine: 命令行参数一定要包含进程路径，如aa bb cc
             currentDirectory: 启动目录, 可空
             showType: 显示方式，如果省略本参数,默认为“普通激活”方式.，可选值:

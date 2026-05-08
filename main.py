@@ -287,7 +287,7 @@ else:
 # Nuitka hint: include OLA package for plugin system
 try:
     import OLA  # noqa: F401 - 仅用于Nuitka包含提示
-except Exception:
+except ImportError:
     pass  # 开发环境可能找不到,忽略
 
 logger = logging.getLogger(__name__)
@@ -4062,19 +4062,255 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
         show_critical_box(None, "错误", "无法获取必要的硬件信息以进行授权。\n请检查系统设置或联系支持。")
         sys.exit(1)
 
-    # 绕过第三方服务验证，直接设置为已验证状态
-    is_validated = True
-    license_key = "NO_LICENSE_REQUIRED"
+    #  优化：尝试从加密缓存加载许可证密钥，但仍需在线验证
+    license_key = load_local_license()
+    if license_key:
+        logging.info(" 从加密缓存加载到许可证密钥，将进行在线验证")
+    else:
+        logging.info(" 未找到缓存的许可证密钥，需要用户输入")
+
+    is_validated = False
     last_status_code = 0
 
-    # 设置默认的授权类型和验证标记
-    VALIDATED_LICENSE_TYPE = "EDITOR"
-    sys._license_validated = True
-    sys._registration_verified = os.urandom(32).hex()
-    sys._registration_hwid = hardware_id
-    server_license_validation_enabled = False
+    # We need a session object. It's good practice to create it once and reuse.
+    # Let's make it available for both registration and validation.
+    http_session = requests.Session()
 
-    logging.info(" 授权验证已绕过（第三方服务验证已移除）")
+    # --- ADDED: Initial check and potential migration attempt ---
+    # Determine if the current hardware_id is likely an old format from the file
+    is_old_format_hwid = isinstance(hardware_id, str) and len(hardware_id) != 64
+
+    #  强化：跳过迁移逻辑，因为不再使用本地许可证文件
+    # 所有验证都必须通过在线方式进行
+    logging.info(" 强制在线验证模式：跳过本地许可证文件和迁移逻辑")
+
+    # After potential migration attempt (or if not needed), proceed with standard validation/input loop.
+    # If migration succeeded, hardware_id is now the new SHA256 ID.
+    # If migration failed or wasn't needed, hardware_id is either the original valid ID, the old format ID, or None.
+
+    # We now enter a loop that continues until is_validated becomes True
+    # If is_validated was already True after initial checks (e.g., valid local HWID + Key), this loop is skipped.
+    # Note: Initial validation with local key is now handled BEFORE this loop if hardware_id is already a valid SHA256.
+    # If hardware_id was old format and migration failed, we enter this loop.
+
+    # ============================================================================
+    # 【安全关键】硬件ID注册 - 所有模式都必须完成，不可跳过
+    # ============================================================================
+    # 注意：硬件ID注册与插件模式的授权验证是两个独立的安全层：
+    # 1. 硬件ID注册：所有用户（插件模式/非插件模式）都必须完成，用于追踪和管理客户端
+    # 2. 授权验证：仅在插件模式且服务器开启验证时需要，用于验证付费授权
+    # ============================================================================
+
+    logging.info("【安全检查】开始强制硬件ID注册（所有模式必须完成）...")
+    try:
+        initial_registration_result = attempt_client_registration(hardware_id, http_session)
+    finally:
+        try:
+            http_session.close()
+        except Exception:
+            pass
+
+    # 【安全关键】检查注册结果 - 必须成功，否则退出程序
+    if initial_registration_result.get("is_banned", False):
+        ban_reason = initial_registration_result.get("ban_reason", "未提供原因")
+        logging.critical(f"【安全阻止】硬件ID已被封禁: {ban_reason}")
+        show_critical_box(
+            None,
+            "账号已被封禁",
+            f"您的硬件ID已被封禁，无法使用本软件。\n\n"
+            f"封禁原因: {ban_reason}\n\n"
+            f"如有疑问，请联系技术支持。"
+        )
+        sys.exit(1)
+
+    if not initial_registration_result.get("success", False):
+        logging.critical("【安全失败】硬件ID注册失败，程序无法继续运行")
+        failure_reason = str(initial_registration_result.get("error") or "").strip()
+        if not failure_reason:
+            status_code = initial_registration_result.get("status_code")
+            failure_reason = f"注册失败，状态码: {status_code}" if status_code else "网络异常，请重启软件"
+        show_critical_box(
+            None,
+            "注册失败",
+            f"{failure_reason}\n\n如果网络是校园网或公司网，可能无法连接。"
+        )
+        sys.exit(1)
+
+    logging.info("【安全通过】硬件ID注册成功")
+
+    logging.info("【安全通过】硬件ID未被封禁")
+
+    # 获取服务器的验证状态（仅影响插件模式的授权验证，不影响硬件ID注册）
+    server_license_validation_enabled = initial_registration_result.get("license_validation_enabled", True)
+    logging.info(f"服务器许可证验证状态: {'开启' if server_license_validation_enabled else '关闭'}")
+
+    # ============================================================================
+    # 【第二层安全】插件模式授权验证（可选，根据服务器开关决定）
+    # ============================================================================
+    # 注意：此处的验证与上面的硬件ID注册是两个不同的安全层：
+    # - 硬件ID注册：已在上方完成，所有用户必须通过，不可跳过
+    # - 授权验证：仅在插件模式启用且服务器开关开启时需要
+    # ============================================================================
+
+    # 检查是否启用了插件模式
+    try:
+        from utils.app_paths import get_config_path
+        config_path = get_config_path()
+        plugin_mode_enabled = False
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+                plugin_mode_enabled = config_data.get('plugin_settings', {}).get('enabled', False)
+        logging.info(f"插件模式状态: {'已启用' if plugin_mode_enabled else '未启用'}")
+    except Exception as e:
+        logging.warning(f"读取插件模式配置失败: {e}")
+        plugin_mode_enabled = False
+
+    # 插件模式验证逻辑（根据服务器验证开关决定）
+    # 注意：此处只验证授权码，硬件ID注册已在上方强制完成
+    if plugin_mode_enabled:
+        logging.info("检测到插件模式已启用")
+
+        # 插件模式下，根据服务器验证开关来决定是否需要验证授权码
+        if server_license_validation_enabled:
+            logging.info("服务器验证开关已开启，插件模式需要进行授权验证")
+
+            # 检查是否有有效的授权码
+            if not license_key or license_key == "SERVER_VALIDATION_DISABLED":
+                logging.critical("插件模式已启用且服务器要求验证，但未找到有效的授权码")
+                show_critical_box(
+                    None,
+                    "插件模式需要授权",
+                    "检测到配置文件中已启用插件模式，且服务器要求授权验证，但未找到有效的授权码。\n\n"
+                    "插件模式需要有效的授权才能使用。\n"
+                    "程序启动后，请在全局设置中禁用插件模式，或完成授权验证。\n\n"
+                    "本次运行将临时禁用插件模式（不修改配置文件）。"
+                )
+                # 【修复】仅在内存中禁用，不修改config.json，保留用户配置
+                logging.info("临时禁用插件模式（本次运行），配置文件保持不变")
+                plugin_mode_enabled = False
+            else:
+                # 服务器验证开关已开启，强制进行在线验证，确保授权码有效且未过期
+                logging.info("插件模式：开始强制在线验证授权码的有效性和时效性...")
+                try:
+                    is_valid, status_code, license_type = enforce_online_validation(hardware_id, license_key)
+
+                    if not is_valid:
+                        logging.critical(f"插件模式授权验证失败：状态码 {status_code}")
+                        show_critical_box(
+                            None,
+                            "插件授权验证失败",
+                            f"插件模式授权验证失败（状态码：{status_code}）。\n\n"
+                            "可能的原因：\n"
+                            "- 授权码已过期\n"
+                            "- 授权码无效\n"
+                            "- 网络连接失败\n\n"
+                            "插件模式将被自动禁用。"
+                        )
+
+                        # 删除无效的授权文件
+                        try:
+                            if os.path.exists(LICENSE_FILE):
+                                os.remove(LICENSE_FILE)
+                                logging.info("已删除无效的授权文件")
+                        except:
+                            pass
+
+                        # 【修复】仅在内存中禁用，不修改config.json，保留用户配置
+                        logging.info("临时禁用插件模式（授权验证失败），配置文件保持不变")
+                        plugin_mode_enabled = False
+                    else:
+                        # 更新授权类型（VALIDATED_LICENSE_TYPE 已在模块级别定义）
+                        VALIDATED_LICENSE_TYPE = license_type
+                        logging.info(f"插件模式授权验证成功，授权类型: {license_type}")
+
+                        # 【新增】启动插件授权后台监控线程
+                        try:
+                            _start_plugin_license_monitor(
+                                hardware_id=hardware_id,
+                                license_key=license_key,
+                                app_instance=app,
+                            )
+                            logging.info("插件授权后台监控线程已启动")
+                        except Exception as monitor_error:
+                            logging.error(f"启动插件授权监控线程失败: {monitor_error}", exc_info=True)
+
+                except Exception as e:
+                    logging.error(f"插件模式授权验证异常: {e}", exc_info=True)
+                    show_critical_box(
+                        None,
+                        "插件授权验证异常",
+                        f"插件模式授权验证过程中发生异常：{str(e)}\n\n"
+                        "插件模式将被自动禁用。"
+                    )
+                    plugin_mode_enabled = False
+        else:
+            # 服务器验证开关已关闭，插件模式不需要验证授权码
+            # 但硬件ID注册已在上方强制完成，这是不可跳过的
+            logging.info("服务器验证开关已关闭，插件模式无需授权验证")
+            logging.info("注意：虽然跳过授权验证，但硬件ID注册已强制完成")
+            # 设置默认的授权类型，允许插件模式正常运行
+            VALIDATED_LICENSE_TYPE = "PLUGIN_NO_VALIDATION"
+            logging.info("已设置插件模式为无需验证状态")
+
+    # 非插件模式：只需要注册硬件ID（已完成），无需验证授权码
+    # 插件模式：已在上面的逻辑中处理授权验证
+    # 注意：无论哪种模式，硬件ID注册都已在前面强制完成
+    if not plugin_mode_enabled:
+        logging.info("非插件模式：硬件ID已注册（上方完成），无需验证授权码")
+        is_validated = True
+        license_key = "NO_LICENSE_REQUIRED"
+        sys._license_validated = True
+        VALIDATED_LICENSE_TYPE = "EDITOR"
+
+        # 设置注册验证标记（反调试检查需要）
+        sys._registration_verified = os.urandom(32).hex()
+        sys._registration_hwid = hardware_id
+
+        logging.info("非插件模式授权验证成功（仅硬件ID注册）")
+    elif plugin_mode_enabled and not server_license_validation_enabled:
+        # 插件模式但服务器验证关闭：硬件ID已注册（上方完成），无需验证授权码
+        logging.info("插件模式且服务器验证关闭：无需验证授权码")
+        is_validated = True
+        license_key = "SERVER_VALIDATION_DISABLED"
+        sys._license_validated = True
+        VALIDATED_LICENSE_TYPE = "EDITOR"
+
+        # 设置注册验证标记（反调试检查需要）
+        sys._registration_verified = os.urandom(32).hex()
+        sys._registration_hwid = hardware_id
+
+        logging.info("插件模式授权验证成功（服务器禁用验证模式）")
+    elif plugin_mode_enabled and server_license_validation_enabled:
+        # 插件模式且服务器验证开启：已在上面的代码中处理过验证逻辑
+        # 这里检查验证是否成功
+        if license_key and license_key not in ["NO_LICENSE_REQUIRED", "SERVER_VALIDATION_DISABLED"]:
+            logging.info("插件模式验证已完成，继续启动流程")
+            is_validated = True
+            sys._license_validated = True
+            sys._registration_verified = os.urandom(32).hex()
+            sys._registration_hwid = hardware_id
+        else:
+            logging.warning("插件模式验证未完成，可能已被禁用")
+            is_validated = True  # 允许继续，因为插件模式可能已被自动禁用
+            license_key = "NO_LICENSE_REQUIRED"
+            sys._license_validated = True
+            VALIDATED_LICENSE_TYPE = "EDITOR"
+            sys._registration_verified = os.urandom(32).hex()
+            sys._registration_hwid = hardware_id
+
+    # 旧的验证逻辑已被移除，新逻辑如下：
+    # - 非插件模式：只需注册硬件ID，无需验证授权码
+    # - 插件模式+服务器验证关闭：无需验证授权码
+    # - 插件模式+服务器验证开启：需要验证授权码
+    #
+    # 如果服务器关闭了验证，直接跳过许可证验证（但插件模式除外）
+    # if not server_license_validation_enabled:
+    # --- END MODIFIED validation/input loop ---
+
+    # This block is reached ONLY if is_validated is True (loop condition is false)
+    logging.info("锁定 授权验证成功，启动主程序...")
+    logging.info(f"搜索 授权信息: 硬件ID=***..., 许可证={'已验证' if license_key else '未知'}")
     # ==================== 密钥验证相关代码结束 ====================
 
     # 反调试：多重验证标记检查（防止跳过注册流程）
