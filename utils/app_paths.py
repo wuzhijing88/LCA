@@ -31,11 +31,15 @@ def get_app_root() -> str:
     return _to_long_path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def get_user_data_dir(app_name: str = "LCA") -> str:
+def get_legacy_user_data_dir(app_name: str = "LCA") -> str:
     base_dir = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
     if not base_dir:
         base_dir = os.path.expanduser("~")
-    path = os.path.join(base_dir, app_name)
+    return os.path.join(base_dir, app_name)
+
+
+def get_user_data_dir(app_name: str = "LCA") -> str:
+    path = get_app_root()
     try:
         os.makedirs(path, exist_ok=True)
     except Exception:
@@ -52,7 +56,7 @@ def _ensure_dir(path: str) -> str:
 
 
 def _get_runtime_root(app_name: str = "LCA") -> str:
-    return get_user_data_dir(app_name)
+    return get_app_root()
 
 
 def _iter_legacy_names(filename_or_names: str | Iterable[str]) -> Iterable[str]:
@@ -64,12 +68,13 @@ def _iter_legacy_names(filename_or_names: str | Iterable[str]) -> Iterable[str]:
             yield str(item)
 
 
-def _migrate_file(filename_or_names: str | Iterable[str], new_path: str) -> None:
+def _migrate_file(filename_or_names: str | Iterable[str], new_path: str, app_name: str = "LCA") -> None:
     if os.path.exists(new_path):
         return
 
     app_root = get_app_root()
     cwd = os.getcwd()
+    legacy_user_data_dir = get_legacy_user_data_dir(app_name)
     try:
         argv_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     except Exception:
@@ -78,10 +83,12 @@ def _migrate_file(filename_or_names: str | Iterable[str], new_path: str) -> None
     for legacy_name in _iter_legacy_names(filename_or_names):
         legacy_paths = [
             os.path.join(app_root, legacy_name),
-            os.path.join(cwd, legacy_name),
+            os.path.join(legacy_user_data_dir, legacy_name),
         ]
         if argv_dir:
             legacy_paths.append(os.path.join(argv_dir, legacy_name))
+        if not getattr(sys, "frozen", False):
+            legacy_paths.append(os.path.join(cwd, legacy_name))
 
         for legacy_path in legacy_paths:
             if not legacy_path or legacy_path == new_path:
@@ -96,14 +103,14 @@ def _migrate_file(filename_or_names: str | Iterable[str], new_path: str) -> None
 
 
 def get_config_path(app_name: str = "LCA") -> str:
-    new_path = os.path.join(get_user_data_dir(app_name), "config.json")
-    _migrate_file(["config/default_config.json", "config.json"], new_path)
+    new_path = os.path.join(get_app_root(), "config.json")
+    _migrate_file(["config.json", "config/default_config.json"], new_path, app_name=app_name)
     return new_path
 
 
 def get_favorites_path(app_name: str = "LCA") -> str:
-    new_path = os.path.join(get_user_data_dir(app_name), "workflow_favorites.json")
-    _migrate_file("workflow_favorites.json", new_path)
+    new_path = os.path.join(get_app_root(), "workflow_favorites.json")
+    _migrate_file("workflow_favorites.json", new_path, app_name=app_name)
     return new_path
 
 
@@ -151,60 +158,6 @@ def normalize_workflow_image_path(raw_path: str, app_name: str = "LCA") -> str:
     return absolute_value
 
 
-def get_market_root(app_name: str = "LCA") -> str:
-    path = os.path.join(get_user_data_dir(app_name), "market")
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-    return path
-
-
-def get_market_packages_dir(app_name: str = "LCA") -> str:
-    path = os.path.join(get_market_root(app_name), "packages")
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-    return path
-
-
-def get_market_installed_dir(app_name: str = "LCA") -> str:
-    path = os.path.join(get_market_root(app_name), "installed")
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-    return path
-
-
-def get_market_runtime_dir(app_name: str = "LCA") -> str:
-    path = os.path.join(get_market_root(app_name), "runtime")
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-    return path
-
-
-def get_market_cache_dir(app_name: str = "LCA") -> str:
-    path = os.path.join(get_market_root(app_name), "cache")
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-    return path
-
-
-def get_market_user_overrides_dir(app_name: str = "LCA") -> str:
-    path = os.path.join(get_market_root(app_name), "user_overrides")
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-    return path
-
-
 def get_resource_root() -> str:
     return _ensure_dir(os.path.join(get_app_root(), "resources"))
 
@@ -214,32 +167,28 @@ def get_resource_path(*parts: str) -> str:
 
 
 def get_logs_dir(app_name: str = "LCA") -> str:
-    return _ensure_dir(os.path.join(_get_runtime_root(app_name), "logs"))
+    return _ensure_dir(os.path.join(get_app_root(), "logs"))
 
 
 def get_runtime_data_dir(app_name: str = "LCA") -> str:
-    return _ensure_dir(os.path.join(_get_runtime_root(app_name), "runtime_data"))
+    return _ensure_dir(os.path.join(get_app_root(), "runtime_data"))
 
 
 def get_workflows_dir(app_name: str = "LCA") -> str:
-    if getattr(sys, "frozen", False):
-        root = get_user_data_dir(app_name)
-    else:
-        root = get_app_root()
-    return _ensure_dir(os.path.join(root, "workflows"))
+    return _ensure_dir(os.path.join(get_app_root(), "workflows"))
 
 
 def get_runtime_state_dir(app_name: str = "LCA") -> str:
-    return _ensure_dir(os.path.join(_get_runtime_root(app_name), "runtime", "state"))
+    return _ensure_dir(os.path.join(get_app_root(), "runtime", "state"))
 
 
 def get_hardware_id_path(app_name: str = "LCA") -> str:
     new_path = os.path.join(get_runtime_state_dir(app_name), "hardware_id.txt")
-    _migrate_file(["runtime/state/hardware_id.txt", "hardware_id.txt"], new_path)
+    _migrate_file(["runtime/state/hardware_id.txt", "hardware_id.txt"], new_path, app_name=app_name)
     return new_path
 
 
 def get_license_cache_path(app_name: str = "LCA") -> str:
     new_path = os.path.join(get_runtime_state_dir(app_name), "license.dat")
-    _migrate_file(["license.dat", os.path.join("ui", "license.dat")], new_path)
+    _migrate_file(["license.dat", os.path.join("ui", "license.dat")], new_path, app_name=app_name)
     return new_path

@@ -183,18 +183,14 @@ def _collect_image_paths(image_path: str, image_paths_text: str) -> List[str]:
 
     # 单图模式
     if image_path:
-        if os.path.exists(image_path):
+        try:
+            resolved = resolver.resolve(image_path) if resolver else None
+        except Exception:
+            resolved = None
+        if resolved and os.path.exists(resolved):
+            test_image_paths.append(resolved)
+        elif os.path.exists(image_path):
             test_image_paths.append(image_path)
-        else:
-            try:
-                if resolver:
-                    resolved = resolver.resolve(image_path)
-                else:
-                    resolved = None
-                if resolved and os.path.exists(resolved):
-                    test_image_paths.append(resolved)
-            except Exception:
-                pass
 
     # 多图模式
     if image_paths_text:
@@ -218,19 +214,13 @@ def _collect_image_paths(image_path: str, image_paths_text: str) -> List[str]:
             else:
                 full_path = line
 
-            if os.path.exists(full_path):
-                if full_path not in test_image_paths:
-                    test_image_paths.append(full_path)
-            else:
-                try:
-                    if resolver:
-                        resolved = resolver.resolve(full_path)
-                    else:
-                        resolved = None
-                    if resolved and os.path.exists(resolved) and resolved not in test_image_paths:
-                        test_image_paths.append(resolved)
-                except Exception:
-                    pass
+            try:
+                resolved = resolver.resolve(full_path) if resolver else None
+            except Exception:
+                resolved = None
+            candidate_path = resolved if resolved and os.path.exists(resolved) else full_path
+            if os.path.exists(candidate_path) and candidate_path not in test_image_paths:
+                test_image_paths.append(candidate_path)
 
     return test_image_paths
 

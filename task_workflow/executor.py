@@ -15,7 +15,6 @@ from task_workflow.workflow_identity import (
     normalize_workflow_id,
 )
 from task_workflow.variable_resolver import resolve_params
-from tasks.task_utils import get_image_path_resolver
 from utils.input_guard import (
     acquire_input_guard,
     get_input_lock_timeout_seconds,
@@ -26,6 +25,7 @@ from utils.input_guard import (
 from utils.runtime_control import install_global_sleep_patch, thread_control_context
 from utils.window_finder import WindowFinder
 from utils.ntfy_push import normalize_card_ntfy_push_settings
+from utils.thread_start_utils import is_thread_start_task_type
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,9 @@ class WorkflowExecutor(QObject):
                  default_step_log_name: Optional[str] = None,
                  external_stop_checker: Optional[Callable[[], bool]] = None,
                  external_pause_checker: Optional[Callable[[], bool]] = None,
-                 cleanup_runtime_image_on_finish: bool = True):
+                 cleanup_runtime_image_on_finish: bool = True,
+                 clear_runtime_state_on_start: bool = True,
+                 infinite_loop_guard_enabled: bool = False):
         """
         初始化工作流执行器
 
@@ -120,6 +122,8 @@ class WorkflowExecutor(QObject):
             max_execution_steps: 最大执行步数限制
             result_variable_handler: 结果变量写入回调
             cleanup_runtime_image_on_finish: 执行结束时是否清理全局识图运行态
+            clear_runtime_state_on_start: 执行开始时是否清理当前上下文运行态
+            infinite_loop_guard_enabled: 是否启用无出口循环逻辑保护
             parent: 父对象
         """
         super().__init__(parent)
@@ -151,12 +155,8 @@ class WorkflowExecutor(QObject):
         self._external_stop_checker = external_stop_checker if callable(external_stop_checker) else None
         self._external_pause_checker = external_pause_checker if callable(external_pause_checker) else None
         self._cleanup_runtime_image_on_finish = bool(cleanup_runtime_image_on_finish)
-
-        if self.images_dir and os.path.isdir(self.images_dir):
-            try:
-                get_image_path_resolver().add_search_path(self.images_dir, priority=0)
-            except Exception as exc:
-                logger.warning(f"注册工作流图库目录失败: {exc}")
+        self._clear_runtime_state_on_start = bool(clear_runtime_state_on_start)
+        self._infinite_loop_guard_enabled = bool(infinite_loop_guard_enabled)
 
         if isinstance(self.cards_data, list):
             converted_cards = {}
@@ -612,25 +612,6 @@ class WorkflowExecutor(QObject):
                                 set_var("虚拟鼠标坐标X", yolo_result.get("virtual_mouse_x"))
                                 set_var("虚拟鼠标坐标Y", yolo_result.get("virtual_mouse_y"))
                                 set_var("虚拟鼠标类别", yolo_result.get("virtual_mouse_class"))
-                    elif task_type == "地图导航":
-                        map_result = (
-                            context.get_map_navigation_result(card_id)
-                            or context.get_latest_map_navigation_result()
-                            or {}
-                        )
-                        set_var("地图X", map_result.get("map_x"))
-                        set_var("地图Y", map_result.get("map_y"))
-                        set_var("定位置信度", map_result.get("confidence"))
-                        set_var("定位模式", map_result.get("match_mode"))
-                        set_var("锁定状态", map_result.get("locked"))
-                        set_var("失锁次数", map_result.get("lost_count"))
-                        set_var("目标范围X1", map_result.get("x1"))
-                        set_var("目标范围Y1", map_result.get("y1"))
-                        set_var("目标范围X2", map_result.get("x2"))
-                        set_var("目标范围Y2", map_result.get("y2"))
-                        set_var("路线ID", map_result.get("route_id"))
-                        set_var("最近路点索引", map_result.get("nearest_route_index"))
-                        set_var("距下一路点距离", map_result.get("distance_to_next_point"))
                     elif task_type in {"AI工具", "查找图片并点击", "图片点击"}:
                         ai_output = context.get_card_data(card_id, "ai_output_text")
                         if ai_output is not None:
@@ -1434,6 +1415,263 @@ class WorkflowExecutor(QObject):
             action_text = str(action or "").strip()
             return action_text in ("继续执行本步骤", "继续本步骤")
 
+    @staticmethod
+    def _normalize_graph_card_id(card_id: Any) -> Optional[int]:
+        if card_id is None or isinstance(card_id, bool):
+            return None
+        try:
+            return int(card_id)
+        except (TypeError, ValueError):
+            text = str(card_id or "").strip()
+            if not text:
+                return None
+            try:
+                return int(float(text))
+            except (TypeError, ValueError):
+                return None
+
+    @staticmethod
+    def _normalize_step_action_text(action: Any) -> str:
+        try:
+            from tasks.task_utils import normalize_step_action
+
+            return normalize_step_action(action)
+        except Exception:
+            action_text = str(action or "").strip()
+            if action_text in ("继续执行本步骤", "继续本步骤"):
+                return "继续执行本步骤"
+            if action_text in ("跳转到步骤", "跳转到指定步骤"):
+                return "跳转到步骤"
+            if action_text in ("停止工作流", "结束工作流", "结束流程", "终止流程"):
+                return "停止工作流"
+            return "执行下一步"
+
+    @classmethod
+    def _normalize_jump_target_for_graph(cls, value: Any) -> Optional[int]:
+        return cls._normalize_graph_card_id(value)
+
+    def _get_card_params_for_graph(self, card_obj: Any) -> Dict[str, Any]:
+        if isinstance(card_obj, dict):
+            params = card_obj.get("parameters", {}) or {}
+        else:
+            params = getattr(card_obj, "parameters", {}) or {}
+        return params if isinstance(params, dict) else {}
+
+    def _get_card_type_for_graph(self, card_obj: Any) -> str:
+        if isinstance(card_obj, dict):
+            return str(card_obj.get("task_type", "") or "").strip()
+        return str(getattr(card_obj, "task_type", "") or "").strip()
+
+    def _build_card_id_lookup_for_graph(self) -> Dict[int, Any]:
+        lookup: Dict[int, Any] = {}
+        for raw_key, card_obj in (self.cards_data or {}).items():
+            normalized_key = self._normalize_graph_card_id(raw_key)
+            if normalized_key is not None:
+                lookup.setdefault(normalized_key, card_obj)
+            if isinstance(card_obj, dict):
+                normalized_id = self._normalize_graph_card_id(card_obj.get("id", raw_key))
+            else:
+                normalized_id = self._normalize_graph_card_id(getattr(card_obj, "card_id", raw_key))
+            if normalized_id is not None:
+                lookup[normalized_id] = card_obj
+        return lookup
+
+    def _build_connection_map_for_graph(self) -> Dict[int, List[Dict[str, Any]]]:
+        connection_map: Dict[int, List[Dict[str, Any]]] = {}
+        for connection in self.connections_data or []:
+            if not isinstance(connection, dict):
+                continue
+            start_id = self._normalize_graph_card_id(connection.get("start_card_id"))
+            end_id = self._normalize_graph_card_id(connection.get("end_card_id"))
+            if start_id is None or end_id is None:
+                continue
+            conn_type = str(connection.get("type") or "sequential").strip().lower() or "sequential"
+            connection_map.setdefault(start_id, []).append(
+                {
+                    "start_card_id": start_id,
+                    "end_card_id": end_id,
+                    "type": conn_type,
+                }
+            )
+        return connection_map
+
+    def _resolve_next_edges_for_graph(
+        self,
+        card_id: int,
+        success: bool,
+        connection_map: Dict[int, List[Dict[str, Any]]],
+        valid_card_ids: Set[int],
+    ) -> Set[int]:
+        connections = connection_map.get(card_id, [])
+        targets: Set[int] = set()
+
+        random_connections = [c for c in connections if c.get("type") == "random"]
+        if random_connections:
+            for connection in random_connections:
+                end_id = self._normalize_graph_card_id(connection.get("end_card_id"))
+                if end_id in valid_card_ids:
+                    targets.add(end_id)
+            return targets
+
+        preferred_type = "success" if success else "failure"
+        preferred_connections = [c for c in connections if c.get("type") == preferred_type]
+        if preferred_connections:
+            for connection in preferred_connections:
+                end_id = self._normalize_graph_card_id(connection.get("end_card_id"))
+                if end_id in valid_card_ids:
+                    targets.add(end_id)
+            return targets
+
+        for connection in connections:
+            if connection.get("type") != "sequential":
+                continue
+            end_id = self._normalize_graph_card_id(connection.get("end_card_id"))
+            if end_id in valid_card_ids:
+                targets.add(end_id)
+        return targets
+
+    def _resolve_action_edges_for_graph(
+        self,
+        card_id: int,
+        card_params: Dict[str, Any],
+        success: bool,
+        connection_map: Dict[int, List[Dict[str, Any]]],
+        valid_card_ids: Set[int],
+    ) -> tuple[Set[int], bool]:
+        action_key = "on_success" if success else "on_failure"
+        target_key = "success_jump_target_id" if success else "failure_jump_target_id"
+        action = self._normalize_step_action_text(card_params.get(action_key, "执行下一步"))
+
+        if action == "停止工作流":
+            return set(), True
+        if action == "继续执行本步骤":
+            return {card_id}, False
+        if action == "跳转到步骤":
+            target_id = self._normalize_jump_target_for_graph(card_params.get(target_key))
+            if target_id in valid_card_ids:
+                return {target_id}, False
+            return set(), True
+
+        next_targets = self._resolve_next_edges_for_graph(card_id, success, connection_map, valid_card_ids)
+        return next_targets, not bool(next_targets)
+
+    def _build_possible_flow_graph(self) -> tuple[Dict[int, Set[int]], Set[int]]:
+        card_lookup = self._build_card_id_lookup_for_graph()
+        valid_card_ids = set(card_lookup.keys())
+        connection_map = self._build_connection_map_for_graph()
+        graph: Dict[int, Set[int]] = {card_id: set() for card_id in valid_card_ids}
+        terminal_possible: Set[int] = set()
+
+        for card_id, card_obj in card_lookup.items():
+            params = self._get_card_params_for_graph(card_obj)
+            task_type = self._get_card_type_for_graph(card_obj)
+
+            outcomes = [True]
+            if not is_thread_start_task_type(task_type):
+                outcomes.append(False)
+
+            for success in outcomes:
+                edges, can_end = self._resolve_action_edges_for_graph(
+                    card_id,
+                    params,
+                    success,
+                    connection_map,
+                    valid_card_ids,
+                )
+                graph[card_id].update(edges)
+                if can_end:
+                    terminal_possible.add(card_id)
+
+        return graph, terminal_possible
+
+    def _detect_infinite_loop_logic(self, start_card_id: Any = None) -> Optional[Dict[str, Any]]:
+        """检测从起点可达、没有任何可能出口的闭合循环。"""
+        graph, terminal_possible = self._build_possible_flow_graph()
+        start_id = self._normalize_graph_card_id(start_card_id if start_card_id is not None else self.start_card_id)
+        if start_id is None or start_id not in graph:
+            return None
+
+        reachable: Set[int] = set()
+        stack = [start_id]
+        while stack:
+            current = stack.pop()
+            if current in reachable or current not in graph:
+                continue
+            reachable.add(current)
+            for next_id in graph.get(current, set()):
+                if next_id not in reachable:
+                    stack.append(next_id)
+
+        index = 0
+        indexes: Dict[int, int] = {}
+        lowlinks: Dict[int, int] = {}
+        stack_nodes: List[int] = []
+        on_stack: Set[int] = set()
+        components: List[Set[int]] = []
+
+        def strong_connect(node: int) -> None:
+            nonlocal index
+            indexes[node] = index
+            lowlinks[node] = index
+            index += 1
+            stack_nodes.append(node)
+            on_stack.add(node)
+
+            for next_node in graph.get(node, set()):
+                if next_node not in reachable:
+                    continue
+                if next_node not in indexes:
+                    strong_connect(next_node)
+                    lowlinks[node] = min(lowlinks[node], lowlinks[next_node])
+                elif next_node in on_stack:
+                    lowlinks[node] = min(lowlinks[node], indexes[next_node])
+
+            if lowlinks[node] == indexes[node]:
+                component: Set[int] = set()
+                while stack_nodes:
+                    member = stack_nodes.pop()
+                    on_stack.discard(member)
+                    component.add(member)
+                    if member == node:
+                        break
+                components.append(component)
+
+        for card_id in sorted(reachable):
+            if card_id not in indexes:
+                strong_connect(card_id)
+
+        for component in components:
+            has_cycle = len(component) > 1 or any(card_id in graph.get(card_id, set()) for card_id in component)
+            if not has_cycle:
+                continue
+            has_outgoing = any(
+                next_id not in component
+                for card_id in component
+                for next_id in graph.get(card_id, set())
+            )
+            has_terminal_exit = any(card_id in terminal_possible for card_id in component)
+            if not has_outgoing and not has_terminal_exit:
+                return {
+                    "cards": sorted(component),
+                    "start_card_id": start_id,
+                }
+        return None
+
+    def _emit_infinite_loop_warning(self, message: str) -> None:
+        try:
+            self.show_warning.emit("检测到无限循环", message)
+        except Exception as exc:
+            logger.debug(f"发出无限循环警告失败: {exc}")
+
+    def _format_infinite_loop_message(self, loop_info: Dict[str, Any]) -> str:
+        loop_cards = loop_info.get("cards") if isinstance(loop_info, dict) else []
+        card_text = "、".join(str(card_id) for card_id in (loop_cards or [])) or "未知"
+        return (
+            "当前工作流存在没有出口的循环逻辑，继续执行会陷入无限循环。\n\n"
+            f"涉及卡片: {card_text}\n\n"
+            "请为该循环添加至少一个可跳出的成功/失败分支、停止工作流动作，或调整跳转目标后再运行。"
+        )
+
     def _maybe_hot_reset_ocr_by_next_card(self, current_card_id: int, current_task_type: str, next_card_id: Any):
         """
         OCR热重置策略：
@@ -1530,9 +1768,8 @@ class WorkflowExecutor(QObject):
         """导出运行变量快照，不自动清空运行变量。"""
         snapshot: Dict[str, Any] = {}
         try:
-            from task_workflow.workflow_context import export_global_vars
-
-            exported = export_global_vars(self.workflow_id)
+            context = self._get_workflow_var_context()
+            exported = context.export_vars() if context is not None else None
             if isinstance(exported, dict):
                 snapshot = exported
         except Exception as exc:
@@ -1588,12 +1825,13 @@ class WorkflowExecutor(QObject):
             logger.warning(f"绑定执行线程变量上下文失败: {bind_exc}")
 
         # 每次执行前清理上次运行遗留变量，避免串数据影响本次流程。
-        try:
-            from task_workflow.workflow_context import clear_runtime_state_for_new_run
+        if self._clear_runtime_state_on_start:
+            try:
+                from task_workflow.workflow_context import clear_runtime_state_for_new_run
 
-            clear_runtime_state_for_new_run(workflow_id=self.workflow_id)
-        except Exception as clear_exc:
-            logger.warning(f"执行前运行态清理失败: {clear_exc}")
+                clear_runtime_state_for_new_run(workflow_id=self.workflow_id)
+            except Exception as clear_exc:
+                logger.warning(f"执行前运行态清理失败: {clear_exc}")
 
         # 线程起点资源路由键：用于截图/OCR资源按 lane 做粘性分配。
         try:
@@ -1735,20 +1973,6 @@ class WorkflowExecutor(QObject):
                 logger.info("工作流结束，已清理所有OCR上下文数据")
             except Exception as e:
                 logger.warning(f"清理OCR上下文数据时发生错误: {e}")
-
-            try:
-                from utils.runtime_image_cleanup import cleanup_map_navigation_runtime_on_stop
-
-                cleanup_map_navigation_runtime_on_stop(
-                    release_bundle_cache=False,
-                    workflow_id=self.workflow_id,
-                    target_hwnd=self.target_hwnd,
-                    auto_close_only=True,
-                    include_orphans=False,
-                )
-                logger.info("工作流结束，已按策略清理地图导航子程序")
-            except Exception as e:
-                logger.warning(f"清理地图导航子程序时发生错误: {e}")
 
             # 统一清理图片相关缓存（覆盖异常/停止等路径）
             if self._cleanup_runtime_image_on_finish:
@@ -2178,6 +2402,14 @@ class WorkflowExecutor(QObject):
                 logger.error(error_msg)
                 return False, error_msg
 
+            if self._infinite_loop_guard_enabled:
+                loop_info = self._detect_infinite_loop_logic(self.start_card_id)
+                if loop_info:
+                    error_msg = self._format_infinite_loop_message(loop_info)
+                    logger.error(error_msg)
+                    self._emit_infinite_loop_warning(error_msg)
+                    return False, error_msg
+
             # 开始执行工作流
             self.step_details.emit("开始执行工作流...")
 
@@ -2190,8 +2422,12 @@ class WorkflowExecutor(QObject):
             while current_card_id is not None:
                 execution_count += 1
                 if self._max_execution_steps is not None and execution_count > self._max_execution_steps:
-                    error_msg = f"工作流执行步数超过限制: {self._max_execution_steps}"
+                    error_msg = (
+                        f"工作流执行步数超过限制: {self._max_execution_steps}\n\n"
+                        "这通常表示当前逻辑进入了无法结束的循环，已自动停止工作流。"
+                    )
                     logger.error(error_msg)
+                    self._emit_infinite_loop_warning(error_msg)
                     return False, error_msg
 
                 # 【重试标志重置】每轮循环开始时清除重试标志
@@ -2242,22 +2478,6 @@ class WorkflowExecutor(QObject):
                     error_msg = f"工作流跳转到非法卡片: {current_card_id}"
                     logger.error(error_msg)
                     return False, error_msg
-
-                # 【测试流程】环路检测：如果是测试流程模式，检测循环
-                if self.test_mode == 'flow':
-                    # 如果当前卡片已经访问过，说明检测到循环
-                    if current_card_id in self._visited_cards:
-                        if not self._cycle_detected:
-                            # 第一次检测到循环，标记并允许继续执行一次
-                            self._cycle_detected = True
-                            logger.info(f"[测试流程] 检测到循环：卡片 {current_card_id} 已访问过，允许再执行一次后停止")
-                        else:
-                            # 第二次遇到同一个卡片，停止执行
-                            logger.info(f"[测试流程] 循环已执行一次，停止工作流")
-                            return True, "[测试流程] 流程测试完成（已循环一次）"
-
-                    # 记录当前卡片为已访问
-                    self._visited_cards.add(current_card_id)
 
                 # 获取当前卡片信息
                 current_card = self.cards_data[current_card_id]

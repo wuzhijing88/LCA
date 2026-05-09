@@ -2,7 +2,6 @@ import json
 import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from market.refs import is_market_workflow_ref
 from tasks.task_utils import get_image_path_resolver
 from utils.app_paths import normalize_workflow_image_path
 
@@ -14,8 +13,6 @@ def favorite_path_key(filepath: str) -> str:
     normalized = str(filepath or "").strip()
     if not normalized:
         return ""
-    if is_market_workflow_ref(normalized):
-        return normalized
     return os.path.normcase(os.path.abspath(normalized))
 
 
@@ -117,7 +114,7 @@ def _normalize_saved_local_favorite(item: Dict[str, Any]) -> Optional[Dict[str, 
     if not isinstance(item, dict):
         return None
     filepath = str(item.get("filepath") or "").strip()
-    if not filepath or is_market_workflow_ref(filepath):
+    if not filepath:
         return None
     abs_path = os.path.abspath(filepath)
     return {
@@ -128,17 +125,7 @@ def _normalize_saved_local_favorite(item: Dict[str, Any]) -> Optional[Dict[str, 
 
 
 def _normalize_saved_manual_favorite(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not isinstance(item, dict):
-        return None
-    filepath = str(item.get("filepath") or "").strip()
-    if not filepath or not is_market_workflow_ref(filepath):
-        return None
-    return {
-        "name": str(item.get("name") or "").strip() or filepath,
-        "filepath": filepath,
-        "checked": bool(item.get("checked", True)),
-        "source": "manual",
-    }
+    return None
 
 
 def _derive_workspaces_from_legacy_favorites(raw_favorites: Iterable[Dict[str, Any]]) -> List[str]:

@@ -41,7 +41,7 @@ _FOREGROUND_BUTTON_RELEASE_TIMEOUT_SECONDS = 0.250
 _FOREGROUND_BUTTON_RELEASE_POLL_SECONDS = 0.002
 _FOREGROUND_CLICK_CADENCE_LOCK = threading.RLock()
 _FOREGROUND_CLICK_LAST_TS: dict[str, float] = {}
-_FOREGROUND_CURSOR_VERIFY_TIMEOUT_SECONDS = 0.120
+_FOREGROUND_CURSOR_VERIFY_TIMEOUT_SECONDS = 0.200
 _FOREGROUND_CURSOR_VERIFY_POLL_SECONDS = 0.002
 _FOREGROUND_CURSOR_VERIFY_TOLERANCE = 2
 _MOUSE_BUTTON_VK_MAP = {
@@ -190,6 +190,13 @@ def _get_cursor_position() -> Optional[tuple[int, int]]:
     except Exception:
         return None
     return None
+
+
+def _set_cursor_position(x: int, y: int) -> bool:
+    try:
+        return bool(ctypes.windll.user32.SetCursorPos(int(x), int(y)))
+    except Exception:
+        return False
 
 
 
@@ -378,6 +385,13 @@ def _ensure_foreground_cursor_ready(
             moved = False
 
         if moved and _wait_cursor_reach_target(
+            target_x,
+            target_y,
+            stop_checker=stop_checker,
+        ):
+            return True
+
+        if _set_cursor_position(target_x, target_y) and _wait_cursor_reach_target(
             target_x,
             target_y,
             stop_checker=stop_checker,

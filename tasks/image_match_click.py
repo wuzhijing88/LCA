@@ -610,7 +610,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 # 确保 os 模块可用
                 import os
                 image_name = os.path.basename(absolute_image_path)
-            logger.debug(f"使用图片: {image_name}")
+            logger.info(f"[找图] 使用模板: {image_name} ({absolute_image_path})")
             # Optional: Check existence here, though _resolve_image_paths should have done it
             # if not os.path.exists(absolute_image_path):
             #      logger.error(f"文件未找到: {absolute_image_path}")

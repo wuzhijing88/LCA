@@ -264,9 +264,15 @@ class TemplatePreloader:
         # 打包环境优先用户目录与可执行目录
         if getattr(sys, "frozen", False):
             try:
-                from utils.app_paths import get_user_data_dir
+                from utils.app_paths import get_images_dir
 
-                _append_dir(os.path.join(get_user_data_dir("LCA"), "images"))
+                _append_dir(get_images_dir("LCA"))
+            except Exception:
+                pass
+            try:
+                from utils.app_paths import get_legacy_user_data_dir
+
+                _append_dir(os.path.join(get_legacy_user_data_dir("LCA"), "images"))
             except Exception:
                 pass
             try:

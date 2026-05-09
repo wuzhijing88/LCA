@@ -378,41 +378,48 @@ class ImagePathResolver:
             except Exception:
                 return p.absolute()
 
+        def add_existing_path(path_value) -> None:
+            try:
+                candidate = normalize_path(Path(path_value))
+            except Exception:
+                return
+            if candidate.exists() and candidate not in self._search_paths:
+                self._search_paths.append(candidate)
+
         # 打包环境优先使用用户数据目录，避免 CWD 漂移导致读到错误模板。
         if getattr(sys, 'frozen', False):
             try:
-                from utils.app_paths import get_user_data_dir
-                user_images = normalize_path(Path(get_user_data_dir("LCA")) / "images")
-                if user_images.exists() and user_images not in self._search_paths:
-                    self._search_paths.append(user_images)
+                from utils.app_paths import get_images_dir
+                add_existing_path(get_images_dir("LCA"))
             except Exception:
                 pass
 
         # 当前工作目录下的 images/
-        cwd_images = normalize_path(Path.cwd() / "images")
-        if cwd_images.exists() and cwd_images not in self._search_paths:
-            self._search_paths.append(cwd_images)
+        if not getattr(sys, 'frozen', False):
+            add_existing_path(Path.cwd() / "images")
 
         # 2. 程序所在目录下的 images/
         if getattr(sys, 'frozen', False):
             # 打包环境：使用可执行文件所在目录
             exe_dir = normalize_path(Path(sys.executable).parent)
-            exe_images = exe_dir / "images"
-            if exe_images.exists() and exe_images not in self._search_paths:
-                self._search_paths.append(exe_images)
+            add_existing_path(exe_dir / "images")
+
+            try:
+                from utils.app_paths import get_legacy_user_data_dir
+                add_existing_path(Path(get_legacy_user_data_dir("LCA")) / "images")
+            except Exception:
+                pass
+
+            add_existing_path(Path.cwd() / "images")
 
             # 3. PyInstaller 的 _MEIPASS 目录（临时解压目录）
             if hasattr(sys, '_MEIPASS'):
-                meipass_images = normalize_path(Path(sys._MEIPASS) / "images")
-                if meipass_images.exists() and meipass_images not in self._search_paths:
-                    self._search_paths.append(meipass_images)
+                add_existing_path(Path(sys._MEIPASS) / "images")
         else:
             # 开发环境：使用脚本所在目录
             try:
                 script_dir = normalize_path(Path(__file__).parent.parent)
-                script_images = script_dir / "images"
-                if script_images.exists() and script_images not in self._search_paths:
-                    self._search_paths.append(script_images)
+                add_existing_path(script_dir / "images")
             except NameError:
                 pass
 

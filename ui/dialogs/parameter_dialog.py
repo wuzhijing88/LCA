@@ -2689,7 +2689,6 @@ class ParameterDialog(QDialog):
 
             task_module = get_task_module(self.task_type)
             if task_module is None or not hasattr(task_module, action_name):
-                logger.debug("参数对话框未找到按钮动作: %s", action_name)
                 return
 
             current_params = self.get_parameters()

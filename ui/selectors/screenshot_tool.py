@@ -63,7 +63,42 @@ def _get_context_images_dir(context) -> str:
         candidate = str(getattr(context, "images_dir", "") or "").strip()
     except Exception:
         candidate = ""
-    return candidate or _get_default_images_dir()
+    return _normalize_screenshot_save_dir(candidate)
+
+
+def _normalize_screenshot_save_dir(save_dir: str) -> str:
+    raw_save_dir = str(save_dir or "").strip()
+    default_images_dir = _get_default_images_dir()
+    if (not raw_save_dir) or raw_save_dir.replace("/", "\\").lower() in {"images", ".\images"}:
+        return default_images_dir
+
+    if os.path.isabs(raw_save_dir):
+        normalized_dir = raw_save_dir
+    else:
+        try:
+            from utils.app_paths import get_app_root
+
+            normalized_dir = os.path.abspath(os.path.join(get_app_root(), raw_save_dir))
+        except Exception:
+            normalized_dir = os.path.abspath(raw_save_dir)
+
+    try:
+        from utils.app_paths import get_legacy_user_data_dir
+
+        legacy_images_dir = os.path.abspath(os.path.join(get_legacy_user_data_dir("LCA"), "images"))
+        normalized_abs = os.path.abspath(normalized_dir)
+        legacy_norm = os.path.normcase(legacy_images_dir)
+        normalized_norm = os.path.normcase(normalized_abs)
+        legacy_prefix = legacy_norm + os.sep
+        if normalized_norm == legacy_norm:
+            return default_images_dir
+        if normalized_norm.startswith(legacy_prefix):
+            relative_suffix = os.path.relpath(normalized_abs, legacy_images_dir)
+            return os.path.join(default_images_dir, relative_suffix)
+    except Exception:
+        pass
+
+    return normalized_dir
 
 try:
     import win32gui
@@ -98,19 +133,7 @@ class ScreenshotOverlay(QWidget):
         super().__init__(None)  # 独立窗口
 
         self.target_hwnd = target_hwnd
-        raw_save_dir = str(save_dir or "").strip()
-        if (not raw_save_dir) or raw_save_dir.replace("/", "\\").lower() in {"images", ".\\images"}:
-            self.save_dir = _get_default_images_dir()
-        else:
-            if os.path.isabs(raw_save_dir):
-                self.save_dir = raw_save_dir
-            else:
-                try:
-                    from utils.app_paths import get_app_root
-
-                    self.save_dir = os.path.abspath(os.path.join(get_app_root(), raw_save_dir))
-                except Exception:
-                    self.save_dir = os.path.abspath(raw_save_dir)
+        self.save_dir = _normalize_screenshot_save_dir(save_dir)
         self.parent_widget = parent
         self.card_id = card_id
         self._workflow_token = self._normalize_workflow_token(workflow_id)

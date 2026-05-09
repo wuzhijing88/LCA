@@ -39,9 +39,6 @@ class WorkflowContext:
     # YOLO检测结果存储 {card_id: yolo_result}
     yolo_results: Dict[int, Dict[str, Any]] = field(default_factory=dict)
 
-    # 地图导航结果存储 {card_id: map_navigation_result}
-    map_navigation_results: Dict[int, Dict[str, Any]] = field(default_factory=dict)
-
     # 通用数据存储 {card_id: {key: value}}
     card_data: Dict[int, Dict[str, Any]] = field(default_factory=dict)
 
@@ -70,7 +67,6 @@ class WorkflowContext:
         self.ocr_result_snapshots.clear()
         self.image_results.clear()
         self.yolo_results.clear()
-        self.map_navigation_results.clear()
         self.card_data.clear()
         self.ai_conversations.clear()
         with self.global_vars_lock:
@@ -290,43 +286,6 @@ class WorkflowContext:
 
         return None
 
-    def set_map_navigation_result(self, card_id: int, result: Dict[str, Any]):
-        """设置地图导航结果"""
-        if len(self.map_navigation_results) > 10:
-            old_cards = sorted([cid for cid in self.map_navigation_results.keys() if cid != card_id])
-            for old_card_id in old_cards[:len(old_cards)//2]:
-                del self.map_navigation_results[old_card_id]
-                logger.debug(f"自动清理旧地图导航结果: 卡片 {old_card_id}")
-
-        self.map_navigation_results[card_id] = dict(result or {})
-        logger.debug(
-            "设置卡片 %d 的地图导航结果: 地图坐标=(%s, %s)",
-            card_id,
-            result.get("map_x") if isinstance(result, dict) else None,
-            result.get("map_y") if isinstance(result, dict) else None,
-        )
-
-    def get_map_navigation_result(self, card_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        """获取地图导航结果"""
-        if card_id is not None:
-            result = self.map_navigation_results.get(card_id)
-            return dict(result) if isinstance(result, dict) else result
-
-        if self.map_navigation_results:
-            latest_card_id = max(self.map_navigation_results.keys())
-            result = self.map_navigation_results[latest_card_id]
-            return dict(result) if isinstance(result, dict) else result
-
-        return None
-
-    def get_latest_map_navigation_result(self) -> Optional[Dict[str, Any]]:
-        """获取最新的地图导航结果"""
-        if self.map_navigation_results:
-            latest_card_id = max(self.map_navigation_results.keys())
-            result = self.map_navigation_results[latest_card_id]
-            return dict(result) if isinstance(result, dict) else result
-        return None
-
     def clear_all_yolo_data(self):
         """清除所有YOLO相关结果与系统变量。"""
         self.yolo_results.clear()
@@ -349,17 +308,6 @@ class WorkflowContext:
         if latest_card_id == card_id:
             self.remove_global_var('latest_yolo_card_id')
             self.remove_global_var('latest_yolo_timestamp')
-
-    def clear_all_map_navigation_data(self):
-        """清除所有地图导航结果。"""
-        self.map_navigation_results.clear()
-        logger.debug("清除所有地图导航结果")
-
-    def clear_card_map_navigation_data(self, card_id: int):
-        """清理单卡地图导航运行态数据。"""
-        if card_id in self.map_navigation_results:
-            del self.map_navigation_results[card_id]
-            logger.debug(f"清理卡片 {card_id} 的地图导航结果")
 
     def set_card_data(self, card_id: int, key: str, value: Any):
         """设置卡片数据"""
@@ -905,10 +853,9 @@ class WorkflowContext:
                 logger.debug(f"清除卡片 {card_id} 的所有数据")
 
     def clear_card_runtime_data(self, card_id: int):
-        """清理单卡运行态数据（OCR/YOLO/地图导航/card_data）。"""
+        """清理单卡运行态数据（OCR/YOLO/card_data）。"""
         self.clear_card_ocr_data(card_id)
         self.clear_card_yolo_data(card_id)
-        self.clear_card_map_navigation_data(card_id)
         if card_id in self.card_data:
             del self.card_data[card_id]
             logger.debug(f"清理卡片 {card_id} 的剩余 card_data")
@@ -1047,7 +994,6 @@ class WorkflowContext:
         self.ocr_results.clear()
         self.ocr_result_snapshots.clear()
         self.yolo_results.clear()
-        self.map_navigation_results.clear()
         self.card_data.clear()
         for card_id, names in placeholder_map.items():
             self.card_data[card_id] = {
@@ -1522,8 +1468,17 @@ class WorkflowContextManager:
             workflow_key = self._find_context_key_unlocked(target_context)
 
             if workflow_key is None:
-                target_context = self._ensure_default_context_unlocked()
-                workflow_key = "default"
+                if target_context is None:
+                    target_context = self._ensure_default_context_unlocked()
+                    workflow_key = "default"
+                else:
+                    workflow_key = self._normalize_workflow_id(
+                        getattr(target_context, "workflow_id", None)
+                    )
+                    previous_context = self._contexts.get(workflow_key)
+                    if previous_context is not None and previous_context is not target_context:
+                        self._context_keys_by_object.pop(id(previous_context), None)
+                    self._bind_context_unlocked(workflow_key, target_context)
 
             self._thread_local.context = target_context
             target_context.workflow_id = workflow_key
@@ -1826,52 +1781,4 @@ def get_latest_yolo_result(workflow_id: str = "default") -> Optional[Dict[str, A
     """获取最新YOLO检测结果的便捷函数"""
     context = get_workflow_context(workflow_id)
     return context.get_latest_yolo_result()
-
-
-def set_map_navigation_result(card_id: int, result: Dict[str, Any], workflow_id: str = "default"):
-    """设置地图导航结果的便捷函数"""
-    context = get_workflow_context(workflow_id)
-    context.set_map_navigation_result(card_id, result)
-
-
-def get_map_navigation_result(
-    card_id: Optional[int] = None,
-    workflow_id: str = "default",
-) -> Optional[Dict[str, Any]]:
-    """获取地图导航结果的便捷函数"""
-    context = get_workflow_context(workflow_id)
-    return context.get_map_navigation_result(card_id)
-
-
-def get_latest_map_navigation_result(workflow_id: str = "default") -> Optional[Dict[str, Any]]:
-    """获取最新地图导航结果的便捷函数"""
-    context = get_workflow_context(workflow_id)
-    return context.get_latest_map_navigation_result()
-
-
-def clear_all_map_navigation_data(workflow_id: str = "default"):
-    """清除指定上下文的地图导航运行态数据。"""
-    context = get_workflow_context(workflow_id)
-    context.clear_all_map_navigation_data()
-
-
-def clear_card_map_navigation_data(card_id: int, workflow_id: str = "default"):
-    """清理单卡地图导航运行态数据。"""
-    context = get_workflow_context(workflow_id)
-    context.clear_card_map_navigation_data(card_id)
-
-
-def clear_all_map_navigation_runtime_data():
-    """清除当前上下文池中全部地图导航运行态数据。"""
-    context_snapshot = _context_manager.contexts
-    seen_context_ids = set()
-    for context in context_snapshot.values():
-        context_id = id(context)
-        if context_id in seen_context_ids:
-            continue
-        seen_context_ids.add(context_id)
-        try:
-            context.clear_all_map_navigation_data()
-        except Exception:
-            continue
 

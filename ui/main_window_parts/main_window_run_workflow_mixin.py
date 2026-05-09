@@ -935,36 +935,6 @@ class MainWindowRunWorkflowMixin:
 
                             logger.info(f"[单卡测试] 已清除跳转参数: {cleared_str}")
 
-                        # 【重要修复】强制设置成功和失败操作为"执行下一步"，防止"继续执行本步骤"导致无限循环
-
-                        params_modified = []
-
-                        if params.get('on_success') == '继续执行本步骤':
-
-                            old_value = params['on_success']
-
-                            params['on_success'] = '执行下一步'
-
-                            params_modified.append(f"on_success: '{old_value}' -> '执行下一步'")
-
-                            logger.warning(f"[单卡测试] 检测到'继续执行本步骤'设置，已强制修改为'执行下一步'以防止无限循环")
-
-                        if params.get('on_failure') == '继续执行本步骤':
-
-                            old_value = params['on_failure']
-
-                            params['on_failure'] = '执行下一步'
-
-                            params_modified.append(f"on_failure: '{old_value}' -> '执行下一步'")
-
-                            logger.warning(f"[单卡测试] 检测到'继续执行本步骤'设置，已强制修改为'执行下一步'以防止无限循环")
-
-                        if params_modified:
-
-                            modified_str = ', '.join(params_modified)
-
-                            logger.info(f"[单卡测试] 已修改循环执行参数: {modified_str}")
-
                         if hasattr(self, "_apply_ai_cli_runtime_parameter_overrides"):
 
                             try:
@@ -1038,40 +1008,6 @@ class MainWindowRunWorkflowMixin:
                                     'position': {'x': card_obj.x(), 'y': card_obj.y()}
 
                                 }
-
-                        # 【重要修复】遍历所有卡片，清理"继续执行本步骤"参数，防止无限循环
-
-                        cards_cleaned = []
-
-                        for cid, card_data in serialized_cards.items():
-
-                            params = card_data.get('parameters', {})
-
-                            card_modified = False
-
-                            if params.get('on_success') == '继续执行本步骤':
-
-                                params['on_success'] = '执行下一步'
-
-                                card_modified = True
-
-                                logger.warning(f"[流程测试] 卡片 {cid}: 检测到 on_success='继续执行本步骤'，已强制修改为'执行下一步'")
-
-                            if params.get('on_failure') == '继续执行本步骤':
-
-                                params['on_failure'] = '执行下一步'
-
-                                card_modified = True
-
-                                logger.warning(f"[流程测试] 卡片 {cid}: 检测到 on_failure='继续执行本步骤'，已强制修改为'执行下一步'")
-
-                            if card_modified:
-
-                                cards_cleaned.append(cid)
-
-                        if cards_cleaned:
-
-                            logger.info(f"[流程测试] 已清理 {len(cards_cleaned)} 个卡片的循环执行参数: {cards_cleaned}")
 
                         # 添加虚拟起点
 

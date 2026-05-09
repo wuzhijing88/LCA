@@ -29,24 +29,7 @@ logger = logging.getLogger(__name__)
 
 TASK_NAME = '子工作流'
 SUPPORTED_CONNECTION_TYPES = frozenset({"sequential", "success", "failure", "random"})
-_DEFAULT_SUB_WORKFLOW_BASE_MAX_STEPS = 10000
-_SUB_WORKFLOW_STEPS_PER_CARD = 2000
 _MISSING = object()
-
-
-def _resolve_sub_workflow_max_execution_steps(cards: Any) -> int:
-    raw_value = str(os.environ.get("LCA_SUB_WORKFLOW_MAX_EXECUTION_STEPS", "") or "").strip()
-    if raw_value:
-        try:
-            configured = int(raw_value)
-            if configured > 0:
-                return configured
-        except (TypeError, ValueError):
-            logger.warning(f"[子工作流] 非法的执行步数限制配置: {raw_value}")
-
-    card_count = len(cards) if isinstance(cards, list) else 0
-    card_count = max(1, int(card_count or 0))
-    return max(_DEFAULT_SUB_WORKFLOW_BASE_MAX_STEPS, card_count * _SUB_WORKFLOW_STEPS_PER_CARD)
 
 
 def _build_sub_workflow_runtime_id(
@@ -453,8 +436,8 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
 
         # 【限制4】创建子工作流独立的上下文
         from task_workflow.workflow_context import (
-            WorkflowContext,
             get_current_workflow_context,
+            get_workflow_context,
             set_current_workflow_context,
         )
 
@@ -465,7 +448,14 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
                 logger.debug(f"[子工作流] 获取父工作流上下文失败: {exc}")
                 parent_workflow_context = None
 
-        sub_workflow_context = WorkflowContext()
+        sub_workflow_id = _build_sub_workflow_runtime_id(
+            parent_workflow_context=parent_workflow_context,
+            workflow_filepath=workflow_filepath,
+            parent_card_id=parent_card_id,
+        )
+
+        sub_workflow_context = get_workflow_context(sub_workflow_id)
+        sub_workflow_context.clear()
         logger.info("[子工作流] 创建独立上下文")
 
         # 继承父工作流变量快照，确保子工作流卡片参数可直接引用父变量
@@ -528,8 +518,7 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
             raise RuntimeError(f"子工作流缺少{THREAD_START_TASK_TYPE}")
 
         start_card_id = start_type_cards[0]['id']
-        max_execution_steps = _resolve_sub_workflow_max_execution_steps(cards)
-        logger.info(f"[子工作流] 从卡片 {start_card_id} 开始执行，最大步数限制: {max_execution_steps}")
+        logger.info(f"[子工作流] 从卡片 {start_card_id} 开始执行，无固定步数限制")
 
         from task_workflow.executor import WorkflowExecutor
 
@@ -537,12 +526,6 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
             _save_sub_card_result_variable,
             result_prefixes=sub_result_prefixes,
         )
-        sub_workflow_id = _build_sub_workflow_runtime_id(
-            parent_workflow_context=parent_workflow_context,
-            workflow_filepath=workflow_filepath,
-            parent_card_id=parent_card_id,
-        )
-
         sub_executor = WorkflowExecutor(
             cards_data=card_map,
             connections_data=connections,
@@ -557,13 +540,15 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
             workflow_var_context=sub_workflow_context,
             allowed_card_ids=valid_card_ids,
             disallowed_task_types={TASK_NAME},
-            max_execution_steps=max_execution_steps,
+            max_execution_steps=None,
             result_variable_handler=result_handler,
             default_step_log_scope='sub',
             default_step_log_name=sub_workflow_name,
             external_stop_checker=stop_checker if callable(stop_checker) else None,
             external_pause_checker=pause_checker if callable(pause_checker) else None,
             cleanup_runtime_image_on_finish=False,
+            clear_runtime_state_on_start=False,
+            infinite_loop_guard_enabled=True,
         )
 
         if parent_executor is not None and hasattr(parent_executor, 'step_log'):
@@ -571,6 +556,15 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
                 sub_executor.step_log.connect(parent_executor.step_log.emit)
             except Exception as exc:
                 logger.debug(f"[子工作流] 绑定步骤日志透传失败: {exc}")
+        if (
+            parent_executor is not None
+            and hasattr(parent_executor, 'show_warning')
+            and hasattr(sub_executor, 'show_warning')
+        ):
+            try:
+                sub_executor.show_warning.connect(parent_executor.show_warning.emit)
+            except Exception as exc:
+                logger.debug(f"[子工作流] 绑定警告弹窗透传失败: {exc}")
 
         if callable(stop_checker) and stop_checker():
             logger.info("[子工作流] 执行前检测到停止请求")
