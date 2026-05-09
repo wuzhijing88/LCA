@@ -171,12 +171,10 @@ def run_qt_event_loop(
     app,
     log_maintenance_loop,
     plugin_init_thread,
-    main_process_memory_watchdog,
     task_state_manager,
     main_window,
     system_tray,
     cleanup_runtime_state_variables_cb,
-    trim_main_process_memory_cb,
     exit_cleanup_join_timeout_sec: float,
 ):
     exit_cleanup_thread = None
@@ -246,33 +244,10 @@ def run_qt_event_loop(
             logging.error(f"[后台清理] OCR 清理失败: {error}")
 
         try:
-            from utils.runtime_image_cleanup import cleanup_map_navigation_runtime_on_stop
-
-            cleanup_result = cleanup_map_navigation_runtime_on_stop(
-                release_bundle_cache=False,
-                auto_close_only=False,
-                include_orphans=True,
-            )
-            logging.info(
-                "[后台清理] 地图导航运行态清理完成: runtime=%s subprocesses=%s",
-                bool(cleanup_result.get("runtime")),
-                bool(cleanup_result.get("subprocesses")),
-            )
-        except Exception as error:
-            logging.error(f"[后台清理] 地图导航清理失败: {error}")
-
-        try:
             from utils.screenshot_helper import cleanup_all_screenshot_engines
             cleanup_all_screenshot_engines()
         except Exception as error:
             logging.error(f"[后台清理] 截图子系统清理失败: {error}")
-
-        try:
-            trimmed_mb = trim_main_process_memory_cb()
-            if trimmed_mb > 1.0:
-                logging.info(f"[后台清理] 退出阶段主进程内存修剪，释放约 {trimmed_mb:.1f} MB")
-        except Exception as error:
-            logging.debug(f"[后台清理] 退出阶段主进程内存修剪失败: {error}")
 
         logging.info("[后台清理] 所有清理工作完成，程序可以安全退出")
 
@@ -294,12 +269,6 @@ def run_qt_event_loop(
                 plugin_init_thread.join(timeout=1.0)
         except Exception as error:
             logging.warning(f"[插件初始化] 等待初始化线程退出失败: {error}")
-
-        try:
-            if main_process_memory_watchdog is not None:
-                main_process_memory_watchdog.stop(timeout=1.5)
-        except Exception as error:
-            logging.warning(f"[内存巡检] 停止失败: {error}")
 
         try:
             if task_state_manager is not None:

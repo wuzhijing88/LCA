@@ -3,8 +3,7 @@ import os
 import sys
 
 from PySide6.QtWidgets import QMessageBox
-from app_core.client_identity import attempt_client_registration, get_hardware_id
-from app_core.license_store import LICENSE_FILE
+from app_core.client_identity import get_hardware_id
 from app_core.plugin_activation_service import prepare_plugin_mode_activation
 
 from utils.window_binding_utils import (
@@ -194,8 +193,6 @@ class GlobalSettingsDialogSaveMixin:
 
                     import sys
 
-                    import requests
-
                     try:
 
 
@@ -208,7 +205,7 @@ class GlobalSettingsDialogSaveMixin:
 
                             # 查询服务器验证状态
 
-                            http_session = requests.Session()
+                            http_session = None
 
                             try:
 
@@ -664,9 +661,7 @@ class GlobalSettingsDialogSaveMixin:
 
             'enable_connection_line_animation': self.connection_line_animation_checkbox.isChecked() if hasattr(self, 'connection_line_animation_checkbox') else self.current_config.get('enable_connection_line_animation', True),
 
-            'enable_update_check': self.enable_update_check.isChecked() if hasattr(self, 'enable_update_check') else self.current_config.get('enable_update_check', True),
-
-            'market_update_server_base': self.current_config.get('market_update_server_base', ''),
+            'enable_update_check': self.enable_update_check.isChecked() if hasattr(self, 'enable_update_check') else self.current_config.get('enable_update_check', False),
 
             'ntfy_settings': self._build_ntfy_settings_from_form() if hasattr(self, '_build_ntfy_settings_from_form') else self.current_config.get('ntfy_settings', {}),
 

@@ -346,7 +346,7 @@ class MainWindowGlobalSettingsMixin:
 
             if hasattr(self, 'update_integration') and self.update_integration:
 
-                enable_update_check = bool(self.config.get('enable_update_check', True))
+                enable_update_check = bool(self.config.get('enable_update_check', False))
 
                 self.update_integration.enable(enable_update_check)
 

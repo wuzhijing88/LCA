@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-import requests
-
 from app_core.client_identity import attempt_client_registration
 from app_core.license_runtime import (
     bind_license_to_hwid,
@@ -62,7 +60,7 @@ def _result(
     )
 
 
-def _close_session_quietly(session: Optional[requests.Session]) -> None:
+def _close_session_quietly(session: Optional[object]) -> None:
     if session is None:
         return
     try:
@@ -181,7 +179,7 @@ def _safe_validate_license_with_server(
 def _safe_bind_license_to_hwid(
     hardware_id: str,
     license_key: str,
-    session: requests.Session,
+    session: object,
 ) -> bool:
     try:
         return bool(bind_license_to_hwid(hardware_id, license_key, session))
@@ -190,11 +188,7 @@ def _safe_bind_license_to_hwid(
 
 
 def _register_client_for_plugin_mode(hardware_id: str) -> dict:
-    session = requests.Session()
-    try:
-        return attempt_client_registration(hardware_id, session)
-    finally:
-        _close_session_quietly(session)
+    return attempt_client_registration(hardware_id, None)
 
 
 def prepare_plugin_mode_activation(hardware_id: str) -> PluginActivationResult:
@@ -205,6 +199,14 @@ def prepare_plugin_mode_activation(hardware_id: str) -> PluginActivationResult:
             title=ERROR_TITLE,
             message="\u65e0\u6cd5\u83b7\u53d6\u786c\u4ef6ID\uff0c\u8bf7\u68c0\u67e5\u7cfb\u7edf\u73af\u5883\u3002",
         )
+
+    set_validation_session()
+    return _result(
+        success=True,
+        status_code=200,
+        license_type="LOCAL_ONLY",
+        validation_enabled=False,
+    )
 
     registration_result = _safe_register_client_for_plugin_mode(normalized_hardware_id)
     if not registration_result.get("success", False):
@@ -284,7 +286,7 @@ def prepare_plugin_mode_activation(hardware_id: str) -> PluginActivationResult:
 def validate_plugin_license_key(
     hardware_id: str,
     license_key: str,
-    session: requests.Session,
+    session: object,
 ) -> PluginActivationResult:
     normalized_hardware_id = str(hardware_id or "").strip()
     normalized_license_key = str(license_key or "").strip()
@@ -301,6 +303,16 @@ def validate_plugin_license_key(
             title=LICENSE_EMPTY_TITLE,
             message="\u8bf7\u8f93\u5165\u6388\u6743\u7801\u540e\u518d\u9a8c\u8bc1\u3002",
         )
+
+    set_validation_session()
+    return _result(
+        success=True,
+        title="\u672c\u5730\u6a21\u5f0f\u5df2\u542f\u7528",
+        message="\u5df2\u79fb\u9664\u5728\u7ebf\u6388\u6743\u9a8c\u8bc1\u3002",
+        status_code=200,
+        license_type="LOCAL_ONLY",
+        validation_enabled=False,
+    )
 
     bind_attempted = False
     is_valid, status_code, license_type, extra_info = _safe_validate_license_with_server(

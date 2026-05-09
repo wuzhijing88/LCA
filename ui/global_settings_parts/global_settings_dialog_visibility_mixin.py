@@ -257,8 +257,6 @@ class GlobalSettingsDialogVisibilityMixin:
 
             import os
 
-            import requests
-
             # 首先检查服务器是否启用了验证
 
             try:
@@ -293,7 +291,7 @@ class GlobalSettingsDialogVisibilityMixin:
 
                 # 查询服务器验证状态
 
-                http_session = requests.Session()
+                http_session = None
 
                 try:
 
@@ -683,8 +681,6 @@ class GlobalSettingsDialogVisibilityMixin:
 
         try:
 
-            import requests
-
             # 检查 hardware_id 是否有效
 
             if not self.hardware_id or len(self.hardware_id) != 64:
@@ -695,7 +691,7 @@ class GlobalSettingsDialogVisibilityMixin:
 
             # 创建HTTP会话
 
-            http_session = requests.Session()
+            http_session = None
 
             try:
 
@@ -851,15 +847,13 @@ class GlobalSettingsDialogVisibilityMixin:
 
         try:
 
-            import requests
-
             if not self.hardware_id or len(self.hardware_id) != 64:
 
                 logger.error(f"无效的硬件ID: {self.hardware_id}")
 
                 return False
 
-            http_session = requests.Session()
+            http_session = None
 
             try:
 
@@ -1007,15 +1001,13 @@ class GlobalSettingsDialogVisibilityMixin:
 
         try:
 
-            import requests
-
             if not self.hardware_id or len(self.hardware_id) != 64:
 
                 logger.error(f"invalid hardware id: {self.hardware_id}")
 
                 return False
 
-            http_session = requests.Session()
+            http_session = None
 
             try:
 

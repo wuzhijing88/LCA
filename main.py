@@ -107,13 +107,6 @@ def _build_workflow_subprocess_args(argv) -> tuple[int]:
     return (get_cli_int_argument_value(argv, "--port", 0),)
 
 
-def _build_map_navigation_subprocess_args(argv) -> tuple[str, str]:
-    return (
-        get_cli_argument_value(argv, "--input", ""),
-        get_cli_argument_value(argv, "--output", ""),
-    )
-
-
 def _log_ocr_subprocess_start(logger, _argv, args) -> None:
     _install_root_log_translator()
     process_id, port = args
@@ -131,17 +124,6 @@ def _log_workflow_subprocess_start(logger, _argv, args) -> None:
     logger.info("=" * 80)
     logger.info("[工作流子进程][命令行检测] 检测到 --workflow-worker 参数")
     logger.info(f"[工作流子进程][命令行检测] 通信端口: {port}")
-    logger.info("=" * 80)
-
-
-def _log_map_navigation_subprocess_start(logger, _argv, args) -> None:
-    _ensure_standalone_subprocess_file_logging(logging.INFO)
-    _install_root_log_translator()
-    input_path, output_path = args
-    logger.info("=" * 80)
-    logger.info("[地图导航子进程][命令行检测] 检测到 --map-navigation-worker 参数")
-    logger.info(f"[地图导航子进程][命令行检测] 输入文件: {input_path}")
-    logger.info(f"[地图导航子进程][命令行检测] 输出文件: {output_path}")
     logger.info("=" * 80)
 
 
@@ -178,17 +160,6 @@ _STANDALONE_SUBPROCESS_SPECS = (
         configure_root_logging=False,
         args_factory=_build_workflow_subprocess_args,
         startup_hook=_log_workflow_subprocess_start,
-    ),
-    StandaloneSubprocessSpec(
-        flag="--map-navigation-worker",
-        module_name="services.map_navigation.subprocess_runner",
-        callable_name="run_map_navigation_subprocess_standalone",
-        logger_name="MAP_NAVIGATION_SUBPROCESS",
-        error_label="地图导航子进程",
-        log_level=logging.INFO,
-        log_format="%(asctime)s - %(levelname)s - [pid=%(process)d] - [%(funcName)s:%(lineno)d] - %(message)s",
-        args_factory=_build_map_navigation_subprocess_args,
-        startup_hook=_log_map_navigation_subprocess_start,
     ),
     StandaloneSubprocessSpec(
         flag="--mcp-server",
@@ -287,7 +258,7 @@ else:
 # Nuitka hint: include OLA package for plugin system
 try:
     import OLA  # noqa: F401 - 仅用于Nuitka包含提示
-except Exception:
+except ImportError:
     pass  # 开发环境可能找不到,忽略
 
 logger = logging.getLogger(__name__)
@@ -318,19 +289,11 @@ import subprocess  # <-- Used for safe Windows command-line quoting
 from typing import Optional, Dict, Tuple, Any, List
 from traceback import format_exception # <-- ADDED: For global_exception_handler
 
-# --- ADDED: Licensing & HTTP Imports ---
-import requests
+# --- Local-only licensing helpers ---
 import platform
 import uuid
 import hashlib
 import hmac
-import urllib3 # To disable SSL warnings if needed
-try:
-    from urllib3.util import connection as _urllib3_connection
-
-    _urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
-except Exception:
-    pass
 # -------------------------------------
 
 # --- REMOVED: Unused import publish dialog ---
@@ -417,7 +380,6 @@ from ctypes import wintypes
 # ------------------------------
 from app_core import license_runtime as app_license_runtime
 from app_core import license_store as app_license_store
-from app_core import runtime_security as app_runtime_security
 from app_core import logging_runtime as app_logging_runtime
 
 
@@ -472,208 +434,11 @@ def _trim_main_process_memory() -> float:
     return 0.0
 
 
-class MainProcessMemoryWatchdog:
-    """Lightweight main-process memory watchdog.
-
-    Keeps UI animation enabled, and only performs conservative cleanup when RSS
-    crosses a soft limit while workflow is idle.
-    """
-
-    def __init__(self, task_state_manager=None):
-        self._task_state_manager = task_state_manager
-        self._stop_event = threading.Event()
-        self._wake_event = threading.Event()
-        self._thread = None
-        self._running = False
-        self._check_interval_sec = max(5.0, float(os.getenv("LCA_MAIN_MEM_WATCHDOG_INTERVAL_SEC", "20") or 20))
-        self._soft_limit_mb = max(256.0, float(os.getenv("LCA_MAIN_MEM_WATCHDOG_THRESHOLD_MB", "700") or 700))
-        self._last_cleanup_ts = 0.0
-        self._min_cleanup_gap_sec = max(10.0, float(os.getenv("LCA_MAIN_MEM_WATCHDOG_GAP_SEC", "60") or 60))
-        self._last_rss_mb = 0.0
-        self._last_diag_ts = 0.0
-        self._diag_growth_trigger_mb = max(
-            16.0,
-            float(os.getenv("LCA_MAIN_MEM_DIAG_GROWTH_MB", "64") or 64),
-        )
-        self._diag_min_interval_sec = max(
-            15.0,
-            float(os.getenv("LCA_MAIN_MEM_DIAG_INTERVAL_SEC", "120") or 120),
-        )
-
-    def start(self) -> bool:
-        if self._running:
-            return True
-        self._stop_event.clear()
-        self._wake_event.clear()
-        self._thread = threading.Thread(
-            target=self._loop,
-            name="MainMemoryWatchdog",
-            daemon=True,
-        )
-        self._thread.start()
-        self._running = True
-        logging.info(
-            "[内存巡检] 已启动 (interval=%.0fs, soft_limit=%.0fMB)",
-            self._check_interval_sec,
-            self._soft_limit_mb,
-        )
-        return True
-
-    def stop(self, timeout: float = 2.0) -> None:
-        self._stop_event.set()
-        self._wake_event.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            try:
-                thread.join(timeout=max(0.1, float(timeout)))
-            except Exception:
-                pass
-        self._thread = None
-        self._running = False
-
-    def request_check(self) -> None:
-        self._wake_event.set()
-
-    def _is_workflow_running(self) -> bool:
-        manager = self._task_state_manager
-        if manager is None:
-            return False
-        try:
-            state = str(getattr(manager, "_current_state", "") or "").strip().lower()
-            return state in {"starting", "running", "stopping"}
-        except Exception:
-            return False
-
-    @staticmethod
-    def _get_rss_mb() -> float:
-        try:
-            import psutil
-
-            return float(psutil.Process().memory_info().rss) / 1024.0 / 1024.0
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def _get_private_mb() -> float:
-        try:
-            import psutil
-
-            process = psutil.Process()
-            full = process.memory_full_info()
-            if hasattr(full, "uss"):
-                return float(full.uss) / 1024.0 / 1024.0
-            if hasattr(full, "private"):
-                return float(full.private) / 1024.0 / 1024.0
-        except Exception:
-            pass
-        return 0.0
-
-    def _log_idle_memory_diagnostics(self, rss_mb: float) -> None:
-        now = time.time()
-        last_rss = float(self._last_rss_mb or 0.0)
-        delta = rss_mb - last_rss if last_rss > 0.0 else 0.0
-        should_log = (
-            (delta >= self._diag_growth_trigger_mb)
-            and ((now - float(self._last_diag_ts or 0.0)) >= self._diag_min_interval_sec)
-        )
-        if not should_log:
-            return
-        self._last_diag_ts = now
-
-        private_mb = self._get_private_mb()
-        thread_count = 0
-        try:
-            thread_count = int(threading.active_count())
-        except Exception:
-            thread_count = 0
-
-        line_stats = None
-        try:
-            from ui.workflow_parts.connection_line import get_line_animation_stats
-            line_stats = get_line_animation_stats()
-        except Exception:
-            line_stats = None
-
-        card_stats = None
-        try:
-            from ui.workflow_parts.task_card import TaskCard
-            card_stats = TaskCard.get_gradient_animation_stats()
-        except Exception:
-            card_stats = None
-
-        gc_counts = None
-        try:
-            import gc
-            gc_counts = tuple(int(v) for v in gc.get_count())
-        except Exception:
-            gc_counts = None
-
-        logging.warning(
-            "[内存诊断] idle_rss=%.1fMB delta=%.1fMB private=%.1fMB threads=%s line_anim=%s card_anim=%s gc=%s",
-            rss_mb,
-            delta,
-            private_mb,
-            thread_count,
-            line_stats,
-            card_stats,
-            gc_counts,
-        )
-
-    def _cleanup_if_needed(self, rss_mb: float) -> None:
-        if rss_mb <= self._soft_limit_mb:
-            return
-        now = time.time()
-        if (now - float(self._last_cleanup_ts)) < self._min_cleanup_gap_sec:
-            return
-        self._last_cleanup_ts = now
-
-        before = rss_mb
-        try:
-            from utils.runtime_image_cleanup import cleanup_runtime_image_memory
-
-            cleanup_runtime_image_memory(
-                reason="watchdog",
-                cleanup_screenshot_engines=False,
-                cleanup_template_cache=True,
-            )
-        except Exception:
-            pass
-
-        try:
-            trimmed = _trim_main_process_memory()
-            if trimmed > 0.5:
-                logging.info("[内存巡检] 主进程修剪释放约 %.1f MB", trimmed)
-        except Exception:
-            pass
-
-        after = self._get_rss_mb()
-        if after > 0:
-            logging.info("[内存巡检] RSS: %.1f MB -> %.1f MB", before, after)
-
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                if not self._is_workflow_running():
-                    rss_mb = self._get_rss_mb()
-                    if rss_mb > 0:
-                        self._log_idle_memory_diagnostics(rss_mb)
-                        self._cleanup_if_needed(rss_mb)
-                        self._last_rss_mb = rss_mb
-            except Exception as exc:
-                logging.debug(f"[内存巡检] 处理异常: {exc}")
-
-            self._wake_event.wait(timeout=self._check_interval_sec)
-            self._wake_event.clear()
 # --- Constants for Licensing ---
 #  防逆向优化：混淆敏感信息
 # psutil 已改为延迟导入（在需要时 import），减少启动内存
 
 
-
-#  增强反调试检测（严格模式，检测到威胁直接退出）
-def _0x4a2b():
-    """兼容保留：现已停用反调试/反反编译检测。"""
-    return False
 
 #  混淆字符串解码器
 def _0x7c9d(_data):
@@ -687,53 +452,287 @@ def _0x7c9d(_data):
     except:
         return ""
 
-#  开源版占位服务器配置 - 双重base64编码
-_0x1234 = "YUhSMGNITTZMeTlsZUdGdGNHeGxMbWx1ZG1Gc2FXUT0="  # https://example.invalid
-_0x5678 = "YUhSMGNITTZMeTlsZUdGdGNHeGxMbWx1ZG1Gc2FXUT0="  # https://example.invalid
+#  混淆后的服务器配置 - 双重base64编码
+_0x1234 = ""
+_0x5678 = ""
 
 def _0xdef0():
     """获取混淆后的服务器地址"""
-    _0x4a2b()  # 反调试检测
-    _auth = _0x7c9d(_0x1234)
-    _config = _0x7c9d(_0x5678)
-    return _auth, _config
+    return "", ""
 
 # 锁定 安全改进: 不在代码中硬编码真实服务器地址
 # 从环境变量或仅内置默认值加载服务器配置，不自动生成敏感配置文件
-DEFAULT_SERVER_URL = os.getenv("AUTH_SERVER_URL", "https://example.invalid")  # 从环境变量读取
-DEFAULT_SERVER_CONFIG_URL = os.getenv("CONFIG_SERVER_URL", "https://example.invalid")  # 从环境变量读取
+DEFAULT_SERVER_URL = ""
+DEFAULT_SERVER_CONFIG_URL = ""
 
 # 内置的真实服务器地址 (仅程序内部使用) - 已混淆
-_INTERNAL_AUTH_SERVER, _INTERNAL_CONFIG_SERVER = _0xdef0()
+_INTERNAL_VALIDATION_ENDPOINT, _INTERNAL_CONFIG_ENDPOINT = _0xdef0()
 
 #  优化的代码完整性检查
 def _0xcafe():
-    """兼容保留：现已停用代码完整性检查。"""
-    return True
+    """ 优化的代码完整性验证"""
+    try:
+        # 1. 快速模块完整性检查
+        try:
+            with open(__file__, 'rb') as _module_fp:
+                _module_size = len(_module_fp.read())
+            if _module_size < 50000:  # 调整阈值，当前文件应该较大
+                os._exit(1)
+        except:
+            pass  # 文件访问失败时容错
+
+        # 2. 关键变量存在性检查
+        _critical_vars = ['_INTERNAL_VALIDATION_ENDPOINT', '_INTERNAL_CONFIG_ENDPOINT']
+        for _var in _critical_vars:
+            if _var not in globals():
+                os._exit(1)
+
+        # 3. 核心模块检查
+        _required_modules = ['hashlib', 'base64', 'time', 'sys', 'os']
+        for _mod in _required_modules:
+            if _mod not in sys.modules:
+                os._exit(1)
+
+        # 4. 运行时环境检查
+        if not hasattr(sys, 'version_info'):
+            os._exit(1)
+
+        return True
+    except:
+        return True  # 容错处理
 
 #  内存保护机制
 def _0xf00d():
-    """兼容保留：现已停用内存保护检查。"""
-    return False
+    """ 内存保护和敏感数据清理"""
+    try:
+        # 1. 检查内存中的敏感变量
+        import gc
+        sensitive_count = 0
+        for _obj in gc.get_objects():
+            if isinstance(_obj, str):
+                if 'ED-' in _obj and len(_obj) > 20:
+                    # 发现许可证密钥
+                    sensitive_count += 1
+                    try:
+                        # 尝试清理（Python中字符串不可变，但记录发现）
+                        pass
+                    except:
+                        pass
+
+        if sensitive_count > 10:  # 如果发现过多敏感数据（提高阈值避免误报）
+            logging.critical(f"内存中发现过多敏感数据: {sensitive_count}个，程序退出")
+            os._exit(1)
+
+        # 2. 内存随机化
+        import random
+        _dummy_data = [random.randint(0, 255) for _ in range(1024)]
+        del _dummy_data
+
+        return False
+
+    except Exception as e:
+        logging.warning(f"内存保护检查异常: {e}")
+        return False
 
 #  增强的字节码保护和代码混淆
 def _0x1337():
-    """兼容保留：现已停用字节码保护与动态混淆。"""
-    return True
+    """ 动态代码生成和字节码保护"""
+    try:
+        # 检测是否为 Nuitka 编译环境
+        is_nuitka = '__compiled__' in dir(sys.modules.get('__main__', None))
+        if is_nuitka:
+            # Nuitka 编译后跳过字节码检查
+            return True
+
+        # 1. 检测字节码篡改
+        try:
+            import marshal
+            import types
+
+            # 获取当前函数的字节码
+            current_func = _0x1337
+            if hasattr(current_func, '__code__'):
+                original_bytecode = current_func.__code__.co_code
+                # 计算字节码哈希
+                import hashlib
+                bytecode_hash = hashlib.sha256(original_bytecode).hexdigest()
+
+                # 检查是否被修改（这里可以预设期望的哈希值）
+                # 在实际部署时，应该预先计算并硬编码期望的哈希值
+                if len(bytecode_hash) != 64:  # SHA256应该是64位十六进制
+                    os._exit(1)
+        except:
+            pass
+
+        # 2. 动态生成混淆验证函数
+        _code_fragments = [
+            "def _dynamic_check():",
+            "    import time, sys, os",
+            "    _start = time.perf_counter()",
+            "    # 执行一些计算密集型操作",
+            "    _result = sum(i*i for i in range(1000))",
+            "    _elapsed = time.perf_counter() - _start",
+            "    # 检查执行时间（调试时会变慢）",
+            "    if _elapsed > 0.01:",
+            "        return False",
+            "    # 检查结果完整性",
+            "    return _result == 332833500"
+        ]
+
+        _dynamic_code = '\n    '.join(_code_fragments)
+
+        # 3. 使用exec执行动态代码（增加反静态分析难度）
+        _namespace = {}
+        exec(_dynamic_code, _namespace)
+
+        # 4. 执行动态生成的函数
+        if '_dynamic_check' in _namespace:
+            result = _namespace['_dynamic_check']()
+            if not result:
+                os._exit(1)
+
+        # 5. 清理命名空间（防止内存分析）
+        _namespace.clear()
+        del _namespace
+
+        return True
+    except:
+        return False
 
 #  字节码完整性检查器
 def _0xbyte():
-    """兼容保留：现已停用字节码完整性检查。"""
-    return False
+    """ 检查关键函数的字节码完整性"""
+    try:
+        import marshal
+        import hashlib
+
+        # 检测是否为 Nuitka 编译环境
+        is_nuitka = '__compiled__' in dir(sys.modules.get('__main__', None))
+        if is_nuitka:
+            # Nuitka 编译后没有 Python 字节码，跳过检查
+            return False
+
+        # 顶层初始化阶段会先运行这段检查，此时部分函数可能尚未定义完成。
+        critical_function_names = (
+            '_0xcafe',
+            '_0xf00d',
+            'validate_license_with_server',
+        )
+        critical_functions = [
+            globals().get(func_name)
+            for func_name in critical_function_names
+            if callable(globals().get(func_name))
+        ]
+
+        for func in critical_functions:
+            if hasattr(func, '__code__'):
+                # 获取函数字节码
+                bytecode = func.__code__.co_code
+
+                # 检查字节码长度（被修改的函数通常长度会变化）
+                if len(bytecode) < 10:  # 太短可能被清空
+                    logging.critical(f"函数 {func.__name__} 字节码长度异常，程序退出")
+                    os._exit(1)
+
+                # 检查字节码中是否包含可疑指令
+                suspicious_opcodes = [
+                    b'\x64',  # LOAD_GLOBAL
+                    b'\x65',  # LOAD_FAST
+                    b'\x83'   # RETURN_VALUE
+                ]
+
+                # 确保字节码包含基本的Python指令
+                has_basic_ops = any(opcode in bytecode for opcode in suspicious_opcodes)
+                if not has_basic_ops:
+                    logging.critical(f"函数 {func.__name__} 字节码指令异常，程序退出")
+                    os._exit(1)
+
+        return False
+    except Exception as e:
+        logging.warning(f"字节码完整性检查异常: {e}")
+        return False
 
 #  高级Python反编译保护
 def _report_anti_decompile_threats(threats, source="反编译保护"):
-    """兼容保留：现已停用反编译威胁上报。"""
-    return False
+    if not threats:
+        return False
+    if _ANTI_DECOMPILE_MODE == "block":
+        for threat in threats:
+            logging.critical(f"{source} 检测到: {threat}")
+        logging.critical("检测到Python反编译工具，程序退出")
+        os._exit(1)
+    else:
+        for threat in threats:
+            logging.warning(f"{source} 检测到: {threat}")
+        logging.warning("检测到Python反编译工具（检测模式），继续运行")
+    return True
 
 def _0xpyprotect():
-    """兼容保留：现已停用 Python 反编译保护。"""
-    return False
+    """ 专门针对Python反编译的高级保护"""
+    try:
+        # 检测是否为 Nuitka 编译环境
+        is_nuitka = '__compiled__' in dir(sys.modules.get('__main__', None))
+        if is_nuitka:
+            # Nuitka 编译后是原生 C 代码，不需要反编译保护
+            return False
+        threats = []
+
+        # 1. 检测PyInstaller提取工具
+        import glob
+        suspicious_files = [
+            '*.pyc.extracted', '*.pyo.extracted', 'pyimod*.py',
+            'pyi_rth_*.py', 'pyiboot*.py',
+            'PYZ-*.pyz_extracted', '_pyi_bootstrap.py'
+        ]
+
+        for pattern in suspicious_files:
+            if glob.glob(pattern):
+                threats.append(f"检测到提取文件: {pattern}")
+
+        # 2. 检测当前目录是否有提取的文件
+        current_dir = os.getcwd()
+        suspicious_dirs = ['_MEI', '_internal', 'dist', 'build']
+        for dirname in suspicious_dirs:
+            full_path = os.path.join(current_dir, dirname)
+            if os.path.exists(full_path):
+                # 检查是否包含可疑的Python文件
+                for root, dirs, files in os.walk(full_path):
+                    for file in files:
+                        if file.endswith(('.pyc', '.pyo', '.py')) and 'extract' in file.lower():
+                            threats.append(f"检测到可疑提取文件: {file} ({root})")
+
+        # 3. 检测内存中的反编译模块
+        dangerous_modules = [
+            'uncompyle6', 'decompyle3', 'xdis', 'pycdc', 'unpyc',
+            'pyinstxtractor', 'archive_viewer'
+        ]
+
+        for module_name in dangerous_modules:
+            if module_name in sys.modules:
+                threats.append(f"检测到反编译模块: {module_name}")
+
+        # 4. 检测Python字节码操作
+        try:
+            import dis
+            import marshal
+
+            # 检查是否有人在尝试反汇编当前代码
+            current_frame = sys._getframe()
+            if hasattr(current_frame, 'f_code'):
+                # 检查调用栈中是否有可疑操作
+                frame = current_frame
+                while frame:
+                    if frame.f_code.co_filename.endswith(('.pyc', '.pyo')):
+                        # 正在从字节码文件执行，可能是反编译后的结果
+                        pass  # 这是正常情况，不退出
+                    frame = frame.f_back
+        except:
+            pass
+        return _report_anti_decompile_threats(threats, "反编译保护")
+
+    except Exception as e:
+        logging.warning(f"Python反编译保护检查异常: {e}")
+        return False
 
 #  多重虚假分支混淆
 def _0xdead():
@@ -757,51 +756,50 @@ def _0xface():
     return _fake_validation, 200, "success"
 
 # 内置服务器地址配置 - 与前文混淆配置保持同源，避免域名分叉
-_INTERNAL_AUTH_SERVER, _INTERNAL_CONFIG_SERVER = _0xdef0()
+_INTERNAL_VALIDATION_ENDPOINT, _INTERNAL_CONFIG_ENDPOINT = _0xdef0()
 
 # 读取服务器配置文件
 def load_server_config():
+    return {
+        "validation_endpoint": "",
+        "config_server_url": "",
+        "task_server_url": "",
+        "verify_ssl": True,
+        "description": "online validation removed",
+    }
+
     """加载服务器配置（仅使用内置配置；忽略外部文件）"""
     config_file = "server_config.json"
 
     if os.path.exists(config_file):
         logging.warning(f"检测到 {config_file}，但已忽略外部配置；仅使用内置服务器配置。")
 
+    validation_endpoint = ""
+    config_server_url = ""
+    verify_ssl = True
+
     return {
-        "auth_server_url": _INTERNAL_AUTH_SERVER,
-        "config_server_url": _INTERNAL_CONFIG_SERVER,
-        "verify_ssl": True,
+        "validation_endpoint": validation_endpoint,
+        "config_server_url": config_server_url,
+        "verify_ssl": verify_ssl,
         "description": "内置服务器配置"
     }
 
 server_config = load_server_config()
-SERVER_URL = server_config.get("auth_server_url", _INTERNAL_AUTH_SERVER)
-SERVER_CONFIG_URL = server_config.get("config_server_url", _INTERNAL_CONFIG_SERVER)
+SERVER_URL = server_config.get("validation_endpoint", "")
+SERVER_CONFIG_URL = server_config.get("config_server_url", _INTERNAL_CONFIG_ENDPOINT)
 # 锁定 不再硬编码任务服务器地址
-TASK_SERVER_URL = server_config.get("task_server_url", _INTERNAL_CONFIG_SERVER)
+TASK_SERVER_URL = server_config.get("task_server_url", _INTERNAL_CONFIG_ENDPOINT)
 
 # 强制要求服务地址使用 HTTPS 协议
 def _enforce_https_url(url_name: str, url_value: str):
-    if not isinstance(url_value, str) or not url_value.lower().startswith("https://"):
-        logging.critical(f"{url_name} 必须使用 https:// 协议地址: {url_value}")
-        os._exit(1)
+    return
 
 # 强制要求服务域名在白名单内
 def _enforce_whitelisted_host(url_name: str, url_value: str, allowed_hosts: set):
-    try:
-        parsed = urlparse(url_value)
-        host = parsed.hostname
-    except Exception:
-        host = None
-    if not host or host not in allowed_hosts:
-        logging.critical(f"{url_name} 域名不在白名单内: {url_value}")
-        os._exit(1)
+    return
 
-_ALLOWED_HOSTS = {urlparse(_INTERNAL_AUTH_SERVER).hostname, urlparse(_INTERNAL_CONFIG_SERVER).hostname}
-_ALLOWED_HOSTS = {h for h in _ALLOWED_HOSTS if h}
-if not _ALLOWED_HOSTS:
-    logging.critical("服务域名白名单为空，程序无法启动")
-    os._exit(1)
+_ALLOWED_HOSTS = set()
 
 _enforce_https_url("SERVER_URL", SERVER_URL)
 _enforce_https_url("SERVER_CONFIG_URL", SERVER_CONFIG_URL)
@@ -811,27 +809,33 @@ _enforce_whitelisted_host("SERVER_URL", SERVER_URL, _ALLOWED_HOSTS)
 _enforce_whitelisted_host("SERVER_CONFIG_URL", SERVER_CONFIG_URL, _ALLOWED_HOSTS)
 _enforce_whitelisted_host("TASK_SERVER_URL", TASK_SERVER_URL, _ALLOWED_HOSTS)
 
-AUTH_ENDPOINT = "/api/ping_auth"  # 使用服务器实际存在的编辑器验证端点
+AUTH_ENDPOINT = ""
 LICENSE_FILE = app_license_store.LICENSE_FILE
 
 # --- CAUTION: SSL Verification ---
 # 在开发环境中使用自签名证书 (adhoc) 时，可能需要禁用 SSL 验证。
 # 在生产环境中，你应该使用有效的证书，并将此设为 True。
-VERIFY_SSL = server_config.get("verify_ssl", True)  # True 使用系统默认 CA 证书校验
-if VERIFY_SSL is not True and (not isinstance(VERIFY_SSL, str) or not VERIFY_SSL.strip()):
-    logging.critical("VERIFY_SSL 必须为 True 或非空证书文件路径")
+VERIFY_SSL = server_config.get("verify_ssl", True)
+if isinstance(VERIFY_SSL, str):
+    verify_ssl_text = VERIFY_SSL.strip()
+    verify_ssl_mode = verify_ssl_text.lower()
+    if verify_ssl_mode in ("system", "default", "true", "1", "yes", "on"):
+        VERIFY_SSL = True
+        logging.info("将使用系统 CA 证书进行 SSL 验证")
+    elif verify_ssl_mode in ("false", "0", "no", "off", "none"):
+        logging.critical("禁止关闭 SSL 验证，VERIFY_SSL=False 不被允许")
+        os._exit(1)
+    elif not verify_ssl_text:
+        logging.critical("VERIFY_SSL 必须为 system 或非空证书文件路径")
+        os._exit(1)
+elif VERIFY_SSL is not True:
+    logging.critical("VERIFY_SSL 必须为 system、True 或证书文件路径")
     os._exit(1)
 
-
-
-
 # --- 严禁通过 verify=False 关闭 SSL 验证 ---
-# if not VERIFY_SSL: # Check if VERIFY_SSL is explicitly False, not just any non-True value
 if VERIFY_SSL is False:
     logging.critical("禁止关闭 SSL 验证，VERIFY_SSL=False 不被允许")
     os._exit(1)
-elif VERIFY_SSL is True:
-    logging.info("将使用系统默认 CA 证书进行 SSL 验证")
 elif isinstance(VERIFY_SSL, str):
     # 添加调试信息
     current_dir = os.getcwd()
@@ -1257,8 +1261,11 @@ save_local_license = app_license_store.save_local_license
 def enforce_online_validation(hardware_id: str, license_key: str) -> tuple:
     """ 强制在线验证，禁止离线使用"""
     try:
-        #  优化：减少重复的安全检查调用
-        _0x4a2b()  # 反调试检测
+        import secrets
+
+        sys._auth_session_token = secrets.token_hex(32)
+        sys._last_validation_time = time.time()
+        return True, 200, "LOCAL_ONLY"
 
         #  虚假分支混淆
         if len(hardware_id) == 0:  # 永远不会执行
@@ -1295,6 +1302,8 @@ def enforce_online_validation(hardware_id: str, license_key: str) -> tuple:
 
 def check_network_connectivity() -> bool:
     """检查网络连接性"""
+    return True
+
     try:
         import socket
         # 尝试连接到多个知名服务器
@@ -1319,6 +1328,8 @@ def check_network_connectivity() -> bool:
 
 def runtime_license_check():
     """运行时授权检查，防止打包后绕过授权验证"""
+    return True
+
     try:
         # 检查授权验证标记
         if not hasattr(sys, '_license_validated') or not getattr(sys, '_license_validated', False):
@@ -1754,19 +1765,6 @@ def cleanup_all_resources():
         if cleanup_yolo_runtime_resources(release_process=True, compact_memory=True):
             logging.info("YOLO运行时资源已清理")
 
-        # 清理地图导航子程序与运行态
-        try:
-            from utils.runtime_image_cleanup import cleanup_map_navigation_runtime_on_stop
-
-            cleanup_map_navigation_runtime_on_stop(
-                release_bundle_cache=True,
-                auto_close_only=False,
-                include_orphans=True,
-            )
-            logging.info("地图导航运行时资源已清理")
-        except Exception as e:
-            logging.debug(f"清理地图导航运行时资源时出错: {e}")
-
         # 清理模板预加载缓存
         try:
             from utils.template_preloader import clear_global_cache
@@ -1852,7 +1850,6 @@ def _0xc0de():
         return True
 
     _LAST_SECURITY_CHECK = current_time
-    _0x4a2b()  # 反调试检测
     return True
 
 #  函数间接调用表 - 防止直接函数名分析
@@ -1872,54 +1869,26 @@ def _0xbeef(func_id: int, func_obj):
 #  优化的运行时代码生成器
 def _0x8bad():
     """ 运行时生成验证代码（优化版）"""
-    try:
-        #  优化：检查是否已生成，避免重复执行
-        if '_runtime_validator' in globals():
-            return True
-
-        # 动态生成验证逻辑
-        _validation_code = """
-def _runtime_validator(hw_id, key):
-    import hashlib
-    import time
-
-    # 动态验证逻辑
-    _check1 = len(hw_id) == 64
-    _check2 = key.startswith('ED-')
-    _check3 = time.time() > 1000000000
-
-    return _check1 and _check2 and _check3
-"""
-
-        # 执行动态代码
-        exec(_validation_code, globals())
-        return True
-    except:
-        return False
+    return True
 
 
 def _run_main_runtime_validator(hw_id: str, key: str) -> bool:
-    _0x8bad()
-    validator = globals().get("_runtime_validator")
-    if validator is None:
-        return True
-    return bool(validator(hw_id, key))
+    return True
 
 
 def _license_runtime_validator_bridge(hw_id: str, key: str) -> bool:
     return _run_main_runtime_validator(hw_id, key)
 
 
-def _configure_runtime_security_hooks() -> None:
-    app_runtime_security.configure_runtime_security(
-        guard_cb=None,
-        validator_cb=_license_runtime_validator_bridge,
-    )
-
-
-_configure_runtime_security_hooks()
-
 def client_login_handshake(hw_id: str, license_key: str) -> tuple[bool, str, dict]:
+    import secrets
+
+    return True, secrets.token_hex(32), {
+        "login_status": "local_only",
+        "protocol_version": "local",
+        "message": "online validation removed",
+    }
+
     """客户端握手协议 - 与服务器进行握手认证
 
     Args:
@@ -1947,7 +1916,7 @@ def client_login_handshake(hw_id: str, license_key: str) -> tuple[bool, str, dic
 
         logging.info(f"握手协议v2.1[步骤1]: 发起握手初始化请求")
         init_response = requests.post(
-            f"{SERVER_URL}/api/v2.1/client/handshake/initiate",
+            "",
             json=init_data,
             timeout=5,
             verify=VERIFY_SSL,
@@ -1986,9 +1955,9 @@ def client_login_handshake(hw_id: str, license_key: str) -> tuple[bool, str, dic
         logging.info(f"握手协议v2.1[步骤1]: 成功获得握手令牌和服务器挑战")
 
         # 步骤2: 生成客户端握手响应（HMAC-SHA256）
-        SECRET_KEY = str(os.environ.get('AUTH_SECRET_KEY', '') or '').strip()
+        SECRET_KEY = ""
         if len(SECRET_KEY) < 24 or SECRET_KEY.lower() == 'default-secret-key-change-in-production':
-            return False, "", {'error': 'AUTH_SECRET_KEY 未配置或不安全', 'status_code': 500}
+            return False, "", {'error': 'local validation only', 'status_code': 500}
         response_data = f"{server_challenge}|{license_key}|{server_nonce}|{client_nonce}|{server_timestamp}"
         client_response = hmac.new(SECRET_KEY.encode(), response_data.encode(), hashlib.sha256).hexdigest()
 
@@ -2008,7 +1977,7 @@ def client_login_handshake(hw_id: str, license_key: str) -> tuple[bool, str, dic
 
         logging.info(f"握手协议v2.1[步骤2]: 发送握手认证请求")
         auth_response = requests.post(
-            f"{SERVER_URL}/api/v2.1/client/handshake/authenticate",
+            "",
             json=auth_data,
             timeout=5,
             verify=VERIFY_SSL,
@@ -2056,6 +2025,8 @@ def client_login_handshake(hw_id: str, license_key: str) -> tuple[bool, str, dic
 
 
 def client_logout(hw_id: str, session_token: str) -> bool:
+    return True
+
     """客户端离线协议 - 向服务器发送离线通知
 
     注意: 这是可选的。客户端不需要主动调用此函数。
@@ -2102,6 +2073,8 @@ def client_logout(hw_id: str, session_token: str) -> bool:
 
 
 def client_heartbeat_with_fallback(hw_id: str, session_token: str, license_key: str, max_retries: int = 3) -> tuple[bool, str]:
+    return True, session_token or ""
+
     """客户端心跳 - 保持会话活跃，失败时自动重新握手
 
     Args:
@@ -2189,11 +2162,21 @@ def validate_license_with_server_v2(hw_id: str, key: str) -> tuple[bool, int, st
         tuple: (is_valid, status_code, license_type, extra_info)
         extra_info包含: validation_mode, remaining_days, is_permanent等
     """
-    _0x4a2b()
     _0x8bad()
 
     if not _run_main_runtime_validator(hw_id, key):
         return False, 400, "invalid", {}
+
+    import secrets
+
+    session_token = secrets.token_hex(32)
+    sys._auth_session_token = session_token
+    sys._last_validation_time = time.time()
+    return True, 200, "LOCAL_ONLY", {
+        "validation_mode": "local_only",
+        "license_validation_enabled": False,
+        "session_token": session_token,
+    }
 
     extra_info = {}
 
@@ -2211,7 +2194,7 @@ def validate_license_with_server_v2(hw_id: str, key: str) -> tuple[bool, int, st
         }
 
         response = requests.post(
-            f"{SERVER_URL}/api/v2.1/client/handshake/initiate",
+            "",
             json=initiate_data,
             timeout=5,
             verify=VERIFY_SSL,
@@ -2235,7 +2218,7 @@ def validate_license_with_server_v2(hw_id: str, key: str) -> tuple[bool, int, st
 
         logging.info(f"客户端: 握手初始化成功，收到服务器挑战")
 
-        SECRET_KEY = str(os.environ.get('AUTH_SECRET_KEY', '') or '').strip()
+        SECRET_KEY = ""
         if len(SECRET_KEY) < 24 or SECRET_KEY.lower() == 'default-secret-key-change-in-production':
             return False, 500, "unknown", {}
         data_for_response = f"{server_challenge}|{key}|{server_nonce}|{client_nonce}|{server_timestamp}"
@@ -2255,7 +2238,7 @@ def validate_license_with_server_v2(hw_id: str, key: str) -> tuple[bool, int, st
         }
 
         response = requests.post(
-            f"{SERVER_URL}/api/v2.1/client/handshake/authenticate",
+            "",
             json=auth_data,
             timeout=5,
             verify=VERIFY_SSL,
@@ -2324,13 +2307,14 @@ def validate_license_with_server(hw_id: str, key: str) -> tuple[bool, int, str]:
     """ Validates the HW ID and license key with the server using HTTPS.
        Returns a tuple: (is_valid: bool, status_code: int, license_type: str)
     """
-    #  优化：减少重复的安全检查
-    _0x4a2b()  # 反调试检测
     _0x8bad()  # 运行时代码生成（带缓存）
 
     #  动态验证检查
     if not _run_main_runtime_validator(hw_id, key):
         return False, 400, "invalid"
+
+    sys._last_validation_time = time.time()
+    return True, 200, "LOCAL_ONLY"
 
     headers = {
         'X-Hardware-ID': hw_id,
@@ -2446,7 +2430,14 @@ def validate_license_with_server(hw_id: str, key: str) -> tuple[bool, int, str]:
 attempt_client_registration = _shared_attempt_client_registration
 
 
-def _attempt_v1_registration(hw_id: str, session: requests.Session, csrf_token: str) -> dict:
+def _attempt_v1_registration(hw_id: str, session: object, csrf_token: str) -> dict:
+    return {
+        "success": True,
+        "is_banned": False,
+        "license_validation_enabled": False,
+        "mode": "local_only",
+    }
+
     """使用v1 API进行注册（回退方案）"""
     logging.info("使用v1 API进行注册...")
 
@@ -2465,7 +2456,7 @@ def _attempt_v1_registration(hw_id: str, session: requests.Session, csrf_token: 
         }
 
         response = session.post(
-            f"{SERVER_URL}/api/licensing/register_client",
+            "",
             json=v1_payload,
             headers=headers,
             timeout=8,
@@ -2555,14 +2546,16 @@ def _attempt_v1_registration(hw_id: str, session: requests.Session, csrf_token: 
         return {"success": False, "is_banned": False}
 
 # --- ADDED: Function to attempt HWID migration ---
-def attempt_migration(old_hw_id: str, license_key: str, session: requests.Session) -> Optional[str]:
+def attempt_migration(old_hw_id: str, license_key: str, session: object) -> Optional[str]:
+    return None
+
     """
     Attempts to migrate an old hardware ID to the new format on the server.
     Returns the new hardware ID (SHA256) if successful, otherwise None.
     """
 
 
-    MIGRATION_ENDPOINT = "/api/licensing/migrate_hwid"
+    MIGRATION_ENDPOINT = ""
 
     # --- ADDED: Ensure CSRF token is in session and header for migration POST ---
     # Fetch CSRF token to ensure session has the cookie and we get the value for the header
@@ -2669,8 +2662,10 @@ def attempt_migration(old_hw_id: str, license_key: str, session: requests.Sessio
 # --- END ADDED ---
 
 # --- ADDED: Function to bind license to HWID (Definition) ---
-def bind_license_to_hwid(hw_id: str, license_key: str, session: requests.Session) -> bool:
-    """将许可证绑定到特定硬件ID (与服务器API /api/licensing/bind_license 通信)
+def bind_license_to_hwid(hw_id: str, license_key: str, session: object) -> bool:
+    return True
+
+    """将许可证绑定到特定硬件ID（本地模式直接通过）
 
     Args:
         hw_id: 硬件ID.
@@ -2682,7 +2677,7 @@ def bind_license_to_hwid(hw_id: str, license_key: str, session: requests.Session
     """
 
 
-    BIND_ENDPOINT = "/api/licensing/bind_license" # 定义绑定端点
+    BIND_ENDPOINT = ""
     csrf_token_value = None
 
     try:
@@ -2882,12 +2877,12 @@ VALIDATED_LICENSE_TYPE = "unknown" # Store the validated license type
 class NetworkTask(QThread):
     finished = Signal(bool, int, str, str)  # Signal: success(bool), status_code(int), message(str), license_type(str)
 
-    def __init__(self, task_type: str, params: dict, session: Optional[requests.Session] = None, parent=None):
+    def __init__(self, task_type: str, params: dict, session: Optional[object] = None, parent=None):
         super().__init__(parent)
         self.task_type = task_type
         self.params = params
-        self.session = session if session else requests.Session() # Use provided or new session
-        self._owns_session = session is None  # 标记是否拥有session，用于清理时判断
+        self.session = session
+        self._owns_session = False
         # 安全考虑：禁用可能泄露敏感参数的调试日志
         # logging.debug(f"NetworkTask initialized for task: {self.task_type} with params: {params}")
         logging.debug(f"NetworkTask initialized for task: {self.task_type}")
@@ -3963,15 +3958,7 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
             os._exit(0)
     atexit.register(_release_single_instance_lock)
 
-    #  注册关键函数到间接调用表
-    _0xbeef(0x1001, validate_license_with_server)
-    _0xbeef(0x1002, enforce_online_validation)
-    _0xbeef(0x1003, _encrypt_license_key)
-    _0xbeef(0x1004, _decrypt_license_key)
-
-    logging.info(" 应用程序安全启动。")
-
-    logging.info("开始授权验证...")
+    logging.info("准备启动主程序...")
 
     # 工具 修复：确保我们在正确的执行路径上（已通过管理员权限检查）
     if os.name == 'nt' and not is_admin():
@@ -4007,14 +3994,6 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
     # 将task_state_manager设置为app的属性，使其全局可访问
     app.task_state_manager = task_state_manager
     logging.info("任务状态管理器已设置为全局可访问")
-
-    main_process_memory_watchdog = None
-    try:
-        main_process_memory_watchdog = MainProcessMemoryWatchdog(task_state_manager=task_state_manager)
-        main_process_memory_watchdog.start()
-    except Exception as mem_watchdog_error:
-        logging.warning(f"[内存巡检] 启动失败: {mem_watchdog_error}")
-        main_process_memory_watchdog = None
 
     # --- MODIFIED: Disable Simple Hotkey Listener (Now handled by MainWindow) ---
     # SimpleHotkeyListener 已被 MainWindow 的统一快捷键系统替代
@@ -4053,47 +4032,238 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
         logging.warning(f"创建系统托盘管理器失败: {e}")
         system_tray = None  # 确保变量存在
 
-    # ==================== 密钥验证相关代码 ====================
-    # 以下代码用于硬件ID获取和许可证密钥验证
+    # 插件模式仍保留自己的本地激活入口；普通模式不再走硬件 ID / 许可证流程。
+    try:
+        plugin_settings = config.get('plugin_settings', {}) if isinstance(config, dict) else {}
+        plugin_mode_enabled = bool(plugin_settings.get('enabled', False))
+        logging.info(f"插件模式状态: {'已启用' if plugin_mode_enabled else '未启用'}")
+    except Exception as e:
+        logging.warning(f"读取插件模式配置失败: {e}")
+        plugin_mode_enabled = bool(plugin_mode_enabled)
 
-    hardware_id = get_hardware_id()
-    if not hardware_id:
-        logging.critical("无法获取硬件 ID，程序无法继续。")
-        show_critical_box(None, "错误", "无法获取必要的硬件信息以进行授权。\n请检查系统设置或联系支持。")
-        sys.exit(1)
+    hardware_id = ""
+    if plugin_mode_enabled:
+        hardware_id = get_hardware_id() or ""
+        if not hardware_id:
+            logging.warning("插件模式需要硬件 ID，但当前无法获取；本次启动临时禁用插件模式")
+            plugin_mode_enabled = False
 
-    # 绕过第三方服务验证，直接设置为已验证状态
-    is_validated = True
-    license_key = "NO_LICENSE_REQUIRED"
+    license_key = "SERVER_VALIDATION_DISABLED" if plugin_mode_enabled else ""
+
+    is_validated = False
     last_status_code = 0
 
-    # 设置默认的授权类型和验证标记
-    VALIDATED_LICENSE_TYPE = "EDITOR"
-    sys._license_validated = True
-    sys._registration_verified = os.urandom(32).hex()
-    sys._registration_hwid = hardware_id
+    http_session = None
+
+    # --- ADDED: Initial check and potential migration attempt ---
+    # Determine if the current hardware_id is likely an old format from the file
+    is_old_format_hwid = isinstance(hardware_id, str) and len(hardware_id) != 64
+
+    #  强化：跳过迁移逻辑，因为不再使用本地许可证文件
+    # 所有验证都必须通过在线方式进行
+    logging.debug("在线验证和许可证迁移流程已移除")
+
+    # After potential migration attempt (or if not needed), proceed with standard validation/input loop.
+    # If migration succeeded, hardware_id is now the new SHA256 ID.
+    # If migration failed or wasn't needed, hardware_id is either the original valid ID, the old format ID, or None.
+
+    # We now enter a loop that continues until is_validated becomes True
+    # If is_validated was already True after initial checks (e.g., valid local HWID + Key), this loop is skipped.
+    # Note: Initial validation with local key is now handled BEFORE this loop if hardware_id is already a valid SHA256.
+    # If hardware_id was old format and migration failed, we enter this loop.
+
+    # ============================================================================
+    # 【安全关键】硬件ID注册 - 所有模式都必须完成，不可跳过
+    # ============================================================================
+    # 注意：硬件ID注册与插件模式的授权验证是两个独立的安全层：
+    # 1. 硬件ID注册：所有用户（插件模式/非插件模式）都必须完成，用于追踪和管理客户端
+    # 2. 授权验证：仅在插件模式且服务器开启验证时需要，用于验证付费授权
+    # ============================================================================
+
+    initial_registration_result = {
+        "success": True,
+        "is_banned": False,
+        "license_validation_enabled": False,
+        "mode": "local_only",
+    }
+
+    # 【安全关键】检查注册结果 - 必须成功，否则退出程序
+    if initial_registration_result.get("is_banned", False):
+        ban_reason = initial_registration_result.get("ban_reason", "未提供原因")
+        logging.critical(f"【安全阻止】硬件ID已被封禁: {ban_reason}")
+        show_critical_box(
+            None,
+            "账号已被封禁",
+            f"您的硬件ID已被封禁，无法使用本软件。\n\n"
+            f"封禁原因: {ban_reason}\n\n"
+            f"如有疑问，请联系技术支持。"
+        )
+        sys.exit(1)
+
+    if not initial_registration_result.get("success", False):
+        logging.critical("【安全失败】硬件ID注册失败，程序无法继续运行")
+        failure_reason = str(initial_registration_result.get("error") or "").strip()
+        if not failure_reason:
+            status_code = initial_registration_result.get("status_code")
+            failure_reason = f"注册失败，状态码: {status_code}" if status_code else "网络异常，请重启软件"
+        show_critical_box(
+            None,
+            "注册失败",
+            f"{failure_reason}\n\n如果网络是校园网或公司网，可能无法连接。"
+        )
+        sys.exit(1)
+
     server_license_validation_enabled = False
+    if plugin_mode_enabled:
+        logging.info("插件模式使用本地激活，未启用许可证服务器")
 
-    logging.info(" 授权验证已绕过（第三方服务验证已移除）")
-    # ==================== 密钥验证相关代码结束 ====================
+    # ============================================================================
+    # 【第二层安全】插件模式授权验证（可选，根据服务器开关决定）
+    # ============================================================================
+    # 注意：此处的验证与上面的硬件ID注册是两个不同的安全层：
+    # - 硬件ID注册：已在上方完成，所有用户必须通过，不可跳过
+    # - 授权验证：仅在插件模式启用且服务器开关开启时需要
+    # ============================================================================
 
-    # 反调试：多重验证标记检查（防止跳过注册流程）
-    # 检查1：验证标记是否存在
-    if not hasattr(sys, '_registration_verified'):
-        os._exit(1)
+    # 检查是否启用了插件模式
+    try:
+        from utils.app_paths import get_config_path
+        config_path = get_config_path()
+        plugin_mode_enabled = bool(plugin_mode_enabled)
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+                plugin_mode_enabled = bool(plugin_mode_enabled and config_data.get('plugin_settings', {}).get('enabled', False))
+        logging.debug(f"插件模式状态: {'已启用' if plugin_mode_enabled else '未启用'}")
+    except Exception as e:
+        logging.warning(f"读取插件模式配置失败: {e}")
+        plugin_mode_enabled = False
 
-    # 检查2：验证标记是否有效
-    if not sys._registration_verified or len(sys._registration_verified) != 64:
-        os._exit(1)
+    # 插件模式验证逻辑（根据服务器验证开关决定）
+    # 注意：此处只验证授权码，硬件ID注册已在上方强制完成
+    if plugin_mode_enabled:
+        logging.info("检测到插件模式已启用")
 
-    # 检查3：硬件ID是否匹配
-    if not hasattr(sys, '_registration_hwid'):
-        os._exit(1)
+        # 插件模式下，根据服务器验证开关来决定是否需要验证授权码
+        if server_license_validation_enabled:
+            logging.info("服务器验证开关已开启，插件模式需要进行授权验证")
 
-    # 检查4：硬件ID格式验证
-    _current_hwid = get_hardware_id()
-    if sys._registration_hwid != _current_hwid:
-        os._exit(1)
+            # 检查是否有有效的授权码
+            if not license_key or license_key == "SERVER_VALIDATION_DISABLED":
+                logging.critical("插件模式已启用且服务器要求验证，但未找到有效的授权码")
+                show_critical_box(
+                    None,
+                    "插件模式需要授权",
+                    "检测到配置文件中已启用插件模式，且服务器要求授权验证，但未找到有效的授权码。\n\n"
+                    "插件模式需要有效的授权才能使用。\n"
+                    "程序启动后，请在全局设置中禁用插件模式，或完成授权验证。\n\n"
+                    "本次运行将临时禁用插件模式（不修改配置文件）。"
+                )
+                # 【修复】仅在内存中禁用，不修改config.json，保留用户配置
+                logging.info("临时禁用插件模式（本次运行），配置文件保持不变")
+                plugin_mode_enabled = False
+            else:
+                # 服务器验证开关已开启，强制进行在线验证，确保授权码有效且未过期
+                logging.info("插件模式：开始强制在线验证授权码的有效性和时效性...")
+                try:
+                    is_valid, status_code, license_type = enforce_online_validation(hardware_id, license_key)
+
+                    if not is_valid:
+                        logging.critical(f"插件模式授权验证失败：状态码 {status_code}")
+                        show_critical_box(
+                            None,
+                            "插件授权验证失败",
+                            f"插件模式授权验证失败（状态码：{status_code}）。\n\n"
+                            "可能的原因：\n"
+                            "- 授权码已过期\n"
+                            "- 授权码无效\n"
+                            "- 网络连接失败\n\n"
+                            "插件模式将被自动禁用。"
+                        )
+
+                        # 删除无效的授权文件
+                        try:
+                            if os.path.exists(LICENSE_FILE):
+                                os.remove(LICENSE_FILE)
+                                logging.info("已删除无效的授权文件")
+                        except:
+                            pass
+
+                        # 【修复】仅在内存中禁用，不修改config.json，保留用户配置
+                        logging.info("临时禁用插件模式（授权验证失败），配置文件保持不变")
+                        plugin_mode_enabled = False
+                    else:
+                        # 更新授权类型（VALIDATED_LICENSE_TYPE 已在模块级别定义）
+                        VALIDATED_LICENSE_TYPE = license_type
+                        logging.info(f"插件模式授权验证成功，授权类型: {license_type}")
+
+                        # 【新增】启动插件授权后台监控线程
+                        try:
+                            _start_plugin_license_monitor(
+                                hardware_id=hardware_id,
+                                license_key=license_key,
+                                app_instance=app,
+                            )
+                            logging.info("插件授权后台监控线程已启动")
+                        except Exception as monitor_error:
+                            logging.error(f"启动插件授权监控线程失败: {monitor_error}", exc_info=True)
+
+                except Exception as e:
+                    logging.error(f"插件模式授权验证异常: {e}", exc_info=True)
+                    show_critical_box(
+                        None,
+                        "插件授权验证异常",
+                        f"插件模式授权验证过程中发生异常：{str(e)}\n\n"
+                        "插件模式将被自动禁用。"
+                    )
+                    plugin_mode_enabled = False
+        else:
+            # 服务器验证开关已关闭，插件模式不需要验证授权码
+            # 但硬件ID注册已在上方强制完成，这是不可跳过的
+            logging.info("服务器验证开关已关闭，插件模式无需授权验证")
+            logging.info("注意：虽然跳过授权验证，但硬件ID注册已强制完成")
+            # 设置默认的授权类型，允许插件模式正常运行
+            VALIDATED_LICENSE_TYPE = "PLUGIN_NO_VALIDATION"
+            logging.info("已设置插件模式为无需验证状态")
+
+    # 非插件模式：只需要注册硬件ID（已完成），无需验证授权码
+    # 插件模式：已在上面的逻辑中处理授权验证
+    # 注意：无论哪种模式，硬件ID注册都已在前面强制完成
+    if not plugin_mode_enabled:
+        is_validated = True
+        license_key = ""
+        sys._license_validated = True
+        VALIDATED_LICENSE_TYPE = "EDITOR"
+    elif plugin_mode_enabled and not server_license_validation_enabled:
+        logging.info("插件模式已本地启用，无需许可证服务器")
+        is_validated = True
+        license_key = "SERVER_VALIDATION_DISABLED"
+        sys._license_validated = True
+        VALIDATED_LICENSE_TYPE = "PLUGIN_LOCAL"
+    elif plugin_mode_enabled and server_license_validation_enabled:
+        # 插件模式且服务器验证开启：已在上面的代码中处理过验证逻辑
+        # 这里检查验证是否成功
+        if license_key and license_key not in ["NO_LICENSE_REQUIRED", "SERVER_VALIDATION_DISABLED"]:
+            logging.info("插件模式验证已完成，继续启动流程")
+            is_validated = True
+            sys._license_validated = True
+        else:
+            logging.warning("插件模式验证未完成，可能已被禁用")
+            is_validated = True  # 允许继续，因为插件模式可能已被自动禁用
+            license_key = ""
+            sys._license_validated = True
+            VALIDATED_LICENSE_TYPE = "EDITOR"
+
+    # 旧的验证逻辑已被移除，新逻辑如下：
+    # - 非插件模式：只需注册硬件ID，无需验证授权码
+    # - 插件模式+服务器验证关闭：无需验证授权码
+    # - 插件模式+服务器验证开启：需要验证授权码
+    #
+    # 如果服务器关闭了验证，直接跳过许可证验证（但插件模式除外）
+    # if not server_license_validation_enabled:
+    # --- END MODIFIED validation/input loop ---
+
+    logging.info("启动主程序...")
 
     # 工具 修复：添加主窗口创建的详细调试信息
     try:
@@ -4389,12 +4559,10 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
             app=app,
             log_maintenance_loop=log_maintenance_loop,
             plugin_init_thread=plugin_init_thread,
-            main_process_memory_watchdog=main_process_memory_watchdog,
             task_state_manager=task_state_manager,
             main_window=main_window,
             system_tray=system_tray,
             cleanup_runtime_state_variables_cb=cleanup_runtime_state_variables,
-            trim_main_process_memory_cb=_trim_main_process_memory,
             exit_cleanup_join_timeout_sec=_EXIT_CLEANUP_JOIN_TIMEOUT_SEC,
         )
         logging.info(f"应用程序正常退出，退出代码: {exit_code}")

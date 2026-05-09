@@ -12,29 +12,7 @@ logger = logging.getLogger(__name__)
 
 class MainWindowInitStateMixin:
     def _verify_main_window_registration(self):
-        # 反调试：入口验证检查（防止直接实例化MainWindow绕过注册）
-
-        import sys
-
-        import os
-
-        # 验证1：检查注册标记
-
-        if not hasattr(sys, '_registration_verified'):
-
-            os._exit(1)
-
-        # 验证2：检查硬件ID标记
-
-        if not hasattr(sys, '_registration_hwid'):
-
-            os._exit(1)
-
-        # 验证3：验证token长度
-
-        if len(getattr(sys, '_registration_verified', '')) != 64:
-
-            os._exit(1)
+        return
 
     def _initialize_main_window_core_state(
         self,
@@ -98,7 +76,7 @@ class MainWindowInitStateMixin:
 
             else:
 
-                logger.info(f"插件模式授权检查通过 (license_key={license_key[:20] if len(license_key) > 20 else license_key}...)")
+                logger.info("插件模式本地检查通过")
 
         self.images_dir = images_dir # <<< RE-ADDED: Store images directory
 

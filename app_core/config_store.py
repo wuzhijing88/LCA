@@ -8,51 +8,11 @@ from utils.app_paths import get_config_path
 
 CONFIG_FILE = get_config_path()
 
-DEFAULT_QQ_GROUP_LINKS = []
-
-REMOVED_QQ_GROUP_IDS = frozenset({
-    "956602250",
-})
-
-DEFAULT_QQ_GROUP_LINKS_BY_ID = {
-    group["id"]: dict(group) for group in DEFAULT_QQ_GROUP_LINKS
-}
+DEFAULT_QQ_GROUP_LINKS: list[dict[str, str]] = []
 
 
-def _merge_default_qq_group_links(groups: Any) -> list[dict[str, str]]:
-    merged_groups = [dict(group) for group in DEFAULT_QQ_GROUP_LINKS]
-    seen_custom_keys = set()
-
-    if not isinstance(groups, list):
-        return merged_groups
-
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-
-        group_name = str(group.get("name", "")).strip()
-        group_id = str(group.get("id", "")).strip()
-        group_url = str(group.get("url", "")).strip()
-
-        if not group_name or not group_id or not group_url:
-            continue
-        if group_id in REMOVED_QQ_GROUP_IDS:
-            continue
-        if group_id in DEFAULT_QQ_GROUP_LINKS_BY_ID:
-            continue
-
-        group_key = (group_id, group_url)
-        if group_key in seen_custom_keys:
-            continue
-
-        seen_custom_keys.add(group_key)
-        merged_groups.append({
-            "name": group_name,
-            "id": group_id,
-            "url": group_url,
-        })
-
-    return merged_groups
+def _merge_default_qq_group_links(_groups: Any) -> list[dict[str, str]]:
+    return []
 
 
 def _build_default_config() -> dict:
@@ -129,7 +89,7 @@ def load_config() -> dict:
                 try:
                     save_config(dict(defaults))
                 except Exception as save_err:
-                    logging.warning(f"修复 QQ 群配置失败：{save_err}")
+                    logging.warning(f"清理群链接配置失败：{save_err}")
             defaults.setdefault("foreground_mouse_driver_backend", defaults.get("foreground_driver_backend", "interception"))
             defaults.setdefault("foreground_keyboard_driver_backend", defaults.get("foreground_driver_backend", "interception"))
             defaults.setdefault("enable_canvas_grid", True)

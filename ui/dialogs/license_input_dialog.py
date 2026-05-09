@@ -1,6 +1,5 @@
 import logging
 
-import requests
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QDialog,
@@ -21,7 +20,7 @@ logger = logging.getLogger(__name__)
 class _LicenseValidationWorker(QThread):
     validation_finished = Signal(bool, int, str, str)
 
-    def __init__(self, hardware_id: str, license_key: str, session: requests.Session, parent=None):
+    def __init__(self, hardware_id: str, license_key: str, session: object, parent=None):
         super().__init__(parent)
         self.hardware_id = str(hardware_id or "").strip()
         self.license_key = str(license_key or "").strip()
@@ -51,7 +50,7 @@ class _LicenseValidationWorker(QThread):
 
 
 class LicenseInputDialog(QDialog):
-    def __init__(self, hardware_id: str, http_session: requests.Session, parent=None):
+    def __init__(self, hardware_id: str, http_session: object = None, parent=None):
         super().__init__(parent)
         self.hardware_id = str(hardware_id or "").strip()
         self.http_session = http_session

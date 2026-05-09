@@ -141,7 +141,7 @@ class MainWindowStatusMixin:
 
     def _position_qq_link_label(self):
 
-        """将QQ群链接在状态栏内垂直居中定位"""
+        """将官网链接在状态栏内垂直居中定位"""
 
         if not hasattr(self, 'step_detail_label'):
 
