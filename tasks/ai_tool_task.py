@@ -2335,6 +2335,8 @@ class _PersistentMcpToolClient:
         transport_retry_tokens = (
             "mcp 服务不可用",
             "mcp 服务异常退出",
+            "mcp server exited",
+            "server exited unexpectedly",
             "broken pipe",
             "connection reset",
             "connection aborted",
