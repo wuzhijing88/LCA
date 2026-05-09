@@ -1,235 +1,45 @@
-# ==============================================
-# Python 相关文件
-# ==============================================
-# 字节码文件
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyd
+*.pyo
 
-# 自定义
-
-
-# 分发/打包
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-*.manifest
-*.spec
-
-# 单元测试/覆盖率报告
-htmlcov/
-.tox/
-.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 .coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
 
-# 翻译
-*.mo
-*.pot
-
-# Django
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask
-instance/
-.webassets-cache
-
-# Scrapy
-.scrapy
-
-# Sphinx 文档
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-Pipfile.lock
-
-# PEP 582
-__pypackages__/
-
-# Celery
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath
-*.sage.py
-
-# 环境变量
-.env
-.venv
-env/
 venv/
-ENV/
-env.bak/
-venv.bak/
+.venv/
 
-# Spyder
-.spyderproject
-.spyproject
-
-# Rope
-.ropeproject
-
-# mkdocs
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre
-.pyre/
-
-# ==============================================
-# PyQt 相关文件
-# ==============================================
-# PyQt 编译文件
-*.ui.py
-*.qrc.py
-*.pyc
-*.pyo
-*.pyd
-
-# Qt Creator
-*.pro.user*
-*.qbs.user*
-*.moc
-*.moc.cpp
-*.qmake.stash
-*.qmlc
-*.jsc
-
-# ==============================================
-# IDE 相关文件
-# ==============================================
-# Visual Studio Code
-.vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-
-# PyCharm
-
-*.iws
-*.iml
-*.ipr
-out/
-.idea/
-.trae/
-.codebuddy/
-.cursor/
-.qoder/
-.claude/
-
-# Eclipse
-.project
-.classpath
-.cproject
-.settings/
-
-# NetBeans
-nbproject/
-nbbuild/
-nbdist/
-
-# ==============================================
-# 操作系统相关文件
-# ==============================================
-# Windows
-Thumbs.db
-Thumbs.db:encryptable
-ehthumbs.db
-ehthumbs_vista.db
-*.stackdump
-[Dd]esktop.ini
-$RECYCLE.BIN/
-*.lnk
-*.url
-
-
-# ==============================================
-# 项目特定文件
-# ==============================================
-# 日志文件
 logs/
+runtime/
+runtime_data/
+.runtime_data/
 
+# Local runtime/user data
+config.json
+workflow_favorites.json
+images/
+workflows/
+docs/打包发布.txt
+_publish_worktree/
 
-# 临时文件
-tmp/
-temp/
-*.tmp
-*.temp
+backups/
+__tmp_*/
+备份/
+build_assets/packaging/build_output/
+build_assets/packaging/release_output/
+build_assets/packaging/map_navigation_worker_build_output/
 
-# 数据库文件
-*.db
-*.sqlite
-*.sqlite3
-identifier.sqlite
+config/credentials.json
+config/build_auth_secret.b64x2
+certs/*.pem
+lcaa.top_cert/
+jw3-auth-server-ubuntu-deploy/*.log
+jw3-auth-server-ubuntu-deploy/admin_sessions.json
+jw3-auth-server-ubuntu-deploy/jw3_auth.db*
+jw3-auth-server-ubuntu-deploy/data/*.db*
+jw3-auth-server-ubuntu-deploy/logs/
 
-# 配置文件（如果包含敏感信息）
-config.ini
-settings.ini
-secrets.json
-config/local_api_key.json
-
-# 资源文件缓存
-resources/cache/
-resources/temp/
-
-# 用户数据
-user_data/
-cache/
-
-# 备份文件
-*.bak
-*.backup
-*.old
-
-
-
-# 压缩文件（可选）
-*.zip
-*.rar
-*.7z
+nuitka-crash-report.xml
