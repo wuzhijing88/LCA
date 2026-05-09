@@ -90,26 +90,69 @@ logger = logging.getLogger(__name__)
 _VAR_PATTERN = re.compile(r"\$\{([^{}]+)\}|\{\{([^{}]+)\}\}")
 _MISSING = object()
 _COMPLETE_PRESS_HOLD_SECONDS = DEFAULT_KEY_HOLD_SECONDS
+_DEFAULT_COMBO_REPEAT_INTERVAL_SECONDS = 0.02
 _COMBO_STEP_SPLIT_PATTERN = re.compile(r"[,\n;，；]+")
-_COMBO_REPEAT_SUFFIX_PATTERN = re.compile(r"^(?P<body>.+?)\s*\*\s*(?P<count>\d+)\s*$")
+_COMBO_ARG_SPLIT_PATTERN = re.compile(r"[,，]")
+_COMBO_REPEAT_SUFFIX_PATTERN = re.compile(
+    r"^(?P<body>.+?)\s*\*\s*(?P<count>\d+)(?:\s*(?:@|/|每隔|间隔)\s*(?P<interval>\d+(?:\.\d+)?))?\s*$"
+)
 _COMBO_WAIT_TOKEN_PATTERN = re.compile(
-    r"^(?P<name>wait|delay|sleep|等待|延迟)\s*\((?P<args>[^()]*)\)\s*$",
+    r"^(?P<name>wait|delay|sleep|pause|等待|延迟|停顿)\s*(?:\((?P<args>[^()]*)\)|(?P<plain>\d+(?:\.\d+)?(?:\s*[,，]\s*\d+(?:\.\d+)?)?))\s*$",
     re.IGNORECASE,
 )
+_COMBO_KEY_FUNCTION_TOKEN_PATTERN = re.compile(
+    r"^(?P<name>key_down|keydown|down_key|key_hold|key_up|keyup|up_key|key_release|release_key|key_press|keypress|press_key|key_tap|tap_key|key|press|tap|按键按下|按键按住|按键松开|按键释放|按键点按|按键敲击|按键)\s*\((?P<args>[^()]*)\)\s*$",
+    re.IGNORECASE,
+)
+_COMBO_KEY_FUNCTION_ACTIONS = {
+    "key_down": "down",
+    "keydown": "down",
+    "down_key": "down",
+    "key_hold": "down",
+    "按键按下": "down",
+    "按键按住": "down",
+    "key_up": "up",
+    "keyup": "up",
+    "up_key": "up",
+    "key_release": "up",
+    "release_key": "up",
+    "按键松开": "up",
+    "按键释放": "up",
+    "key_press": "press",
+    "keypress": "press",
+    "press_key": "press",
+    "key_tap": "press",
+    "tap_key": "press",
+    "key": "press",
+    "press": "press",
+    "tap": "press",
+    "按键点按": "press",
+    "按键敲击": "press",
+    "按键": "press",
+}
 _COMBO_ACTION_SUFFIX_PATTERN = re.compile(
-    r"^(?P<key>.+?)(?:\((?P<act1>[^()]+)\)|\s+(?P<act2>down|up|press|按下|松开|弹起|释放|完整按键|完整))$",
+    r"^(?P<key>.+?)(?:\((?P<act1>[^()]+)\)|\s+(?P<act2>down|hold|up|release|press|tap|click|按下|按住|松开|弹起|抬起|释放|完整按键|完整|点按|点击|敲击))$",
     re.IGNORECASE,
 )
 _COMBO_ACTION_ALIASES = {
     "down": "down",
+    "hold": "down",
     "按下": "down",
+    "按住": "down",
     "up": "up",
+    "release": "up",
     "松开": "up",
     "弹起": "up",
+    "抬起": "up",
     "释放": "up",
     "press": "press",
+    "tap": "press",
+    "click": "press",
     "完整": "press",
     "完整按键": "press",
+    "点按": "press",
+    "点击": "press",
+    "敲击": "press",
 }
 _COMBO_KEY_ALIASES = {
     "control": "ctrl",
@@ -132,6 +175,25 @@ _COMBO_KEY_ALIASES = {
     "退格": "backspace",
     "esc": "esc",
     "escape": "esc",
+    "上": "up",
+    "下": "down",
+    "左": "left",
+    "右": "right",
+    "方向上": "up",
+    "方向下": "down",
+    "方向左": "left",
+    "方向右": "right",
+    "上箭头": "up",
+    "下箭头": "down",
+    "左箭头": "left",
+    "右箭头": "right",
+    "页上": "pageup",
+    "上一页": "pageup",
+    "页下": "pagedown",
+    "下一页": "pagedown",
+    "大写锁定": "capslock",
+    "数字锁定": "numlock",
+    "截图": "printscreen",
 }
 _RECORDED_KEY_ALIASES = {
     "left ctrl": "ctrl",
@@ -155,18 +217,27 @@ _RECORDED_KEY_ALIASES = {
 _COMBO_MOUSE_PREFIX_ALIASES = {
     "mouse_left": "left",
     "mouseleft": "left",
+    "mouse_l": "left",
+    "lbutton": "left",
+    "leftbutton": "left",
     "left": "left",
     "左键": "left",
     "鼠标左键": "left",
     "鼠标左": "left",
     "mouse_right": "right",
     "mouseright": "right",
+    "mouse_r": "right",
+    "rbutton": "right",
+    "rightbutton": "right",
     "right": "right",
     "右键": "right",
     "鼠标右键": "right",
     "鼠标右": "right",
     "mouse_middle": "middle",
     "mousemiddle": "middle",
+    "mouse_m": "middle",
+    "mbutton": "middle",
+    "middlebutton": "middle",
     "middle": "middle",
     "中键": "middle",
     "鼠标中键": "middle",
@@ -183,19 +254,23 @@ _COMBO_MOUSE_ACTION_SUFFIX_ALIASES = {
     "_press": "仅按下",
     "press": "仅按下",
     "按下": "仅按下",
+    "按住": "仅按下",
     "_up": "仅松开",
     "up": "仅松开",
     "_release": "仅松开",
     "release": "仅松开",
     "松开": "仅松开",
     "弹起": "仅松开",
+    "抬起": "仅松开",
     "释放": "仅松开",
     "_click": "完整点击",
     "_single": "完整点击",
     "click": "完整点击",
+    "tap": "完整点击",
     "single": "完整点击",
     "点击": "完整点击",
     "单击": "完整点击",
+    "点按": "完整点击",
 }
 _COMBO_MOUSE_ACTION_SUFFIX_ITEMS = sorted(
     _COMBO_MOUSE_ACTION_SUFFIX_ALIASES.items(),
@@ -217,10 +292,16 @@ _COMBO_MOUSE_WHEEL_PREFIX_ALIASES = {
     "wheeldown": "down",
     "scroll_up": "up",
     "scroll_down": "down",
+    "scrollup": "up",
+    "scrolldown": "down",
     "滚轮上": "up",
     "滚轮下": "down",
+    "滚轮向上": "up",
+    "滚轮向下": "down",
     "鼠标滚轮上": "up",
     "鼠标滚轮下": "down",
+    "鼠标滚轮向上": "up",
+    "鼠标滚轮向下": "down",
 }
 _COMBO_INSERT_MOUSE_ACTION_OPTIONS: List[Tuple[str, Optional[str]]] = [
     ("左键单击", "mouse_left"),
@@ -259,10 +340,12 @@ _KEY_MOUSE_ACTION_ALIASES = {
     "释放": KEY_MOUSE_ACTION_RELEASE,
     "松开": KEY_MOUSE_ACTION_RELEASE,
 }
-_MAX_KEY_MOUSE_KEYS = 3
-_MAX_KEY_MOUSE_MOUSE_ACTIONS = 1
+_MAX_KEY_MOUSE_KEYS: Optional[int] = None
+_MAX_KEY_MOUSE_MOUSE_ACTIONS: Optional[int] = None
 _RECORDED_DOUBLE_CLICK_SECONDS = 0.35
 _RECORDED_DOUBLE_CLICK_DISTANCE = 8
+_RECORDED_DELAY_MIN_SECONDS = 0.02
+_RECORDED_LONG_PRESS_SECONDS = 0.20
 
 
 def _stringify_value(value) -> str:
@@ -446,28 +529,34 @@ def show_combo_sequence_examples(params: Dict[str, Any], **kwargs) -> None:
 
 2. 连按次数
    写法: a*3
+   写法: a*5@0.2
+   写法: key_press(a,5,0.2)
    含义: 连按 3 次 a
+   说明: @0.2 或第 3 个参数表示每次之间等待 0.2 秒
 
 3. 按下/松开
    写法: ctrl(按下), a, ctrl(松开)
-   写法: ctrl down + a + ctrl up
+   写法: ctrl(按下), a*5@0.2, ctrl(松开)
+   写法: ctrl hold + a tap + ctrl release
    含义: 先按住 ctrl，执行 a，再松开 ctrl
 
 4. 等待
    写法: wait(0.2)
+   写法: wait 0.2
    写法: wait(0.1,0.3)
    含义: 固定等待 0.2 秒，或随机等待 0.1-0.3 秒
 
 5. 快捷组合写法
    写法: ctrl+shift+a
    含义: 自动展开为按下 ctrl/shift/a，再逆序松开
-   限制: 整个输入里最多 3 个按键动作
+   说明: 可连续写多组，例如 ctrl+a, wait(0.1), ctrl+c
 
-=== 鼠标动作（最多 1 个，支持坐标） ===
+=== 鼠标动作（支持多步骤与坐标） ===
 
 6. 单击（默认）
    写法: mouse_left(1163,947)
    写法: 鼠标左键(1163,947)
+   写法: 鼠标左键点击(1163，947)
    含义: 在坐标 (1163,947) 执行一次左键点击
 
 7. 双击
@@ -477,7 +566,7 @@ def show_combo_sequence_examples(params: Dict[str, Any], **kwargs) -> None:
 8. 按下/松开
    写法: mouse_left_down(1163,947), mouse_left_up(1163,947)
    写法: 鼠标左键按下(1163,947), 鼠标左键松开(1163,947)
-   说明: 这一组按下+松开按 1 个鼠标动作计算
+   说明: 可穿插按键与等待，适合拖拽或按住技能键再点击
 
 9. 右键/中键
    写法: mouse_right(300,400)
@@ -487,24 +576,32 @@ def show_combo_sequence_examples(params: Dict[str, Any], **kwargs) -> None:
    写法: mouse_wheel_up(300,400)
    写法: mouse_wheel_down(300,400,3)  # 第3个参数是滚动步数
    写法: 鼠标滚轮上(300,400), 鼠标滚轮下(300,400,3)
+   写法: 滚轮向下(3)
    写法: mouse_wheel_down() / mouse_wheel_down(3)  # 无坐标时使用当前鼠标位置
 
 11. 与按键混合
    写法: w(按下), mouse_left(1163,947), w(松开)
    写法: w(按下), mouse_left(), w(松开)  # 无坐标点击当前鼠标位置
+   写法: shift(按住), 鼠标左键按下(500,300), wait 0.2, 鼠标左键松开(650,300), shift(松开)
+
+12. 常用别名
+   命令式写法: key_down(ctrl), key_press(a,3,0.1), key_up(ctrl)
+   按键动作: down/hold/按下/按住, up/release/松开/释放, press/tap/点按/敲击
+   鼠标动作: click/tap/点击/单击, double/dbl/双击, down/按住, up/release/松开
+   按键名: 空格/回车/退格/上箭头/下箭头/左箭头/右箭头/上一页/下一页
 
 === 分隔符 ===
 
-12. 步骤分隔支持 , ; 换行 和 +
+13. 步骤分隔支持 , ; 换行 和 +
    示例: w(按下)+wait(0.05)+space+w(松开)
 
 === 面板工具 ===
 
-13. 开始录制按键
+14. 开始录制按键
    点击后开始记录按键，再点一次停止并回填到输入框
-   录制支持单个/多个按键，并可附带 1 个鼠标单击或双击动作
+   录制支持连续按键与多个鼠标单击/双击动作
 
-14. 获取点击坐标 + 插入鼠标动作
+15. 获取点击坐标 + 插入鼠标动作
    先取坐标，再点“插入鼠标动作”选择类型自动导入
 
 === 注意 ===
@@ -512,7 +609,7 @@ def show_combo_sequence_examples(params: Dict[str, Any], **kwargs) -> None:
 • 坐标按目标窗口客户区处理
 • 插入时坐标是 0,0 会自动写成无坐标语法（执行时使用当前鼠标位置）
 • 新配置统一保存到“键盘按键”；旧单键/旧组合键会自动迁移
-• 整个输入里最多 3 个按键动作，另外最多 1 个鼠标动作
+• 按键动作与鼠标动作默认不限制数量，可按顺序自由组合
 • 显式写了 (按下) 的按键，必须写对应的 (松开)
 • 推荐先用“详细说明”里的格式填写，避免语法错误
 """
@@ -937,11 +1034,11 @@ def _parse_combo_wait_token(token_body: str) -> Optional[Dict[str, Any]]:
     if not match:
         return None
 
-    args_text = str(match.group("args") or "").strip()
+    args_text = str(match.group("args") or match.group("plain") or "").strip()
     if not args_text:
         return None
 
-    parts = [part.strip() for part in args_text.split(",") if part.strip()]
+    parts = [part.strip() for part in _COMBO_ARG_SPLIT_PATTERN.split(args_text) if part.strip()]
     if len(parts) == 1:
         duration = _coerce_non_negative_duration(parts[0], 0.0)
         return {
@@ -962,6 +1059,56 @@ def _parse_combo_wait_token(token_body: str) -> Optional[Dict[str, Any]]:
             "random": True,
         }
     return None
+
+
+def _parse_combo_key_function_token(token_body: str) -> Optional[Dict[str, Any]]:
+    """解析命令式按键步骤，示例：key_down(ctrl) / key_press(a,3,0.2) / key_up(ctrl)。"""
+    text = str(token_body or "").strip()
+    if not text:
+        return None
+
+    match = _COMBO_KEY_FUNCTION_TOKEN_PATTERN.match(text)
+    if not match:
+        return None
+
+    action_name = str(match.group("name") or "").strip().lower()
+    action = _COMBO_KEY_FUNCTION_ACTIONS.get(action_name, "")
+    if not action:
+        return None
+
+    args_text = str(match.group("args") or "").strip()
+    if not args_text:
+        return None
+
+    parts = [part.strip() for part in _COMBO_ARG_SPLIT_PATTERN.split(args_text) if part.strip()]
+    if len(parts) not in (1, 2, 3):
+        return None
+
+    key_name = _normalize_combo_key_name(parts[0])
+    if not key_name:
+        return None
+
+    count = 1
+    if len(parts) == 2:
+        try:
+            count = max(1, int(parts[1]))
+        except Exception:
+            return None
+
+    repeat_interval = None
+    if len(parts) == 3:
+        try:
+            count = max(1, int(parts[1]))
+            repeat_interval = _coerce_non_negative_duration(parts[2], _DEFAULT_COMBO_REPEAT_INTERVAL_SECONDS)
+        except Exception:
+            return None
+
+    return {"op": action, "key": key_name, "count": count, "repeat_interval": repeat_interval}
+
+
+def _resolve_combo_repeat_interval(step: Dict[str, Any], default: float = _DEFAULT_COMBO_REPEAT_INTERVAL_SECONDS) -> float:
+    """解析重复步骤之间的等待间隔。"""
+    return _coerce_non_negative_duration(step.get("repeat_interval", default), default)
 
 
 def _resolve_combo_wait_duration(step: Dict[str, Any]) -> float:
@@ -1243,7 +1390,11 @@ def _split_combo_expression_steps(expression_text: str) -> List[str]:
         return []
 
     normalized = text.replace("\r", "\n")
-    if re.search(r"(按下|松开|弹起|释放|down|up|press|\*\s*\d+|mouse_|鼠标|\(\s*-?\d+\s*,\s*-?\d+\s*\))", normalized, re.IGNORECASE):
+    if re.search(
+        r"(按键|按下|按住|松开|弹起|抬起|释放|点按|点击|敲击|key_|key\s*\(|keydown|keyup|keypress|down|hold|up|release|press|tap|click|\*\s*\d+|mouse_|鼠标|\(\s*-?\d+\s*[,，]\s*-?\d+\s*\))",
+        normalized,
+        re.IGNORECASE,
+    ):
         normalized = re.sub(r"\s*\+\s*", ",", normalized)
 
     parts: List[str] = []
@@ -1281,13 +1432,18 @@ def _split_combo_expression_steps(expression_text: str) -> List[str]:
 
 
 def _build_mouse_action_identity(step: Dict[str, Any]) -> Tuple[Any, ...]:
-    """构建鼠标逻辑动作标识，用于限制最多一个鼠标动作。"""
+    """构建鼠标逻辑动作标识，用于匹配按下/松开这一类成对鼠标步骤。"""
     return (
         str(step.get("button", "left") or "left").strip().lower(),
         int(step.get("x", 0) or 0) if step.get("x") is not None else None,
         int(step.get("y", 0) or 0) if step.get("y") is not None else None,
         bool(step.get("use_current_position", False)),
     )
+
+
+def _combo_limit_exceeded(limit: Optional[int], value: int) -> bool:
+    """None 表示不限制；正整数表示启用上限。"""
+    return isinstance(limit, int) and limit > 0 and value > limit
 
 
 def _count_recorded_key_actions(events: List[Dict[str, Any]]) -> int:
@@ -1302,7 +1458,7 @@ def _count_recorded_key_actions(events: List[Dict[str, Any]]) -> int:
 
 
 def _validate_key_mouse_operation_limits(operations: List[Dict[str, Any]]) -> None:
-    """限制最多 3 个按键动作，且同时按下不超过 3 个键；鼠标逻辑动作最多 1 个。"""
+    """按配置校验按键/鼠标动作数量；默认不限制，保留入口便于以后按需收紧。"""
     active_keys: Set[str] = set()
     key_action_count = 0
     mouse_action_count = 0
@@ -1316,10 +1472,10 @@ def _validate_key_mouse_operation_limits(operations: List[Dict[str, Any]]) -> No
         if op == "down":
             if key_name:
                 key_action_count += 1
-                if key_action_count > _MAX_KEY_MOUSE_KEYS:
+                if _combo_limit_exceeded(_MAX_KEY_MOUSE_KEYS, key_action_count):
                     raise ValueError(f"键盘按键最多只允许 {_MAX_KEY_MOUSE_KEYS} 个按键动作")
                 active_keys.add(key_name)
-                if len(active_keys) > _MAX_KEY_MOUSE_KEYS:
+                if _combo_limit_exceeded(_MAX_KEY_MOUSE_KEYS, len(active_keys)):
                     raise ValueError(f"键盘按键最多同时按下 {_MAX_KEY_MOUSE_KEYS} 个键")
             continue
 
@@ -1330,16 +1486,16 @@ def _validate_key_mouse_operation_limits(operations: List[Dict[str, Any]]) -> No
 
         if op == "press":
             key_action_count += count
-            if key_action_count > _MAX_KEY_MOUSE_KEYS:
+            if _combo_limit_exceeded(_MAX_KEY_MOUSE_KEYS, key_action_count):
                 raise ValueError(f"键盘按键最多只允许 {_MAX_KEY_MOUSE_KEYS} 个按键动作")
             current_key_count = len(active_keys) + (0 if key_name in active_keys else 1)
-            if current_key_count > _MAX_KEY_MOUSE_KEYS:
+            if _combo_limit_exceeded(_MAX_KEY_MOUSE_KEYS, current_key_count):
                 raise ValueError(f"键盘按键最多同时按下 {_MAX_KEY_MOUSE_KEYS} 个键")
             continue
 
         if op == "mouse_wheel":
             mouse_action_count += count
-            if mouse_action_count > _MAX_KEY_MOUSE_MOUSE_ACTIONS:
+            if _combo_limit_exceeded(_MAX_KEY_MOUSE_MOUSE_ACTIONS, mouse_action_count):
                 raise ValueError(f"键盘按键最多只允许 {_MAX_KEY_MOUSE_MOUSE_ACTIONS} 个鼠标动作")
             continue
 
@@ -1361,7 +1517,7 @@ def _validate_key_mouse_operation_limits(operations: List[Dict[str, Any]]) -> No
         else:
             mouse_action_count += action_count
 
-        if mouse_action_count > _MAX_KEY_MOUSE_MOUSE_ACTIONS:
+        if _combo_limit_exceeded(_MAX_KEY_MOUSE_MOUSE_ACTIONS, mouse_action_count):
             raise ValueError(f"键盘按键最多只允许 {_MAX_KEY_MOUSE_MOUSE_ACTIONS} 个鼠标动作")
 
 
@@ -1457,7 +1613,7 @@ def _parse_combo_mouse_action_token(token_body: str) -> Optional[Dict[str, Any]]
             "use_current_position": True,
         }
 
-    parts = [part.strip() for part in inside.split(",")]
+    parts = [part.strip() for part in _COMBO_ARG_SPLIT_PATTERN.split(inside)]
     if len(parts) != 2:
         return None
     try:
@@ -1509,7 +1665,7 @@ def _parse_combo_mouse_wheel_token(token_body: str) -> Optional[Dict[str, Any]]:
             "use_current_position": True,
         }
 
-    parts = [part.strip() for part in inside.split(",") if part.strip()]
+    parts = [part.strip() for part in _COMBO_ARG_SPLIT_PATTERN.split(inside) if part.strip()]
     if len(parts) == 1:
         try:
             wheel_clicks = max(1, int(parts[0]))
@@ -1591,6 +1747,50 @@ def _format_recorded_mouse_token(event: Dict[str, Any]) -> str:
     return f"{prefix}({int(x_value)},{int(y_value)})"
 
 
+def _recording_timestamp() -> float:
+    """录制专用单调时间戳，避免系统时间调整影响间隔。"""
+    try:
+        return float(time.perf_counter())
+    except Exception:
+        return float(time.time())
+
+
+def _get_recorded_event_time(event: Dict[str, Any], fallback: Optional[float] = None) -> Optional[float]:
+    """读取录制事件的开始时间。"""
+    try:
+        value = event.get("time", fallback)
+        if value is None:
+            return fallback
+        return float(value)
+    except Exception:
+        return fallback
+
+
+def _get_recorded_event_end_time(event: Dict[str, Any], fallback: Optional[float] = None) -> Optional[float]:
+    """读取录制事件的结束时间；没有结束时间时使用开始时间。"""
+    start_time = _get_recorded_event_time(event, fallback)
+    try:
+        value = event.get("end_time", start_time)
+        if value is None:
+            return start_time
+        return float(value)
+    except Exception:
+        return start_time
+
+
+def _append_recorded_delay_token(result_parts: List[str], delay_seconds: float) -> None:
+    """将相邻录制动作之间的真实间隔写成 wait(...)。"""
+    try:
+        safe_delay = max(0.0, float(delay_seconds))
+    except Exception:
+        safe_delay = 0.0
+    if safe_delay < _RECORDED_DELAY_MIN_SECONDS:
+        return
+    wait_token = _build_combo_wait_token(safe_delay)
+    if wait_token:
+        result_parts.append(wait_token)
+
+
 def _build_recorded_combo_sequence(events: List[Dict[str, Any]]) -> str:
     """将录制到的键盘/鼠标事件转成可编辑步骤文本。"""
     if not events:
@@ -1621,24 +1821,49 @@ def _build_recorded_combo_sequence(events: List[Dict[str, Any]]) -> str:
                 and str(next_event.get("event_type", "") or "").strip().lower() == "up"
                 and str(next_event.get("key", "") or "").strip() == key_name
             ):
-                tokens.append({"type": "key", "op": "press", "key": key_name})
+                down_time = _get_recorded_event_time(event)
+                up_time = _get_recorded_event_time(next_event, down_time)
+                hold_seconds = 0.0
+                if down_time is not None and up_time is not None:
+                    hold_seconds = max(0.0, float(up_time) - float(down_time))
+                if hold_seconds >= _RECORDED_LONG_PRESS_SECONDS:
+                    tokens.append({"type": "key", "op": "down", "key": key_name, "time": down_time, "end_time": down_time})
+                    tokens.append({"type": "key", "op": "up", "key": key_name, "time": up_time, "end_time": up_time})
+                else:
+                    tokens.append({"type": "key", "op": "press", "key": key_name, "time": down_time, "end_time": up_time})
                 index += 2
                 continue
 
         if event_type == "down":
-            tokens.append({"type": "key", "op": "down", "key": key_name})
+            event_time = _get_recorded_event_time(event)
+            tokens.append({"type": "key", "op": "down", "key": key_name, "time": event_time, "end_time": event_time})
         elif event_type == "up":
-            tokens.append({"type": "key", "op": "up", "key": key_name})
+            event_time = _get_recorded_event_time(event)
+            tokens.append({"type": "key", "op": "up", "key": key_name, "time": event_time, "end_time": event_time})
         index += 1
 
     result_parts: List[str] = []
     index = 0
     total = len(tokens)
+    previous_end_time: Optional[float] = None
+
+    def append_timed_part(token: Dict[str, Any], part: str) -> None:
+        nonlocal previous_end_time
+        if not part:
+            return
+        start_time = _get_recorded_event_time(token)
+        if previous_end_time is not None and start_time is not None:
+            _append_recorded_delay_token(result_parts, start_time - previous_end_time)
+        result_parts.append(part)
+        end_time = _get_recorded_event_end_time(token, start_time)
+        if end_time is not None:
+            previous_end_time = end_time
+
     while index < total:
         token = tokens[index]
         token_type = str(token.get("type", "") or "").strip().lower()
         if token_type == "mouse":
-            result_parts.append(_format_recorded_mouse_token(token))
+            append_timed_part(token, _format_recorded_mouse_token(token))
             index += 1
             continue
 
@@ -1649,27 +1874,14 @@ def _build_recorded_combo_sequence(events: List[Dict[str, Any]]) -> str:
             continue
 
         if op == "press":
-            repeat = 1
-            next_index = index + 1
-            while next_index < total:
-                next_token = tokens[next_index]
-                if (
-                    str(next_token.get("type", "") or "").strip().lower() == "key"
-                    and next_token.get("op") == "press"
-                    and next_token.get("key") == key_name
-                ):
-                    repeat += 1
-                    next_index += 1
-                    continue
-                break
-            result_parts.append(f"{key_name}*{repeat}" if repeat > 1 else key_name)
-            index = next_index
+            append_timed_part(token, key_name)
+            index += 1
             continue
 
         if op == "down":
-            result_parts.append(f"{key_name}(按下)")
+            append_timed_part(token, f"{key_name}(按下)")
         elif op == "up":
-            result_parts.append(f"{key_name}(松开)")
+            append_timed_part(token, f"{key_name}(松开)")
         index += 1
 
     return ", ".join(result_parts)
@@ -1783,7 +1995,7 @@ def _resolve_recorded_mouse_position(target_hwnd: Optional[int], mouse_module=No
 
 
 def toggle_combo_key_sequence_record(params: Dict[str, Any], **kwargs) -> None:
-    """开始/停止键盘按键录制，可附带一个鼠标单击/双击动作。"""
+    """开始/停止键盘按键录制，可记录多段按键与鼠标单击/双击动作。"""
     parameter_panel = kwargs.get("parameter_panel")
     if not parameter_panel:
         logger.warning("键盘按键录制失败：参数面板不可用")
@@ -1818,6 +2030,7 @@ def toggle_combo_key_sequence_record(params: Dict[str, Any], **kwargs) -> None:
 
     def _on_key_event(event):
         try:
+            event_time = _recording_timestamp()
             event_type = str(getattr(event, "event_type", "") or "").strip().lower()
             if event_type not in ("down", "up"):
                 return
@@ -1828,24 +2041,24 @@ def toggle_combo_key_sequence_record(params: Dict[str, Any], **kwargs) -> None:
             if event_type == "down":
                 if key_name in pressed_keys:
                     return
-                if _count_recorded_key_actions(recorded_events) >= _MAX_KEY_MOUSE_KEYS:
+                if _combo_limit_exceeded(_MAX_KEY_MOUSE_KEYS, _count_recorded_key_actions(recorded_events)):
                     ignored_keys.add(key_name)
                     return
                 pressed_keys.add(key_name)
-                recorded_events.append({"type": "key", "event_type": "down", "key": key_name})
+                recorded_events.append({"type": "key", "event_type": "down", "key": key_name, "time": event_time})
                 return
             if key_name in ignored_keys:
                 ignored_keys.discard(key_name)
                 return
             if key_name in pressed_keys:
                 pressed_keys.remove(key_name)
-            recorded_events.append({"type": "key", "event_type": "up", "key": key_name})
+            recorded_events.append({"type": "key", "event_type": "up", "key": key_name, "time": event_time})
         except Exception:
             return
 
     def _on_mouse_event(button_name: str):
         try:
-            now = time.time()
+            now = _recording_timestamp()
             x_value, y_value = _resolve_recorded_mouse_position(target_hwnd, mouse)
             last_mouse = getattr(parameter_panel, "_combo_seq_recording_last_mouse", None)
 
@@ -1857,12 +2070,16 @@ def toggle_combo_key_sequence_record(params: Dict[str, Any], **kwargs) -> None:
                     delta_x = abs(int(last_mouse.get("x", 0) or 0) - x_value)
                     delta_y = abs(int(last_mouse.get("y", 0) or 0) - y_value)
                     if same_button and delta_time <= _RECORDED_DOUBLE_CLICK_SECONDS and delta_x <= _RECORDED_DOUBLE_CLICK_DISTANCE and delta_y <= _RECORDED_DOUBLE_CLICK_DISTANCE:
+                        first_event = recorded_events[event_index]
+                        first_time = _get_recorded_event_time(first_event, now)
                         recorded_events[event_index] = {
                             "type": "mouse",
                             "button": button_name,
                             "action": "双击",
                             "x": x_value,
                             "y": y_value,
+                            "time": first_time,
+                            "end_time": now,
                         }
                         setattr(
                             parameter_panel,
@@ -1877,9 +2094,6 @@ def toggle_combo_key_sequence_record(params: Dict[str, Any], **kwargs) -> None:
                         )
                         return
 
-            if any(str(item.get("type", "") or "").strip().lower() == "mouse" for item in recorded_events):
-                return
-
             recorded_events.append(
                 {
                     "type": "mouse",
@@ -1887,6 +2101,7 @@ def toggle_combo_key_sequence_record(params: Dict[str, Any], **kwargs) -> None:
                     "action": "完整点击",
                     "x": x_value,
                     "y": y_value,
+                    "time": now,
                 }
             )
             setattr(
@@ -2131,6 +2346,7 @@ def _parse_combo_expression(expression: Any) -> List[Dict[str, Any]]:
             continue
 
         repeat_count = 1
+        repeat_interval: Optional[float] = None
         body = step
 
         repeat_match = _COMBO_REPEAT_SUFFIX_PATTERN.match(body)
@@ -2139,6 +2355,12 @@ def _parse_combo_expression(expression: Any) -> List[Dict[str, Any]]:
             repeat_count = int(repeat_match.group("count") or 1)
             if repeat_count <= 0:
                 raise ValueError(f"无效重复次数：{step}")
+            interval_text = str(repeat_match.group("interval") or "").strip()
+            if interval_text:
+                repeat_interval = _coerce_non_negative_duration(
+                    interval_text,
+                    _DEFAULT_COMBO_REPEAT_INTERVAL_SECONDS,
+                )
 
         wait_info = _parse_combo_wait_token(body)
         if wait_info:
@@ -2154,6 +2376,28 @@ def _parse_combo_expression(expression: Any) -> List[Dict[str, Any]]:
             )
             continue
 
+        key_function_info = _parse_combo_key_function_token(body)
+        if key_function_info:
+            action = str(key_function_info.get("op") or "press")
+            inner_count = max(1, int(key_function_info.get("count", 1) or 1))
+            total_count = repeat_count * inner_count
+            step_repeat_interval = (
+                repeat_interval
+                if repeat_interval is not None
+                else key_function_info.get("repeat_interval", None)
+            )
+            if action in ("down", "up") and total_count > 1:
+                raise ValueError(f"按下/松开步骤不支持重复次数：{step}")
+            parsed_operations.append(
+                {
+                    "op": action,
+                    "key": str(key_function_info.get("key") or ""),
+                    "count": total_count,
+                    "repeat_interval": step_repeat_interval,
+                }
+            )
+            continue
+
         mouse_wheel_info = _parse_combo_mouse_wheel_token(body)
         if mouse_wheel_info:
             parsed_operations.append(
@@ -2165,6 +2409,7 @@ def _parse_combo_expression(expression: Any) -> List[Dict[str, Any]]:
                     "wheel_clicks": int(mouse_wheel_info["wheel_clicks"]),
                     "use_current_position": bool(mouse_wheel_info.get("use_current_position", False)),
                     "count": repeat_count,
+                    "repeat_interval": repeat_interval,
                 }
             )
             continue
@@ -2183,6 +2428,7 @@ def _parse_combo_expression(expression: Any) -> List[Dict[str, Any]]:
                     "y": mouse_action_info.get("y"),
                     "use_current_position": bool(mouse_action_info.get("use_current_position", False)),
                     "count": repeat_count,
+                    "repeat_interval": repeat_interval,
                 }
             )
             continue
@@ -2197,7 +2443,7 @@ def _parse_combo_expression(expression: Any) -> List[Dict[str, Any]]:
             if not action:
                 raise ValueError(f"无效动作：{step}")
         else:
-            for action_suffix in ("按下", "松开", "弹起", "释放"):
+            for action_suffix in ("完整按键", "按下", "按住", "松开", "弹起", "抬起", "释放", "完整", "点按", "点击", "敲击"):
                 if body.endswith(action_suffix):
                     key_body = body[: -len(action_suffix)].strip()
                     action = _normalize_combo_action(action_suffix)
@@ -2214,8 +2460,19 @@ def _parse_combo_expression(expression: Any) -> List[Dict[str, Any]]:
             if not chord_keys:
                 raise ValueError(f"无效组合：{step}")
 
-            for _ in range(repeat_count):
+            for repeat_index in range(repeat_count):
                 parsed_operations.extend(_build_combo_chord_operations(chord_keys))
+                if repeat_interval is not None and repeat_index < repeat_count - 1:
+                    parsed_operations.append(
+                        {
+                            "op": "wait",
+                            "duration": repeat_interval,
+                            "duration_min": repeat_interval,
+                            "duration_max": repeat_interval,
+                            "random": False,
+                            "count": 1,
+                        }
+                    )
             continue
 
         normalized_key = _normalize_combo_key_name(key_body)
@@ -2230,6 +2487,7 @@ def _parse_combo_expression(expression: Any) -> List[Dict[str, Any]]:
                 "op": action or "press",
                 "key": normalized_key,
                 "count": repeat_count,
+                "repeat_interval": repeat_interval,
             }
         )
 
@@ -2386,10 +2644,17 @@ def _execute_combo_expression_foreground(
     stop_checker=None,
     foreground_input_manager=None,
     target_hwnd: Optional[int] = None,
+    failure_detail: Optional[Dict[str, str]] = None,
 ) -> bool:
     """执行可编辑组合键（前台）。"""
+    def _set_failure_detail(message: str) -> None:
+        if failure_detail is not None:
+            failure_detail["message"] = str(message or "").strip()
+
     if not driver or not hasattr(driver, "key_down") or not hasattr(driver, "key_up"):
-        logger.error("[前台模式组合键] 驱动不支持key_down/key_up方法")
+        message = "[前台模式组合键] 驱动不支持key_down/key_up方法"
+        logger.error(message)
+        _set_failure_detail(message)
         return False
 
     pressed_keys: List[str] = []
@@ -2418,9 +2683,12 @@ def _execute_combo_expression_foreground(
                 x_value = int(raw_x) if raw_x is not None else 0
                 y_value = int(raw_y) if raw_y is not None else 0
                 wheel_clicks = max(1, int(step.get("wheel_clicks", 1) or 1))
+                repeat_interval = _resolve_combo_repeat_interval(step, 0.01)
 
                 if foreground_input_manager is None or not hasattr(foreground_input_manager, "scroll_mouse"):
-                    logger.error("[前台模式组合键] 可编辑序列滚轮失败：输入管理器不支持滚轮")
+                    message = "[前台模式组合键] 可编辑序列滚轮失败：输入管理器不支持滚轮"
+                    logger.error(message)
+                    _set_failure_detail(message)
                     _release_foreground_keys(driver, pressed_keys)
                     _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
                     return False
@@ -2428,6 +2696,9 @@ def _execute_combo_expression_foreground(
                 total_scroll_steps = max(1, count) * wheel_clicks
                 for step_index in range(total_scroll_steps):
                     _raise_if_stopped(stop_checker, "前台组合键可编辑序列")
+                    if target_hwnd:
+                        _activate_foreground_window(target_hwnd)
+                        precise_sleep(0.08)
                     # LB 等驱动下，修饰键可能在长滚轮过程中丢状态，这里逐步重申修饰键按下。
                     for held_key in pressed_keys:
                         if held_key in modifier_key_names:
@@ -2444,9 +2715,9 @@ def _execute_combo_expression_foreground(
                         foreground_input_manager.scroll_mouse(direction, clicks=1, x=screen_x, y=screen_y)
                     )
                     if not result:
-                        logger.error(
-                            f"[前台模式组合键] 滚轮失败: direction={direction}, clicks={wheel_clicks}, pos=({screen_x},{screen_y})"
-                        )
+                        message = f"[前台模式组合键] 滚轮失败: direction={direction}, clicks={wheel_clicks}, pos=({screen_x},{screen_y})"
+                        logger.error(message)
+                        _set_failure_detail(message)
                         _release_foreground_keys(driver, pressed_keys)
                         _release_foreground_mouse_buttons(
                             foreground_input_manager,
@@ -2454,8 +2725,8 @@ def _execute_combo_expression_foreground(
                             target_hwnd,
                         )
                         return False
-                    if step_index < total_scroll_steps - 1:
-                        _hold_for_duration(0.01, "前台组合键滚轮步进间隔")
+                    if step_index < total_scroll_steps - 1 and repeat_interval > 0:
+                        _hold_for_duration(repeat_interval, "前台组合键滚轮步进间隔")
                 continue
 
             if op in ("mouse_click", "mouse_action"):
@@ -2468,9 +2739,12 @@ def _execute_combo_expression_foreground(
                 click_action = str(step.get("mouse_action", "完整点击") or "完整点击").strip()
                 normalized_action = normalize_click_action(click_action, default="完整点击")
                 auto_release = normalized_action != "仅按下"
+                repeat_interval = _resolve_combo_repeat_interval(step)
 
                 if foreground_input_manager is None:
-                    logger.error("[前台模式组合键] 可编辑序列鼠标点击失败：输入管理器不可用")
+                    message = "[前台模式组合键] 可编辑序列鼠标点击失败：输入管理器不可用"
+                    logger.error(message)
+                    _set_failure_detail(message)
                     _release_foreground_keys(driver, pressed_keys)
                     _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
                     return False
@@ -2479,6 +2753,9 @@ def _execute_combo_expression_foreground(
                     _raise_if_stopped(stop_checker, "前台组合键可编辑序列")
                     stored_x: Optional[int] = x_value
                     stored_y: Optional[int] = y_value
+                    if target_hwnd:
+                        _activate_foreground_window(target_hwnd)
+                        precise_sleep(0.08)
                     if use_current_position:
                         screen_x, screen_y = _resolve_foreground_runtime_position(foreground_input_manager)
                         stored_x, stored_y = None, None
@@ -2502,9 +2779,13 @@ def _execute_combo_expression_foreground(
                         execution_mode="foreground",
                         target_hwnd=target_hwnd,
                     ):
-                        logger.error(
-                            f"[前台模式组合键] 鼠标步骤失败: action={normalized_action}, button={button}, pos=({screen_x},{screen_y})"
+                        message = (
+                            f"[前台模式组合键] 鼠标步骤失败: action={normalized_action}, "
+                            f"button={button}, pos=({screen_x},{screen_y})。"
+                            "前台模式的鼠标完整点击需要绑定窗口已经在前台；请确认目标窗口可见、未最小化，并已成功激活。"
                         )
+                        logger.error(message)
+                        _set_failure_detail(message)
                         _release_foreground_keys(driver, pressed_keys)
                         _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
                         return False
@@ -2517,19 +2798,23 @@ def _execute_combo_expression_foreground(
                                 pressed_mouse_buttons.pop(idx)
                                 break
 
-                    if count > 1 and i < count - 1:
-                        _hold_for_duration(0.02, "前台组合键重复间隔")
+                    if count > 1 and i < count - 1 and repeat_interval > 0:
+                        _hold_for_duration(repeat_interval, "前台组合键重复间隔")
                 continue
 
             if not key_name:
-                logger.error("[前台模式组合键] 可编辑序列存在空键名")
+                message = "[前台模式组合键] 可编辑序列存在空键名"
+                logger.error(message)
+                _set_failure_detail(message)
                 _release_foreground_keys(driver, pressed_keys)
                 _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
                 return False
 
             if op == "down":
                 if not bool(driver.key_down(key_name)):
-                    logger.error(f"[前台模式组合键] 按下失败: {key_name}")
+                    message = f"[前台模式组合键] 按下失败: {key_name}"
+                    logger.error(message)
+                    _set_failure_detail(message)
                     _release_foreground_keys(driver, pressed_keys)
                     _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
                     return False
@@ -2546,27 +2831,51 @@ def _execute_combo_expression_foreground(
                     logger.warning(f"[前台模式组合键] 松开返回失败: {key_name}")
                 continue
 
+            repeat_interval = _resolve_combo_repeat_interval(step)
             for i in range(max(1, count)):
                 _raise_if_stopped(stop_checker, "前台组合键可编辑序列")
                 hold_duration = _default_complete_press_hold_seconds()
-                if _execute_precise_key_hold(driver, key_name, hold_duration, "前台组合键可编辑序列"):
-                    if count > 1 and i < count - 1:
-                        _hold_for_duration(0.02, "前台组合键重复间隔")
+                held_key_names = list(pressed_keys)
+                if held_key_names:
+                    modified_press_fn = getattr(driver, "modified_key_press", None)
+                    if callable(modified_press_fn):
+                        try:
+                            if bool(modified_press_fn(key_name, held_key_names, hold_duration)):
+                                if count > 1 and i < count - 1 and repeat_interval > 0:
+                                    _hold_for_duration(repeat_interval, "前台组合键重复间隔")
+                                continue
+                        except Exception:
+                            pass
+
+                    for held_key in held_key_names:
+                        if held_key in modifier_key_names:
+                            try:
+                                driver.key_down(held_key)
+                            except Exception:
+                                continue
+
+                if not held_key_names and _execute_precise_key_hold(driver, key_name, hold_duration, "前台组合键可编辑序列"):
+                    if count > 1 and i < count - 1 and repeat_interval > 0:
+                        _hold_for_duration(repeat_interval, "前台组合键重复间隔")
                     continue
 
                 if not bool(driver.key_down(key_name)):
-                    logger.error(f"[前台模式组合键] 按键执行失败: {key_name}")
+                    message = f"[前台模式组合键] 按键执行失败: {key_name}"
+                    logger.error(message)
+                    _set_failure_detail(message)
                     _release_foreground_keys(driver, pressed_keys)
                     _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
                     return False
                 _hold_for_duration(hold_duration, "前台组合键按住")
                 if not bool(driver.key_up(key_name)):
-                    logger.error(f"[前台模式组合键] 按键弹起失败: {key_name}")
+                    message = f"[前台模式组合键] 按键弹起失败: {key_name}"
+                    logger.error(message)
+                    _set_failure_detail(message)
                     _release_foreground_keys(driver, pressed_keys)
                     _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
                     return False
-                if count > 1 and i < count - 1:
-                    _hold_for_duration(0.02, "前台组合键重复间隔")
+                if count > 1 and i < count - 1 and repeat_interval > 0:
+                    _hold_for_duration(repeat_interval, "前台组合键重复间隔")
 
         return True
     except InterruptedError:
@@ -2574,7 +2883,9 @@ def _execute_combo_expression_foreground(
         _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
         raise
     except Exception as e:
-        logger.error(f"[前台模式组合键] 可编辑序列执行失败: {e}", exc_info=True)
+        message = f"[前台模式组合键] 可编辑序列执行失败: {e}"
+        logger.error(message, exc_info=True)
+        _set_failure_detail(message)
         _release_foreground_keys(driver, pressed_keys)
         _release_foreground_mouse_buttons(foreground_input_manager, pressed_mouse_buttons, target_hwnd)
         return False
@@ -2620,6 +2931,7 @@ def _execute_combo_expression_background(simulator: Any, operations: List[Dict[s
                 x_value = int(raw_x) if raw_x is not None else 0
                 y_value = int(raw_y) if raw_y is not None else 0
                 wheel_clicks = max(1, int(step.get("wheel_clicks", 1) or 1))
+                repeat_interval = _resolve_combo_repeat_interval(step, 0.01)
 
                 total_scroll_steps = max(1, count) * wheel_clicks
                 delta_unit = 120 if direction == "up" else -120
@@ -2655,8 +2967,8 @@ def _execute_combo_expression_background(simulator: Any, operations: List[Dict[s
                         _release_background_mouse_buttons(simulator, pressed_mouse_buttons)
                         return False
 
-                    if step_index < total_scroll_steps - 1:
-                        _hold_for_duration(0.01, "后台组合键滚轮步进间隔")
+                    if step_index < total_scroll_steps - 1 and repeat_interval > 0:
+                        _hold_for_duration(repeat_interval, "后台组合键滚轮步进间隔")
                 continue
 
             if op in ("mouse_click", "mouse_action"):
@@ -2669,6 +2981,7 @@ def _execute_combo_expression_background(simulator: Any, operations: List[Dict[s
                 click_action = str(step.get("mouse_action", "完整点击") or "完整点击").strip()
                 normalized_action = normalize_click_action(click_action, default="完整点击")
                 auto_release = normalized_action != "仅按下"
+                repeat_interval = _resolve_combo_repeat_interval(step)
 
                 for i in range(max(1, count)):
                     _raise_if_stopped(stop_checker, "后台组合键可编辑序列")
@@ -2699,8 +3012,8 @@ def _execute_combo_expression_background(simulator: Any, operations: List[Dict[s
                                 pressed_mouse_buttons.pop(idx)
                                 break
 
-                    if count > 1 and i < count - 1:
-                        _hold_for_duration(0.02, "后台组合键重复间隔")
+                    if count > 1 and i < count - 1 and repeat_interval > 0:
+                        _hold_for_duration(repeat_interval, "后台组合键重复间隔")
                 continue
 
             vk_code = VK_CODE.get(key_name)
@@ -2731,6 +3044,7 @@ def _execute_combo_expression_background(simulator: Any, operations: List[Dict[s
                 continue
 
             send_key = getattr(simulator, "send_key", None)
+            repeat_interval = _resolve_combo_repeat_interval(step)
             for i in range(max(1, count)):
                 _raise_if_stopped(stop_checker, "后台组合键可编辑序列")
                 if callable(send_key):
@@ -2752,8 +3066,8 @@ def _execute_combo_expression_background(simulator: Any, operations: List[Dict[s
                         _release_background_mouse_buttons(simulator, pressed_mouse_buttons)
                         return False
 
-                if count > 1 and i < count - 1:
-                    _hold_for_duration(0.02, "后台组合键重复间隔")
+                if count > 1 and i < count - 1 and repeat_interval > 0:
+                    _hold_for_duration(repeat_interval, "后台组合键重复间隔")
 
         return True
     except InterruptedError:
@@ -3248,27 +3562,35 @@ def _activate_foreground_window(target_hwnd: Optional[int]):
         if not win32gui.IsWindow(target_hwnd):
             logger.warning(f"目标窗口句柄 {target_hwnd} 无效或已销毁。将在当前活动窗口执行操作。")
             return False
-        elif win32gui.IsIconic(target_hwnd): # Check if minimized
-            logger.debug(f"目标窗口 {target_hwnd} 已最小化，尝试恢复并激活...")
-            win32gui.ShowWindow(target_hwnd, win32con.SW_RESTORE)
-            precise_sleep(0.15) # Slightly longer delay after restore
-            win32gui.SetForegroundWindow(target_hwnd)
-            precise_sleep(0.15) # Slightly longer delay after set foreground
-        else:
-            logger.debug(f"尝试将窗口 {target_hwnd} 设置为前台。")
-            win32gui.SetForegroundWindow(target_hwnd)
-            precise_sleep(0.1) # Give OS time to set foreground
 
-        # Optional: Verify activation
-        precise_sleep(0.1) # Wait a bit more before checking
+        foreground_target = int(target_hwnd)
+        try:
+            from utils.window_activation_utils import activate_window
+            activated_hwnd = activate_window(int(target_hwnd), log_prefix="键盘按键")
+            if activated_hwnd:
+                foreground_target = int(activated_hwnd)
+                logger.debug(f"已请求激活目标窗口: target={target_hwnd}, activated={activated_hwnd}")
+            else:
+                logger.warning(f"目标窗口 {target_hwnd} 激活请求未成功，尝试基础激活")
+        except Exception as activate_error:
+            logger.warning(f"稳健激活目标窗口失败: {activate_error}，尝试基础激活")
+
+        if win32gui.IsIconic(foreground_target):
+            win32gui.ShowWindow(foreground_target, win32con.SW_RESTORE)
+            precise_sleep(0.15)
+
+        win32gui.SetForegroundWindow(foreground_target)
+        precise_sleep(0.15)
+
         activated_hwnd = win32gui.GetForegroundWindow()
-        if activated_hwnd != target_hwnd:
-             logger.warning(f"尝试设置前台窗口 {target_hwnd}，但当前前台窗口仍为 {activated_hwnd}。操作可能在错误窗口发生。")
-             # return False # Decide if this should be considered a failure
-        else:
-             logger.debug(f"窗口 {target_hwnd} 已成功激活。")
+        target_root = int(win32gui.GetAncestor(int(target_hwnd), win32con.GA_ROOT) or 0)
+        active_root = int(win32gui.GetAncestor(int(activated_hwnd), win32con.GA_ROOT) or 0)
+        if activated_hwnd == target_hwnd or (target_root > 0 and target_root == active_root):
+            logger.debug(f"窗口 {target_hwnd} 已成功激活。")
+            return True
 
-        return True # Activation attempted (might not guarantee success, but we tried)
+        logger.warning(f"尝试设置前台窗口 {target_hwnd}，但当前前台窗口仍为 {activated_hwnd}。操作可能在错误窗口发生。")
+        return False
 
     except Exception as e:
         logger.warning(f"设置前台窗口 {target_hwnd} 时出错: {e}。将在当前活动窗口执行操作。")
@@ -3656,54 +3978,66 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
             logger.info("[前台模式键盘按键] 启动前台键盘按键执行流程")
             try:
                 if not foreground_input.initialize():
-                    logger.error("[前台模式键盘按键] 驱动初始化失败")
-                    return False, failure_action, failure_jump_target
+                    detail = "[前台模式键盘按键] 驱动初始化失败"
+                    logger.error(detail)
+                    return False, failure_action, failure_jump_target, detail
 
                 driver = foreground_input._active_driver
                 driver_type = foreground_input.get_driver_type()
                 logger.info(f"[前台模式键盘按键] 使用驱动: {driver_type}")
 
-                # 激活目标窗口（对于PyAutoGUI模式）
-                if driver_type == 'pyautogui' and target_hwnd:
+                # 前台按键/组合键会发到当前前台窗口；含鼠标动作时还有前台校验，所以所有前台驱动都先激活目标。
+                if target_hwnd:
                     _activate_foreground_window(target_hwnd)
                     precise_sleep(0.1)
 
                 if not driver or not hasattr(driver, 'key_down') or not hasattr(driver, 'key_up'):
-                    logger.error("[前台模式键盘按键] 驱动不支持key_down/key_up方法")
-                    return False, failure_action, failure_jump_target
+                    detail = "[前台模式键盘按键] 驱动不支持key_down/key_up方法"
+                    logger.error(detail)
+                    return False, failure_action, failure_jump_target, detail
 
                 if not combo_key_sequence_text:
-                    logger.error("[前台模式键盘按键] 可编辑内容为空，无法执行")
-                    return False, failure_action, failure_jump_target
+                    detail = "[前台模式键盘按键] 可编辑内容为空，无法执行"
+                    logger.error(detail)
+                    return False, failure_action, failure_jump_target, detail
 
                 try:
                     combo_operations = _parse_combo_expression(combo_key_sequence_text)
                 except ValueError as parse_error:
-                    logger.error(f"[前台模式键盘按键] 可编辑内容解析失败: {parse_error}")
-                    return False, failure_action, failure_jump_target
+                    detail = f"[前台模式键盘按键] 可编辑内容解析失败: {parse_error}"
+                    logger.error(detail)
+                    return False, failure_action, failure_jump_target, detail
 
                 if not combo_operations:
-                    logger.error("[前台模式键盘按键] 可编辑内容为空，无法执行")
-                    return False, failure_action, failure_jump_target
+                    detail = "[前台模式键盘按键] 可编辑内容为空，无法执行"
+                    logger.error(detail)
+                    return False, failure_action, failure_jump_target, detail
 
                 logger.info(f"[前台模式键盘按键] 可编辑内容解析成功，共 {len(combo_operations)} 步")
+                combo_failure_detail: Dict[str, str] = {}
                 if _execute_combo_expression_foreground(
                     driver,
                     combo_operations,
                     stop_checker,
                     foreground_input_manager=foreground_input,
                     target_hwnd=target_hwnd,
+                    failure_detail=combo_failure_detail,
                 ):
                     logger.info("[前台模式键盘按键] 可编辑内容执行成功")
                     return True, success_action, success_jump_target
-                logger.error("[前台模式键盘按键] 可编辑内容执行失败")
-                return False, failure_action, failure_jump_target
+                detail = combo_failure_detail.get("message") or (
+                    "[前台模式键盘按键] 可编辑内容执行失败。"
+                    "如果组合键包含鼠标完整点击，请确认绑定目标窗口可见、未最小化，并且能被切到前台。"
+                )
+                logger.error(detail)
+                return False, failure_action, failure_jump_target, detail
 
             except InterruptedError:
                 return False, "停止工作流", None
             except Exception as e:
-                logger.error(f"[前台模式键盘按键] 执行失败: {e}", exc_info=True)
-                return False, failure_action, failure_jump_target
+                detail = f"[前台模式键盘按键] 执行失败: {e}"
+                logger.error(detail, exc_info=True)
+                return False, failure_action, failure_jump_target, detail
 
         # 前台模式守卫：如果是前台模式但没有匹配到任何操作类型，返回错误
         if is_foreground_mode:
@@ -3965,8 +4299,8 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "type": "textarea",
             "default": "",
             "height": 72,
-            "placeholder": "示例1: a\n示例2: ctrl+shift+a\n示例3: ctrl(按下), wait(0.05), a, ctrl(松开)\n示例4: ctrl(按下), mouse_left_double(1163,947), ctrl(松开)\n示例5: mouse_left(500,300)\n示例6: mouse_wheel_down(500,300,3)",
-            "tooltip": "支持单个按键；整个输入最多 3 个按键动作，另外最多 1 个鼠标动作；显式按下的按键必须配套松开。",
+            "placeholder": "示例1: a\n示例2: ctrl+shift+a\n示例3: key_down(ctrl), key_press(a,5,0.2), key_up(ctrl)\n示例4: ctrl(按下), a*5@0.2, ctrl(松开)\n示例5: mouse_left(500,300), wait 0.2, mouse_right(500,300)\n示例6: mouse_wheel_down(500,300,3)",
+            "tooltip": "支持多段按键、快捷组合、命令式按键、重复间隔、等待、多个鼠标动作和滚轮；显式按下/按住的按键必须配套松开。",
             "condition": {"param": "input_type", "value": KEY_MOUSE_INPUT_TYPE}
         },
         "combo_key_sequence_record": {
@@ -3974,7 +4308,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "type": "button",
             "button_text": "开始录制按键",
             "action": "toggle_combo_key_sequence_record",
-            "tooltip": "支持录制最多 3 个按键动作，并附带 1 个鼠标单击或双击动作，坐标会一并写入。",
+            "tooltip": "支持连续录制按键与多个鼠标单击或双击动作，坐标和动作间隔会一并写入。",
             "condition": {"param": "input_type", "value": KEY_MOUSE_INPUT_TYPE}
         },
         "combo_key_sequence_help": {
@@ -3999,7 +4333,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "type": "button",
             "button_text": "插入鼠标动作",
             "action": "insert_combo_mouse_action_from_picker",
-            "tooltip": "点击选择要插入的鼠标动作；整个内容里最多保留 1 个鼠标动作。",
+            "tooltip": "点击选择要插入的鼠标动作；可连续插入多个动作。",
             "condition": {"param": "input_type", "value": KEY_MOUSE_INPUT_TYPE}
         },
         "combo_seq_mouse_x": {
