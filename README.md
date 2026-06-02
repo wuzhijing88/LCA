@@ -47,22 +47,6 @@ python -m venv venv
 .\venv\Scripts\python main.py
 ```
 
-## 不提交的本地数据
-
-以下内容应保留在本机，不进入公开仓库：
-
-- `config.json`
-- `workflow_favorites.json`
-- `images/`
-- `workflows/`
-- `logs/`
-- `runtime/`
-- `runtime_data/`
-- `.runtime_data/`
-- `venv/`
-- 打包输出目录
-- 私有凭据、证书、服务端部署文档和 release 附件
-
 ## 许可证
 
 本项目使用 GNU Affero General Public License v3.0。详情见 `LICENSE`。
