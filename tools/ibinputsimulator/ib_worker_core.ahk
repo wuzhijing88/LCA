@@ -2,8 +2,11 @@
 
 global _ib_pressed_keys := Map()
 global _ib_pressed_buttons := Map()
+global _ib_driver_name := ""
 
 IbWorkerMain(driverName, driverArg := "") {
+    global _ib_driver_name
+    _ib_driver_name := StrLower(Trim(driverName))
     try {
         ; Force mode=0 during bootstrap. Hook mode can fail in some packaged envs
         ; and is not required because IbSend() toggles hook per call.
@@ -585,8 +588,15 @@ _ib_mouse_up(button, x := "", y := "") {
 }
 
 _ib_emit_button_event_at_target(btn, tx, ty, downOrUp) {
+    global _ib_driver_name
     ; D/U 事件始终携带目标坐标，禁止使用当前坐标发包。
     ; 这样即使发生瞬时指针扰动，也不会退化为“在原位置点击”。
+    if _ib_driver_name = "logitech" || _ib_driver_name = "logitechghubnew" {
+        ; Logitech 的 MouseClick Hook 会返回成功，但部分驱动版本只处理移动包。
+        ; 直接调用 DLL 的按钮事件接口，确保按下/松开进入罗技驱动。
+        IbMouseButtonEvent(btn, downOrUp)
+        return
+    }
     IbMouseClick(btn, tx, ty, 1, 0, downOrUp)
 }
 

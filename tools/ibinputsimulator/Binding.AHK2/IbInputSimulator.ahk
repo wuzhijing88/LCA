@@ -26,6 +26,8 @@ IbSendInit(send_type := "AnyDriver", mode := 1, args*){
         result := DllCall("IbInputSimulator\IbSendInit", "Int", 1, "Int", 0, "Ptr", 0, "Int")
     else if (send_type == "Logitech")
         result := DllCall("IbInputSimulator\IbSendInit", "Int", 2, "Int", 0, "Ptr", 0, "Int")
+    else if (send_type == "LogitechGHubNew")
+        result := DllCall("IbInputSimulator\IbSendInit", "Int", 6, "Int", 0, "Ptr", 0, "Int")
     else if (send_type == "Razer")
         result := DllCall("IbInputSimulator\IbSendInit", "Int", 3, "Int", 0, "Ptr", 0, "Int")
     else if (send_type == "DD"){
@@ -125,6 +127,30 @@ IbMouseClick(args*){
     IbSendMode(1)
     MouseClick(args*)
     IbSendMode(0)
+}
+
+IbMouseButtonEvent(button, down_or_up){
+    static event_codes := Map(
+        "left:d", 0x0002,
+        "left:u", 0x0004,
+        "right:d", 0x0008,
+        "right:u", 0x0010,
+        "middle:d", 0x0020,
+        "middle:u", 0x0040
+    )
+
+    event_key := StrLower(Trim(button)) ":" StrLower(Trim(down_or_up))
+    if !event_codes.Has(event_key)
+        throw Error("UnsupportedMouseButtonEvent")
+
+    result := DllCall(
+        "IbInputSimulator\IbSendMouseClick",
+        "UInt", event_codes[event_key],
+        "Int"
+    )
+    if !result
+        throw Error("IbSendMouseClickFailed")
+    return true
 }
 
 IbMouseClickDrag(args*){

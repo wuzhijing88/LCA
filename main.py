@@ -2187,21 +2187,59 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
         except Exception as popup_fix_error:
             logging.warning(f"安装 QComboBox 下拉修复器失败：{popup_fix_error}")
 
-        # --- 新增：首次启动时检查并安装 Interception 驱动 ---
-        def check_and_install_interception_driver():
-            """首次启动时检查并安装 Interception 驱动"""
+        # 启动后统一检查当前配置涉及的本地输入驱动。
+        def check_input_driver_requirements():
+            """检查罗技版本约束和 Interception 驱动状态。"""
             try:
                 from PySide6.QtCore import QTimer
-                import os
                 from utils.input_simulation.mode_utils import requires_interception_driver
-
-                logging.info("开始检查 Interception 驱动状态...")
+                from utils.interception_installation_prompt import (
+                    request_interception_installation,
+                )
+                from utils.logitech_runtime import (
+                    detect_logitech_runtime,
+                    is_logitech_ibinputsimulator_configured,
+                )
 
                 config = getattr(main_window, "config", {}) or {}
                 execution_mode = str(config.get("execution_mode", "") or "").strip().lower()
                 legacy_backend = str(config.get("foreground_driver_backend", "interception") or "interception").strip().lower()
                 mouse_backend = str(config.get("foreground_mouse_driver_backend", legacy_backend) or legacy_backend).strip().lower()
                 keyboard_backend = str(config.get("foreground_keyboard_driver_backend", legacy_backend) or legacy_backend).strip().lower()
+
+                if is_logitech_ibinputsimulator_configured(config):
+                    logging.info("开始检查 Logitech 输入运行时...")
+                    version_result = detect_logitech_runtime()
+                    if version_result.compatible:
+                        logging.info(
+                            "罗技输入运行时检查通过: "
+                            f"type={version_result.send_type}, "
+                            f"version={version_result.detected_version}, "
+                            f"source={version_result.source}"
+                        )
+                    else:
+                        logging.warning(version_result.user_message().replace("\n", " "))
+
+                        def show_logitech_version_dialog():
+                            try:
+                                from PySide6.QtWidgets import QMessageBox
+
+                                msg_box = QMessageBox(main_window)
+                                msg_box.setIcon(QMessageBox.Icon.Warning)
+                                msg_box.setWindowTitle("罗技输入驱动不可用")
+                                msg_box.setText(version_result.user_message())
+                                msg_box.setInformativeText(
+                                    "请按提示修复驱动后重启电脑和 LCA。\n"
+                                    "驱动状态符合要求前，罗技前台输入不会启动。"
+                                )
+                                msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+                                msg_box.exec()
+                            except Exception as dialog_error:
+                                logging.error(f"显示罗技驱动版本提示失败: {dialog_error}")
+
+                        QTimer.singleShot(200, show_logitech_version_dialog)
+
+                logging.info("开始检查 Interception 驱动状态...")
 
                 if not requires_interception_driver(
                     execution_mode,
@@ -2214,18 +2252,18 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
                     )
                     return
 
-                # 检查驱动安装程序是否存在
-                installer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                             "Interception", "command line installer", "install-interception.exe")
-
-                if not os.path.exists(installer_path):
-                    logging.warning(f"Interception 驱动安装程序不存在: {installer_path}")
-                    return
-
-                # 尝试检测驱动是否已安装（通过尝试加载DLL）
+                # 未安装时只询问，不得在初始化链路中自动安装。
                 try:
                     from utils.interception_driver import get_driver
                     driver = get_driver()
+
+                    if not driver.is_driver_registered():
+                        logging.info("Interception 驱动未安装，等待用户确认是否安装")
+                        QTimer.singleShot(
+                            1000,
+                            lambda: request_interception_installation(main_window, config),
+                        )
+                        return
 
                     # 尝试初始化驱动（不显示重启提示）
                     if driver.initialize():
@@ -2269,8 +2307,8 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
 
         # 延迟执行驱动检查，确保主窗口完全显示后再检查
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(500, check_and_install_interception_driver)
-        logging.info("已安排 Interception 驱动检查（延迟500ms）")
+        QTimer.singleShot(500, check_input_driver_requirements)
+        logging.info("已安排输入驱动检查（延迟500ms）")
         # --- 驱动检查结束 ---
 
     except Exception as main_window_error:

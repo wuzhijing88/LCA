@@ -22,6 +22,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 from utils.app_paths import get_app_root, get_user_data_dir
 from utils.input_simulation.mode_utils import normalize_ib_driver_name
 from utils.input_timing import DEFAULT_CLICK_HOLD_SECONDS, DEFAULT_KEY_HOLD_SECONDS
+from utils.logitech_runtime import detect_logitech_runtime
 from utils.precise_sleep import precise_sleep as _shared_precise_sleep
 
 
@@ -144,6 +145,7 @@ class IbInputSimulatorDriver:
         normalized_driver = normalize_ib_driver_name(driver)
 
         self._driver_name = normalized_driver
+        self._runtime_driver_name = normalized_driver
         self._driver_arg = str(driver_arg or "").strip()
 
         self._process: Optional[subprocess.Popen[str]] = None
@@ -266,6 +268,23 @@ class IbInputSimulatorDriver:
     def initialize(self) -> bool:
         with self._lock:
             self._abort_request_event.clear()
+            if str(self._driver_name or "").strip().lower() == "logitech":
+                runtime_result = detect_logitech_runtime()
+                if not runtime_result.compatible:
+                    self.close()
+                    self._abort_request_event.clear()
+                    self._last_error_message = runtime_result.driver_error()
+                    logger.error(runtime_result.user_message().replace("\n", " "))
+                    return False
+                self._runtime_driver_name = runtime_result.send_type
+                logger.info(
+                    "Logitech 输入运行时已选择: "
+                    f"driver={self._runtime_driver_name}, "
+                    f"product={runtime_result.detected_name} {runtime_result.detected_version}, "
+                    f"source={runtime_result.source}"
+                )
+            else:
+                self._runtime_driver_name = self._driver_name
             if self._ready and self._is_alive():
                 return True
 
@@ -318,7 +337,10 @@ class IbInputSimulatorDriver:
                 self._last_error_message = ""
                 self._worker_core_source_path = source_core_script
                 self._worker_core_source_mtime_ns = source_core_mtime_ns
-                logger.info(f"IbInputSimulator 驱动初始化成功: driver={self._driver_name}")
+                logger.info(
+                    "IbInputSimulator 驱动初始化成功: "
+                    f"configured={self._driver_name}, runtime={self._runtime_driver_name}"
+                )
                 return True
             except Exception as exc:
                 detail = self._collect_stderr()
@@ -344,7 +366,7 @@ class IbInputSimulatorDriver:
                 include_dll = str(include_file.parent / "IbInputSimulator.dll")
             logger.error(
                 "IbInputSimulator init context: "
-                f"driver={self._driver_name}, "
+                f"driver={self._driver_name}, runtime_driver={self._runtime_driver_name}, "
                 f"ahk_exe={ahk_exe}, ahk_exists={bool(ahk_exe and os.path.isfile(ahk_exe))}, "
                 f"include={include_path}, include_exists={bool(include_path and os.path.isfile(include_path))}, "
                 f"dll={include_dll}, dll_exists={bool(include_dll and os.path.isfile(include_dll))}, "
@@ -464,7 +486,7 @@ class IbInputSimulatorDriver:
     def _build_wrapper_script(self, include_file: Path, core_script: Path) -> str:
         include_path = self._escape_ahk_string(str(include_file))
         core_path = self._escape_ahk_string(str(core_script))
-        driver_name = self._escape_ahk_string(self._driver_name)
+        driver_name = self._escape_ahk_string(self._runtime_driver_name)
         driver_arg = self._escape_ahk_string(self._driver_arg)
 
         return (

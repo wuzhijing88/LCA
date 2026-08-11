@@ -556,12 +556,17 @@ class ForegroundInputManager:
         )
         return any(key in text for key in keywords)
 
+    def _is_logitech_runtime_error(self, error_detail: str) -> bool:
+        text = str(error_detail or "").strip().lower().replace(" ", "")
+        return "logitechruntimeunavailable" in text
+
     def _show_ib_driver_missing_prompt(self, error_detail: str) -> None:
-        if not self._is_ib_driver_missing_error(error_detail):
+        runtime_error = self._is_logitech_runtime_error(error_detail)
+        if not runtime_error and not self._is_ib_driver_missing_error(error_detail):
             return
 
         driver_key = str(self._ib_driver or "").strip().lower() or "logitech"
-        signature = f"{driver_key}:driver_missing"
+        signature = f"{driver_key}:runtime_unavailable" if runtime_error else f"{driver_key}:driver_missing"
         if signature in self._ib_missing_prompt_signatures:
             return
         self._ib_missing_prompt_signatures.add(signature)
@@ -586,13 +591,21 @@ class ForegroundInputManager:
                 try:
                     msg_box = QMessageBox()
                     msg_box.setIcon(QMessageBox.Icon.Warning)
-                    msg_box.setWindowTitle("前台驱动不可用")
-                    msg_box.setText(f"{display_name}驱动未就绪，前台输入无法执行。")
-                    msg_box.setInformativeText(
-                        "请先安装并启用对应驱动后重试。\n"
-                        "安装完成后请重启软件。\n"
-                        "必要时请以管理员身份运行软件。"
-                    )
+                    if runtime_error and driver_key == "logitech":
+                        from utils.logitech_runtime import detect_logitech_runtime
+
+                        runtime_result = detect_logitech_runtime()
+                        msg_box.setWindowTitle("罗技输入驱动不可用")
+                        msg_box.setText("当前罗技输入环境不能用于 LCA 前台输入。")
+                        msg_box.setInformativeText(runtime_result.user_message())
+                    else:
+                        msg_box.setWindowTitle("前台驱动不可用")
+                        msg_box.setText(f"{display_name}驱动未就绪，前台输入无法执行。")
+                        msg_box.setInformativeText(
+                            "请先安装并启用对应驱动后重试。\n"
+                            "安装完成后请重启软件。\n"
+                            "必要时请以管理员身份运行软件。"
+                        )
                     msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
                     msg_box.exec()
                 except Exception as e:

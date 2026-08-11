@@ -358,6 +358,17 @@ class MainWindowGlobalSettingsMixin:
 
                 logger.error(f"显示错误消息框失败: {msg_error}")
 
+        # 用户在前台模式中选择 Interception 后，必须再次明确同意才能安装。
+        try:
+
+            from utils.interception_installation_prompt import request_interception_installation
+
+            request_interception_installation(self, self.config)
+
+        except Exception as install_prompt_error:
+
+            logger.error(f"处理 Interception 安装确认时出错: {install_prompt_error}", exc_info=True)
+
     def open_global_settings(self):
 
         """打开全局设置对话框"""

@@ -213,7 +213,6 @@ class InterceptionDriver:
         self.relative_move_scale = 1.0  # 与前台二保持一致：不做DPI补偿
         self._mouse_lock = RLock()
         self._key_lock = RLock()
-        self._auto_install_attempted = False
         self._keyboard_predicate = None
         self._mouse_predicate = None
         self._all_devices_predicate = None
@@ -246,16 +245,7 @@ class InterceptionDriver:
                     self.driver_restart_required = True
                     logger.warning("检测到驱动已注册，但当前未生效")
                 else:
-                    install_result = self._try_auto_install_driver()
-                    if install_result == "installed":
-                        self.driver_just_installed = True
-                        self.driver_restart_required = True
-                        logger.warning("驱动安装完成，需要重启计算机使驱动生效")
-                    elif install_result == "already_installed":
-                        self.driver_restart_required = True
-                        logger.warning("驱动已安装，但当前仍未生效")
-                    elif install_result == "no_change":
-                        logger.error("驱动安装程序执行成功，但未检测到驱动注册状态变化")
+                    logger.warning("Interception 驱动未安装；初始化过程不会自动安装驱动")
                 self._keyboard_predicate = None
                 self._mouse_predicate = None
                 self.dll = None
@@ -346,6 +336,11 @@ class InterceptionDriver:
         keyboard_filters = cls._read_upper_filters(_KEYBOARD_CLASS_GUID)
         mouse_filters = cls._read_upper_filters(_MOUSE_CLASS_GUID)
         return _KEYBOARD_FILTER_NAME in keyboard_filters and _MOUSE_FILTER_NAME in mouse_filters
+
+    @classmethod
+    def is_driver_registered(cls) -> bool:
+        """只读检查 Interception 键盘和鼠标过滤驱动是否已注册。"""
+        return cls._is_driver_registered()
 
     def get_restart_prompt_config(self) -> Optional[Tuple[str, str, str]]:
         if self.driver_just_installed:
@@ -467,47 +462,116 @@ class InterceptionDriver:
         logger.info(f"驱动设备绑定完成: keyboard={self.keyboard_device}, mouse={self.mouse_device}")
         return True
 
-    def _try_auto_install_driver(self) -> str:
-        """尝试自动安装 Interception 驱动（仅在当前进程执行一次）。"""
-        if self._auto_install_attempted:
-            return "skipped"
-        self._auto_install_attempted = True
-
+    def install_driver(self) -> str:
+        """显式安装驱动；调用方必须先取得用户同意。"""
         if not os.path.exists(INSTALLER_PATH):
             logger.warning(f"驱动安装程序不存在: {INSTALLER_PATH}")
-            return "failed"
-
-        if not self._is_admin():
-            logger.error("自动安装驱动需要管理员权限")
-            return "failed"
+            return "installer_missing"
 
         installed_before = self._is_driver_registered()
 
         try:
-            result = subprocess.run(
-                [INSTALLER_PATH, "/install"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            if int(result.returncode) != 0:
-                logger.error(f"驱动安装失败，返回码: {result.returncode}")
+            if self._is_admin():
+                result = subprocess.run(
+                    [INSTALLER_PATH, "/install"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return_code = int(result.returncode)
+            else:
+                return_code = self._run_installer_elevated()
+
+            if return_code == -1223:
+                logger.info("用户取消了 Interception 驱动管理员授权")
+                return "cancelled"
+            if return_code == -258:
+                logger.error("Interception 驱动安装等待超时")
+                return "timeout"
+            if return_code != 0:
+                logger.error(f"驱动安装失败，返回码: {return_code}")
                 return "failed"
 
             installed_after = self._is_driver_registered()
-            if installed_after and not installed_before:
-                return "installed"
-            if installed_after and installed_before:
+            if installed_before:
                 return "already_installed"
-
-            return "no_change"
+            if not installed_after:
+                logger.warning("安装程序执行成功，但重启前未检测到完整的过滤驱动注册信息")
+            self.driver_just_installed = True
+            self.driver_restart_required = True
+            return "installed"
         except subprocess.TimeoutExpired:
             logger.error("驱动安装超时")
-            return "failed"
+            return "timeout"
         except Exception as e:
-            logger.error(f"自动安装驱动失败: {e}")
+            logger.error(f"安装 Interception 驱动失败: {e}")
             return "failed"
+
+    @staticmethod
+    def _run_installer_elevated() -> int:
+        """通过 UAC 启动官方安装器并等待完成。"""
+        class ShellExecuteInfo(ctypes.Structure):
+            _fields_ = (
+                ("cbSize", wintypes.DWORD),
+                ("fMask", wintypes.ULONG),
+                ("hwnd", wintypes.HWND),
+                ("lpVerb", wintypes.LPCWSTR),
+                ("lpFile", wintypes.LPCWSTR),
+                ("lpParameters", wintypes.LPCWSTR),
+                ("lpDirectory", wintypes.LPCWSTR),
+                ("nShow", ctypes.c_int),
+                ("hInstApp", wintypes.HINSTANCE),
+                ("lpIDList", wintypes.LPVOID),
+                ("lpClass", wintypes.LPCWSTR),
+                ("hkeyClass", wintypes.HKEY),
+                ("dwHotKey", wintypes.DWORD),
+                ("hIcon", wintypes.HANDLE),
+                ("hProcess", wintypes.HANDLE),
+            )
+
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        execute = shell32.ShellExecuteExW
+        execute.argtypes = (ctypes.POINTER(ShellExecuteInfo),)
+        execute.restype = wintypes.BOOL
+        wait_for_process = kernel32.WaitForSingleObject
+        wait_for_process.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        wait_for_process.restype = wintypes.DWORD
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        get_exit_code.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        execute_info = ShellExecuteInfo()
+        execute_info.cbSize = ctypes.sizeof(execute_info)
+        execute_info.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
+        execute_info.lpVerb = "runas"
+        execute_info.lpFile = INSTALLER_PATH
+        execute_info.lpParameters = "/install"
+        execute_info.lpDirectory = os.path.dirname(INSTALLER_PATH)
+        execute_info.nShow = 0  # SW_HIDE
+
+        if not execute(ctypes.byref(execute_info)):
+            error_code = ctypes.get_last_error()
+            return -int(error_code or 1)
+        if not execute_info.hProcess:
+            return -1
+
+        try:
+            wait_result = int(wait_for_process(execute_info.hProcess, 120000))
+            if wait_result == 0x00000102:  # WAIT_TIMEOUT
+                return -258
+            if wait_result != 0x00000000:  # WAIT_OBJECT_0
+                return -int(ctypes.get_last_error() or 1)
+            exit_code = wintypes.DWORD()
+            if not get_exit_code(execute_info.hProcess, ctypes.byref(exit_code)):
+                return -int(ctypes.get_last_error() or 1)
+            return int(exit_code.value)
+        finally:
+            close_handle(execute_info.hProcess)
 
     def _detect_dpi_scale(self):
         """自动检测DPI缩放因子
