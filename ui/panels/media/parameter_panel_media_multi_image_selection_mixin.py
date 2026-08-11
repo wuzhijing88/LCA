@@ -1,0 +1,11 @@
+from .parameter_panel_media_multi_image_selection_delete_mixin import ParameterPanelMediaMultiImageSelectionDeleteMixin
+from .parameter_panel_media_multi_image_selection_dialog_mixin import ParameterPanelMediaMultiImageSelectionDialogMixin
+from .parameter_panel_media_multi_image_selection_sync_mixin import ParameterPanelMediaMultiImageSelectionSyncMixin
+
+
+class ParameterPanelMediaMultiImageSelectionMixin(
+    ParameterPanelMediaMultiImageSelectionDialogMixin,
+    ParameterPanelMediaMultiImageSelectionSyncMixin,
+    ParameterPanelMediaMultiImageSelectionDeleteMixin,
+):
+    pass

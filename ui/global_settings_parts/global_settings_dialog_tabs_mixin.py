@@ -1,0 +1,13 @@
+from .global_settings_dialog_execution_tab_mixin import GlobalSettingsDialogExecutionTabMixin
+from .global_settings_dialog_hotkey_tab_mixin import GlobalSettingsDialogHotkeyTabMixin
+from .global_settings_dialog_other_tab_mixin import GlobalSettingsDialogOtherTabMixin
+from .global_settings_dialog_window_tab_mixin import GlobalSettingsDialogWindowTabMixin
+
+
+class GlobalSettingsDialogTabsMixin(
+    GlobalSettingsDialogWindowTabMixin,
+    GlobalSettingsDialogExecutionTabMixin,
+    GlobalSettingsDialogHotkeyTabMixin,
+    GlobalSettingsDialogOtherTabMixin,
+):
+    pass

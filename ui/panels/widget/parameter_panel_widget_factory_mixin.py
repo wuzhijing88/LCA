@@ -1,0 +1,18 @@
+from ..parameter_panel_support import *
+from .parameter_panel_widget_factory_build_mixin import ParameterPanelWidgetFactoryBuildMixin
+from .parameter_panel_widget_factory_debug_mixin import ParameterPanelWidgetFactoryDebugMixin
+from .parameter_panel_widget_factory_focus_mixin import ParameterPanelWidgetFactoryFocusMixin
+from .parameter_panel_widget_hint_factory_mixin import ParameterPanelWidgetHintFactoryMixin
+from .parameter_panel_widget_postprocess_mixin import ParameterPanelWidgetPostprocessMixin
+from .parameter_panel_widget_type_factory_mixin import ParameterPanelWidgetTypeFactoryMixin
+
+
+class ParameterPanelWidgetFactoryMixin(
+    ParameterPanelWidgetHintFactoryMixin,
+    ParameterPanelWidgetTypeFactoryMixin,
+    ParameterPanelWidgetPostprocessMixin,
+    ParameterPanelWidgetFactoryBuildMixin,
+    ParameterPanelWidgetFactoryFocusMixin,
+    ParameterPanelWidgetFactoryDebugMixin,
+):
+    pass

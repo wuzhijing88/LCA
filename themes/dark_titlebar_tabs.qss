@@ -1,0 +1,171 @@
+/* 标题栏和标签页深色主题样式 - 追加到 dark.qss */
+
+/* 自定义标题栏 */
+#CustomTitleBar {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    border-bottom: 1px solid #3e3e3e;
+}
+
+
+/* 标题栏工具按钮 */
+#CustomTitleBar QToolButton {
+    background-color: transparent;
+    border: none;
+    padding: 4px;
+    margin: 1px 2px;
+    border-radius: 4px;
+    color: #e0e0e0;
+}
+
+#CustomTitleBar QToolButton:hover {
+    background-color: #3a3a3a;
+}
+
+#CustomTitleBar QToolButton:pressed {
+    background-color: #252525;
+}
+
+#CustomTitleBar QToolButton:disabled {
+    opacity: 0.5;
+}
+
+/* 标题栏窗口按钮 */
+#CustomTitleBar QPushButton#windowButton {
+    background-color: transparent;
+    border: none;
+    padding: 0px 10px;
+    margin: 0px 2px;
+    border-radius: 4px;
+    color: #b0b0b0;
+    font-family: "Segoe UI Symbol", "Segoe UI Emoji", "Arial";
+    font-size: 14px;
+    min-width: 36px;
+    min-height: 30px;
+}
+
+#CustomTitleBar QPushButton#windowButton:hover {
+    background-color: #3a3a3a;
+    color: #e0e0e0;
+    border-radius: 4px;
+}
+
+#CustomTitleBar QPushButton#windowButton:pressed {
+    background-color: #252525;
+    border-radius: 4px;
+}
+
+/* 关闭按钮特殊样式 */
+#CustomTitleBar QPushButton#closeButton:hover {
+    background-color: #e81123;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 0px 10px;
+}
+
+#CustomTitleBar QPushButton#closeButton:pressed {
+    background-color: #b00000;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 0px 10px;
+}
+
+/* 标题栏标签 */
+#CustomTitleBar QLabel#titleLabel {
+    color: #e0e0e0;
+    background-color: transparent;
+}
+
+/* 标签页控件 */
+QTabWidget {
+    background-color: #1e1e1e;
+    border: none;
+}
+
+QTabWidget::pane {
+    background-color: #1e1e1e;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    top: -1px;
+}
+
+QTabBar {
+    background-color: #1e1e1e;
+}
+
+QTabBar::tab {
+    background-color: #252525;
+    color: #b0b0b0;
+    border: 1px solid #3e3e3e;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+    padding: 8px 20px;
+    margin-right: 2px;
+    min-width: 80px;
+}
+
+QTabBar::tab:hover {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+}
+
+QTabBar::tab:selected {
+    background-color: #1e1e1e;
+    color: #e0e0e0;
+    border-bottom: 2px solid #0078d4;
+    font-weight: 600;
+}
+
+
+QTabBar::tab:!selected {
+    margin-top: 2px;
+}
+
+/* 标签页关闭按钮 */
+QTabBar::close-button {
+    background-color: transparent;
+    border-radius: 2px;
+    padding: 2px;
+}
+
+QTabBar::close-button:hover {
+    background-color: #3a3a3a;
+}
+
+QTabBar::close-button:pressed {
+    background-color: #252525;
+}
+
+/* 自定义标签页关闭按钮（QPushButton） */
+QPushButton#tabCloseButton {
+    background: transparent;
+    border: none;
+    color: #b0b0b0;
+    font-size: 16px;
+    font-weight: bold;
+    padding: 0px;
+    margin: 0px;
+}
+
+QPushButton#tabCloseButton:hover {
+    background: #e81123;
+    color: white;
+    border-radius: 2px;
+}
+
+/* 标签页添加按钮 */
+QTabBar QToolButton {
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 4px;
+    color: #b0b0b0;
+}
+
+QTabBar QToolButton:hover {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+}

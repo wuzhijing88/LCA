@@ -1,0 +1,2 @@
+from .parameter_panel_widget_factory_mixin import ParameterPanelWidgetFactoryMixin
+from .parameter_panel_widget_registry_mixin import ParameterPanelWidgetRegistryMixin

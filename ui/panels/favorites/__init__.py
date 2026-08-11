@@ -1,0 +1,1 @@
+from .parameter_panel_favorites_mixin import ParameterPanelFavoritesMixin

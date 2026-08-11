@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+工作流任务管理器
+负责管理多个工作流任务的创建、执行、删除等操作
+"""
+
+import logging
+from functools import partial
+from typing import Dict, List, Optional, Any, Set, Tuple
+from PySide6.QtCore import QObject, Signal, QTimer
+
+from ..workflow_parts.workflow_task import WorkflowTask
+from utils.workflow_workspace_utils import get_effective_workflow_images_dir
+
+logger = logging.getLogger(__name__)
+
+
+class WorkflowTaskManager(QObject):
+    """工作流任务管理器"""
+
+    # 信号定义
+    task_added = Signal(int)  # task_id
+    task_removed = Signal(int)  # task_id
+    task_status_changed = Signal(int, str)  # task_id, status
+    all_tasks_completed = Signal(bool, str)  # success, result_type(completed/failed/stopped)
+
+    def __init__(self, task_modules: Dict[str, Any], images_dir: str, config: dict, parent=None):
+        """
+        初始化任务管理器
+
+        Args:
+            task_modules: 任务模块字典
+            images_dir: 图片目录
+            config: 全局配置
+            parent: 父对象
+        """
+        super().__init__(parent)
+
+        self.task_modules = task_modules
+        self.images_dir = images_dir
+        self.config = config
+
+        self.tasks: Dict[int, WorkflowTask] = {}  # {task_id: WorkflowTask}
+        self.next_task_id = 1
+        self._pending_remove_task_ids: Set[int] = set()
+        self._last_execute_error_message = ""
+
+        # 当前执行状态
+        self._is_executing = False
+        self._executing_task_ids: List[int] = []
+
+        # 跳转配置
+        self.jump_enabled = True  # 全局跳转开关
+        self._current_jump_depth = 0  # 当前跳转深度
+        # 移除跳转次数限制，允许无限循环，用户可以通过停止按钮停止
+
+        logger.info("工作流任务管理器初始化完成")
+
+    @staticmethod
+    def _task_has_running_thread(task: Optional[WorkflowTask]) -> bool:
+        if task is None:
+            return False
+        try:
+            thread = getattr(task, "executor_thread", None)
+            return bool(thread and thread.isRunning())
+        except Exception:
+            return False
+
+    @classmethod
+    def _task_has_active_runtime(cls, task: Optional[WorkflowTask]) -> bool:
+        if task is None:
+            return False
+
+        if cls._task_has_running_thread(task):
+            return True
+
+        executor = getattr(task, "executor", None)
+        if executor is not None and hasattr(executor, "is_running"):
+            try:
+                return bool(executor.is_running())
+            except Exception:
+                return False
+
+        return False
+
+    def has_active_runtime_tasks(self, task_ids: Optional[List[int]] = None) -> bool:
+        if task_ids is None:
+            tasks = self.get_all_tasks()
+        else:
+            tasks = [
+                self.tasks[task_id]
+                for task_id in task_ids
+                if task_id in self.tasks
+            ]
+
+        for task in tasks:
+            if self._task_has_active_runtime(task):
+                return True
+
+        return False
+
+    @staticmethod
+    def _resolve_execution_result(task_statuses: List[str]) -> Tuple[bool, str]:
+        normalized_statuses = [
+            str(status or "").strip().lower()
+            for status in task_statuses
+            if str(status or "").strip()
+        ]
+
+        if any(status == 'stopped' for status in normalized_statuses):
+            return False, 'stopped'
+
+        if normalized_statuses and all(status == 'completed' for status in normalized_statuses):
+            return True, 'completed'
+
+        return False, 'failed'
+
+    @staticmethod
+    def _workflow_contains_yolo_task(workflow_data: Any) -> bool:
+        if not isinstance(workflow_data, dict):
+            return False
+        cards = workflow_data.get("cards")
+        if not isinstance(cards, list):
+            return False
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            task_type = str(card.get("task_type") or "").strip()
+            if task_type and "YOLO" in task_type.upper():
+                return True
+        return False
+
+    @staticmethod
+    def _format_execution_mode_label(mode: str) -> str:
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode.startswith("foreground"):
+            return "前台模式"
+        if normalized_mode.startswith("background"):
+            return "后台模式"
+        return normalized_mode or "未知模式"
+
+    @staticmethod
+    def _format_screenshot_engine_label(engine: str) -> str:
+        normalized_engine = str(engine or "").strip().lower()
+        engine_map = {
+            "wgc": "WGC",
+            "printwindow": "PrintWindow",
+            "gdi": "GDI",
+            "dxgi": "DXGI",
+        }
+        return engine_map.get(normalized_engine, normalized_engine or "未知引擎")
+
+    def _set_last_execute_error(self, message: str) -> None:
+        self._last_execute_error_message = str(message or "").strip()
+
+    def get_last_execute_error_message(self) -> str:
+        return str(getattr(self, "_last_execute_error_message", "") or "").strip()
+
+    def _validate_yolo_runtime_for_tasks(self, tasks: List[Any]) -> Tuple[bool, str]:
+        yolo_tasks = [
+            task for task in tasks
+            if self._workflow_contains_yolo_task(getattr(task, "workflow_data", None))
+        ]
+        if not yolo_tasks:
+            return True, ""
+
+        task_names = "、".join(
+            str(getattr(task, "name", "") or "").strip() or f"任务{idx + 1}"
+            for idx, task in enumerate(yolo_tasks[:3])
+        )
+        if len(yolo_tasks) > 3:
+            task_names = f"{task_names} 等{len(yolo_tasks)}个任务"
+
+        requires_native_screenshot_engine = False
+        for task in yolo_tasks:
+            execution_mode = str(
+                getattr(task, "execution_mode", "") or self.config.get("execution_mode", "")
+            ).strip().lower()
+            if execution_mode.startswith("foreground"):
+                requires_native_screenshot_engine = True
+                continue
+            return False, (
+                f"任务“{task_names}”包含YOLO，当前执行模式为"
+                f"{self._format_execution_mode_label(execution_mode)}。"
+                "YOLO原生模式仅支持前台模式，且截图引擎必须为DXGI或GDI。"
+            )
+
+        if not requires_native_screenshot_engine:
+            return True, ""
+
+        screenshot_engine = str(self.config.get("screenshot_engine", "") or "").strip().lower()
+        if screenshot_engine not in {"dxgi", "gdi"}:
+            return False, (
+                f"任务“{task_names}”包含YOLO，当前截图引擎为"
+                f"{self._format_screenshot_engine_label(screenshot_engine)}。"
+                "YOLO仅支持DXGI/GDI前台截图，请到全局设置切换后重试。"
+            )
+
+        return True, ""
+
+    def _schedule_remove_task_retry(self, task_id: int, delay_ms: int = 200) -> None:
+        if task_id in self._pending_remove_task_ids:
+            return
+        self._pending_remove_task_ids.add(task_id)
+
+        def _retry_remove() -> None:
+            self._pending_remove_task_ids.discard(task_id)
+            try:
+                self.remove_task(task_id)
+            except Exception as exc:
+                logger.warning("延迟移除重试失败：task_id=%s, error=%s", task_id, exc)
+
+        QTimer.singleShot(max(50, int(delay_ms)), _retry_remove)
+
+    def add_task(self, name: str, filepath: str, workflow_data: dict) -> int:
+        """
+        添加新任务
+
+        Args:
+            name: 任务名称
+            filepath: 任务文件路径
+            workflow_data: 工作流数据
+
+        Returns:
+            新任务的ID
+        """
+        # 找最小可用ID（复用已删除的ID）
+        task_id = 1
+        while task_id in self.tasks:
+            task_id += 1
+        # 更新next_task_id以保持一致性
+        if task_id >= self.next_task_id:
+            self.next_task_id = task_id + 1
+
+        # 创建任务对象
+        task_images_dir = get_effective_workflow_images_dir(workflow_data, self.images_dir)
+
+        task = WorkflowTask(
+            task_id=task_id,
+            name=name,
+            filepath=filepath,
+            workflow_data=workflow_data,
+            task_modules=self.task_modules,
+            images_dir=task_images_dir,
+            config=self.config,
+            parent=self
+        )
+
+        # 连接任务信号
+        task.status_changed.connect(partial(self._on_task_status_changed, task_id))
+        task.runtime_cleanup_finished.connect(partial(self._on_task_runtime_cleanup_finished, task_id))
+
+        # 添加到管理器
+        self.tasks[task_id] = task
+        self.task_added.emit(task_id)
+
+        logger.info(f"添加任务成功: ID={task_id}, 名称='{name}'")
+        return task_id
+
+    def remove_task(self, task_id: int) -> bool:
+        """
+        Remove task safely.
+        The task object is deleted only after its execution thread exits.
+
+        Args:
+            task_id: task id
+
+        Returns:
+            True when removed immediately, False when deferred or not found
+        """
+        if task_id not in self.tasks:
+            logger.warning("移除任务失败：未找到 task_id=%s", task_id)
+            return False
+
+        task = self.tasks[task_id]
+        status = str(getattr(task, "status", "") or "")
+        is_active_status = status in ("running", "paused", "starting", "stopping")
+        thread_running = self._task_has_running_thread(task)
+
+        if is_active_status or thread_running:
+            logger.info(
+                "Task %s is still active (status=%s, thread_running=%s), stop and cleanup before remove",
+                task_id,
+                status,
+                thread_running,
+            )
+            try:
+                task.stop()
+            except Exception as stop_err:
+                logger.warning("移除前停止任务失败：task_id=%s, error=%s", task_id, stop_err)
+
+            cleanup_ok = True
+            force_cleanup = getattr(task, "_force_cleanup_executor", None)
+            if callable(force_cleanup):
+                try:
+                    cleanup_ok = bool(force_cleanup())
+                except Exception as cleanup_err:
+                    cleanup_ok = False
+                    logger.warning("移除前强制清理失败：task_id=%s, error=%s", task_id, cleanup_err)
+
+            thread_running = self._task_has_running_thread(task)
+            if thread_running and not cleanup_ok:
+                logger.warning("Task %s thread still running after cleanup, defer remove", task_id)
+                self._schedule_remove_task_retry(task_id, delay_ms=200)
+                return False
+            if thread_running:
+                logger.warning("Task %s thread still running, defer remove", task_id)
+                self._schedule_remove_task_retry(task_id, delay_ms=200)
+                return False
+
+        del self.tasks[task_id]
+        self._pending_remove_task_ids.discard(task_id)
+        self.task_removed.emit(task_id)
+        try:
+            task.deleteLater()
+        except RuntimeError:
+            pass
+
+        logger.info("Task removed: ID=%s, name='%s'", task_id, task.name)
+        return True
+
+    def get_task(self, task_id: int) -> Optional[WorkflowTask]:
+        """获取任务对象"""
+        return self.tasks.get(task_id)
+
+    def find_task_by_filepath(self, filepath: str) -> Optional[WorkflowTask]:
+        """按文件路径或来源引用查找任务。"""
+        import os
+        normalized_filepath = os.path.normpath(filepath)
+        for task in self.tasks.values():
+            task_filepath = str(getattr(task, 'filepath', '') or '')
+            if task_filepath and os.path.normpath(task_filepath) == normalized_filepath:
+                return task
+            source_ref = str(getattr(task, 'source_ref', '') or '')
+            if source_ref and source_ref == filepath:
+                return task
+        return None
+
+    def get_all_tasks(self) -> List[WorkflowTask]:
+        """获取所有任务列表（按ID排序）"""
+        return [self.tasks[tid] for tid in sorted(self.tasks.keys())]
+
+    def get_enabled_tasks(self) -> List[WorkflowTask]:
+        """获取所有启用的任务，first_execute=True的任务排在最前面"""
+        enabled = [task for task in self.get_all_tasks() if task.enabled]
+        # 将first_execute=True的任务排在最前面
+        enabled.sort(key=lambda t: (not getattr(t, 'first_execute', False)))
+        return enabled
+
+    def get_executable_tasks(self) -> List[WorkflowTask]:
+        """获取所有可执行的任务"""
+        return [task for task in self.get_all_tasks() if task.can_execute()]
+
+    def execute_all(self, current_task_id: Optional[int] = None) -> bool:
+        """
+        执行所有可执行的任务（或执行指定的当前任务）
+
+        Args:
+            current_task_id: 当前任务ID（跳转模式下使用，None表示执行所有）
+
+        Returns:
+            是否成功启动执行
+        """
+        if self._is_executing:
+            logger.warning("已有任务正在执行中")
+            return False
+
+        self._set_last_execute_error("")
+
+        # 获取工作流执行模式
+        workflow_exec_mode = self.config.get('workflow_execution_mode', 'sequential_jump')
+
+        # 【关键修复】检查是否有first_execute=True的任务（仅在跳转模式下生效）
+        if workflow_exec_mode == 'sequential_jump':
+            first_execute_task = None
+            all_tasks = self.get_all_tasks()
+            logger.info(f"========== 检查首个执行任务 ==========")
+            for task in all_tasks:
+                first_execute_attr = getattr(task, 'first_execute', False)
+                logger.info(f"  任务 '{task.name}': first_execute={first_execute_attr}, enabled={task.enabled}, can_execute={task.can_execute()}")
+                if first_execute_attr and task.can_execute():
+                    first_execute_task = task
+                    logger.info(f"  找到首个执行任务: '{task.name}'")
+                    break
+
+            if first_execute_task:
+                valid_runtime, error_message = self._validate_yolo_runtime_for_tasks([first_execute_task])
+                if not valid_runtime:
+                    self._set_last_execute_error(error_message)
+                    logger.warning("首个执行任务启动前校验失败: %s", error_message)
+                    return False
+
+                # 如果有first_execute任务，优先执行它，忽略其他任务
+                logger.info(f"========== 执行首个执行任务: '{first_execute_task.name}' ==========")
+                thread = first_execute_task.execute_async()
+                if thread is not None:
+                    self._is_executing = True
+                    self._executing_task_ids = [first_execute_task.task_id]
+                    return True
+                self._is_executing = False
+                self._executing_task_ids = []
+                logger.warning(f"首个执行任务启动失败: '{first_execute_task.name}'")
+                return False
+
+            # 多工作流跳转执行模式：只执行当前任务
+            if current_task_id is None:
+                # 如果没有指定任务，尝试获取第一个可执行任务
+                executable_tasks = self.get_executable_tasks()
+                if not executable_tasks:
+                    logger.warning("跳转模式下没有可执行的任务")
+                    return False
+                task = executable_tasks[0]
+                current_task_id = task.task_id
+                logger.info(f"跳转模式下未指定任务，自动选择第一个可执行任务: '{task.name}'")
+            else:
+                task = self.get_task(current_task_id)
+                if not task:
+                    logger.error(f"任务ID {current_task_id} 不存在")
+                    return False
+
+            if not task.can_execute():
+                logger.warning(f"任务 '{task.name}' 无法执行")
+                return False
+
+            valid_runtime, error_message = self._validate_yolo_runtime_for_tasks([task])
+            if not valid_runtime:
+                self._set_last_execute_error(error_message)
+                logger.warning("跳转模式任务启动前校验失败: %s", error_message)
+                return False
+
+            logger.info(f"跳转模式：执行任务 '{task.name}'")
+
+            # 异步执行
+            thread = task.execute_async()
+            if thread is not None:
+                self._is_executing = True
+                self._executing_task_ids = [current_task_id]
+                return True
+            self._is_executing = False
+            self._executing_task_ids = []
+            logger.warning(f"跳转模式任务启动失败: '{task.name}'")
+            return False
+
+        else:
+            # 多工作流并行执行模式：异步执行所有任务
+            executable_tasks = self.get_executable_tasks()
+
+            if not executable_tasks:
+                logger.warning("没有可执行的任务")
+                return False
+
+            valid_runtime, error_message = self._validate_yolo_runtime_for_tasks(executable_tasks)
+            if not valid_runtime:
+                self._set_last_execute_error(error_message)
+                logger.warning("并行模式任务启动前校验失败: %s", error_message)
+                return False
+
+            logger.info(f"并行模式：开始执行 {len(executable_tasks)} 个任务")
+
+            # 异步启动所有任务
+            started_count = 0
+            started_task_ids = []
+            for i, task in enumerate(executable_tasks, 1):
+                logger.info(f"尝试启动任务 {i}/{len(executable_tasks)}: ID={task.task_id}, 名称='{task.name}'")
+
+                if not task.can_execute():
+                    logger.warning(f"任务 '{task.name}' 无法执行")
+                    continue
+
+                thread = task.execute_async()
+                if thread:
+                    started_count += 1
+                    started_task_ids.append(task.task_id)
+                else:
+                    logger.error(f"任务 '{task.name}' 启动失败")
+
+            if started_count > 0:
+                self._is_executing = True
+                self._executing_task_ids = started_task_ids
+                logger.info(f"已启动 {started_count}/{len(executable_tasks)} 个任务")
+                return True
+
+            self._is_executing = False
+            self._executing_task_ids = []
+            logger.warning("没有任何任务成功启动")
+            return False
+
+    def execute_task(self, task_id: int) -> bool:
+        """
+        执行单个任务
+
+        Args:
+            task_id: 任务ID
+
+        Returns:
+            是否执行成功
+        """
+        task = self.get_task(task_id)
+        if not task:
+            logger.error(f"执行失败: 任务ID {task_id} 不存在")
+            return False
+
+        if not task.can_execute():
+            logger.warning(f"任务 '{task.name}' 当前状态不允许执行")
+            return False
+
+        valid_runtime, error_message = self._validate_yolo_runtime_for_tasks([task])
+        if not valid_runtime:
+            self._set_last_execute_error(error_message)
+            logger.warning("单任务启动前校验失败: %s", error_message)
+            return False
+
+        logger.info(f"开始执行单个任务: {task.name}")
+
+        # 单个任务执行使用异步模式
+        thread = task.execute_async()
+        return thread is not None
+
+    def stop_task(self, task_id: int):
+        """停止单个任务"""
+        task = self.get_task(task_id)
+        if task:
+            task.stop()
+
+    def stop_all(self):
+        """停止所有任务(包括运行中和暂停的)"""
+        attempted_count = 0
+        stopped_count = 0
+        for task in self.get_all_tasks():
+            thread_running = False
+            try:
+                thread_running = bool(task.executor_thread and task.executor_thread.isRunning())
+            except Exception:
+                thread_running = False
+
+            if task.status in ('running', 'paused') or thread_running:
+                attempted_count += 1
+                if task.stop():
+                    stopped_count += 1
+
+        self._is_executing = False
+        self._executing_task_ids = []
+
+        # 停止时统一清理YOLO运行时（含遗留子进程兜底）
+        try:
+            from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+            cleanup_yolo_runtime_on_stop(
+                release_engine=True,
+                compact_memory=True,
+            )
+        except Exception:
+            pass
+
+        if stopped_count > 0:
+            logger.info(f"已停止 {stopped_count} 个任务")
+        return attempted_count == 0 or stopped_count == attempted_count
+
+    def pause_all_tasks(self):
+        """暂停所有正在运行的任务"""
+        logger.info("暂停所有正在运行的任务")
+
+        attempted_count = 0
+        paused_count = 0
+        for task in self.get_all_tasks():
+            if task.status == 'running':
+                if hasattr(task, 'pause'):
+                    attempted_count += 1
+                    logger.info(f"暂停任务 {task.task_id}")
+                    if task.pause():
+                        paused_count += 1
+
+        logger.info(f"已暂停 {paused_count} 个任务")
+        return attempted_count > 0 and paused_count == attempted_count
+
+    def resume_all_tasks(self):
+        """恢复所有暂停的任务"""
+        logger.info("恢复所有暂停的任务")
+
+        attempted_count = 0
+        resumed_count = 0
+        for task in self.get_all_tasks():
+            if task.status == 'paused':
+                if hasattr(task, 'resume'):
+                    attempted_count += 1
+                    logger.info(f"恢复任务 {task.task_id}")
+                    if task.resume():
+                        resumed_count += 1
+
+        logger.info(f"已恢复 {resumed_count} 个任务")
+        return attempted_count > 0 and resumed_count == attempted_count
+
+    def get_pause_state(self) -> str:
+        active_count = 0
+        running_count = 0
+        paused_count = 0
+
+        for task in self.get_all_tasks():
+            status = str(getattr(task, "status", "") or "").strip().lower()
+            runtime_active = self._task_has_active_runtime(task)
+
+            if status == "paused" and runtime_active:
+                active_count += 1
+                paused_count += 1
+                continue
+
+            if status == "running" or runtime_active:
+                active_count += 1
+                running_count += 1
+
+        if running_count > 0:
+            return "running"
+        if paused_count > 0:
+            return "paused"
+        if self._is_executing and active_count == 0:
+            return "running"
+        return "idle"
+
+    def save_task(self, task_id: int) -> bool:
+        """保存任务到文件"""
+        task = self.get_task(task_id)
+        if not task:
+            logger.error(f"保存失败: 任务ID {task_id} 不存在")
+            return False
+
+        return task.save()
+
+    def save_all_modified(self) -> int:
+        """
+        保存所有已修改的任务
+
+        Returns:
+            保存成功的任务数量
+        """
+        saved_count = 0
+
+        for task in self.get_all_tasks():
+            if task.modified:
+                if task.save():
+                    saved_count += 1
+
+        logger.info(f"已保存 {saved_count} 个已修改的任务")
+        return saved_count
+
+    def _on_task_status_changed(self, task_id: int, status: str):
+        """Handle task status updates and finalize execution when possible."""
+        self.task_status_changed.emit(task_id, status)
+
+        if status in ['completed', 'failed']:
+            self._handle_task_jump(task_id, status)
+
+        self._finalize_execution_if_ready()
+
+    def _on_task_runtime_cleanup_finished(self, task_id: int) -> None:
+        if task_id not in self.tasks:
+            return
+        self._finalize_execution_if_ready()
+
+    def _finalize_execution_if_ready(self) -> bool:
+        if not self._is_executing:
+            return False
+
+        tracked_task_ids = [
+            tid for tid in self._executing_task_ids
+            if tid in self.tasks
+        ]
+        if not tracked_task_ids:
+            self._is_executing = False
+            self._executing_task_ids = []
+            return False
+
+        all_completed = all(
+            self.tasks[tid].status in ['completed', 'failed', 'stopped']
+            for tid in tracked_task_ids
+        )
+        if not all_completed:
+            return False
+
+        if self.has_active_runtime_tasks(tracked_task_ids):
+            logger.info("Task runtime cleanup is still in progress; defer all_tasks_completed")
+            return False
+
+        task_statuses = [
+            self.tasks[tid].status
+            for tid in tracked_task_ids
+        ]
+        all_success, result_type = self._resolve_execution_result(task_statuses)
+
+        self._is_executing = False
+        self._executing_task_ids = []
+        self.all_tasks_completed.emit(all_success, result_type)
+
+        if result_type == 'stopped':
+            logger.info("Workflow execution finished: stopped")
+        elif all_success:
+            logger.info("Workflow execution finished: success")
+        else:
+            logger.info("Workflow execution finished: failed")
+        return True
+
+    def _handle_task_jump(self, task_id: int, status: str):
+        """
+        处理任务跳转逻辑
+
+        注意：跳转逻辑已移至 main_window，此方法已禁用
+
+        Args:
+            task_id: 完成的任务ID
+            status: 任务状态 ('completed' 或 'failed')
+        """
+        # 跳转逻辑已移至 main_window._on_task_execution_finished，此处直接返回
+        logger.debug(f"_handle_task_jump 被调用但已禁用（跳转由main_window统一管理）: task_id={task_id}, status={status}")
+        return
+
+    def _execute_jump(self, target_task):
+        """
+        执行跳转
+
+        Args:
+            target_task: 目标任务对象
+        """
+        if target_task.can_execute():
+            target_task.execute_async()
+        else:
+            logger.warning(f"目标任务 '{target_task.name}' 无法执行 (status: {target_task.status})")
+
+    def clear_all(self):
+        """清空所有任务"""
+        logger.info("清空所有任务")
+
+        # 停止所有运行中的任务
+        self.stop_all()
+
+        # 清空任务列表
+        task_ids = list(self.tasks.keys())
+        for task_id in task_ids:
+            self.remove_task(task_id)
+
+        logger.info("所有任务已清空")
+
+    def get_task_count(self) -> int:
+        """获取任务数量"""
+        return len(self.tasks)
+
+    def get_running_count(self) -> int:
+        """获取正在运行的任务数量"""
+        return sum(1 for task in self.get_all_tasks() if task.status == 'running')
+
+    def find_jump_target(self, source_task: WorkflowTask) -> Optional[int]:
+        """
+        查找跳转目标任务
+
+        Args:
+            source_task: 源任务
+
+        Returns:
+            目标任务ID，如果没有找到则返回None
+        """
+        logger.info(f"========== 查找跳转目标 ==========")
+        logger.info(f"  源任务: {source_task.name} (ID={source_task.task_id})")
+        logger.info(f"  stop_reason: {source_task.stop_reason}")
+        logger.info(f"  jump_rules: {getattr(source_task, 'jump_rules', {})}")
+
+        if not source_task.stop_reason:
+            logger.info(f"  结果: stop_reason为空，不跳转")
+            logger.info(f"==================================")
+            return None
+
+        # 从任务的jump_rules中查找目标
+        jump_rules = getattr(source_task, 'jump_rules', {})
+        target_info = jump_rules.get(source_task.stop_reason)
+
+        logger.info(f"  查找 jump_rules['{source_task.stop_reason}'] = {target_info}")
+
+        if target_info is None:
+            logger.info(f"  结果: 未配置跳转")
+            logger.info(f"==================================")
+            return None
+
+        # 支持两种格式：
+        # 1. 旧格式：target_info 是 int (task_id)
+        # 2. 新格式：target_info 是 dict {'id': task_id, 'name': task_name}
+        if isinstance(target_info, dict):
+            target_id = target_info.get('id')
+            target_name = target_info.get('name')
+        else:
+            # 兼容旧格式
+            target_id = target_info
+            target_name = None
+
+        # 优先使用ID查找
+        if target_id is not None and target_id in self.tasks:
+            target_task = self.tasks[target_id]
+            logger.info(f"  结果: 通过ID找到跳转目标 -> '{target_task.name}' (ID={target_id})")
+            logger.info(f"==================================")
+            return target_id
+
+        # ID不匹配时，使用名称查找
+        if target_name:
+            logger.info(f"  ID={target_id} 不存在，尝试通过名称 '{target_name}' 查找")
+            for task in self.tasks.values():
+                if task.name == target_name:
+                    logger.info(f"  结果: 通过名称找到跳转目标 -> '{task.name}' (ID={task.task_id})")
+                    logger.info(f"==================================")
+                    return task.task_id
+            logger.warning(f"  结果: 名称 '{target_name}' 也找不到，不执行跳转")
+        else:
+            logger.warning(f"  结果: 跳转目标任务 {target_id} 不存在，不执行跳转")
+
+        logger.info(f"==================================")
+        return None
+
+    def __repr__(self):
+        return f"<WorkflowTaskManager tasks={len(self.tasks)}>"

@@ -1,0 +1,9 @@
+from .parameter_panel_selector_picker_package_refresh_mixin import ParameterPanelSelectorPickerPackageRefreshMixin
+from .parameter_panel_selector_picker_package_select_mixin import ParameterPanelSelectorPickerPackageSelectMixin
+
+
+class ParameterPanelSelectorPickerPackageMixin(
+    ParameterPanelSelectorPickerPackageSelectMixin,
+    ParameterPanelSelectorPickerPackageRefreshMixin,
+):
+    pass

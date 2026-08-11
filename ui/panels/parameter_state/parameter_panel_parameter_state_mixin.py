@@ -1,0 +1,17 @@
+from .parameter_panel_parameter_apply_mixin import ParameterPanelParameterApplyMixin
+from .parameter_panel_parameter_cleanup_mixin import ParameterPanelParameterCleanupMixin
+from .parameter_panel_parameter_collect_mixin import ParameterPanelParameterCollectMixin
+from .parameter_panel_parameter_extract_mixin import ParameterPanelParameterExtractMixin
+from .parameter_panel_parameter_reset_mixin import ParameterPanelParameterResetMixin
+from .parameter_panel_parameter_runtime_mixin import ParameterPanelParameterRuntimeMixin
+
+
+class ParameterPanelParameterStateMixin(
+    ParameterPanelParameterExtractMixin,
+    ParameterPanelParameterApplyMixin,
+    ParameterPanelParameterRuntimeMixin,
+    ParameterPanelParameterResetMixin,
+    ParameterPanelParameterCleanupMixin,
+    ParameterPanelParameterCollectMixin,
+):
+    pass
