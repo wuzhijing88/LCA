@@ -10,69 +10,16 @@ import ctypes # <<< RE-ADD ctypes for AttachThreadInput
 # import win32api # Still needed for VkKeyScan, GetCurrentThreadId etc.
 # import win32con # Still needed for WM_ messages
 
-# Try importing Windows specific modules
-try:
-    import win32api
-    import win32gui
-    import win32con
-    import win32process # <<< Keep import for GetWindowThreadProcessId
-    # Optional: Add key code mapping if needed later for background mode
-    # from .win_keycodes import VK_CODE # Now defining it below
-    WINDOWS_AVAILABLE = True
-    PYWIN32_AVAILABLE = True
-except ImportError:
-    WINDOWS_AVAILABLE = False
-    PYWIN32_AVAILABLE = False
-    # print("Warning: pywin32 library not found. Background mode keyboard input might be unavailable.")
+import win32api
+import win32con
+import win32gui
+import win32process
 
-# Try importing PyAutoGUI for foreground mode 2
-try:
-    import pyautogui
-    PYAUTOGUI_AVAILABLE = True
-except ImportError:
-    PYAUTOGUI_AVAILABLE = False
-    # print("Warning: PyAutoGUI library not found. Foreground mode 2 keyboard input might be unavailable.")
+from utils.foreground_input_manager import get_foreground_input_manager
 
-# --- ADDED: Import pyperclip for copy-paste ---
-try:
-    import pyperclip
-    PYPERCLIP_AVAILABLE = True
-except ImportError:
-    PYPERCLIP_AVAILABLE = False
-    # print("Warning: pyperclip library not found. Foreground copy-paste input will be unavailable.")
-# ---------------------------------------------
+foreground_input = get_foreground_input_manager()
 
-# --- ADDED: Import foreground input manager ---
-try:
-    from utils.foreground_input_manager import get_foreground_input_manager
-    foreground_input = get_foreground_input_manager()
-    FOREGROUND_INPUT_AVAILABLE = True
-except ImportError:
-    FOREGROUND_INPUT_AVAILABLE = False
-    foreground_input = None
-# ---------------------------------------------
-
-# --- ADDED: Import task utilities ---
-try:
-    from .task_utils import precise_sleep, coerce_bool
-except ImportError:
-    from utils.precise_sleep import precise_sleep
-
-    def coerce_bool(value, default=False):
-        try:
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, str):
-                lowered = value.strip().lower()
-                if lowered in ("true", "1", "yes", "on"):
-                    return True
-                if lowered in ("false", "0", "no", "off", ""):
-                    return False
-            return bool(value)
-        except Exception:
-            return bool(default)
-
-# ---------------------------------------------
+from .task_utils import precise_sleep, coerce_bool
 from .click_action_executor import execute_simulator_click_action
 from .click_param_resolver import normalize_click_action
 from .click_simulator_adapters import ForegroundDriverSimulatorAdapter
@@ -1963,14 +1910,13 @@ def _resolve_recorded_mouse_position(target_hwnd: Optional[int], mouse_module=No
     screen_x: Optional[int] = None
     screen_y: Optional[int] = None
 
-    if WINDOWS_AVAILABLE:
-        try:
-            screen_x, screen_y = win32api.GetCursorPos()
-            screen_x = int(screen_x)
-            screen_y = int(screen_y)
-        except Exception:
-            screen_x = None
-            screen_y = None
+    try:
+        screen_x, screen_y = win32api.GetCursorPos()
+        screen_x = int(screen_x)
+        screen_y = int(screen_y)
+    except Exception:
+        screen_x = None
+        screen_y = None
 
     if (screen_x is None or screen_y is None) and mouse_module is not None and hasattr(mouse_module, "get_position"):
         try:
@@ -1984,7 +1930,7 @@ def _resolve_recorded_mouse_position(target_hwnd: Optional[int], mouse_module=No
     if screen_x is None or screen_y is None:
         return 0, 0
 
-    if target_hwnd and WINDOWS_AVAILABLE:
+    if target_hwnd:
         try:
             client_x, client_y = win32gui.ScreenToClient(int(target_hwnd), (screen_x, screen_y))
             return int(client_x), int(client_y)
@@ -2527,12 +2473,11 @@ def _resolve_foreground_runtime_position(foreground_input_manager: Any) -> Tuple
                 return int(pos[0]), int(pos[1])
         except Exception:
             pass
-    if WINDOWS_AVAILABLE:
-        try:
-            x_value, y_value = win32api.GetCursorPos()
-            return int(x_value), int(y_value)
-        except Exception:
-            pass
+    try:
+        x_value, y_value = win32api.GetCursorPos()
+        return int(x_value), int(y_value)
+    except Exception:
+        pass
     return 0, 0
 
 
@@ -2550,7 +2495,7 @@ def _resolve_background_runtime_position(simulator: Any) -> Tuple[int, int]:
             screen_x = None
             screen_y = None
 
-    if (screen_x is None or screen_y is None) and WINDOWS_AVAILABLE:
+    if screen_x is None or screen_y is None:
         try:
             screen_x, screen_y = win32api.GetCursorPos()
             screen_x = int(screen_x)
@@ -2563,7 +2508,7 @@ def _resolve_background_runtime_position(simulator: Any) -> Tuple[int, int]:
         return 0, 0
 
     hwnd = getattr(simulator, "hwnd", None)
-    if hwnd and WINDOWS_AVAILABLE:
+    if hwnd:
         try:
             client_x, client_y = win32gui.ScreenToClient(int(hwnd), (int(screen_x), int(screen_y)))
             return int(client_x), int(client_y)
@@ -2628,7 +2573,7 @@ def _release_background_mouse_buttons(
 
 def _to_foreground_screen_coord(target_hwnd: Optional[int], x: int, y: int) -> Tuple[int, int]:
     """将客户区坐标转换为屏幕坐标（前台模式）。"""
-    if not target_hwnd or not WINDOWS_AVAILABLE:
+    if not target_hwnd:
         return int(x), int(y)
 
     try:
@@ -2759,7 +2704,7 @@ def _execute_combo_expression_foreground(
                     if use_current_position:
                         screen_x, screen_y = _resolve_foreground_runtime_position(foreground_input_manager)
                         stored_x, stored_y = None, None
-                        if target_hwnd and WINDOWS_AVAILABLE:
+                        if target_hwnd:
                             try:
                                 client_x, client_y = win32gui.ScreenToClient(target_hwnd, (screen_x, screen_y))
                                 stored_x, stored_y = int(client_x), int(client_y)
@@ -3159,11 +3104,11 @@ def _get_current_window_index(card_id: int, target_hwnd: Optional[int] = None) -
             # 如果HWND在已知列表中，直接返回其索引
             if target_hwnd in known_hwnds:
                 window_index = known_hwnds.index(target_hwnd)
-                logger.info(f"=== 窗口索引计算详情 ===")
+                logger.info("=== 窗口索引计算详情 ===")
                 logger.info(f"目标HWND: {target_hwnd}")
                 logger.info(f"已知HWND列表: {known_hwnds}")
                 logger.info(f"直接匹配索引: {window_index}")
-                logger.info(f"========================")
+                logger.info("========================")
                 return window_index
 
             # 如果不在已知列表中，使用改进的哈希算法
@@ -3180,7 +3125,7 @@ def _get_current_window_index(card_id: int, target_hwnd: Optional[int] = None) -
             combined_hash = (hash1 + hash2 + hash3 + hash4) % 3
 
             # 添加详细的诊断日志
-            logger.info(f"=== 窗口索引计算详情 ===")
+            logger.info("=== 窗口索引计算详情 ===")
             logger.info(f"目标HWND: {target_hwnd}")
             logger.info(f"HWND哈希: {hwnd_hash}")
             logger.info(f"哈希1 ({hwnd_hash} * 17 % 3): {hash1}")
@@ -3188,7 +3133,7 @@ def _get_current_window_index(card_id: int, target_hwnd: Optional[int] = None) -
             logger.info(f"哈希3 ({hwnd_hash} * 47 % 3): {hash3}")
             logger.info(f"哈希4 (移位哈希 % 3): {hash4}")
             logger.info(f"组合哈希索引: {combined_hash}")
-            logger.info(f"========================")
+            logger.info("========================")
 
             return combined_hash
 
@@ -3394,7 +3339,7 @@ def _handle_multi_text_input(text_groups: List[str], card_id: int, window_index:
                             if enabled_windows and len(enabled_windows) > 1:
                                 is_multi_window = True
                         break
-        except:
+        except Exception:
             is_multi_window = False
 
         # 计算文本索引
@@ -3416,7 +3361,7 @@ def _handle_multi_text_input(text_groups: List[str], card_id: int, window_index:
         target_text = text_groups[text_index]
 
         # 添加详细的诊断日志
-        logger.info(f"=== 多组文本分配详情 ===")
+        logger.info("=== 多组文本分配详情 ===")
         logger.info(f"卡片ID: {card_id}")
         logger.info(f"窗口索引: {window_index}")
         logger.info(f"是否多窗口: {is_multi_window}")
@@ -3426,7 +3371,7 @@ def _handle_multi_text_input(text_groups: List[str], card_id: int, window_index:
         logger.info(f"计算的文本索引: {text_index}")
         logger.info(f"分配的文本: '{target_text}'")
         logger.info(f"重置模式: {reset_on_next_run}")
-        logger.info(f"=========================")
+        logger.info("=========================")
 
         return target_text, None
 
@@ -3551,11 +3496,8 @@ VK_CODE = {
 
 # --- Helper for Foreground Activation ---
 def _activate_foreground_window(target_hwnd: Optional[int]):
-    if not target_hwnd or not WINDOWS_AVAILABLE:
-        if not target_hwnd:
-             logger.warning("前台模式执行，但未提供目标窗口句柄。将在当前活动窗口执行操作。")
-        elif not WINDOWS_AVAILABLE:
-             logger.warning("无法激活目标窗口：缺少 'pywin32' 库。将在当前活动窗口执行操作。")
+    if not target_hwnd:
+        logger.warning("前台模式执行，但未提供目标窗口句柄。将在当前活动窗口执行操作。")
         return False # Indicate activation was not attempted or failed prerequisite
 
     try:
@@ -3762,7 +3704,7 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
 
         # 新增：根据执行模式设置前台输入管理器的强制模式（严格隔离）
         is_foreground_mode = execution_mode and execution_mode.startswith('foreground')
-        if FOREGROUND_INPUT_AVAILABLE and is_foreground_mode:
+        if is_foreground_mode:
             foreground_input.set_execution_mode(execution_mode)
             logger.info(f"[鼠标模式] 前台模式 - {execution_mode}")
 
@@ -3849,7 +3791,7 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
                                 _raise_if_stopped(stop_checker, "前台文本输入")
                                 import pyperclip
                                 pyperclip.copy(text_to_type)
-                                logger.info(f"[前台模式文本输入] 文本已复制到剪贴板")
+                                logger.info("[前台模式文本输入] 文本已复制到剪贴板")
 
                                 if driver and hasattr(driver, 'hotkey'):
                                     if driver.hotkey('ctrl', 'v'):
@@ -3859,7 +3801,7 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
                                         logger.error(f"[前台模式文本输入] {driver_type}驱动Ctrl+V发送失败")
                                         return False, failure_action, failure_jump_target
                                 else:
-                                    logger.error(f"[前台模式文本输入] 驱动不支持hotkey方法")
+                                    logger.error("[前台模式文本输入] 驱动不支持hotkey方法")
                                     return False, failure_action, failure_jump_target
 
                             except ImportError:
@@ -3970,9 +3912,6 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
         normalized_execution_mode = str(execution_mode or '').strip().lower()
         is_background_mode = normalized_execution_mode.startswith('background')
         if is_background_mode:
-            if not WINDOWS_AVAILABLE:
-                logger.error("无法执行后台模式：缺少必要的 'pywin32' 库。")
-                return False, failure_action, failure_jump_target
             if not target_hwnd:
                 logger.error("无法执行后台模式：未提供目标窗口句柄 (target_hwnd)。")
                 return False, failure_action, failure_jump_target
@@ -3981,7 +3920,7 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
 
             # 文本输入处理（后台模式）
             if input_type == '文本输入':
-                logger.info(f"[后台模式] 处理文本输入")
+                logger.info("[后台模式] 处理文本输入")
                 try:
                     from utils.input_simulation import global_input_simulator_manager
 
@@ -4113,15 +4052,14 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
 
 def get_params_definition() -> Dict[str, Dict[str, Any]]:
     """获取参数定义"""
-    try:
-        from tasks.task_utils import get_standard_next_step_delay_params, get_standard_action_params, merge_params_definitions
-    except ImportError:
-        # 备用参数定义
-        standard_delay_params = {}
-        standard_action_params = {}
-    else:
-        standard_delay_params = get_standard_next_step_delay_params()
-        standard_action_params = get_standard_action_params()
+    from tasks.task_utils import (
+        get_standard_next_step_delay_params,
+        get_standard_action_params,
+        merge_params_definitions,
+    )
+
+    standard_delay_params = get_standard_next_step_delay_params()
+    standard_action_params = get_standard_action_params()
 
     keyboard_params = {
         "input_type": {
@@ -4277,5 +4215,5 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             standard_delay_params,
             standard_action_params
         )
-    except:
+    except Exception:
         return keyboard_params

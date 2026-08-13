@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from task_workflow.global_var_store import ensure_global_context_loaded, get_global_store
+from task_workflow.global_var_store import ensure_global_context_loaded
 from task_workflow.workflow_context import get_workflow_context
 from task_workflow.workflow_vars import get_context_for_task, update_context_from_variables
 from ui.system_parts.message_box_translator import show_information_box, show_question_box

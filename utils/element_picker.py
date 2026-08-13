@@ -6,7 +6,7 @@
 
 import time
 import threading
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Callable
 from dataclasses import dataclass
 
 from utils.uiautomation_runtime import (

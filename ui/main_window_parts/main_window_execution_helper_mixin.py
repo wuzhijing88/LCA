@@ -1,9 +1,7 @@
-import copy
 import logging
 import os
 
-import win32gui
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QMessageBox
 
 from utils.thread_start_utils import is_thread_start_task_type
 from utils.window_finder import sanitize_window_lookup_title
@@ -102,11 +100,11 @@ class MainWindowExecutionHelperMixin:
 
                             start_card = copy.deepcopy(card)
 
-                            logger.info(f"  找到线程起点卡片")
+                            logger.info("  找到线程起点卡片")
 
                         else:
 
-                            logger.warning(f"  跳过额外的线程起点卡片")
+                            logger.warning("  跳过额外的线程起点卡片")
 
                         continue
 
@@ -240,12 +238,6 @@ class MainWindowExecutionHelperMixin:
 
         tasks_to_save = []
 
-        current_task_id = None
-
-        if hasattr(self, 'workflow_tab_widget') and self.workflow_tab_widget:
-
-            current_task_id = self.workflow_tab_widget.get_current_task_id()
-
         for task_item in all_tasks:
 
             workflow_view = self.workflow_tab_widget.task_views.get(task_item.task_id)
@@ -256,9 +248,7 @@ class MainWindowExecutionHelperMixin:
 
                 logger.info(f"从画布获取最新工作流数据: {task_item.name}")
 
-                variables_override = self._resolve_variables_override(task_item, current_task_id)
-
-                latest_workflow_data = workflow_view.serialize_workflow(variables_override=variables_override)
+                latest_workflow_data = workflow_view.serialize_workflow()
 
                 task_item.update_workflow_data(latest_workflow_data)
 
@@ -474,7 +464,7 @@ class MainWindowExecutionHelperMixin:
 
                                 results.append(hwnd)
 
-                        except:
+                        except Exception:
 
                             pass
 

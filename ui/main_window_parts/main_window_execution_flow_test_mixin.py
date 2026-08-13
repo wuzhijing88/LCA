@@ -22,7 +22,7 @@ class MainWindowExecutionFlowTestMixin:
 
         if not self.workflow_view or not hasattr(self.workflow_view, 'cards'):
 
-            logger.warning(f"workflow_view不存在或没有cards属性，无法更新失败的路径")
+            logger.warning("workflow_view不存在或没有cards属性，无法更新失败的路径")
 
             return
 
@@ -168,7 +168,7 @@ class MainWindowExecutionFlowTestMixin:
 
         try:
 
-            logger.info(f"=== 测试卡片执行请求 ===")
+            logger.info("=== 测试卡片执行请求 ===")
 
             logger.info(f"卡片ID: {card_id}")
 
@@ -230,7 +230,7 @@ class MainWindowExecutionFlowTestMixin:
 
         try:
 
-            logger.info(f"=== 测试流程执行请求 ===")
+            logger.info("=== 测试流程执行请求 ===")
 
             logger.info(f"起始卡片ID: {card_id}")
 

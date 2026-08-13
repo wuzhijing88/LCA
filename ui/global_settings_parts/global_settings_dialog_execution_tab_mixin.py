@@ -1,6 +1,4 @@
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -8,9 +6,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..main_window_parts.main_window_dropdown_helpers import CenteredTextDelegate, NoWheelSpinBox
-from ..main_window_parts.main_window_dropdown_widget import CustomDropdown, QComboBox
+from ..main_window_parts.main_window_dropdown_widget import QComboBox
 from ..main_window_parts.main_window_support import normalize_execution_mode_setting
+from utils.input_simulation.mode_utils import parse_foreground_backends
 
 class GlobalSettingsDialogExecutionTabMixin:
     def _create_execution_tab(self):
@@ -95,19 +93,9 @@ class GlobalSettingsDialogExecutionTabMixin:
 
             self.foreground_driver_combo.addItem(display_name, backend)
 
-        legacy_backend = str(self.current_config.get('foreground_driver_backend', 'interception') or 'interception').strip().lower()
-
-        configured_mouse_backend = str(
-
-            self.current_config.get('foreground_mouse_driver_backend', legacy_backend) or legacy_backend
-
-        ).strip().lower()
+        configured_mouse_backend, configured_keyboard_backend = parse_foreground_backends(self.current_config)
 
         backend_index = self.foreground_driver_combo.findData(configured_mouse_backend)
-
-        if backend_index < 0:
-
-            backend_index = self.foreground_driver_combo.findData('interception')
 
         if backend_index >= 0:
 
@@ -135,17 +123,7 @@ class GlobalSettingsDialogExecutionTabMixin:
 
             self.foreground_keyboard_driver_combo.addItem(display_name, backend)
 
-        configured_keyboard_backend = str(
-
-            self.current_config.get('foreground_keyboard_driver_backend', legacy_backend) or legacy_backend
-
-        ).strip().lower()
-
         keyboard_backend_index = self.foreground_keyboard_driver_combo.findData(configured_keyboard_backend)
-
-        if keyboard_backend_index < 0:
-
-            keyboard_backend_index = self.foreground_keyboard_driver_combo.findData('interception')
 
         if keyboard_backend_index >= 0:
 
@@ -240,10 +218,9 @@ class GlobalSettingsDialogExecutionTabMixin:
         # 从配置读取当前截图引擎
 
         current_engine = self.current_config.get('screenshot_engine', 'wgc')
-
-        display_engine = self.screenshot_engine_reverse_map.get(current_engine, "WGC (适用Win11)")
-
-        self.screenshot_engine_combo.setCurrentText(display_engine)
+        display_engine = self.screenshot_engine_reverse_map.get(current_engine)
+        if display_engine:
+            self.screenshot_engine_combo.setCurrentText(display_engine)
 
         # 设置工具提示
 
@@ -350,18 +327,6 @@ class GlobalSettingsDialogExecutionTabMixin:
         if index >= 0:
 
             self.screenshot_engine_combo.setCurrentIndex(index)
-
-        else:
-
-            # 后台模式下若之前选择不可用（如 GDI/DXGI），强制切换到 WGC
-
-            if not is_foreground:
-
-                wgc_index = self.screenshot_engine_combo.findText("WGC (适用Win11)")
-
-                if wgc_index >= 0:
-
-                    self.screenshot_engine_combo.setCurrentIndex(wgc_index)
 
         # Limit popup height to item count to avoid empty space
 

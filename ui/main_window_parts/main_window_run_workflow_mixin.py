@@ -1,9 +1,8 @@
 import copy
-import json
 import logging
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QMessageBox
 
 from task_workflow.process_proxy import create_process_workflow_runtime
 from utils.thread_start_utils import THREAD_START_TASK_TYPE, is_thread_start_task_type
@@ -98,7 +97,7 @@ class MainWindowRunWorkflowMixin:
 
         first_execute_task = None
 
-        logger.info(f"========== 检查首个执行任务 ==========")
+        logger.info("========== 检查首个执行任务 ==========")
 
         logger.info(f"test_mode = {test_mode}")
 
@@ -130,9 +129,9 @@ class MainWindowRunWorkflowMixin:
 
         if not first_execute_task:
 
-            logger.info(f"  未找到首个执行任务")
+            logger.info("  未找到首个执行任务")
 
-        logger.info(f"======================================")
+        logger.info("======================================")
 
         # 【关键】立即确定要执行的任务，优先使用首个执行任务
 
@@ -160,7 +159,7 @@ class MainWindowRunWorkflowMixin:
 
             else:
 
-                logger.warning(f"get_current_task_id() 返回 None")
+                logger.warning("get_current_task_id() 返回 None")
 
         if not actual_task:
 
@@ -204,12 +203,6 @@ class MainWindowRunWorkflowMixin:
 
         backup_failed_tasks = []
 
-        current_task_id = None
-
-        if hasattr(self, 'workflow_tab_widget') and self.workflow_tab_widget:
-
-            current_task_id = self.workflow_tab_widget.get_current_task_id()
-
         for task_item in all_tasks:
 
             # 先从画布获取最新工作流数据
@@ -222,9 +215,7 @@ class MainWindowRunWorkflowMixin:
 
                 logger.info(f"从画布获取最新工作流数据: {task_item.name}")
 
-                variables_override = self._resolve_variables_override(task_item, current_task_id)
-
-                latest_workflow_data = workflow_view.serialize_workflow(variables_override=variables_override)
+                latest_workflow_data = workflow_view.serialize_workflow()
 
             else:
 
@@ -382,20 +373,13 @@ class MainWindowRunWorkflowMixin:
 
                     # 保存任务
 
-                    current_task_id = None
-
-                    if hasattr(self, 'workflow_tab_widget') and self.workflow_tab_widget:
-
-                        current_task_id = self.workflow_tab_widget.get_current_task_id()
-
-                    variables_override = self._resolve_variables_override(task, current_task_id)
-
-                    workflow_data = task_workflow_view.serialize_workflow(variables_override=variables_override)
+                    workflow_data = task_workflow_view.serialize_workflow()
 
                     import json
 
                     try:
 
+                        workflow_data.pop("variables", None)
                         with open(filepath, 'w', encoding='utf-8') as f:
 
                             json.dump(workflow_data, f, indent=2, ensure_ascii=False)
@@ -505,15 +489,7 @@ class MainWindowRunWorkflowMixin:
 
             # --- Use serialize_workflow() for structured data ---
 
-            current_task_id = None
-
-            if hasattr(self, 'workflow_tab_widget') and self.workflow_tab_widget:
-
-                current_task_id = self.workflow_tab_widget.get_current_task_id()
-
-            variables_override = self._resolve_variables_override(actual_task, current_task_id)
-
-            workflow_data = workflow_view.serialize_workflow(variables_override=variables_override) # <-- 使用确定的任务的WorkflowView
+            workflow_data = workflow_view.serialize_workflow()
 
             if not workflow_data or not workflow_data.get("cards"):
 
@@ -827,7 +803,7 @@ class MainWindowRunWorkflowMixin:
 
                 if test_mode:
 
-                    logger.info(f"[测试模式] 进入测试模式分支")
+                    logger.info("[测试模式] 进入测试模式分支")
 
                     # 创建一个虚拟的测试线程起点卡片（ID使用负数，避免与真实卡片冲突）
 
@@ -1034,23 +1010,21 @@ class MainWindowRunWorkflowMixin:
                 from task_workflow.workflow_vars import workflow_context_key
 
                 workflow_id = workflow_context_key(getattr(actual_task, "task_id", None)) or "default"
+                runtime_start_card_ids = [start_card_id] if test_mode else start_card_ids
                 self.executor, self.executor_thread = create_process_workflow_runtime(
                     cards_data=cards_dict,
                     connections_data=connections_list,
                     execution_mode=self.current_execution_mode,
+                    screenshot_engine=self.config.get("screenshot_engine"),
                     images_dir=self.images_dir,
                     workflow_id=workflow_id,
                     workflow_filepath=getattr(actual_task, "filepath", None),
-                    start_card_id=start_card_id,
-                    start_card_ids=start_card_ids,
+                    start_card_ids=runtime_start_card_ids,
                     target_window_title=target_window_title or self.current_target_window_title,
                     target_hwnd=target_hwnd,
                     thread_labels=thread_labels,
                     bound_windows=self.bound_windows,
-                    logger_obj=logger,
-                    enable_thread_window_binding=not test_mode,
-                    single_mode_overrides={"test_mode": test_mode},
-                    config=self.config,
+                    test_mode=test_mode,
                     parent=self,
                 )
 

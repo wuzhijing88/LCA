@@ -14,41 +14,15 @@ import logging
 import time
 import ctypes
 from ctypes import wintypes
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 import random
 
-try:
-    from .universal_resolution_adapter import (
-        get_universal_adapter, CoordinateInfo, CoordinateType,
-        REFERENCE_WIDTH, REFERENCE_HEIGHT
-    )
-except ImportError:
-    # 如果适配器不可用，使用默认值
-    REFERENCE_WIDTH = 1280
-    REFERENCE_HEIGHT = 720
-
-    class CoordinateType:
-        REFERENCE = "reference"
-        PHYSICAL = "physical"
-        LOGICAL = "logical"
-
-    class CoordinateInfo:
-        def __init__(self, x=0, y=0, width=0, height=0, coord_type=None, source_window=None, timestamp=0.0):
-            self.x = x
-            self.y = y
-            self.width = width
-            self.height = height
-            self.coord_type = coord_type or CoordinateType.PHYSICAL
-            self.source_window = source_window
-            self.timestamp = timestamp
-
-    def get_universal_adapter():
-        class MockAdapter:
-            def get_window_state(self, hwnd):
-                return None
-        return MockAdapter()
+from .universal_resolution_adapter import (
+    get_universal_adapter, CoordinateInfo, CoordinateType,
+    REFERENCE_WIDTH, REFERENCE_HEIGHT
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +143,7 @@ class UniversalCoordinateSystem:
                 return offset_x, offset_y
 
         except Exception as e:
-            logger.error(f"处理点击坐标失败: {e}")
-            logger.error(f"回退到原始坐标: ({coord_info.x}, {coord_info.y})")
-            return coord_info.x, coord_info.y
+            raise RuntimeError(f"处理点击坐标失败: {e}") from e
     
     def process_ocr_region(self, coord_info: CoordinateInfo, target_hwnd: int) -> Tuple[int, int, int, int]:
         """处理OCR区域坐标"""
@@ -186,8 +158,7 @@ class UniversalCoordinateSystem:
             return target_coord.x, target_coord.y, target_coord.width, target_coord.height
             
         except Exception as e:
-            logger.error(f"处理OCR区域失败: {e}")
-            return coord_info.x, coord_info.y, coord_info.width, coord_info.height
+            raise RuntimeError(f"处理OCR区域失败: {e}") from e
     
     def _convert_to_screen_coordinates(self, client_x: int, client_y: int, hwnd: int) -> Tuple[int, int]:
         """将客户区坐标转换为屏幕坐标（每次都实时获取窗口位置）"""
@@ -216,13 +187,12 @@ class UniversalCoordinateSystem:
                 screen_x, screen_y = point.x, point.y
                 logger.debug(f"[坐标转换] 转换成功: 客户区({client_x}, {client_y}) -> 屏幕({screen_x}, {screen_y})")
                 return screen_x, screen_y
-            else:
-                logger.warning(f"[坐标转换] ClientToScreen转换失败，使用原始坐标")
-                return client_x, client_y
+            raise RuntimeError(f"ClientToScreen 失败: hwnd={hwnd}, client=({client_x}, {client_y})")
 
+        except RuntimeError:
+            raise
         except Exception as e:
-            logger.error(f"[坐标转换] 转换失败: {e}")
-            return client_x, client_y
+            raise RuntimeError(f"客户区转屏幕坐标失败: {e}") from e
     
     def validate_coordinate(self, coord_info: CoordinateInfo, target_hwnd: int) -> bool:
         """验证坐标是否在窗口范围内"""

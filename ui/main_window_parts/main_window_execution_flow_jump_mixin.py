@@ -87,7 +87,7 @@ class MainWindowExecutionFlowJumpMixin:
 
         """
 
-        logger.info(f"========== _execute_jump_target 被调用 ==========")
+        logger.info("========== _execute_jump_target 被调用 ==========")
 
         logger.info(f"task_id={task_id}")
 
@@ -252,31 +252,3 @@ class MainWindowExecutionFlowJumpMixin:
         """任务移除后，解绑运行时信号。"""
 
         self._disconnect_task_runtime_signals(task_id)
-
-    def _resolve_variables_override(self, task, current_task_id):
-
-        """根据任务与当前上下文状态选择变量覆盖源。"""
-
-        if task is None:
-
-            return None
-
-        try:
-
-            from task_workflow.workflow_vars import pick_variables_override
-
-            return pick_variables_override(
-
-                target_task_id=getattr(task, "task_id", None),
-
-                current_task_id=current_task_id,
-
-                task_workflow_data=getattr(task, "workflow_data", None),
-
-            )
-
-        except Exception as exc:
-
-            logger.warning(f"选择变量覆盖源失败: {exc}")
-
-            return None

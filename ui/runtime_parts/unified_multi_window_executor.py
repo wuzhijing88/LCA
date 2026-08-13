@@ -8,31 +8,25 @@ import asyncio
 import logging
 import time
 import threading
-from typing import Dict, List, Optional, Any, Callable, AsyncGenerator, Union
+from typing import Dict, List, Optional, Any, Callable, AsyncGenerator
 from dataclasses import dataclass, field
 from enum import Enum
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-import weakref
 from collections import defaultdict, deque
-import traceback
 
 from task_workflow.process_proxy import create_process_workflow_runtime
 from utils.thread_start_utils import THREAD_START_TASK_TYPE, is_thread_start_task_type
 
 # PySide6 异步支持
-from PySide6.QtCore import QObject, Signal, QTimer, QThread
+from PySide6.QtCore import QObject, Signal, QThread
 try:
-    from PySide6.QtAsyncio import QAsyncioEventLoop, QAsyncioTask
     QTASYNCIO_AVAILABLE = True
 except ImportError:
     QTASYNCIO_AVAILABLE = False
     logging.warning("PySide6.QtAsyncio 不可用，将使用传统异步模式")
 
 # 增强停止管理器
-from ..runtime_parts.enhanced_multi_window_stop_manager import EnhancedMultiWindowStopManager
-from ..runtime_parts.multi_window_stop_integration import MultiWindowStopIntegration
 
 logger = logging.getLogger(__name__)
 
@@ -358,7 +352,7 @@ class SynchronizationManager:
             for barrier in self._barriers.values():
                 try:
                     barrier.abort()
-                except:
+                except Exception:
                     pass
             self._barriers.clear()
             self._events.clear()
@@ -2373,21 +2367,22 @@ class UnifiedMultiWindowExecutor(QObject):
                 logger.info(f"多窗口执行器使用全局execution_mode: {global_execution_mode}")
             else:
                 logger.info("多窗口执行器未设置全局execution_mode，使用默认后台一模式")
+            from utils.screenshot_helper import get_screenshot_engine
+
+            screenshot_engine = str(get_screenshot_engine() or "").strip().lower()
             workflow_id = f"window_{window.hwnd}_{id(window)}"
             executor, process_thread = create_process_workflow_runtime(
                 cards_data=cards_data,
                 connections_data=connections_data,
                 execution_mode=detected_execution_mode,
+                screenshot_engine=screenshot_engine,
                 images_dir=images_dir,
                 workflow_id=workflow_id,
-                start_card_id=start_card_id,
                 start_card_ids=start_card_ids,
                 target_window_title=target_window_title,
                 target_hwnd=window.hwnd,
                 thread_labels=thread_labels,
                 bound_windows=self._runtime_bound_windows or [{"title": window.title, "hwnd": window.hwnd, "enabled": True}],
-                logger_obj=logger,
-                workflow_data=workflow_data if isinstance(workflow_data, dict) else None,
                 parent=None,
             )
 

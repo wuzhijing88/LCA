@@ -19,7 +19,7 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
-from utils.app_paths import get_app_root, get_user_data_dir
+from utils.app_paths import get_app_root
 from utils.input_simulation.mode_utils import normalize_ib_driver_name
 from utils.input_timing import DEFAULT_CLICK_HOLD_SECONDS, DEFAULT_KEY_HOLD_SECONDS
 from utils.logitech_runtime import detect_logitech_runtime
@@ -197,73 +197,12 @@ class IbInputSimulatorDriver:
             return 0
 
     def _iter_root_candidates(self) -> List[Path]:
-        roots: List[Path] = []
-
-        def add_root(path_value: Any) -> None:
-            try:
-                text = str(path_value or "").strip()
-                if not text:
-                    return
-                root = Path(text).resolve()
-                if not root.exists():
-                    return
-                key = str(root).lower()
-                if key not in seen:
-                    seen.add(key)
-                    roots.append(root)
-            except Exception:
-                return
-
-        seen = set()
-        add_root(get_app_root())
-        add_root(Path.cwd())
-
-        try:
-            add_root(Path(__file__).resolve().parent.parent)
-        except Exception:
-            pass
-
-        try:
-            add_root(Path(sys.executable).resolve().parent)
-        except Exception:
-            pass
-
-        try:
-            add_root(Path(sys.argv[0]).resolve().parent)
-        except Exception:
-            pass
-
-        try:
-            meipass = getattr(sys, "_MEIPASS", "")
-            if meipass:
-                add_root(meipass)
-        except Exception:
-            pass
-
-        add_root(get_user_data_dir("LCA"))
-        return roots
+        return [Path(get_app_root()).resolve()]
 
     def _get_writable_storage_root(self) -> Path:
-        candidates: List[Path] = []
-        for root in self._iter_root_candidates():
-            candidates.append(root)
-
-        candidates.append(Path(get_user_data_dir("LCA")))
-
-        seen = set()
-        for root in candidates:
-            try:
-                key = str(root).lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                test_dir = root / "tools" / "ibinputsimulator"
-                test_dir.mkdir(parents=True, exist_ok=True)
-                return root
-            except Exception:
-                continue
-
-        return Path(get_user_data_dir("LCA"))
+        root = Path(get_app_root()).resolve()
+        (root / "tools" / "ibinputsimulator").mkdir(parents=True, exist_ok=True)
+        return root
 
     def initialize(self) -> bool:
         with self._lock:

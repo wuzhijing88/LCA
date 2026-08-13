@@ -1,7 +1,6 @@
 import logging
 import os
 
-from PySide6.QtCore import QTimer
 
 from ..control_center_parts.control_center_runtime import TaskState
 

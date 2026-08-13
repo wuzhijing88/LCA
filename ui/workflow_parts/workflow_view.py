@@ -131,8 +131,6 @@ class WorkflowView(
 
         # Store cards for easy access
         self.cards: Dict[int, TaskCard] = {}
-        self._next_card_id = 0
-        self._max_loaded_id = -1 # Track max ID during loading
         self._cache_policy_cache_disabled: Optional[bool] = None
         self._cache_policy_shadow_disabled: Optional[bool] = None
         self._render_cache_guard_timer: Optional[QTimer] = None
@@ -148,10 +146,6 @@ class WorkflowView(
             self._render_cache_guard_timer.start()
         except Exception:
             self._render_cache_guard_timer = None
-
-        # --- Log initialization --- 
-        log_func = logging.info if logging.getLogger().hasHandlers() else print
-        log_func("WorkflowView Initialized.")
 
         # --- Demo Setup Removed --- 
         # The user will add cards manually now
@@ -182,9 +176,6 @@ class WorkflowView(
         # <<< ADDED: Track flashing cards >>>
         self.flashing_card_ids = set()
         # <<< END ADDED >>>
-
-        # 防重入标志：防止 _block_edit_if_running 循环弹窗
-        self._is_showing_block_dialog = False
 
         # 网格设置
         self._grid_enabled = False

@@ -61,14 +61,6 @@ def _get_monitor_info_from_handle(monitor_handle) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _safe_positive_int(value: Any, default: int = 96) -> int:
-    try:
-        num = int(value)
-        return num if num > 0 else default
-    except Exception:
-        return default
-
-
 def _get_qt_application():
     try:
         from PySide6.QtWidgets import QApplication
@@ -1731,39 +1723,25 @@ def find_region_binding_equivalent_descendant(
 
 
 def get_window_dpi(hwnd: int) -> int:
-    """获取窗口 DPI，失败返回 96。"""
-    try:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        if hasattr(user32, "GetDpiForWindow"):
-            return _safe_positive_int(user32.GetDpiForWindow(int(hwnd)), 96)
-    except Exception:
-        pass
-    return 96
+    """获取窗口 DPI。GetDpiForWindow 失败则抛错。"""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    if not hasattr(user32, "GetDpiForWindow"):
+        raise RuntimeError("当前系统没有 GetDpiForWindow")
+    dpi = int(user32.GetDpiForWindow(int(hwnd)))
+    if dpi <= 0:
+        raise RuntimeError(f"GetDpiForWindow 返回无效 DPI: hwnd={hwnd}, dpi={dpi}")
+    return dpi
 
 
 def get_system_dpi() -> int:
-    """获取系统 DPI，失败返回 96。"""
-    try:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-
-        user32.GetDC.argtypes = [ctypes.c_void_p]
-        user32.GetDC.restype = ctypes.c_void_p
-        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        user32.ReleaseDC.restype = ctypes.c_int
-        gdi32.GetDeviceCaps.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        gdi32.GetDeviceCaps.restype = ctypes.c_int
-
-        hdc = user32.GetDC(0)
-        if not hdc:
-            return 96
-
-        try:
-            return _safe_positive_int(gdi32.GetDeviceCaps(hdc, 88), 96)  # LOGPIXELSX
-        finally:
-            user32.ReleaseDC(0, hdc)
-    except Exception:
-        return 96
+    """获取系统 DPI。GetDpiForSystem 失败则抛错。"""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    if not hasattr(user32, "GetDpiForSystem"):
+        raise RuntimeError("当前系统没有 GetDpiForSystem")
+    dpi = int(user32.GetDpiForSystem())
+    if dpi <= 0:
+        raise RuntimeError(f"GetDpiForSystem 返回无效 DPI: {dpi}")
+    return dpi
 
 
 def build_window_info(
@@ -1885,5 +1863,7 @@ def build_window_info(
             info["qt_dpi"] = 96.0 * qt_device_pixel_ratio
 
         return info
+    except (RuntimeError, ValueError):
+        raise
     except Exception:
         return None

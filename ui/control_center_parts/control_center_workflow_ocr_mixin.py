@@ -55,7 +55,7 @@ class ControlCenterWorkflowOcrMixin:
         try:
             from services.multiprocess_ocr_pool import cleanup_ocr_services_on_stop
 
-            cleanup_ocr_services_on_stop(deep_cleanup=True)
+            cleanup_ocr_services_on_stop()
             logger.info("\u3010OCR\u6e05\u7406\u3011\u5df2\u5f3a\u5236\u5173\u95ed\u6240\u6709OCR\u5b50\u8fdb\u7a0b")
             self.log_message("OCR\u8fdb\u7a0b\u5df2\u5173\u95ed")
         except Exception as e:

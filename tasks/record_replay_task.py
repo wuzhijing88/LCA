@@ -11,14 +11,13 @@ import logging
 import os
 from typing import Dict, Any, Optional, Tuple
 from pynput.mouse import Button, Controller as MouseController
-from pynput.keyboard import Controller as KeyboardController, Key
+from pynput.keyboard import Controller as KeyboardController
 from utils.app_paths import get_config_path
 from utils.relative_mouse_move import perform_timed_relative_move
 from utils.window_binding_utils import get_bound_windows_for_mode
 
 try:
     import win32api
-    import win32con
     WIN32_AVAILABLE = True
 except ImportError:
     WIN32_AVAILABLE = False
@@ -37,7 +36,6 @@ try:
     from utils.enhanced_input import (
         create_mouse_controller,
         create_keyboard_controller,
-        is_pydirectinput_available
     )
     ENHANCED_INPUT_AVAILABLE = True
 except ImportError:
@@ -256,7 +254,7 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                 logger.info(f"使用传入的窗口句柄: {hwnd} (来自标签页绑定或全局配置)")
             else:
                 # 如果没有传入target_hwnd，回退到从config.json读取（向下兼容）
-                logger.warning(f"未传入target_hwnd，回退到从config.json读取窗口句柄")
+                logger.warning("未传入target_hwnd，回退到从config.json读取窗口句柄")
                 try:
                     config_path = get_config_path()
                     if os.path.exists(config_path):
@@ -278,7 +276,7 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
 
             if hwnd and win32gui.IsWindow(hwnd):
                 # 【关键】使用与录制相同的激活逻辑 - 查找顶级父窗口并使用TOPMOST激活
-                logger.info(f"[录制回放] ========== 开始窗口激活流程 ==========")
+                logger.info("[录制回放] ========== 开始窗口激活流程 ==========")
                 logger.info(f"[录制回放] 绑定窗口句柄: {hwnd}")
 
                 try:
@@ -286,7 +284,7 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                     import win32con
 
                     # 步骤0: 查找顶级父窗口（主窗口）
-                    logger.info(f"[录制回放] 步骤0: 查找顶级父窗口...")
+                    logger.info("[录制回放] 步骤0: 查找顶级父窗口...")
                     target_hwnd = hwnd
                     parent = win32gui.GetParent(hwnd)
 
@@ -308,21 +306,21 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                     activation_hwnd = target_hwnd
 
                     # 步骤1: 恢复最小化的窗口
-                    logger.info(f"[录制回放] 步骤1: 检查窗口是否最小化...")
+                    logger.info("[录制回放] 步骤1: 检查窗口是否最小化...")
                     if win32gui.IsIconic(activation_hwnd):
                         logger.info(f"[录制回放] 窗口已最小化，正在恢复: {activation_hwnd}")
                         win32gui.ShowWindow(activation_hwnd, win32con.SW_RESTORE)
                         time.sleep(0.1)
                     else:
-                        logger.info(f"[录制回放] 窗口未最小化")
+                        logger.info("[录制回放] 窗口未最小化")
 
                     # 步骤2: 确保窗口可见并在顶层
-                    logger.info(f"[录制回放] 步骤2: 显示窗口...")
+                    logger.info("[录制回放] 步骤2: 显示窗口...")
                     win32gui.ShowWindow(activation_hwnd, win32con.SW_SHOW)
                     time.sleep(0.05)
 
                     # 步骤3: 将窗口置于最顶层（临时）
-                    logger.info(f"[录制回放] 步骤3: 设置窗口为TOPMOST...")
+                    logger.info("[录制回放] 步骤3: 设置窗口为TOPMOST...")
                     HWND_TOPMOST = -1
                     HWND_NOTOPMOST = -2
                     SWP_NOMOVE = 0x0002
@@ -335,10 +333,10 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
                     )
                     time.sleep(0.1)
-                    logger.info(f"[录制回放] 已设置为TOPMOST")
+                    logger.info("[录制回放] 已设置为TOPMOST")
 
                     # 步骤4: 获取线程ID并附加输入
-                    logger.info(f"[录制回放] 步骤4: 附加线程输入...")
+                    logger.info("[录制回放] 步骤4: 附加线程输入...")
                     foreground_hwnd = win32gui.GetForegroundWindow()
                     foreground_thread_id = None  # 在外层定义，避免作用域问题
                     target_thread_id = None
@@ -351,35 +349,35 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                         # 附加线程输入
                         if foreground_thread_id != target_thread_id:
                             ctypes.windll.user32.AttachThreadInput(foreground_thread_id, target_thread_id, True)
-                            logger.info(f"[录制回放] 已附加线程输入")
+                            logger.info("[录制回放] 已附加线程输入")
                         else:
-                            logger.info(f"[录制回放] 前台线程与目标线程相同，无需附加")
+                            logger.info("[录制回放] 前台线程与目标线程相同，无需附加")
                     else:
-                        logger.warning(f"[录制回放] 无法获取前台窗口")
+                        logger.warning("[录制回放] 无法获取前台窗口")
 
                     # 步骤5: 设置为前台窗口
-                    logger.info(f"[录制回放] 步骤5: 设置为前台窗口...")
+                    logger.info("[录制回放] 步骤5: 设置为前台窗口...")
                     win32gui.SetForegroundWindow(activation_hwnd)
                     time.sleep(0.1)
                     current_fg = win32gui.GetForegroundWindow()
                     logger.info(f"[录制回放] SetForegroundWindow后，当前前台窗口: {current_fg}")
 
                     # 步骤6: 取消topmost，恢复为普通窗口
-                    logger.info(f"[录制回放] 步骤6: 取消TOPMOST...")
+                    logger.info("[录制回放] 步骤6: 取消TOPMOST...")
                     ctypes.windll.user32.SetWindowPos(
                         activation_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
                     )
 
                     # 步骤7: 分离线程输入
-                    logger.info(f"[录制回放] 步骤7: 分离线程输入...")
+                    logger.info("[录制回放] 步骤7: 分离线程输入...")
                     if foreground_hwnd != 0 and foreground_thread_id is not None and target_thread_id is not None:
                         if foreground_thread_id != target_thread_id:
                             ctypes.windll.user32.AttachThreadInput(foreground_thread_id, target_thread_id, False)
-                            logger.info(f"[录制回放] 已分离线程输入")
+                            logger.info("[录制回放] 已分离线程输入")
 
                     # 步骤8: 再次确认窗口在前台
-                    logger.info(f"[录制回放] 步骤8: 再次确认窗口在前台...")
+                    logger.info("[录制回放] 步骤8: 再次确认窗口在前台...")
                     win32gui.BringWindowToTop(activation_hwnd)
                     time.sleep(0.2)
 
@@ -388,21 +386,21 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                     logger.info(f"[录制回放] 激活完成! 目标窗口: {activation_hwnd} ({window_title}), 当前前台: {final_fg}")
 
                     if final_fg == activation_hwnd:
-                        logger.info(f"[录制回放] ✓ 窗口激活成功!")
+                        logger.info("[录制回放] ✓ 窗口激活成功!")
                     else:
-                        logger.warning(f"[录制回放] ✗ 窗口可能未激活成功，前台窗口不匹配")
+                        logger.warning("[录制回放] ✗ 窗口可能未激活成功，前台窗口不匹配")
 
                 except Exception as e:
                     logger.error(f"[录制回放] ✗ 激活窗口过程发生异常: {e}", exc_info=True)
                     # 尝试备用方法：简单激活
                     try:
-                        logger.info(f"[录制回放] 尝试备用激活方法...")
+                        logger.info("[录制回放] 尝试备用激活方法...")
                         win32gui.ShowWindow(hwnd, 5)  # SW_SHOW
                         win32gui.SetForegroundWindow(hwnd)
-                    except:
+                    except Exception:
                         pass
 
-                logger.info(f"[录制回放] ========== 窗口激活流程结束 ==========")
+                logger.info("[录制回放] ========== 窗口激活流程结束 ==========")
 
                 # 【关键】已在激活流程中等待0.2秒，无需额外等待
 
@@ -452,12 +450,9 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
 
     # 初始化增强型输入控制器
     if ENHANCED_INPUT_AVAILABLE:
-        mouse_ctrl = create_mouse_controller(prefer_pydirectinput=True)
-        keyboard_ctrl = create_keyboard_controller(prefer_pydirectinput=True)
-        if is_pydirectinput_available():
-            logger.info("使用PyDirectInput进行输入控制（极低延迟模式）")
-        else:
-            logger.info("PyDirectInput不可用，使用pynput")
+        mouse_ctrl = create_mouse_controller()
+        keyboard_ctrl = create_keyboard_controller()
+        logger.info("使用 pynput 进行输入控制")
     else:
         mouse_ctrl = MouseController()
         keyboard_ctrl = KeyboardController()
@@ -721,7 +716,7 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                             _execute_replay._replay_engine = ReplayEngine()
                         _execute_replay._replay_engine.execute_action(action, recording_area, window_offset_x, window_offset_y, recording_mode)
                     else:
-                        logger.warning(f"按键为空")
+                        logger.warning("按键为空")
 
                 elif action_type == 'key_release':
                     # 使用统一的回放引擎处理按键释放
@@ -733,7 +728,7 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                             _execute_replay._replay_engine = ReplayEngine()
                         _execute_replay._replay_engine.execute_action(action, recording_area, window_offset_x, window_offset_y, recording_mode)
                     else:
-                        logger.warning(f"按键为空")
+                        logger.warning("按键为空")
 
             except Exception as e:
                 logger.warning(f"回放动作 {i} 失败: {e}")

@@ -8,7 +8,6 @@ import ctypes
 import platform
 import logging
 from collections import deque
-from typing import Callable, Optional
 from utils.precise_sleep import precise_sleep as _shared_precise_sleep
 
 logger = logging.getLogger(__name__)
@@ -41,7 +40,7 @@ class HighPrecisionTimer:
             try:
                 self.winmm.timeEndPeriod(1)
                 logger.debug("Windows高精度计时器已关闭")
-            except:
+            except Exception:
                 pass
 
     @staticmethod

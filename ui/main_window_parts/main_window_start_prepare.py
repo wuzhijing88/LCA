@@ -1,70 +1,16 @@
-from ..workflow_parts import workflow_lifecycle as _wl
+import logging
+import os
 
-QMessageBox = _wl.QMessageBox
-clear_stale_task_executor_refs = _wl.clear_stale_task_executor_refs
-normalize_task_manager_before_start = _wl.normalize_task_manager_before_start
-task_executor_thread_is_running = _wl.task_executor_thread_is_running
-get_favorites_path = _wl.get_favorites_path
-logger = _wl.logger
-os = _wl.os
+from PySide6.QtWidgets import QMessageBox
+
+from utils.app_paths import get_favorites_path
+from ..workflow_parts.workflow_lifecycle import normalize_task_manager_before_start
+
+logger = logging.getLogger(__name__)
 
 
 MSG_NO_EXEC_TITLE = "\u65e0\u6cd5\u6267\u884c"
 MSG_NO_EXEC_TEXT = "\u6ca1\u6709\u53ef\u6267\u884c\u7684\u4efb\u52a1\uff0c\u8bf7\u5148\u5bfc\u5165\u5de5\u4f5c\u6d41"
-MSG_CONFLICT_TITLE = "\u64cd\u4f5c\u51b2\u7a81"
-MSG_CONFLICT_TEXT = "\u6709\u4efb\u52a1\u6b63\u5728\u6e05\u7406\u4e2d\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002"
-
-
-def _resume_paused_tasks_if_needed(ctx) -> bool:
-    self = ctx
-    resumable_tasks = []
-
-    for task in self.task_manager.get_executable_tasks():
-        thread_ref = getattr(task, 'executor_thread', None)
-        if thread_ref is None:
-            continue
-
-        if not task_executor_thread_is_running(task):
-            clear_stale_task_executor_refs(task)
-            if getattr(task, 'status', None) == 'paused':
-                try:
-                    logger.warning(
-                        "task %s is marked paused but executor thread is not running; normalize to stopped before start",
-                        task.task_id,
-                    )
-                    task.stop_reason = 'stopped'
-                    task.status = 'stopped'
-                except Exception as normalize_err:
-                    logger.warning(
-                        "failed to normalize stale paused task before start: task_id=%s, error=%s",
-                        getattr(task, 'task_id', None),
-                        normalize_err,
-                    )
-            continue
-
-        if getattr(task, 'status', None) == 'paused':
-            resumable_tasks.append(task)
-            continue
-
-        logger.warning(
-            "task %s still has a live executor thread reference: status=%s",
-            task.task_id,
-            getattr(task, 'status', None),
-        )
-        QMessageBox.warning(self, MSG_CONFLICT_TITLE, MSG_CONFLICT_TEXT)
-        return True
-
-    if not resumable_tasks:
-        return False
-
-    logger.info(
-        "detected paused tasks with live threads, resume instead of starting: ids=%s",
-        [task.task_id for task in resumable_tasks],
-    )
-    self._resume_workflow()
-    return True
-
-
 def prepare_main_window_start(
     ctx,
     reset_jump_cancel,
@@ -82,9 +28,6 @@ def prepare_main_window_start(
         logger.info('auto jump start: keep jump-cancel flag')
 
     normalize_task_manager_before_start(self.task_manager)
-
-    if _resume_paused_tasks_if_needed(self):
-        return {'should_return': True}
 
     current_canvas_task_id = resolve_current_canvas_task_id()
     current_canvas_task = self.task_manager.get_task(current_canvas_task_id) if current_canvas_task_id is not None else None
@@ -158,9 +101,6 @@ def save_main_window_tasks_before_start(ctx, all_tasks, resolve_current_canvas_t
     logger.info('save and backup tasks before start: total=%s', len(all_tasks))
     saved_count = 0
     backup_failed_tasks = []
-    current_task_id = resolve_current_canvas_task_id()
-
-    from task_workflow.workflow_vars import pick_variables_override
 
     for task in all_tasks:
         workflow_view = self.workflow_tab_widget.task_views.get(task.task_id)
@@ -168,12 +108,7 @@ def save_main_window_tasks_before_start(ctx, all_tasks, resolve_current_canvas_t
 
         if workflow_view:
             logger.info('serialize latest workflow data from canvas: %s', task.name)
-            variables_override = pick_variables_override(
-                target_task_id=task.task_id,
-                current_task_id=current_task_id,
-                task_workflow_data=task.workflow_data,
-            )
-            latest_workflow_data = workflow_view.serialize_workflow(variables_override=variables_override)
+            latest_workflow_data = workflow_view.serialize_workflow()
 
             if latest_workflow_data:
                 task.workflow_data = latest_workflow_data

@@ -7,6 +7,26 @@ from utils.window_binding_utils import (
 
 
 class ParameterPanelTargetWindowSelectionMixin:
+    @staticmethod
+    def _extract_hwnd_from_config(config, source_label: str):
+        """从 config（dict 或带绑定窗口属性的对象）解析第一个启用窗口的句柄。"""
+        if isinstance(config, dict):
+            hwnd = get_active_bound_window_hwnd(config)
+            if hwnd:
+                logger.info(f"从{source_label}活动配置获取窗口句柄: {hwnd}")
+                return hwnd
+        elif hasattr(config, 'active_bound_windows') or hasattr(config, 'bound_windows'):
+            bound_windows = getattr(config, 'active_bound_windows', None)
+            if not isinstance(bound_windows, list):
+                bound_windows = getattr(config, 'bound_windows', None)
+            if bound_windows:
+                enabled_windows = [w for w in bound_windows if w.get('enabled', True)]
+                if enabled_windows:
+                    hwnd = enabled_windows[0].get('hwnd')
+                    logger.info(f"从{source_label}配置对象获取窗口句柄: {hwnd}")
+                    return hwnd
+        return None
+
     def _get_target_window_hwnd(self):
         """获取目标窗口句柄（带全局验证）"""
         try:
@@ -29,7 +49,7 @@ class ParameterPanelTargetWindowSelectionMixin:
                             logger.info(f"已静默切换到有效句柄: {validated_hwnd}（不修改标签页绑定）")
                             return validated_hwnd
                         else:
-                            logger.warning(f"没有可用的全局绑定窗口，继续尝试其他方式获取")
+                            logger.warning("没有可用的全局绑定窗口，继续尝试其他方式获取")
                             # 继续往下执行
                 else:
                     # 如果无法验证，直接返回
@@ -46,41 +66,15 @@ class ParameterPanelTargetWindowSelectionMixin:
 
                 # 检查是否有config属性（主窗口）
                 if hasattr(current_widget, 'config'):
-                    config = current_widget.config
-                    if isinstance(config, dict):
-                        hwnd = get_active_bound_window_hwnd(config)
-                        if hwnd:
-                            logger.info(f"从主窗口活动配置获取窗口句柄: {hwnd}")
-                            return hwnd
-                    elif hasattr(config, 'active_bound_windows') or hasattr(config, 'bound_windows'):
-                        bound_windows = getattr(config, 'active_bound_windows', None)
-                        if not isinstance(bound_windows, list):
-                            bound_windows = getattr(config, 'bound_windows', None)
-                        if bound_windows:
-                            enabled_windows = [w for w in bound_windows if w.get('enabled', True)]
-                            if enabled_windows:
-                                hwnd = enabled_windows[0].get('hwnd')
-                                logger.info(f"从主窗口配置对象获取窗口句柄: {hwnd}")
-                                return hwnd
+                    hwnd = self._extract_hwnd_from_config(current_widget.config, '主窗口')
+                    if hwnd:
+                        return hwnd
 
                 # 检查是否有runner属性（参数面板）
                 if hasattr(current_widget, 'runner') and hasattr(current_widget.runner, 'config'):
-                    config = current_widget.runner.config
-                    if isinstance(config, dict):
-                        hwnd = get_active_bound_window_hwnd(config)
-                        if hwnd:
-                            logger.info(f"从runner活动配置获取窗口句柄: {hwnd}")
-                            return hwnd
-                    elif hasattr(config, 'active_bound_windows') or hasattr(config, 'bound_windows'):
-                        bound_windows = getattr(config, 'active_bound_windows', None)
-                        if not isinstance(bound_windows, list):
-                            bound_windows = getattr(config, 'bound_windows', None)
-                        if bound_windows:
-                            enabled_windows = [w for w in bound_windows if w.get('enabled', True)]
-                            if enabled_windows:
-                                hwnd = enabled_windows[0].get('hwnd')
-                                logger.info(f"从runner配置对象获取窗口句柄: {hwnd}")
-                                return hwnd
+                    hwnd = self._extract_hwnd_from_config(current_widget.runner.config, 'runner')
+                    if hwnd:
+                        return hwnd
 
                 # 检查是否有bound_windows属性（主窗口直接属性）
                 if hasattr(current_widget, 'bound_windows') and current_widget.bound_windows:

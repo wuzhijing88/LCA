@@ -19,6 +19,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import onnxruntime as ort
+from utils.app_paths import get_app_root
 from utils.input_simulation.mode_utils import is_foreground_mode
 
 logger = logging.getLogger(__name__)
@@ -31,15 +33,6 @@ def _read_max_cached_engine_instances() -> int:
     except Exception:
         value = 2
     return max(1, min(8, value))
-
-# 尝试导入ONNX Runtime
-try:
-    import onnxruntime as ort
-    ONNX_AVAILABLE = True
-    logger.info("✓ ONNX Runtime 可用")
-except ImportError as exc:
-    ONNX_AVAILABLE = False
-    logger.warning("× ONNX Runtime 不可用: %s", exc)
 
 
 @dataclass
@@ -157,9 +150,6 @@ class YOLOONNXEngine:
             self._apply_runtime_thresholds(conf_threshold, iou_threshold)
             return
 
-        if not ONNX_AVAILABLE:
-            raise RuntimeError("ONNX Runtime 不可用，请安装: pip install onnxruntime")
-
         self.model_path = model_path
         self.conf_threshold = 0.5
         self.iou_threshold = 0.45
@@ -177,27 +167,17 @@ class YOLOONNXEngine:
         self._apply_runtime_thresholds(conf_threshold, iou_threshold)
         self._initialized = True
 
-    def _resolve_model_path(self) -> Optional[Path]:
-        """解析模型路径"""
+    def _resolve_model_path(self) -> Path:
         path = Path(self.model_path)
+        if path.is_absolute():
+            if path.is_file():
+                return path
+            raise FileNotFoundError(f"模型文件不存在: {path}")
 
-        if path.is_absolute() and path.exists():
-            return path
-
-        current_dir = Path(__file__).parent
-        project_root = current_dir.parent
-
-        candidates = [
-            project_root / self.model_path,
-            project_root / "yolo" / Path(self.model_path).name,
-            Path(self.model_path),
-        ]
-
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-        return None
+        candidate = Path(get_app_root()) / self.model_path
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError(f"模型文件不存在: {candidate}")
 
     def _load_model(self) -> bool:
         """加载ONNX模型"""
@@ -210,13 +190,8 @@ class YOLOONNXEngine:
 
             try:
                 model_path = self._resolve_model_path()
-                if model_path is None:
-                    logger.error(f"模型文件不存在: {self.model_path}")
-                    return False
-
-                if not model_path.suffix.lower() == '.onnx':
-                    logger.error(f"不支持的模型格式: {model_path.suffix}，只支持.onnx格式")
-                    return False
+                if model_path.suffix.lower() != '.onnx':
+                    raise ValueError(f"不支持的模型格式: {model_path.suffix}，只支持.onnx格式")
 
                 # 创建ONNX Runtime会话
                 sess_options = ort.SessionOptions()
@@ -275,9 +250,7 @@ class YOLOONNXEngine:
 
             except Exception as e:
                 logger.error(f"加载ONNX模型失败: {e}")
-                import traceback
-                traceback.print_exc()
-                return False
+                raise
 
 
     @staticmethod
@@ -505,8 +478,7 @@ class YOLOONNXEngine:
 
     def predict(self, image: np.ndarray, classes: Optional[List[str]] = None) -> List[DetectionResult]:
         """执行检测"""
-        if not self._load_model():
-            return []
+        self._load_model()
 
         try:
             import time
@@ -592,9 +564,7 @@ class YOLOONNXEngine:
                         iou_threshold: Optional[float] = None,
                         tracker_type: str = "bytetrack.yaml",
                         persist: bool = True) -> Tuple[List[DetectionResult], Optional[np.ndarray]]:
-        """从窗口句柄进行跟踪（ONNX不支持跟踪，降级为检测）"""
-        logger.warning("ONNX模式不支持目标跟踪，使用普通检测")
-        return self.detect_from_hwnd(hwnd, target_classes, conf_threshold, execution_mode, iou_threshold)
+        raise RuntimeError("ONNX 引擎不支持目标跟踪")
 
     def _capture_window(self, hwnd: int, execution_mode: str = "background") -> Optional[np.ndarray]:
         """捕获窗口截图。"""
@@ -656,7 +626,7 @@ class YOLOONNXEngine:
 
     @property
     def names(self) -> Dict[int, str]:
-        """获取类别名称字典（兼容ultralytics接口）"""
+        """获取类别名称字典"""
         return {i: name for i, name in enumerate(self._class_names)}
 
     def unload_model(self):
@@ -707,36 +677,19 @@ class YOLOONNXEngine:
 
 
 def get_yolo_engine(model_path: str = "yolo/yolov8n.onnx",
-                    device: str = "auto",  # ONNX ignores
                     conf_threshold: float = 0.5,
                     iou_threshold: float = 0.45,
-                    half: bool = False,  # ONNX ignores
-                    max_det: int = 300,
-                    input_size: Optional[int] = None) -> Optional[YOLOONNXEngine]:  # ONNX忽略此参数
-    """
-    获取YOLO引擎实例（单例）
+                    input_size: Optional[int] = None) -> YOLOONNXEngine:
+    """获取 YOLO ONNX 引擎实例。"""
+    normalized_path = str(model_path or "").strip()
+    if not normalized_path:
+        raise ValueError("YOLO 模型路径不能为空")
+    if normalized_path.lower().endswith(".pt"):
+        raise ValueError("YOLO 只支持 .onnx 模型，不接受 .pt")
 
-    注意：ONNX版本会忽略device/half/max_det参数，仅使用CPU推理
-    """
-    # 自动转换.pt为.onnx路径
-    if model_path.endswith('.pt'):
-        onnx_path = model_path.replace('.pt', '.onnx')
-        logger.warning(f"ONNX模式不支持.pt模型，尝试使用: {onnx_path}")
-        logger.warning("如果模型不存在，请使用 utils/convert_yolo_to_onnx.py 转换")
-        model_path = onnx_path
-
-    try:
-        return YOLOONNXEngine(
-            model_path=model_path,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-            input_size=input_size,
-        )
-    except Exception as e:
-        logger.error(f"创建YOLO引擎失败: {e}")
-        return None
-
-
-# 兼容旧接口
-YOLODetection = DetectionResult
-YOLOEngine = YOLOONNXEngine  # 别名
+    return YOLOONNXEngine(
+        model_path=normalized_path,
+        conf_threshold=conf_threshold,
+        iou_threshold=iou_threshold,
+        input_size=input_size,
+    )

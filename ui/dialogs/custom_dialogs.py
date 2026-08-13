@@ -1,7 +1,6 @@
-import sys
 from PySide6.QtWidgets import (QApplication, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, 
-                               QSpacerItem, QSizePolicy, QDialogButtonBox, QStyle, QWidget, QMessageBox, QTextEdit)
-from PySide6.QtGui import QPixmap, QIcon, QPainter, QPen, QColor, QFont
+                               QDialogButtonBox, QStyle, QWidget, QTextEdit)
+from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
 from PySide6.QtCore import Qt, QSize
 from typing import Optional # Use Optional for compatibility
 

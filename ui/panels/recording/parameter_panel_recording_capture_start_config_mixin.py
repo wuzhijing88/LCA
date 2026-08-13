@@ -59,7 +59,7 @@ class ParameterPanelRecordingCaptureStartConfigMixin:
                 activation_hwnd = self._activate_bound_window(hwnd, log_prefix='录制')
                 window_title = win32gui.GetWindowText(activation_hwnd)
                 logger.info(
-                    f'已激活录制目标窗口 '
+                    '已激活录制目标窗口 '
                     f'(句柄={activation_hwnd}, 标题={window_title})'
                 )
             except Exception as error:

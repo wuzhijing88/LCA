@@ -1,6 +1,5 @@
 import copy
 import logging
-import os
 
 from PySide6.QtCore import Qt
 from task_workflow.process_proxy import create_process_workflow_runtime
@@ -108,31 +107,6 @@ class WindowTaskRunnerExecutionMixin:
 
             self._rebuild_card_step_labels(cards)
 
-            cpu_thread_limit = self._get_cpu_logical_thread_limit()
-            if len(session_start_card_ids) > cpu_thread_limit:
-                original_ids = list(session_start_card_ids)
-                session_start_card_ids = original_ids[:cpu_thread_limit]
-                ignored_ids = original_ids[cpu_thread_limit:]
-                allowed_ids = set(session_start_card_ids)
-                thread_labels = {
-                    card_id: label
-                    for card_id, label in thread_labels.items()
-                    if card_id in allowed_ids
-                }
-                logger.warning(
-                    "中控窗口%s线程起点数量(%d)超过CPU逻辑线程上限(%d)，已裁剪为 %d",
-                    self.window_id,
-                    len(original_ids),
-                    cpu_thread_limit,
-                    len(session_start_card_ids),
-                )
-                logger.warning(
-                    "中控窗口%s保留线程起点: %s，忽略线程起点: %s",
-                    self.window_id,
-                    session_start_card_ids,
-                    ignored_ids,
-                )
-
             connections_list = self.workflow_data.get('connections', [])
             if not isinstance(connections_list, list):
                 logger.warning(f"Window {self.window_id} workflow connections must be a list, got {type(connections_list)}")
@@ -184,17 +158,15 @@ class WindowTaskRunnerExecutionMixin:
                 cards_data=cards_dict,
                 connections_data=connections_list,
                 execution_mode=execution_mode,
+                screenshot_engine=self._runtime_config.get("screenshot_engine"),
                 images_dir=images_dir,
                 workflow_id=workflow_id,
                 workflow_filepath=self.workflow_file_path,
-                start_card_id=start_card_id_for_executor,
                 start_card_ids=session_start_card_ids,
                 target_window_title=window_title,
                 target_hwnd=window_hwnd,
                 thread_labels=thread_labels,
                 bound_windows=self.bound_windows,
-                logger_obj=logger,
-                config=self._runtime_config,
                 parent=None,
             )
 
@@ -260,7 +232,7 @@ class WindowTaskRunnerExecutionMixin:
         """工作流开始执行回调"""
         logger.info(f"_on_execution_started 被调用: window_id={self.window_id}")
         self._set_state(TaskState.RUNNING, "工作流已启动")
-        logger.info(f"已发出状态更新信号: 正在运行, 步骤: 工作流已启动")
+        logger.info("已发出状态更新信号: 正在运行, 步骤: 工作流已启动")
 
     def _on_step_details(self, details):
         """步骤详情更新回调"""
@@ -290,9 +262,6 @@ class WindowTaskRunnerExecutionMixin:
             self._last_execution_success = bool(success)
             if not self._capture_runtime_variables_from_executor(self.executor):
                 self._capture_runtime_variables_from_executor(getattr(self, "executor", None))
-            if isinstance(self._last_runtime_variables, dict) and isinstance(self.workflow_data, dict):
-                self.workflow_data["variables"] = copy.deepcopy(self._last_runtime_variables)
-
             # 区分不同的完成状态
             if "被用户停止" in message or "用户停止" in message:
                 # 用户主动停止

@@ -13,7 +13,7 @@
 import time
 import threading
 import concurrent.futures
-from typing import Dict, Any, Optional, Tuple, List, NamedTuple
+from typing import Dict, Any, Optional, Tuple, List
 import cv2
 import numpy as np
 from utils.smart_image_matcher import normalize_match_image
@@ -89,7 +89,6 @@ class ParallelImageRecognizer:
         self.thread_pool = None
         self._screenshot_cache = {}
         self._cache_lock = threading.Lock()
-        self._use_subprocess_match = True
 
         logger.info(f"并行图片识别器初始化: 最大线程数={max_workers} (CPU线程数自动检测)")
     
@@ -193,14 +192,14 @@ class ParallelImageRecognizer:
                         logger.debug(f"缓存截图已过期({(time.time() - cached_time)*1000:.1f}ms)，重新截图")
                         try:
                             del cached_screenshot
-                        except:
+                        except Exception:
                             pass
                         del self._screenshot_cache[cache_key]
                 else:
                     # 旧格式缓存，清理掉
                     try:
                         del cached_data
-                    except:
+                    except Exception:
                         pass
                     del self._screenshot_cache[cache_key]
 
@@ -218,7 +217,7 @@ class ParallelImageRecognizer:
                             del old_ss
                         else:
                             del old_data
-                    except:
+                    except Exception:
                         pass
                 self._screenshot_cache.clear()
                 # 保存新截图和时间戳
@@ -276,7 +275,7 @@ class ParallelImageRecognizer:
                                 screenshot = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
                             else:
                                 screenshot = None
-                            logger.debug(f"[并行识别-前台] 使用统一截图接口，确保坐标为客户区坐标")
+                            logger.debug("[并行识别-前台] 使用统一截图接口，确保坐标为客户区坐标")
                         else:
                             # 没有窗口句柄时才使用全屏截图
                             import mss
@@ -286,7 +285,7 @@ class ParallelImageRecognizer:
                                 sct_img = sct.grab(monitor)
                                 screenshot = np.array(sct_img)
                                 screenshot = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
-                            logger.warning(f"[并行识别-前台] 无窗口句柄，使用全屏截图（坐标为屏幕坐标）")
+                            logger.warning("[并行识别-前台] 无窗口句柄，使用全屏截图（坐标为屏幕坐标）")
                     else:
                         logger.error(f"不支持的执行模式: {execution_mode}")
                         return None
@@ -580,13 +579,6 @@ class ParallelImageRecognizer:
                 except Exception:
                     pass
             self._screenshot_cache.clear()
-
-        try:
-            from services.multiprocess_match_pool import clear_match_subprocess_runtime
-            clear_match_subprocess_runtime()
-        except Exception:
-            pass
-        self._use_subprocess_match = True
 
     def clear_cache(self):
         """兼容接口：清理缓存。"""

@@ -5,9 +5,9 @@ DPI变化通知组件
 
 import logging
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                              QPushButton, QFrame, QMessageBox, QProgressBar)
-from PySide6.QtCore import Qt, QTimer, Signal, QThread
-from PySide6.QtGui import QFont, QIcon
+                              QPushButton, QMessageBox, QProgressBar)
+from PySide6.QtCore import QTimer, Signal, QThread
+from PySide6.QtGui import QFont
 from utils.window_activation_utils import show_and_raise_widget
 
 logger = logging.getLogger(__name__)
@@ -351,7 +351,7 @@ class DPINotificationWidget(QWidget):
         else:
             self.detail_label.setText(
                 f"DPI从 {old_dpi} ({old_scale:.0%}) 变更为 {new_dpi} ({new_scale:.0%})，"
-                f"OCR区域可能需要重新校准"
+                "OCR区域可能需要重新校准"
             )
 
         # 重置UI状态

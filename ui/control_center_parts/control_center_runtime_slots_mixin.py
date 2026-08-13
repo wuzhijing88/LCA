@@ -132,23 +132,22 @@ class WindowTaskRunnerSlotsMixin:
         return f"cc_{window_part}_{slot_part}_{digest}"
 
     def _import_workflow_variables(self, workflow_id: str) -> None:
-        if not isinstance(self.workflow_data, dict):
-            return
-        variables_data = self.workflow_data.get("variables")
-        if not isinstance(variables_data, dict):
-            return
-        try:
-            from task_workflow.workflow_context import import_global_vars
+        """按工作流路径绑定并加载 SQLite 运行变量。"""
+        from task_workflow.runtime_var_store import build_task_key, load_runtime_snapshot
+        from task_workflow.workflow_context import get_workflow_context, import_global_vars
 
-            import_global_vars(variables_data, workflow_id=workflow_id)
-            logger.info(
-                "窗口%s加载运行变量: workflow_id=%s, var_count=%d",
-                self.window_id,
-                workflow_id,
-                self._count_runtime_vars(variables_data),
-            )
-        except Exception as exc:
-            logger.warning("窗口%s加载运行变量失败: %s", self.window_id, exc)
+        task_key = build_task_key(
+            filepath=self.workflow_file_path,
+            task_id=self.workflow_slot,
+            task_name=None,
+        )
+        variables, sources = load_runtime_snapshot(task_key)
+        snapshot = {"global_vars": variables, "var_sources": sources}
+        import_global_vars(snapshot, workflow_id=workflow_id)
+        context = get_workflow_context(workflow_id)
+        context.bind_runtime_storage(task_key=task_key, dirty=False)
+        if isinstance(self.workflow_data, dict):
+            self.workflow_data.pop("variables", None)
 
     def _capture_runtime_variables_from_executor(self, executor_obj) -> bool:
         if executor_obj is None:

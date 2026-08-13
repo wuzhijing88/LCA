@@ -1,253 +1,169 @@
 # -*- coding: utf-8 -*-
-"""
-统一的子进程兜底清理工具。
-
-用于在池对象不存在或状态丢失时，按命令行标记回收工程内孤儿 worker 进程。
-"""
+"""Strict lifecycle registry for subprocess workers owned by this process."""
 
 from __future__ import annotations
 
 import os
 import subprocess
-from typing import Iterable, List, Optional, Set, Tuple
+import threading
+from dataclasses import dataclass
+from typing import Iterable, Tuple
+
+
+class WorkerProcessCleanupError(RuntimeError):
+    def __init__(self, failed_pids: Iterable[int]):
+        self.failed_pids = tuple(sorted({int(pid) for pid in failed_pids}))
+        super().__init__(
+            "failed to terminate registered worker processes: "
+            + ", ".join(str(pid) for pid in self.failed_pids)
+        )
+
+
+@dataclass(frozen=True)
+class _RegisteredWorker:
+    pid: int
+    flag: str
+    process: subprocess.Popen
+
+
+_REGISTRY_LOCK = threading.RLock()
+_REGISTERED_WORKERS: dict[int, _RegisteredWorker] = {}
 
 
 def _normalize_flags(worker_flags: Iterable[str]) -> Tuple[str, ...]:
-    flags: List[str] = []
-    for flag in worker_flags:
-        text = str(flag or "").strip().lower()
-        if text and text not in flags:
-            flags.append(text)
+    if isinstance(worker_flags, (str, bytes)):
+        raise TypeError("worker_flags must be an iterable of flag strings")
+
+    flags = []
+    for raw_flag in worker_flags:
+        if not isinstance(raw_flag, str):
+            raise TypeError("worker flag must be a string")
+        flag = raw_flag.strip().lower()
+        if not flag.startswith("--") or any(character.isspace() for character in flag):
+            raise ValueError(f"invalid worker flag: {raw_flag!r}")
+        if flag in flags:
+            raise ValueError(f"duplicate worker flag: {flag}")
+        flags.append(flag)
+    if not flags:
+        raise ValueError("at least one worker flag is required")
     return tuple(flags)
 
 
-def _normalize_cmdline(cmdline_raw) -> str:
-    try:
-        if isinstance(cmdline_raw, (list, tuple)):
-            return " ".join(str(part) for part in cmdline_raw).lower()
-        return str(cmdline_raw or "").lower()
-    except Exception:
-        return ""
+def _process_pid(process: subprocess.Popen) -> int:
+    if process is None:
+        raise TypeError("process cannot be None")
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError(f"worker process has an invalid pid: {pid!r}")
+    if pid == os.getpid():
+        raise ValueError("cannot register the current process as a worker")
+    if not callable(getattr(process, "poll", None)):
+        raise TypeError("process must provide poll()")
+    return pid
 
 
-def _cmdline_matches(cmdline_text: str, worker_flags: Tuple[str, ...], project_root_lc: str) -> bool:
-    if not cmdline_text:
-        return False
-    if project_root_lc and project_root_lc not in cmdline_text:
-        return False
-    return any(flag in cmdline_text for flag in worker_flags)
+def register_worker_process(process: subprocess.Popen, worker_flag: str) -> int:
+    pid = _process_pid(process)
+    (flag,) = _normalize_flags((worker_flag,))
+    if process.poll() is not None:
+        raise RuntimeError(f"cannot register an exited worker process: pid={pid}")
+
+    with _REGISTRY_LOCK:
+        if pid in _REGISTERED_WORKERS:
+            raise RuntimeError(f"worker process is already registered: pid={pid}")
+        _REGISTERED_WORKERS[pid] = _RegisteredWorker(
+            pid=pid,
+            flag=flag,
+            process=process,
+        )
+    return pid
 
 
-def _normalize_path_text(path_raw) -> str:
-    try:
-        text = str(path_raw or "").strip()
-        if not text:
-            return ""
-        return os.path.abspath(text).lower()
-    except Exception:
-        return ""
-
-
-def _is_path_within_project(path_text: str, project_root_lc: str) -> bool:
-    normalized_path = _normalize_path_text(path_text)
-    normalized_root = _normalize_path_text(project_root_lc)
-    if not normalized_path or not normalized_root:
-        return False
-
-    try:
-        return os.path.commonpath([normalized_path, normalized_root]) == normalized_root
-    except Exception:
-        return False
-
-
-def _extract_process_path(proc, info_key: str, getter_name: str) -> str:
-    try:
-        info = getattr(proc, "info", None)
-        if isinstance(info, dict):
-            candidate = info.get(info_key)
-            if candidate:
-                return _normalize_path_text(candidate)
-    except Exception:
-        pass
-
-    try:
-        getter = getattr(proc, getter_name, None)
-        if callable(getter):
-            return _normalize_path_text(getter())
-    except Exception:
-        pass
-    return ""
-
-
-def _process_matches_worker(
-    proc,
-    worker_flags: Tuple[str, ...],
-    project_root_lc: str,
-    *,
-    require_project_root: bool,
-) -> bool:
-    try:
-        info = getattr(proc, "info", None)
-        if isinstance(info, dict):
-            cmd_text = _normalize_cmdline(info.get("cmdline") or [])
-        else:
-            cmd_text = _normalize_cmdline(getattr(proc, "cmdline", lambda: [])())
-    except Exception:
-        cmd_text = ""
-
-    if not any(flag in cmd_text for flag in worker_flags):
-        return False
-    if not require_project_root or not project_root_lc:
-        return True
-    if project_root_lc in cmd_text:
-        return True
-
-    exe_path = _extract_process_path(proc, "exe", "exe")
-    if _is_path_within_project(exe_path, project_root_lc):
-        return True
-
-    cwd_path = _extract_process_path(proc, "cwd", "cwd")
-    return _is_path_within_project(cwd_path, project_root_lc)
-
-
-def _kill_pid_tree(pid: int) -> bool:
+def unregister_worker_process(process_or_pid) -> bool:
+    if isinstance(process_or_pid, bool):
+        raise TypeError("worker pid must be an integer")
+    if isinstance(process_or_pid, int):
+        pid = process_or_pid
+    else:
+        pid = _process_pid(process_or_pid)
     if pid <= 0:
-        return False
+        raise ValueError("worker pid must be greater than zero")
 
-    # Windows 下优先 taskkill /T，保证整棵子树回收。
-    if os.name == "nt":
-        startupinfo = None
-        creationflags = 0
-        try:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            creationflags = subprocess.CREATE_NO_WINDOW
-        except Exception:
-            startupinfo = None
-            creationflags = 0
+    with _REGISTRY_LOCK:
+        return _REGISTERED_WORKERS.pop(pid, None) is not None
 
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3.0,
-                check=False,
-                startupinfo=startupinfo,
-                creationflags=creationflags,
+
+def get_registered_worker_pids(worker_flags: Iterable[str]) -> Tuple[int, ...]:
+    flags = set(_normalize_flags(worker_flags))
+    with _REGISTRY_LOCK:
+        return tuple(
+            sorted(
+                pid
+                for pid, registration in _REGISTERED_WORKERS.items()
+                if registration.flag in flags
             )
-        except Exception:
-            pass
+        )
+
+
+def _kill_registered_process(registration: _RegisteredWorker, timeout: float = 3.0) -> bool:
+    process = registration.process
+    if process.poll() is not None:
+        return True
+
+    if os.name == "nt":
+        result = subprocess.run(
+            ["taskkill", "/PID", str(registration.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=float(timeout),
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0 and process.poll() is None:
+            return False
+    else:
+        process.terminate()
 
     try:
-        import psutil
-
-        if not psutil.pid_exists(pid):
-            return True
-
-        proc = psutil.Process(pid)
-        children = proc.children(recursive=True)
-        for child in children:
-            try:
-                child.terminate()
-            except Exception:
-                pass
-        try:
-            psutil.wait_procs(children, timeout=1.0)
-        except Exception:
-            pass
-        for child in children:
-            try:
-                if child.is_running():
-                    child.kill()
-            except Exception:
-                pass
-
-        try:
-            if proc.is_running():
-                proc.terminate()
-                proc.wait(timeout=1.0)
-        except Exception:
-            try:
-                if proc.is_running():
-                    proc.kill()
-            except Exception:
-                pass
-
-        return not psutil.pid_exists(pid)
-    except Exception:
+        process.wait(timeout=float(timeout))
+    except subprocess.TimeoutExpired:
         return False
+    return process.poll() is not None
 
 
-def cleanup_worker_processes(
-    worker_flags: Iterable[str],
-    project_root: Optional[str] = None,
-    main_pid: Optional[int] = None,
-) -> int:
-    """
-    清理当前工程内匹配命令行标记的 worker 进程。
-
-    Args:
-        worker_flags: worker 命令行标记，如 '--ocr-worker'
-        project_root: 工程根路径（用于缩小匹配范围）
-        main_pid: 主进程 PID（默认当前进程）
-
-    Returns:
-        成功回收的进程数量
-    """
-    flags = _normalize_flags(worker_flags)
-    if not flags:
-        return 0
-
-    current_pid = int(main_pid or os.getpid())
-    root = project_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    project_root_lc = os.path.abspath(root).lower()
-    target_pids: Set[int] = set()
-
-    try:
-        import psutil
-
-        # 先收集当前主进程子树中的目标进程（即使命令行未完整读取，也优先尝试）
-        try:
-            parent_proc = psutil.Process(current_pid)
-            for child in parent_proc.children(recursive=True):
-                try:
-                    child_pid = int(child.pid)
-                except Exception:
-                    continue
-                if child_pid <= 0 or child_pid == current_pid:
-                    continue
-                if _process_matches_worker(
-                    child,
-                    flags,
-                    project_root_lc,
-                    require_project_root=False,
-                ):
-                    target_pids.add(child_pid)
-        except Exception:
-            pass
-
-        # 再扫描同工程的旧代孤儿进程
-        for proc in psutil.process_iter(["pid", "cmdline"]):
-            try:
-                pid = int(proc.info.get("pid") or 0)
-            except Exception:
-                continue
-            if pid <= 0 or pid == current_pid:
-                continue
-            if _process_matches_worker(
-                proc,
-                flags,
-                project_root_lc,
-                require_project_root=True,
-            ):
-                target_pids.add(pid)
-    except Exception:
-        return 0
+def cleanup_worker_processes(worker_flags: Iterable[str]) -> int:
+    flags = set(_normalize_flags(worker_flags))
+    with _REGISTRY_LOCK:
+        registrations = tuple(
+            registration
+            for registration in _REGISTERED_WORKERS.values()
+            if registration.flag in flags
+        )
 
     cleaned_count = 0
-    for pid in sorted(target_pids):
-        if _kill_pid_tree(pid):
-            cleaned_count += 1
+    failed_pids = []
+    for registration in registrations:
+        try:
+            terminated = _kill_registered_process(registration)
+        except (OSError, subprocess.SubprocessError):
+            terminated = False
+
+        if not terminated:
+            failed_pids.append(registration.pid)
+            continue
+
+        with _REGISTRY_LOCK:
+            _REGISTERED_WORKERS.pop(registration.pid, None)
+        cleaned_count += 1
+
+    if failed_pids:
+        raise WorkerProcessCleanupError(failed_pids)
     return cleaned_count
+
+
+def cleanup_all_registered_worker_processes() -> int:
+    with _REGISTRY_LOCK:
+        flags = tuple(sorted({registration.flag for registration in _REGISTERED_WORKERS.values()}))
+    if not flags:
+        return 0
+    return cleanup_worker_processes(flags)

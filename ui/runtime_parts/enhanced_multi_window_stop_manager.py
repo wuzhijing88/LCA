@@ -5,23 +5,27 @@
 import logging
 import threading
 import time
-import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Callable, Any, Set
+from typing import Dict, List, Optional, Callable, Any
 from PySide6.QtCore import QObject, Signal, QTimer
+from services.multiprocess_ocr_pool import get_existing_multiprocess_ocr_pool
 
 logger = logging.getLogger(__name__)
 
-# 导入OCR停止管理器
-try:
-    from services.enhanced_ocr_pool_stop_manager import get_ocr_stop_manager
-    OCR_STOP_MANAGER_AVAILABLE = True
-except ImportError:
-    OCR_STOP_MANAGER_AVAILABLE = False
-    logger.warning("OCR停止管理器不可用")
+
+def unregister_ocr_windows(window_hwnds: List[int]) -> int:
+    """Remove OCR bindings for exactly the requested windows."""
+    ocr_pool = get_existing_multiprocess_ocr_pool()
+    if ocr_pool is None:
+        return 0
+
+    unregistered_count = 0
+    for window_hwnd in dict.fromkeys(window_hwnds):
+        if ocr_pool.unregister_window(window_hwnd):
+            unregistered_count += 1
+    return unregistered_count
 
 
 class StopState(Enum):
@@ -146,7 +150,7 @@ class GracefulThreadStopper:
             # 2. 等待线程自然结束
             thread.quit()
             if thread.wait(int(timeout * 1000)):
-                logger.debug(f"线程优雅停止成功")
+                logger.debug("线程优雅停止成功")
                 return True
             
             # 3. 不使用 terminate()（可能导致闪退）；保留引用并报告失败
@@ -252,17 +256,6 @@ class EnhancedMultiWindowStopManager(QObject):
         self.thread_stopper = GracefulThreadStopper()
         self.cleanup_manager = ResourceCleanupManager()
 
-        # OCR服务池停止管理器
-        self.ocr_stop_manager = None
-        if OCR_STOP_MANAGER_AVAILABLE:
-            try:
-                self.ocr_stop_manager = get_ocr_stop_manager()
-                logger.info("已集成OCR服务池停止管理器")
-            except Exception as e:
-                logger.warning(f"初始化OCR停止管理器失败: {e}")
-        else:
-            logger.info("OCR停止管理器不可用，跳过集成")
-        
         # 窗口上下文管理
         self.window_contexts: Dict[str, WindowStopContext] = {}
         self._main_lock = threading.RLock()
@@ -451,27 +444,11 @@ class EnhancedMultiWindowStopManager(QObject):
                         context.state = StopState.ERROR
                         context.error_message = str(e)
 
-            # 第四阶段：OCR服务池清理
-            logger.info("第四阶段：清理OCR服务池")
-            if self.ocr_stop_manager:
-                try:
-                    # 同步OCR服务池状态
-                    from services.multiprocess_ocr_pool import get_multi_ocr_pool
-                    ocr_pool = get_multi_ocr_pool()
-                    self.ocr_stop_manager.sync_with_ocr_pool(ocr_pool)
-
-                    # 收集需要停止的窗口句柄
-                    window_hwnds = [ctx.hwnd for ctx in windows_to_stop]
-
-                    # 停止对应的OCR服务
-                    if window_hwnds:
-                        logger.info(f"停止 {len(window_hwnds)} 个窗口的OCR服务")
-                        self.ocr_stop_manager.request_stop_services_for_windows(
-                            window_hwnds, timeout=5.0
-                        )
-
-                except Exception as e:
-                    logger.error(f"OCR服务池清理失败: {e}")
+            # 第四阶段：按窗口注销OCR绑定
+            unregistered_count = unregister_ocr_windows(
+                [context.hwnd for context in windows_to_stop]
+            )
+            logger.info("已注销 %s 个窗口的OCR绑定", unregistered_count)
 
             # 第五阶段：其他资源清理
             logger.info("第五阶段：清理其他资源")
@@ -707,14 +684,6 @@ class EnhancedMultiWindowStopManager(QObject):
 
         # 停止监控
         self.monitor_timer.stop()
-
-        # 清理OCR停止管理器
-        if self.ocr_stop_manager:
-            try:
-                self.ocr_stop_manager.cleanup()
-                logger.debug("OCR停止管理器已清理")
-            except Exception as e:
-                logger.error(f"清理OCR停止管理器失败: {e}")
 
         # 清理信号管理器
         self.signal_manager.cleanup()

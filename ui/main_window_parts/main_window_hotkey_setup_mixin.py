@@ -42,7 +42,7 @@ class MainWindowHotkeySetupMixin:
 
                             keyboard.unhook(hook)
 
-                        except:
+                        except Exception:
 
                             pass
 
@@ -58,7 +58,7 @@ class MainWindowHotkeySetupMixin:
 
                             keyboard.remove_hotkey(hotkey)
 
-                        except:
+                        except Exception:
 
                             pass
 
@@ -442,7 +442,7 @@ class MainWindowHotkeySetupMixin:
 
                         mouse.unhook(hook)
 
-                    except:
+                    except Exception:
 
                         pass
 
@@ -546,7 +546,7 @@ class MainWindowHotkeySetupMixin:
 
                         keyboard.unhook(hook)
 
-                    except:
+                    except Exception:
 
                         pass
 
@@ -560,7 +560,7 @@ class MainWindowHotkeySetupMixin:
 
                         keyboard.remove_hotkey(hotkey)
 
-                    except:
+                    except Exception:
 
                         pass
 

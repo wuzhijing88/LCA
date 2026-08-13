@@ -1,13 +1,20 @@
 from .workflow_view_common import *
 
+operation_logger = logging.getLogger("workflow.operations")
+
+# 本模块只输出撤回结果和必要错误，关闭逐步调试输出。
+debug_print = lambda *args, **kwargs: None
+
 
 class WorkflowViewUndoApplyMixin:
 
     def undo_last_operation(self):
         """撤销最后一个操作。"""
-        debug_print(f"  [UNDO] undo_last_operation called")
+        operation_logger.info("[撤回] 请求撤回，当前历史数量=%s", len(self.undo_stack))
+        debug_print("  [UNDO] undo_last_operation called")
 
         if not self.can_undo():
+            operation_logger.info("[撤回] 无可撤回操作")
             debug_print("  [UNDO] Cannot undo: no operations in stack or workflow is running")
             return
 
@@ -16,12 +23,11 @@ class WorkflowViewUndoApplyMixin:
 
         # 设置撤销操作标志，防止撤销过程中的操作触发新的撤销保存
         self._undoing_operation = True
-        debug_print(f"  [UNDO] Set undoing operation flag to True")
-        logger.info(f"  [UNDO] Set undoing operation flag to True")
+        debug_print("  [UNDO] Set undoing operation flag to True")
 
         # 【闪退修复】双重检查undo_stack，防止竞态条件导致IndexError
         if not self.undo_stack:
-            logger.error("  [UNDO] 撤销栈为空，无法执行撤销（竞态条件）")
+            operation_logger.error("[撤回] 撤销栈为空，无法执行")
             self._undoing_operation = False
             return
 
@@ -37,6 +43,8 @@ class WorkflowViewUndoApplyMixin:
                 self._undo_paste_cards(operation_data)
             elif operation_type == 'delete_card':
                 self._undo_delete_card(operation_data)
+            elif operation_type == 'delete_batch':
+                self._undo_delete_batch(operation_data)
             elif operation_type == 'delete_connection':
                 self._undo_delete_connection(operation_data)
             elif operation_type == 'add_connection':
@@ -45,22 +53,26 @@ class WorkflowViewUndoApplyMixin:
                 self._undo_modify_connection(operation_data)
             elif operation_type == 'add_card':
                 self._undo_add_card(operation_data)
+            elif operation_type == 'change_card_ids':
+                self._undo_change_card_ids(operation_data)
             else:
+                operation_logger.error("[撤回] 未知操作类型: %s", operation_type)
                 debug_print(f"  [UNDO] Unknown operation type: {operation_type}")
                 return
 
             # 更新显示
             self.update_card_sequence_display()
+            operation_logger.info("[撤回] 完成 operation_type=%s，剩余历史数量=%s", operation_type, len(self.undo_stack))
             debug_print(f"  [UNDO] Successfully undone operation: {operation_type}")
 
         except Exception as e:
+            operation_logger.error("[撤回] 失败 operation_type=%s: %s", operation_type, e, exc_info=True)
             debug_print(f"  [UNDO] Error undoing operation {operation_type}: {e}")
-            logger.error(f"撤销操作失败: {e}", exc_info=True)
 
         finally:
             # 无论成功还是失败，都要清除撤销操作标志
             self._undoing_operation = False
-            debug_print(f"  [UNDO] Cleared undoing operation flag")
+            debug_print("  [UNDO] Cleared undoing operation flag")
 
     def _undo_paste_cards(self, operation_data: Dict[str, Any]):
         """撤销粘贴卡片操作"""
@@ -86,6 +98,7 @@ class WorkflowViewUndoApplyMixin:
         """撤销删除卡片操作"""
         card_state = operation_data.get('card_state')
         if not card_state:
+            operation_logger.error("[撤回] 缺少卡片状态，无法恢复")
             debug_print("  [UNDO] No card state found for undo")
             return
 
@@ -97,7 +110,7 @@ class WorkflowViewUndoApplyMixin:
         connections_data = card_state['connections']
 
         debug_print(f"  [UNDO] Restoring deleted card: {card_id} ({task_type})")
-        debug_print(f"  [UNDO] Card state to restore:")
+        debug_print("  [UNDO] Card state to restore:")
         debug_print(f"    - Position: {position}")
         debug_print(f"    - Parameters: {parameters}")
         debug_print(f"    - Custom name: {custom_name}")
@@ -112,6 +125,7 @@ class WorkflowViewUndoApplyMixin:
         debug_print(f"  [UNDO] Calling add_task_card with: pos=({position[0]}, {position[1]}), type={task_type}, id={card_id}")
         restored_card = self.add_task_card(position[0], position[1], task_type, card_id, parameters)
         if not restored_card:
+            operation_logger.error("[撤回] 恢复卡片失败 card_id=%s", card_id)
             debug_print(f"  [撤销] 错误：恢复卡片失败 {card_id}")
             return
 
@@ -123,13 +137,54 @@ class WorkflowViewUndoApplyMixin:
             debug_print(f"  [UNDO] Setting custom name: '{custom_name}'")
             restored_card.set_custom_name(custom_name)
         else:
-            debug_print(f"  [UNDO] No custom name to restore")
+            debug_print("  [UNDO] No custom name to restore")
 
         # 注释已清理（原注释编码损坏）
         debug_print(f"  [UNDO] Scheduling connection restoration for card {card_id} in 500ms")
         QTimer.singleShot(500, lambda: self._restore_card_connections(card_id, connections_data))
 
         debug_print(f"  [UNDO] Successfully restored card {card_id}")
+
+    def _undo_delete_batch(self, operation_data: Dict[str, Any]):
+        """一次恢复批量删除的全部卡片和连线。"""
+        card_states = operation_data.get('card_states')
+        connections_data = operation_data.get('connections')
+        if not isinstance(card_states, list) or not isinstance(connections_data, list):
+            raise TypeError("批量删除撤回数据格式无效")
+
+        for card_state in sorted(card_states, key=lambda item: item['card_id']):
+            card_id = card_state['card_id']
+            if card_id in self.cards:
+                raise RuntimeError(f"恢复批量删除失败，卡片已存在: {card_id}")
+            restored_card = self.add_task_card(
+                card_state['position'][0],
+                card_state['position'][1],
+                card_state['task_type'],
+                card_id,
+                card_state['parameters'],
+            )
+            if restored_card is None:
+                raise RuntimeError(f"恢复批量删除卡片失败: {card_id}")
+            custom_name = card_state.get('custom_name')
+            if custom_name:
+                restored_card.set_custom_name(custom_name)
+
+        restored_keys = set()
+        for connection_data in connections_data:
+            key = (
+                connection_data['start_card_id'],
+                connection_data['end_card_id'],
+                connection_data['line_type'],
+            )
+            if key in restored_keys:
+                continue
+            restored_keys.add(key)
+            start_card = self.cards.get(key[0])
+            end_card = self.cards.get(key[1])
+            if start_card is None or end_card is None:
+                raise RuntimeError(f"恢复批量删除连线失败，缺少端点: {key[0]} -> {key[1]}")
+            if self.add_connection(start_card, end_card, key[2]) is None:
+                raise RuntimeError(f"恢复批量删除连线失败: {key[0]} -> {key[1]} ({key[2]})")
 
     def _restore_card_connections(self, card_id: int, connections_data: List[Dict[str, Any]]):
         """恢复卡片的连接"""
@@ -139,10 +194,11 @@ class WorkflowViewUndoApplyMixin:
         # 设置撤销操作标志，防止连接恢复过程中的操作触发新的撤销保存
         was_undoing = getattr(self, '_undoing_operation', False)
         self._undoing_operation = True
-        debug_print(f"  [UNDO] Set undoing operation flag to True for connection restoration")
+        debug_print("  [UNDO] Set undoing operation flag to True for connection restoration")
 
         restored_card = self.cards.get(card_id)
         if not restored_card:
+            operation_logger.error("[撤回] 恢复连线失败，找不到卡片 card_id=%s", card_id)
             debug_print(f"  [撤销] 错误：无法恢复连线，未找到卡片 {card_id}")
             debug_print(f"  [UNDO] Available cards: {list(self.cards.keys())}")
             return
@@ -183,12 +239,12 @@ class WorkflowViewUndoApplyMixin:
                     break
 
             if existing_conn:
-                debug_print(f"      Connection already exists, skipping")
+                debug_print("      Connection already exists, skipping")
                 successful_restorations += 1
             else:
                 new_conn = self.add_connection(start_card, end_card, line_type)
                 if new_conn:
-                    debug_print(f"      SUCCESS: Restored connection")
+                    debug_print("      SUCCESS: Restored connection")
                     successful_restorations += 1
                 else:
                     debug_print("      错误：创建连线失败")
@@ -198,7 +254,7 @@ class WorkflowViewUndoApplyMixin:
 
         # 如果有连接恢复，触发更新
         if successful_restorations > 0:
-            debug_print(f"  [UNDO] Triggering sequence update after connection restoration")
+            debug_print("  [UNDO] Triggering sequence update after connection restoration")
             self.update_card_sequence_display()
 
         # 恢复撤销操作标志状态
@@ -254,7 +310,7 @@ class WorkflowViewUndoApplyMixin:
 
         if connection_to_remove:
             self.remove_connection(connection_to_remove)
-            debug_print(f"  [UNDO] Added connection removed successfully")
+            debug_print("  [UNDO] Added connection removed successfully")
         else:
             debug_print("  [撤销] 未找到要移除的连线")
 
@@ -267,7 +323,7 @@ class WorkflowViewUndoApplyMixin:
             debug_print("  [UNDO] Missing connection data for modify undo")
             return
 
-        debug_print(f"  [UNDO] Undoing connection modification:")
+        debug_print("  [UNDO] Undoing connection modification:")
         debug_print(f"    Removing new: {new_conn_data['start_card_id']} -> {new_conn_data['end_card_id']} ({new_conn_data['line_type']})")
         debug_print(f"    Restoring old: {old_conn_data['start_card_id']} -> {old_conn_data['end_card_id']} ({old_conn_data['line_type']})")
 
@@ -284,7 +340,7 @@ class WorkflowViewUndoApplyMixin:
 
         if new_connection_to_remove:
             self.remove_connection(new_connection_to_remove)
-            debug_print(f"  [UNDO] Removed new connection")
+            debug_print("  [UNDO] Removed new connection")
         else:
             debug_print("  [撤销] 未找到要移除的新连线")
 
@@ -295,7 +351,7 @@ class WorkflowViewUndoApplyMixin:
         if old_start_card and old_end_card:
             restored_conn = self.add_connection(old_start_card, old_end_card, old_conn_data['line_type'])
             if restored_conn:
-                debug_print(f"  [UNDO] Successfully restored old connection")
+                debug_print("  [UNDO] Successfully restored old connection")
             else:
                 debug_print("  [撤销] 恢复旧连线失败")
         else:
@@ -309,8 +365,17 @@ class WorkflowViewUndoApplyMixin:
             return
 
         card_id = card_data.get('card_id')
-        if card_id and card_id in self.cards:
+        if card_id in self.cards:
             self.delete_card(card_id)
             debug_print(f"  [UNDO] Removed added card: {card_id}")
         else:
             debug_print(f"  [撤销] 未找到要移除的卡片：{card_id}")
+
+    def _undo_change_card_ids(self, operation_data: Dict[str, Any]):
+        id_mapping = operation_data.get('id_mapping')
+        if not isinstance(id_mapping, dict) or not id_mapping:
+            raise TypeError("撤回卡片 ID 操作缺少有效映射")
+        reverse_mapping = {new_id: old_id for old_id, new_id in id_mapping.items()}
+        if len(reverse_mapping) != len(id_mapping):
+            raise ValueError("撤回卡片 ID 映射存在目标冲突")
+        self._apply_card_id_mapping(reverse_mapping)

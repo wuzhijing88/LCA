@@ -1,5 +1,7 @@
 import logging
 
+from .main_window_support import normalize_execution_mode_setting
+
 from PySide6.QtWidgets import QMessageBox
 
 logger = logging.getLogger(__name__)
@@ -25,7 +27,7 @@ class MainWindowExecutionFlowRuntimeMixin:
 
         """
 
-        logger.info(f"========== _on_task_execution_finished 被调用 ==========")
+        logger.info("========== _on_task_execution_finished 被调用 ==========")
 
         logger.info(f"task_id={task_id}, success={success}, stop_reason={stop_reason}")
 
@@ -298,7 +300,7 @@ class MainWindowExecutionFlowRuntimeMixin:
 
                 self._reset_run_button()
 
-            except:
+            except Exception:
 
                 pass
 

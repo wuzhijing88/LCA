@@ -210,11 +210,7 @@ class AsyncScreenshotPipeline:
                 except Exception:
                     pass
 
-        try:
-            self.executor.shutdown(wait=wait, cancel_futures=(not wait))
-        except TypeError:
-            # 兼容旧版本Python
-            self.executor.shutdown(wait=wait)
+        self.executor.shutdown(wait=wait, cancel_futures=(not wait))
 
         with self._lock:
             pending_count = len(self.request_futures)

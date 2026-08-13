@@ -142,8 +142,7 @@ class UnifiedDPIHandler:
     def get_window_dpi_info(self, hwnd: int, check_changes: bool = True) -> Dict[str, Any]:
         """获取窗口DPI信息（带缓存和变化检测）"""
         if not hwnd:
-            logger.warning("窗口句柄为空，返回默认DPI信息")
-            return self._get_default_dpi_info()
+            raise ValueError("窗口句柄为空，无法获取 DPI")
 
         current_time = time.time()
 
@@ -204,21 +203,13 @@ class UnifiedDPIHandler:
                 logger.debug(f"显示器DPI检测失败: {e}")
 
             logger.error(f"窗口 {hwnd} DPI检测失败：GetDpiForWindow/MonitorDPI均不可用")
-            return self._get_default_dpi_info()
+            raise RuntimeError(f"窗口 {hwnd} DPI 不可用")
 
+        except RuntimeError:
+            raise
         except Exception as e:
-            logger.error(f"获取窗口 {hwnd} DPI信息失败: {e}")
-            return self._get_default_dpi_info()
-    
-    def _get_default_dpi_info(self) -> Dict[str, Any]:
-        """获取默认DPI信息"""
-        return {
-            'dpi': 96,
-            'scale_factor': 1.0,
-            'method': 'Default',
-            'is_high_dpi': False
-        }
-    
+            raise RuntimeError(f"获取窗口 {hwnd} DPI信息失败: {e}") from e
+
     def adjust_coordinates(self, hwnd: int, x: int, y: int, 
                           coord_type: str = "client") -> Tuple[int, int]:
         """统一的坐标调整方法"""
@@ -574,7 +565,7 @@ class UnifiedDPIHandler:
 
                 # 清除所有DPI缓存，强制重新检测
                 self.clear_all_cache()
-                logger.info(f"已清除所有DPI缓存，强制重新检测")
+                logger.info("已清除所有DPI缓存，强制重新检测")
 
                 # 触发所有回调函数
                 for callback in self._change_callbacks:
@@ -634,30 +625,13 @@ def serialize_window_dpi_info(
 ) -> Dict[str, Any]:
     """Return the persisted DPI payload used by the UI/config layer."""
     timestamp = float(recorded_at if recorded_at is not None else time.time())
-    raw_info: Dict[str, Any] = {}
-
-    try:
-        handler = dpi_handler if dpi_handler is not None else get_unified_dpi_handler()
-        raw_info = handler.get_window_dpi_info(hwnd, check_changes=False) or {}
-    except Exception as exc:
-        logger.warning(f"获取窗口DPI信息失败 (HWND: {hwnd}): {exc}")
-
-    try:
-        dpi = int(raw_info.get("dpi", 96) or 96)
-    except Exception:
-        dpi = 96
-    if dpi <= 0:
-        dpi = 96
-
-    try:
-        scale_factor = float(raw_info.get("scale_factor", 1.0) or 1.0)
-    except Exception:
-        scale_factor = 1.0
-    if scale_factor <= 0:
-        scale_factor = 1.0
-
-    method = str(raw_info.get("method", "Default") or "Default")
-
+    handler = dpi_handler if dpi_handler is not None else get_unified_dpi_handler()
+    raw_info = handler.get_window_dpi_info(hwnd, check_changes=False) or {}
+    dpi = int(raw_info.get("dpi") or 0)
+    scale_factor = float(raw_info.get("scale_factor") or 0)
+    method = str(raw_info.get("method") or "")
+    if dpi <= 0 or scale_factor <= 0 or not method:
+        raise RuntimeError(f"窗口 DPI 信息无效: hwnd={hwnd}, info={raw_info}")
     return {
         "dpi": dpi,
         "scale_factor": scale_factor,

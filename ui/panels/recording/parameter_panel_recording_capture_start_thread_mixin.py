@@ -32,13 +32,13 @@ class ParameterPanelRecordingCaptureStartThreadMixin:
         self._recording_start_time = time.time()
 
         logger.info(
-            f'录制已启动: '
+            '录制已启动: '
             f'区域={options["recording_area"]}, '
             f'模式={options["recording_mode"]}, '
             f'精度={options["recording_precision"]}'
         )
         logger.info(
-            f'录制线程状态: '
+            '录制线程状态: '
             f'isRunning={self._record_thread.isRunning()}, '
             f'use_raw_input={self._record_thread.use_raw_input}'
         )

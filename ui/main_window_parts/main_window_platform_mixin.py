@@ -296,7 +296,7 @@ class MainWindowPlatformMixin:
 
                     logger.debug("Window move/resize finished")
 
-            except Exception as e:
+            except Exception:
 
                 # Ignore message parsing errors to avoid affecting normal event handling
                 pass

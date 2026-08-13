@@ -14,7 +14,6 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from tasks.task_utils import coerce_bool, capture_and_match_template_smart
 import cv2
-import numpy as np
 from utils.smart_image_matcher import normalize_match_image
 
 logger = logging.getLogger(__name__)
@@ -124,7 +123,7 @@ def test_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = 
         logger.info(f"匹配完成，找到 {len(match_results)}/{len(test_image_paths)} 张图片")
 
         if not match_results:
-            logger.warning(f"未找到任何目标图片")
+            logger.warning("未找到任何目标图片")
             logger.info("=" * 60)
             logger.info("测试完成 - 未找到目标")
             logger.info("=" * 60)
@@ -554,7 +553,7 @@ def _draw_overlay(
                 # 3秒后自动关闭
                 QTimer.singleShot(3000, overlay.close)
 
-                logger.info(f"已绘制识别结果覆盖层，3秒后自动消失")
+                logger.info("已绘制识别结果覆盖层，3秒后自动消失")
             except Exception as e:
                 logger.error(f"创建覆盖层失败: {e}", exc_info=True)
                 if callback:

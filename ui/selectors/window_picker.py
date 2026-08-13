@@ -6,10 +6,8 @@
 """
 
 import logging
-import sys
-import os
 from typing import Optional, Tuple
-from PySide6.QtWidgets import QWidget, QApplication, QMessageBox
+from PySide6.QtWidgets import QWidget, QMessageBox
 from PySide6.QtCore import Signal, QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor
 from ui.system_parts.message_box_translator import place_dialog_on_screen
@@ -30,7 +28,6 @@ try:
     import win32gui
     import win32api
     import win32con
-    import ctypes
     PYWIN32_AVAILABLE = True
 except ImportError:
     PYWIN32_AVAILABLE = False
@@ -448,7 +445,7 @@ class WindowPickerOverlay(QWidget):
                     # 获取窗口位置
                     try:
                         rect = win32gui.GetWindowRect(enum_hwnd)
-                    except:
+                    except Exception:
                         return True
 
                     # 检查窗口尺寸是否有效（排除0尺寸窗口）
@@ -474,7 +471,7 @@ class WindowPickerOverlay(QWidget):
 
                         if not on_screen:
                             return True
-                    except:
+                    except Exception:
                         # 如果检查失败，假设窗口在屏幕上
                         pass
 
@@ -490,7 +487,7 @@ class WindowPickerOverlay(QWidget):
                         # 排除透明/分层窗口（可能是特效窗口）
                         if ex_style & win32con.WS_EX_LAYERED and ex_style & win32con.WS_EX_TRANSPARENT:
                             return True
-                    except:
+                    except Exception:
                         # 如果检查失败，继续处理
                         pass
 
@@ -516,7 +513,7 @@ class WindowPickerOverlay(QWidget):
                         if 'TextInput' in class_name or 'InputMethod' in class_name:
                             return True
 
-                    except:
+                    except Exception:
                         # 如果检查失败，继续处理
                         pass
 
@@ -526,7 +523,7 @@ class WindowPickerOverlay(QWidget):
                         # 获取窗口标题
                         try:
                             title = win32gui.GetWindowText(enum_hwnd)
-                        except:
+                        except Exception:
                             title = ""
 
                         # 计算窗口面积
@@ -539,7 +536,7 @@ class WindowPickerOverlay(QWidget):
                             'title': title,
                             'area': area
                         })
-                except:
+                except Exception:
                     pass
                 return True
 

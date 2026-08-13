@@ -1,4 +1,3 @@
-from ..parameter_panel_support import *
 
 
 class ParameterPanelWindowSnapMixin:

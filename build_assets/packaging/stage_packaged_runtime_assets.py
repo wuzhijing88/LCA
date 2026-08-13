@@ -9,6 +9,13 @@ import sys
 from pathlib import Path
 
 
+PROJECT_ROOT_FOR_IMPORTS = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT_FOR_IMPORTS))
+
+from app_core.ocr_runtime_contract import OCR_REQUIRED_RUNTIME_DLLS
+
+
 def _resolve_existing_path(project_root: Path, candidates: list[str], *, label: str, expect_dir: bool = False) -> Path:
     for relative_path in candidates:
         candidate = (project_root / relative_path).resolve(strict=False)
@@ -49,35 +56,23 @@ def _stage_qt_platform_plugin(project_root: Path, dist_root: Path) -> None:
 
 
 def _stage_ocr_runtime(project_root: Path, dist_root: Path) -> None:
-    print("[5/6] Restore required OCR runtime DLLs...")
-    fastdeploy_libs = _resolve_existing_path(
+    print("[5/6] Restore required ONNX Runtime DLLs...")
+    onnxruntime_capi = _resolve_existing_path(
         project_root,
         [
-            "venv/Lib/site-packages/fastdeploy/libs",
-            "venv/lib/site-packages/fastdeploy/libs",
+            "venv/Lib/site-packages/onnxruntime/capi",
+            "venv/lib/site-packages/onnxruntime/capi",
         ],
-        label="fastdeploy libs",
+        label="onnxruntime capi",
         expect_dir=True,
     )
-    fastdeploy_mklml = fastdeploy_libs / "third_libs" / "paddle_inference" / "third_party" / "install" / "mklml" / "lib"
-    fastdeploy_openvino_bin = fastdeploy_libs / "third_libs" / "openvino" / "runtime" / "bin"
 
-    _copy_required_file(
-        fastdeploy_libs / "onnxruntime_providers_shared.dll",
-        dist_root / "onnxruntime_providers_shared.dll",
-        label="onnxruntime_providers_shared.dll",
-    )
-    for filename in ("mklml.dll", "libiomp5md.dll"):
+    for filename in OCR_REQUIRED_RUNTIME_DLLS:
         _copy_required_file(
-            fastdeploy_mklml / filename,
+            onnxruntime_capi / filename,
             dist_root / filename,
             label=filename,
         )
-    _copy_required_file(
-        fastdeploy_openvino_bin / "plugins.xml",
-        dist_root / "plugins.xml",
-        label="plugins.xml",
-    )
 
 
 def _stage_interception_files(project_root: Path, dist_root: Path) -> None:

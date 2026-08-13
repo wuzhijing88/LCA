@@ -6,7 +6,6 @@
 """
 
 import logging
-import time
 import random
 import ctypes
 import json
@@ -306,7 +305,6 @@ from .virtual_mouse_state import (
 
 # Windows API 相关导入
 try:
-    import win32api
     import win32gui
     import win32con
     PYWIN32_AVAILABLE = True
@@ -527,7 +525,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         # 根据点击位置模式决定是否应用偏移
         if position_mode == '精准坐标':
             # 精准坐标：不应用任何偏移
-            logger.info(f"[精准坐标模式] 使用原始坐标，无偏移")
+            logger.info("[精准坐标模式] 使用原始坐标，无偏移")
         elif position_mode == '固定偏移':
             # 固定偏移：先应用固定偏移，再在偏移后的坐标上叠加随机偏移
             if fixed_offset_x != 0 or fixed_offset_y != 0:
@@ -632,7 +630,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             final_x, final_y = coord_info.x, coord_info.y
             logger.info(f"[{mode_name}模式] 使用客户区坐标: ({final_x}, {final_y})")
 
-        logger.info(f"=== 坐标处理完成 ===")
+        logger.info("=== 坐标处理完成 ===")
         logger.info(f"最终点击坐标: ({final_x}, {final_y}), 模式: {effective_execution_mode}, 动作: {click_action}")
 
         # 执行点击 - 优先使用新的输入模拟模块

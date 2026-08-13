@@ -1,7 +1,23 @@
 from .workflow_view_common import *
 
+operation_logger = logging.getLogger("workflow.operations")
+
+# 撤回记录模块只输出明确错误，不输出逐步调试信息。
+debug_print = lambda *args, **kwargs: None
+
 
 class WorkflowViewUndoStateMixin:
+
+    _UNDO_OPERATION_FIELDS = {
+        'paste_cards': {'pasted_card_ids', 'paste_type'},
+        'delete_card': {'card_state'},
+        'delete_batch': {'card_states', 'connections'},
+        'delete_connection': {'connection_data'},
+        'add_connection': {'connection_data'},
+        'modify_connection': {'old_connection_data', 'new_connection_data'},
+        'add_card': {'card_data'},
+        'change_card_ids': {'id_mapping'},
+    }
 
     def _save_undo_state(self, operation_type: str, operation_data: Dict[str, Any]):
         """保存撤销状态到历史栈。"""
@@ -18,9 +34,20 @@ class WorkflowViewUndoStateMixin:
             logger.info(f"  [UNDO] Skipping undo save during undo operation: {operation_type}")
             return
 
+        if operation_type not in self._UNDO_OPERATION_FIELDS:
+            raise ValueError(f"未知撤回操作类型: {operation_type}")
+        if not isinstance(operation_data, dict):
+            raise TypeError("撤回操作数据必须是字典")
+        expected_fields = self._UNDO_OPERATION_FIELDS[operation_type]
+        if set(operation_data) != expected_fields:
+            raise ValueError(
+                f"撤回操作 {operation_type} 字段错误: "
+                f"期望 {sorted(expected_fields)}，实际 {sorted(operation_data)}"
+            )
+
         undo_state = {
             'operation_type': operation_type,
-            'operation_data': operation_data,
+            'operation_data': copy.deepcopy(operation_data),
             'timestamp': time.time()
         }
 
@@ -56,7 +83,6 @@ class WorkflowViewUndoStateMixin:
                 'parameters': copy.deepcopy(card.parameters),
                 'custom_name': card.custom_name,
                 'position': (card.pos().x(), card.pos().y()),
-                'container_id': getattr(card, "container_id", None),
                 'connections': connections_data
             }
 
@@ -68,7 +94,7 @@ class WorkflowViewUndoStateMixin:
             debug_print(f"  [UNDO] Saved card state for undo: {card.card_id} with {len(connections_data)} connections")
 
         except Exception as e:
-            debug_print(f"  [UNDO] Error saving card state: {e}")
+            operation_logger.error("[撤回记录] 保存卡片删除状态失败: %s", e, exc_info=True)
             logger.error(f"保存卡片状态失败: {e}", exc_info=True)
 
     def _save_connection_state_for_undo(self, connection):
@@ -89,7 +115,7 @@ class WorkflowViewUndoStateMixin:
                 debug_print(f"  [UNDO] Saved connection state for undo: {conn_data['start_card_id']} -> {conn_data['end_card_id']} ({conn_data['line_type']})")
 
         except Exception as e:
-            debug_print(f"  [UNDO] Error saving connection state: {e}")
+            operation_logger.error("[撤回记录] 保存连线删除状态失败: %s", e, exc_info=True)
             logger.error(f"保存连接状态失败: {e}", exc_info=True)
 
     def _save_add_connection_state_for_undo(self, start_card, end_card, line_type):
@@ -109,7 +135,7 @@ class WorkflowViewUndoStateMixin:
             debug_print(f"  [UNDO] Saved add connection state for undo: {conn_data['start_card_id']} -> {conn_data['end_card_id']} ({conn_data['line_type']})")
 
         except Exception as e:
-            debug_print(f"  [UNDO] Error saving add connection state: {e}")
+            operation_logger.error("[撤回记录] 保存连线新增状态失败: %s", e, exc_info=True)
             logger.error(f"保存添加连接状态失败: {e}", exc_info=True)
 
     def _save_modify_connection_state_for_undo(self, old_connection, new_start_card, new_end_card, new_line_type):
@@ -135,12 +161,12 @@ class WorkflowViewUndoStateMixin:
                 'new_connection_data': new_conn_data
             })
 
-            debug_print(f"  [UNDO] Saved modify connection state for undo:")
+            debug_print("  [UNDO] Saved modify connection state for undo:")
             debug_print(f"    Old: {old_conn_data['start_card_id']} -> {old_conn_data['end_card_id']} ({old_conn_data['line_type']})")
             debug_print(f"    New: {new_conn_data['start_card_id']} -> {new_conn_data['end_card_id']} ({new_conn_data['line_type']})")
 
         except Exception as e:
-            debug_print(f"  [UNDO] Error saving modify connection state: {e}")
+            operation_logger.error("[撤回记录] 保存连线修改状态失败: %s", e, exc_info=True)
             logger.error(f"保存修改连接状态失败: {e}", exc_info=True)
 
     def _save_add_card_state_for_undo(self, card_id: int, task_type: str, x: float, y: float, parameters: Optional[dict]):
@@ -161,7 +187,7 @@ class WorkflowViewUndoStateMixin:
             debug_print(f"  [UNDO] Saved add card state for undo: ID={card_id}, type={task_type}, pos=({x}, {y})")
 
         except Exception as e:
-            debug_print(f"  [UNDO] Error saving add card state: {e}")
+            operation_logger.error("[撤回记录] 保存卡片新增状态失败: %s", e, exc_info=True)
             logger.error(f"保存添加卡片状态失败: {e}", exc_info=True)
 
     def can_undo(self) -> bool:

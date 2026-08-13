@@ -17,8 +17,9 @@ except ImportError:  # pragma: no cover - Windows-only application
 
 
 SUPPORTED_LGS_VERSION = "9.02.65"
-SUPPORTED_GHUB_VERSION = "2026.4.919028"
-SUPPORTED_GHUB_DRIVER_VERSION = "2026.0.0.0"
+SUPPORTED_GHUB_VERSION = "2026.4"
+# G HUB 虚拟输入内核驱动的最低可用版本（低于此版本的驱动协议不兼容）。
+MIN_GHUB_DRIVER_VERSION = "2026.0.0.0"
 
 _UNINSTALL_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
 _APP_PATHS_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\LCore.exe"
@@ -31,6 +32,15 @@ _LGS_MOUSE_ENUM_KEY = (
 _GHUB_MOUSE_INSTANCE_PREFIX = r"LGHUBDevice\VID_046D&PID_C231"
 _LGS_MOUSE_INSTANCE_PREFIX = r"LogiDevice\VID_046D&PID_C231"
 _DN_STARTED = 0x00000008
+
+_DEVICE_CLASSES_KEY = r"SYSTEM\CurrentControlSet\Control\DeviceClasses"
+# IbInputSimulator 罗技后端实际打开的总线驱动设备接口 GUID
+# （见 tools/ibinputsimulator .../SendTypes/Logitech.hpp 的 find_device）。
+# 这些接口才是输入能否工作的真实依据，HID 鼠标节点只是旁证。
+_GHUB_BUS_INTERFACE_GUIDS = (
+    "{1abc05c0-c378-41b9-9cef-df1aba82b015}",
+    "{dfbedcdb-2148-416d-9e4d-cecc2424128c}",
+)
 
 
 @dataclass(frozen=True)
@@ -56,33 +66,46 @@ class LogitechRuntimeResult:
 
         if self.reason == "unsupported_ghub_version":
             return (
-                f"当前检测到：{self.detected_name} {self.detected_version or '未知版本'}。\n"
-                f"当前已实测支持 Logitech G HUB {SUPPORTED_GHUB_VERSION}。"
+                f"当前检测到：{self.detected_name} {self.detected_version or '未知版本'}，"
+                "该版本不能用于 LCA 罗技前台输入。\n"
+                f"请卸载后安装指定版本：Logitech G HUB {SUPPORTED_GHUB_VERSION}。"
             )
-        if self.reason in {"ghub_driver_missing", "unsupported_ghub_driver"}:
+        if self.reason == "ghub_driver_missing":
             return (
                 f"当前检测到：{self.detected_name} {self.detected_version or '未知版本'}，"
-                "但 G HUB 虚拟输入驱动不完整或版本不匹配。\n"
-                "请完整重装 G HUB，并在安装时关闭“传输当前设置”。"
+                "但 G HUB 虚拟输入驱动不完整。\n"
+                f"请卸载后重新安装指定版本：Logitech G HUB {SUPPORTED_GHUB_VERSION}，"
+                "安装时关闭“传输当前设置”。"
+            )
+        if self.reason == "unsupported_ghub_driver":
+            return (
+                f"当前检测到：{self.detected_name} {self.detected_version or '未知版本'}，"
+                f"但 G HUB 虚拟输入驱动版本过旧（最低要求 {MIN_GHUB_DRIVER_VERSION}）。\n"
+                f"请卸载后重新安装指定版本：Logitech G HUB {SUPPORTED_GHUB_VERSION}。"
             )
         if self.reason == "ghub_virtual_mouse_not_started":
             return (
                 f"当前检测到：{self.detected_name} {self.detected_version or '未知版本'}，"
-                "但 Logitech G HUB Virtual Mouse 未启动。\n"
-                "请重装 G HUB，关闭“传输当前设置”，然后重启系统。"
+                "驱动已安装但 G HUB 虚拟输入设备当前未挂载。\n"
+                f"请卸载后重新安装指定版本：Logitech G HUB {SUPPORTED_GHUB_VERSION}，"
+                "安装时关闭“传输当前设置”，然后重启系统。"
             )
         if self.reason in {"unsupported_lgs_version", "lgs_binary_not_found"}:
             return (
                 f"当前检测到：{self.detected_name} {self.detected_version or '未知版本'}。\n"
-                f"LGS 输入驱动仅支持 Logitech Gaming Software {SUPPORTED_LGS_VERSION}。"
+                f"请卸载后安装指定版本：Logitech Gaming Software {SUPPORTED_LGS_VERSION}。"
             )
         if self.reason == "lgs_virtual_mouse_not_started":
             return (
                 f"当前检测到 Logitech Gaming Software {self.detected_version or '未知版本'}，"
-                "但 Logitech Gaming Virtual Mouse 未启动。"
+                "但 Logitech Gaming Virtual Mouse 未启动。\n"
+                f"请卸载后重新安装指定版本：Logitech Gaming Software {SUPPORTED_LGS_VERSION}。"
             )
         return (
-            "未检测到可用的 Logitech G HUB 或 Logitech Gaming Software 输入驱动。"
+            "未检测到可用的罗技输入驱动。\n"
+            f"请安装指定版本（二选一，不要同时安装）：\n"
+            f"Logitech G HUB {SUPPORTED_GHUB_VERSION}\n"
+            f"或 Logitech Gaming Software {SUPPORTED_LGS_VERSION}。"
         )
 
     def driver_error(self) -> str:
@@ -129,15 +152,41 @@ def _parse_version(version: str) -> Tuple[int, ...]:
     return tuple(int(part) for part in re.split(r"[.,]", match.group(1)))
 
 
+def _normalized_version_pair(
+    version: str, reference: str
+) -> Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
+    actual_parts = _parse_version(version)
+    reference_parts = _parse_version(reference)
+    if not actual_parts or not reference_parts:
+        return None
+    length = max(len(actual_parts), len(reference_parts))
+    actual_parts += (0,) * (length - len(actual_parts))
+    reference_parts += (0,) * (length - len(reference_parts))
+    return actual_parts, reference_parts
+
+
 def _version_matches(version: str, required: str) -> bool:
+    pair = _normalized_version_pair(version, required)
+    if pair is None:
+        return False
+    return pair[0] == pair[1]
+
+
+def _version_at_least(version: str, minimum: str) -> bool:
+    pair = _normalized_version_pair(version, minimum)
+    if pair is None:
+        return False
+    return pair[0] >= pair[1]
+
+
+def _version_prefix_matches(version: str, required: str) -> bool:
     actual_parts = _parse_version(version)
     required_parts = _parse_version(required)
     if not actual_parts or not required_parts:
         return False
-    length = max(len(actual_parts), len(required_parts))
-    actual_parts += (0,) * (length - len(actual_parts))
-    required_parts += (0,) * (length - len(required_parts))
-    return actual_parts == required_parts
+    if len(actual_parts) < len(required_parts):
+        actual_parts += (0,) * (len(required_parts) - len(actual_parts))
+    return actual_parts[: len(required_parts)] == required_parts
 
 
 def _registry_views() -> Tuple[Tuple[str, int], ...]:
@@ -406,6 +455,70 @@ def _find_started_device(enum_key: str, instance_prefix: str) -> str:
     return ""
 
 
+def _device_interface_linked(interface_guids: Tuple[str, ...]) -> bool:
+    """判断给定设备接口 GUID 中是否存在已激活（Linked）的接口实例。
+
+    这与 IbInputSimulator 打开设备的判据一致：接口已链接才可 CreateFile。
+    只要任一 GUID 下存在 Linked=1 的接口实例即视为可用。
+    """
+    if winreg is None:
+        return False
+    for guid in interface_guids:
+        try:
+            class_key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                f"{_DEVICE_CLASSES_KEY}\\{guid}",
+                0,
+                winreg.KEY_READ,
+            )
+        except OSError:
+            continue
+        try:
+            interface_count = winreg.QueryInfoKey(class_key)[0]
+            for index in range(interface_count):
+                try:
+                    interface_name = winreg.EnumKey(class_key, index)
+                except OSError:
+                    continue
+                # 接口激活时会在 Control 子键写入 Linked=1。不同系统层级可能是
+                # "<iface>\#\Control" 或 "<iface>\Control"，两者都尝试。
+                for control_suffix in ("#\\Control", "Control"):
+                    control_path = (
+                        f"{_DEVICE_CLASSES_KEY}\\{guid}\\{interface_name}\\{control_suffix}"
+                    )
+                    try:
+                        control_key = winreg.OpenKey(
+                            winreg.HKEY_LOCAL_MACHINE,
+                            control_path,
+                            0,
+                            winreg.KEY_READ,
+                        )
+                    except OSError:
+                        continue
+                    try:
+                        linked, _ = winreg.QueryValueEx(control_key, "Linked")
+                    except OSError:
+                        linked = 0
+                    finally:
+                        winreg.CloseKey(control_key)
+                    if int(linked or 0) == 1:
+                        return True
+        finally:
+            winreg.CloseKey(class_key)
+    return False
+
+
+def _ghub_virtual_mouse_ready() -> bool:
+    """G HUB 虚拟鼠标输入是否就绪。
+
+    优先看 IbInputSimulator 真正使用的总线设备接口是否已激活；
+    再退回到 HID 鼠标设备节点是否已启动，兼容旧版 G HUB 的拓扑。
+    """
+    if _device_interface_linked(_GHUB_BUS_INTERFACE_GUIDS):
+        return True
+    return bool(_find_started_device(_GHUB_MOUSE_ENUM_KEY, _GHUB_MOUSE_INSTANCE_PREFIX))
+
+
 def _ghub_driver_versions() -> Tuple[Tuple[str, str], ...]:
     system_root = Path(str(os.environ.get("SystemRoot", r"C:\Windows")))
     driver_dir = system_root / "System32" / "drivers"
@@ -418,11 +531,16 @@ def _ghub_driver_versions() -> Tuple[Tuple[str, str], ...]:
 
 
 def detect_logitech_runtime() -> LogitechRuntimeResult:
+    """检测可用的罗技输入运行时。
+
+    只接受指定应用版本：G HUB 2026.4 或 LGS 9.02.65。版本不符即拒绝，
+    不在两者之间切换，也不放行其它 G HUB / LGS 版本。
+    """
     products = tuple(_iter_uninstall_products())
     ghub_products = tuple(product for product in products if _is_ghub_product(product))
     if ghub_products:
         product = ghub_products[0]
-        if not _version_matches(product.version, SUPPORTED_GHUB_VERSION):
+        if not _version_prefix_matches(product.version, SUPPORTED_GHUB_VERSION):
             return LogitechRuntimeResult(
                 compatible=False,
                 detected_name=product.name,
@@ -441,7 +559,7 @@ def detect_logitech_runtime() -> LogitechRuntimeResult:
                 reason="ghub_driver_missing",
             )
         if any(
-            not _version_matches(version, SUPPORTED_GHUB_DRIVER_VERSION)
+            not _version_at_least(version, MIN_GHUB_DRIVER_VERSION)
             for _, version in driver_versions
         ):
             versions = ", ".join(f"{name}={version}" for name, version in driver_versions)
@@ -453,11 +571,7 @@ def detect_logitech_runtime() -> LogitechRuntimeResult:
                 reason="unsupported_ghub_driver",
             )
 
-        mouse_instance = _find_started_device(
-            _GHUB_MOUSE_ENUM_KEY,
-            _GHUB_MOUSE_INSTANCE_PREFIX,
-        )
-        if not mouse_instance:
+        if not _ghub_virtual_mouse_ready():
             return LogitechRuntimeResult(
                 compatible=False,
                 detected_name=product.name,
@@ -470,7 +584,7 @@ def detect_logitech_runtime() -> LogitechRuntimeResult:
             send_type="LogitechGHubNew",
             detected_name=product.name,
             detected_version=product.version,
-            source=mouse_instance,
+            source=product.source,
             reason="ghub_ready",
         )
 
@@ -522,29 +636,22 @@ def detect_logitech_runtime() -> LogitechRuntimeResult:
 def is_logitech_ibinputsimulator_configured(
     config: Optional[Mapping[str, object]],
 ) -> bool:
+    from utils.input_simulation.mode_utils import (
+        normalize_ib_driver_name,
+        parse_foreground_backends,
+    )
+
     values = dict(config or {})
-    legacy_backend = str(
-        values.get("foreground_driver_backend", "interception") or "interception"
-    ).strip().lower()
-    mouse_backend = str(
-        values.get("foreground_mouse_driver_backend", legacy_backend) or legacy_backend
-    ).strip().lower()
-    keyboard_backend = str(
-        values.get("foreground_keyboard_driver_backend", legacy_backend) or legacy_backend
-    ).strip().lower()
-    driver_name = re.sub(
-        r"[\s_-]+",
-        "",
-        str(values.get("ibinputsimulator_driver", "Logitech") or "Logitech"),
-    ).lower()
-    return driver_name == "logitech" and "ibinputsimulator" in (
+    mouse_backend, keyboard_backend = parse_foreground_backends(values)
+    driver_name = normalize_ib_driver_name(values.get("ibinputsimulator_driver"))
+    return driver_name == "Logitech" and "ibinputsimulator" in (
         mouse_backend,
         keyboard_backend,
     )
 
 
 __all__ = [
-    "SUPPORTED_GHUB_DRIVER_VERSION",
+    "MIN_GHUB_DRIVER_VERSION",
     "SUPPORTED_GHUB_VERSION",
     "SUPPORTED_LGS_VERSION",
     "LogitechRuntimeResult",

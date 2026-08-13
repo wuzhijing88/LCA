@@ -1,7 +1,8 @@
-from ..workflow_parts import workflow_lifecycle as _wl
+import logging
 
-QMessageBox = _wl.QMessageBox
-logger = _wl.logger
+from PySide6.QtWidgets import QMessageBox
+
+logger = logging.getLogger(__name__)
 
 
 MSG_START_FAIL_TITLE = "\u542f\u52a8\u5931\u8d25"

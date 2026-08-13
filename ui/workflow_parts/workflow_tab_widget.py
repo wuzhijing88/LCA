@@ -11,22 +11,13 @@ import json
 from utils.app_paths import get_config_path
 from typing import Dict, Optional, List, Any
 from PySide6.QtWidgets import (QTabWidget, QTabBar, QWidget, QPushButton,
-                               QFileDialog, QMessageBox, QMenu, QDialog)
+                               QFileDialog, QMessageBox, QMenu)
 from PySide6.QtCore import Qt, Signal, QPoint, Slot, QSettings
-from PySide6.QtGui import QIcon, QAction, QWheelEvent, QColor
+from PySide6.QtGui import QWheelEvent
 
-from utils.sub_workflow_path import get_workflow_base_dir, resolve_sub_workflow_path
 from ..workflow_parts.workflow_view import WorkflowView
 from ..workflow_parts.workflow_task_manager import WorkflowTaskManager
 from ..system_parts.menu_style import apply_unified_menu_style
-from task_workflow.workflow_vars import pick_variables_override
-from task_workflow.runtime_var_store import (
-    STORAGE_KIND,
-    build_task_key,
-    is_storage_manifest,
-    load_runtime_snapshot,
-    save_runtime_snapshot,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +134,9 @@ class WorkflowTabWidget(QTabWidget):
         """将任务文件路径归一化为持久化键。"""
         if not filepath:
             return ""
-        try:
-            return os.path.normcase(os.path.abspath(str(filepath)))
-        except Exception:
-            return str(filepath).strip().lower()
+        if not isinstance(filepath, str):
+            raise TypeError("画布视图状态路径必须是字符串")
+        return os.path.normcase(os.path.abspath(filepath))
 
     def _normalize_view_state_payload(self, payload: Any) -> Optional[Dict[str, List[float]]]:
         """校验并标准化画布视图状态结构。"""
@@ -155,20 +145,17 @@ class WorkflowTabWidget(QTabWidget):
 
         transform = payload.get("view_transform")
         center = payload.get("view_center")
-        if not isinstance(transform, (list, tuple)) or len(transform) != 9:
+        if not isinstance(transform, list) or len(transform) != 9:
             return None
-        if not isinstance(center, (list, tuple)) or len(center) != 2:
+        if not isinstance(center, list) or len(center) != 2:
             return None
 
-        try:
-            normalized_transform = [float(value) for value in transform]
-            normalized_center = [float(value) for value in center]
-        except (TypeError, ValueError):
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in transform + center):
             return None
 
         return {
-            "view_transform": normalized_transform,
-            "view_center": normalized_center,
+            "view_transform": list(transform),
+            "view_center": list(center),
         }
 
     def _load_persisted_view_states(self) -> Dict[str, Dict[str, List[float]]]:
@@ -177,13 +164,10 @@ class WorkflowTabWidget(QTabWidget):
         try:
             settings = QSettings("LCA", "LCA")
             raw_payload = settings.value(_VIEW_STATE_SETTINGS_KEY, "")
-            parsed_payload: Dict[str, Any] = {}
-            if isinstance(raw_payload, str):
-                raw_payload = raw_payload.strip()
-                if raw_payload:
-                    parsed_payload = json.loads(raw_payload)
-            elif isinstance(raw_payload, dict):
-                parsed_payload = raw_payload
+            if not isinstance(raw_payload, str):
+                raise TypeError("画布视图持久化状态必须是 JSON 字符串")
+            raw_payload = raw_payload.strip()
+            parsed_payload: Dict[str, Any] = json.loads(raw_payload) if raw_payload else {}
 
             if not isinstance(parsed_payload, dict):
                 return normalized
@@ -278,10 +262,8 @@ class WorkflowTabWidget(QTabWidget):
                 return
 
         previous_index = restore_state.get("index", -1)
-        try:
-            previous_index = int(previous_index)
-        except (TypeError, ValueError):
-            previous_index = -1
+        if isinstance(previous_index, bool) or not isinstance(previous_index, int):
+            raise TypeError("恢复标签页索引必须是整数")
 
         if 0 <= previous_index < self.count():
             self.setCurrentIndex(previous_index)
@@ -323,28 +305,19 @@ class WorkflowTabWidget(QTabWidget):
         logger.info("import_workflow() 开始执行")
         logger.info(f"   传入参数 filepath={filepath}")
 
-        # 检查是否有工作流正在执行
-        from PySide6.QtWidgets import QApplication, QMessageBox
-        main_window = QApplication.activeWindow()
-        if main_window and hasattr(main_window, '_is_any_workflow_running'):
-            if main_window._is_any_workflow_running():
-                # 在底部状态栏显示警告
-                if hasattr(main_window, 'step_detail_label'):
-                    main_window.step_detail_label.setText("【警告】工作流正在执行中，无法导入新工作流")
-                    main_window.step_detail_label.setStyleSheet("""
-                        #stepDetailLabel {
-                            background-color: rgba(180, 180, 180, 180);
-                            color: #FF0000;
-                            font-weight: bold;
-                            border-radius: 5px;
-                            padding: 8px;
-                        }
-                    """)
-                    from PySide6.QtCore import QTimer
-                    QTimer.singleShot(3000, lambda: main_window.step_detail_label.setText("任务执行中..."))
-
-                logger.warning("工作流正在执行，禁止导入新工作流")
-                return None
+        # 直接检查任务生命周期，不依赖当前活动窗口或 UI 状态。
+        active_tasks = [
+            task
+            for task in self.task_manager.get_all_tasks()
+            if self._task_has_active_close_state(task)
+        ]
+        if active_tasks:
+            logger.warning(
+                "工作流处于活动或清理状态，禁止导入: task_ids=%s",
+                [getattr(task, 'task_id', None) for task in active_tasks],
+            )
+            QMessageBox.warning(self, "无法导入", "工作流正在执行或清理，请先明确停止并等待清理完成。")
+            return None
 
         # 如果没有指定文件路径，弹出文件选择对话框（支持多选）
         if not filepath:
@@ -364,7 +337,7 @@ class WorkflowTabWidget(QTabWidget):
                     logger.info(f"   使用主窗口作为父控件: {main_window}")
                     parent_widget = main_window
                 else:
-                    logger.info(f"   使用self作为父控件")
+                    logger.info("   使用self作为父控件")
                     parent_widget = self
 
                 # 改用 getOpenFileNames 支持多选
@@ -447,12 +420,9 @@ class WorkflowTabWidget(QTabWidget):
             import json
             with open(filepath, 'r', encoding='utf-8') as f:
                 workflow_data = json.load(f)
-            workflow_data = self._sanitize_legacy_variables_on_import(workflow_data, filepath)
-
-            # 验证数据格式
-            if 'cards' not in workflow_data or not isinstance(workflow_data.get('cards'), list):
-                QMessageBox.critical(self, "导入失败", "无效的工作流文件格式")
-                return None
+            if isinstance(workflow_data, dict):
+                workflow_data.pop("variables", None)
+            jump_config, window_binding = self._validate_workflow_import_data(workflow_data, filepath)
 
             # 生成任务名称
             name = os.path.basename(filepath)
@@ -464,35 +434,22 @@ class WorkflowTabWidget(QTabWidget):
                 task_id = self.task_manager.add_task(name, filepath, workflow_data)
             finally:
                 self._activate_new_tab_on_add = previous_activate_flag
-            # 加载跳转配置（如果存在）
+            # 加载已经通过严格校验的跳转配置
             task = self.task_manager.get_task(task_id)
-            if task and 'jump_config' in workflow_data:
-                jump_config = workflow_data['jump_config']
-                task.jump_enabled = jump_config.get('enabled', True)
-                task.jump_rules = jump_config.get('rules', {}).copy()
-                task.jump_delay = jump_config.get('delay', 0)
-                task.first_execute = jump_config.get('first_execute', False)
+            if task and jump_config is not None:
+                task.jump_enabled = jump_config['enabled']
+                task.jump_rules = jump_config['rules'].copy()
+                task.jump_delay = jump_config['delay']
+                task.first_execute = jump_config['first_execute']
                 logger.info(f"已加载跳转配置: enabled={task.jump_enabled}, rules={task.jump_rules}, delay={task.jump_delay}秒, first_execute={task.first_execute}")
 
-            # 加载窗口绑定配置（如果存在）
-            if task and 'window_binding' in workflow_data:
-                window_binding = workflow_data['window_binding']
-                task.bound_window_id = window_binding.get('bound_window_id')
-                task.target_window_title = window_binding.get('target_window_title', '')
-                task.target_hwnd = window_binding.get('target_hwnd')
-
-                # 如果保存的句柄有效,尝试验证并重新绑定
-                if task.target_hwnd:
-                    try:
-                        import win32gui
-                        if win32gui.IsWindow(task.target_hwnd):
-                            logger.info(f"已加载窗口绑定: '{task.target_window_title}' (HWND: {task.target_hwnd})")
-                        else:
-                            logger.warning(f"保存的窗口句柄 {task.target_hwnd} 已失效,需要重新绑定")
-                            task.target_hwnd = None
-                    except Exception as e:
-                        logger.warning(f"验证窗口句柄失败: {e}")
-                        task.target_hwnd = None
+            # 窗口句柄在创建任务前已经验证，不允许失效后自动解绑。
+            if task and window_binding is not None:
+                task.bound_window_id = window_binding['bound_window_id']
+                task.target_window_title = window_binding['target_window_title']
+                task.target_hwnd = window_binding['target_hwnd']
+                if task.target_hwnd is not None:
+                    logger.info(f"已加载窗口绑定: '{task.target_window_title}' (HWND: {task.target_hwnd})")
 
             logger.info(f"工作流导入成功: {filepath}")
             self.workflow_imported.emit(task_id)
@@ -511,12 +468,90 @@ class WorkflowTabWidget(QTabWidget):
             QMessageBox.critical(self, "导入失败", f"导入失败:\n{e}")
             return None
 
+    @staticmethod
+    def _validate_workflow_import_data(workflow_data: Any, filepath: str):
+        """校验当前版本工作流格式；不转换旧字段，也不修正失效配置。"""
+        if not isinstance(workflow_data, dict):
+            raise TypeError("工作流根节点必须是字典")
+        if not isinstance(workflow_data.get('cards'), list):
+            raise TypeError("工作流 cards 必须是列表")
+        if not isinstance(workflow_data.get('connections'), list):
+            raise TypeError("工作流 connections 必须是列表")
+
+        workflow_data.pop('variables', None)
+        jump_config = workflow_data.get('jump_config')
+        if jump_config is not None:
+            if not isinstance(jump_config, dict):
+                raise TypeError("工作流 jump_config 必须是字典")
+            required_jump_keys = {'enabled', 'rules', 'delay', 'first_execute'}
+            if set(jump_config) != required_jump_keys:
+                raise ValueError("工作流 jump_config 字段不完整或包含未知字段")
+            if not isinstance(jump_config['enabled'], bool):
+                raise TypeError("工作流 jump_config.enabled 必须是布尔值")
+            if not isinstance(jump_config['first_execute'], bool):
+                raise TypeError("工作流 jump_config.first_execute 必须是布尔值")
+            delay = jump_config['delay']
+            if isinstance(delay, bool) or not isinstance(delay, (int, float)) or delay < 0:
+                raise TypeError("工作流 jump_config.delay 必须是非负数")
+            rules = jump_config['rules']
+            if not isinstance(rules, dict):
+                raise TypeError("工作流 jump_config.rules 必须是字典")
+            for reason, target in rules.items():
+                if not isinstance(reason, str) or not reason.strip():
+                    raise TypeError("工作流跳转原因必须是非空字符串")
+                if not isinstance(target, dict) or set(target) != {'id'}:
+                    raise TypeError(f"跳转规则 '{reason}' 必须使用 {{'id': 整数}} 格式")
+                target_id = target['id']
+                if isinstance(target_id, bool) or not isinstance(target_id, int) or target_id <= 0:
+                    raise TypeError(f"跳转规则 '{reason}' 的 id 必须是正整数")
+
+        window_binding = workflow_data.get('window_binding')
+        if window_binding is not None:
+            if not isinstance(window_binding, dict):
+                raise TypeError("工作流 window_binding 必须是字典")
+            required_window_keys = {'bound_window_id', 'target_window_title', 'target_hwnd'}
+            if set(window_binding) != required_window_keys:
+                raise ValueError("工作流 window_binding 字段不完整或包含未知字段")
+            if not isinstance(window_binding['target_window_title'], str):
+                raise TypeError("工作流 target_window_title 必须是字符串")
+            target_hwnd = window_binding['target_hwnd']
+            if target_hwnd is None:
+                if window_binding['bound_window_id'] is not None or window_binding['target_window_title']:
+                    raise ValueError("未绑定窗口时 bound_window_id 必须为 null 且标题必须为空")
+            else:
+                if isinstance(target_hwnd, bool) or not isinstance(target_hwnd, int) or target_hwnd <= 0:
+                    raise TypeError("工作流 target_hwnd 必须是正整数或 null")
+                if not window_binding['target_window_title'].strip():
+                    raise ValueError("已绑定窗口时 target_window_title 不能为空")
+                import win32gui
+                if not win32gui.IsWindow(target_hwnd):
+                    raise ValueError(f"工作流绑定窗口已失效（HWND: {target_hwnd}），请先修正配置")
+
+        return jump_config, window_binding
+
     def _get_current_workflow_filepath(self) -> Optional[str]:
         task_id = self.get_current_task_id()
         if task_id is None:
             return None
         task = self.task_manager.get_task(task_id)
         return getattr(task, "filepath", None) if task else None
+
+    @staticmethod
+    def _resolve_explicit_sub_workflow_path(filepath: str, parent_workflow_file: Optional[str]) -> str:
+        """只按调用方给出的明确路径解析，不搜索或猜测同名文件。"""
+        if not isinstance(filepath, str) or not filepath.strip():
+            raise ValueError("未指定子工作流文件")
+        if os.path.isabs(filepath):
+            resolved = os.path.abspath(os.path.normpath(filepath))
+        else:
+            if not isinstance(parent_workflow_file, str) or not parent_workflow_file.strip():
+                raise ValueError("相对子工作流路径缺少父工作流文件")
+            parent_path = os.path.abspath(os.path.normpath(parent_workflow_file))
+            parent_dir = parent_path if os.path.isdir(parent_path) else os.path.dirname(parent_path)
+            resolved = os.path.abspath(os.path.normpath(os.path.join(parent_dir, filepath)))
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"子工作流文件不存在: {resolved}")
+        return resolved
 
     def open_sub_workflow(self, filepath: str, parent_workflow_file: Optional[str] = None) -> Optional[int]:
         """
@@ -539,15 +574,12 @@ class WorkflowTabWidget(QTabWidget):
             return None
 
         parent_file = parent_workflow_file or self._get_current_workflow_filepath()
-        resolved_filepath = resolve_sub_workflow_path(filepath, parent_workflow_file=parent_file)
-        if not resolved_filepath:
-            base_dir = get_workflow_base_dir(parent_file)
-            extra_hint = f"\n\n已尝试主流程目录:\n{base_dir}" if base_dir else ""
-            QMessageBox.warning(self, "打开失败", f"文件不存在:\n{filepath}{extra_hint}")
+        try:
+            resolved_filepath = self._resolve_explicit_sub_workflow_path(filepath, parent_file)
+        except (TypeError, ValueError, FileNotFoundError) as exc:
+            QMessageBox.warning(self, "打开失败", str(exc))
             return None
 
-        if os.path.normcase(os.path.normpath(filepath)) != os.path.normcase(os.path.normpath(resolved_filepath)):
-            logger.info(f"[子工作流] 已智能修正路径: {filepath} -> {resolved_filepath}")
         filepath = resolved_filepath
 
         # 检查是否已经打开了这个文件
@@ -566,16 +598,7 @@ class WorkflowTabWidget(QTabWidget):
             import json
             with open(filepath, 'r', encoding='utf-8') as f:
                 workflow_data = json.load(f)
-            workflow_data = self._sanitize_legacy_variables_on_import(workflow_data, filepath)
-
-            # 验证数据格式
-            if 'cards' not in workflow_data or not isinstance(workflow_data.get('cards'), list):
-                # 检查是否是 .module 格式
-                if 'workflow' in workflow_data:
-                    workflow_data = workflow_data['workflow']
-                else:
-                    QMessageBox.critical(self, "打开失败", "无效的工作流文件格式")
-                    return None
+            jump_config, window_binding = self._validate_workflow_import_data(workflow_data, filepath)
 
             # 生成标签页名称（带子流程前缀）
             base_name = os.path.basename(filepath)
@@ -588,6 +611,15 @@ class WorkflowTabWidget(QTabWidget):
             task = self.task_manager.get_task(task_id)
             if task:
                 task.is_sub_workflow = True
+                if jump_config is not None:
+                    task.jump_enabled = jump_config['enabled']
+                    task.jump_rules = jump_config['rules'].copy()
+                    task.jump_delay = jump_config['delay']
+                    task.first_execute = jump_config['first_execute']
+                if window_binding is not None:
+                    task.bound_window_id = window_binding['bound_window_id']
+                    task.target_window_title = window_binding['target_window_title']
+                    task.target_hwnd = window_binding['target_hwnd']
 
             logger.info(f"[子工作流] 打开成功: {filepath}, task_id={task_id}")
             self.workflow_imported.emit(task_id)
@@ -652,118 +684,11 @@ class WorkflowTabWidget(QTabWidget):
             QMessageBox.critical(self, "创建失败", f"创建空白工作流失败:\n{e}")
             return None
 
-    def _sanitize_legacy_variables_on_import(self, workflow_data: dict, filepath: str) -> dict:
-        """导入工作流时清理旧版内嵌变量，并回写文件。"""
-        if not isinstance(workflow_data, dict):
-            return workflow_data
-
-        sanitized = False
-
-        def _clear_legacy_variables(container: dict, scope: str) -> None:
-            nonlocal sanitized
-            if not isinstance(container, dict):
-                return
-            if "variables" not in container:
-                return
-            if is_storage_manifest(container.get("variables")):
-                return
-            container.pop("variables", None)
-            sanitized = True
-            logger.info("检测到旧版工作流变量并已清空: file=%s, scope=%s", filepath, scope)
-
-        # 标准工作流格式
-        _clear_legacy_variables(workflow_data, "root")
-
-        # 模块封装格式（workflow 内嵌）
-        nested_workflow = workflow_data.get("workflow")
-        if isinstance(nested_workflow, dict):
-            _clear_legacy_variables(nested_workflow, "workflow")
-
-        if sanitized and filepath:
-            try:
-                temp_path = f"{filepath}.tmp_sanitize_vars"
-                with open(temp_path, "w", encoding="utf-8") as f:
-                    json.dump(workflow_data, f, ensure_ascii=False, indent=2)
-                os.replace(temp_path, filepath)
-                logger.info("旧版内嵌变量清理结果已回写文件: %s", filepath)
-            except Exception as save_exc:
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except Exception:
-                    pass
-                logger.warning("回写清理后的工作流文件失败: file=%s, error=%s", filepath, save_exc)
-
-        return workflow_data
-
-    def _normalize_runtime_manifest_for_task(self, task) -> None:
-        """自愈历史 runtime manifest 的临时 task_key，统一迁移到稳定 path task_key。"""
-        if task is None or not isinstance(getattr(task, "workflow_data", None), dict):
-            return
-
-        variables_data = task.workflow_data.get("variables")
-        if not is_storage_manifest(variables_data):
-            return
-
-        stable_task_key = build_task_key(
-            filepath=getattr(task, "filepath", None),
-            task_id=getattr(task, "task_id", None),
-            task_name=getattr(task, "name", None),
-        )
-        if not stable_task_key:
-            return
-
-        manifest_task_key = str(variables_data.get("task_key") or "").strip()
-        if manifest_task_key == stable_task_key:
-            return
-
-        try:
-            source_vars, source_sources = ({}, {})
-            if manifest_task_key:
-                source_vars, source_sources = load_runtime_snapshot(manifest_task_key)
-            target_vars, _ = load_runtime_snapshot(stable_task_key)
-
-            if source_vars and not target_vars:
-                save_runtime_snapshot(
-                    stable_task_key,
-                    {
-                        "global_vars": source_vars,
-                        "var_sources": source_sources,
-                    },
-                )
-                target_vars = dict(source_vars)
-
-            normalized_manifest = {
-                "storage": STORAGE_KIND,
-                "task_key": stable_task_key,
-                "count": len(target_vars) if isinstance(target_vars, dict) else 0,
-            }
-            task.workflow_data["variables"] = normalized_manifest
-
-            # 尽量回写修复后的 manifest，避免下次重启再次命中旧 task_key。
-            if getattr(task, "filepath", None):
-                try:
-                    task.save(workflow_data=dict(task.workflow_data))
-                except Exception as save_exc:
-                    logger.warning(f"回写修复后的变量标记失败: {save_exc}")
-
-            logger.info(
-                "已迁移工作流变量 task_key: task_id=%s, old=%s, new=%s",
-                getattr(task, "task_id", None),
-                manifest_task_key or "<empty>",
-                stable_task_key,
-            )
-        except Exception as exc:
-            logger.warning(f"迁移工作流变量 task_key 失败: {exc}")
-
     def _on_task_added(self, task_id: int):
         """任务添加回调"""
         task = self.task_manager.get_task(task_id)
         if not task:
             return
-
-        # 修复历史文件里使用 session task_key 的变量标记，避免重启后变量丢失。
-        self._normalize_runtime_manifest_for_task(task)
 
         # 如果是第一个任务，显示标签栏
         if len(self.task_views) == 0:
@@ -793,7 +718,7 @@ class WorkflowTabWidget(QTabWidget):
         workflow_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         workflow_view.viewport().setMouseTracking(True)
 
-        logger.info(f"WorkflowView创建完成:")
+        logger.info("WorkflowView创建完成:")
         logger.info(f"   dragMode: {workflow_view.dragMode()}")
         logger.info(f"   interactive: {workflow_view.isInteractive()}")
         logger.info(f"   enabled: {workflow_view.isEnabled()}")
@@ -809,11 +734,16 @@ class WorkflowTabWidget(QTabWidget):
 
         # 同步工作流变量快照到上下文
         try:
-            from task_workflow.workflow_vars import update_context_from_variables
+            from task_workflow.runtime_var_store import build_task_key, load_runtime_snapshot
+            from task_workflow.workflow_context import get_workflow_context, import_global_vars
             variables_data = None
             if isinstance(task.workflow_data, dict):
-                variables_data = task.workflow_data.get("variables")
-            update_context_from_variables(task_id, variables_data)
+                task.workflow_data.pop("variables", None)
+            task_key = build_task_key(task.filepath, task.task_id, task.name)
+            variables, sources = load_runtime_snapshot(task_key)
+            workflow_id = f"workflow_{task_id}"
+            import_global_vars({"global_vars": variables, "var_sources": sources}, workflow_id=workflow_id)
+            get_workflow_context(workflow_id).bind_runtime_storage(task_key=task_key, dirty=False)
         except Exception as exc:
             logger.warning(f"同步工作流变量上下文失败: {exc}")
 
@@ -839,6 +769,19 @@ class WorkflowTabWidget(QTabWidget):
         # 注意：connection_deleted信号发出时，conn.start_item可能已被清空，需要在连接前保存
         workflow_view.connection_added.connect(lambda start_card, end_card, conn_type: self._on_connection_changed(start_card))
         workflow_view.connection_deleted.connect(lambda conn: self._on_connection_deleted_for_random_jump(conn, task_id))
+
+        # 测试入口直接连接主窗口处理器；没有连接时菜单点击只会发射信号而不会执行。
+        main_window = self.window()
+        if main_window is None:
+            raise RuntimeError("创建工作流视图时未找到主窗口，无法绑定测试执行入口")
+        workflow_view.test_card_execution_requested.connect(
+            main_window._handle_test_card_execution,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        workflow_view.test_flow_execution_requested.connect(
+            main_window._handle_test_flow_execution,
+            Qt.ConnectionType.QueuedConnection,
+        )
         # 连接子工作流打开信号
         workflow_view.open_sub_workflow_requested.connect(self.open_sub_workflow)
 
@@ -870,7 +813,7 @@ class WorkflowTabWidget(QTabWidget):
         # 重建所有映射关系
         self._rebuild_mappings()
 
-        logger.info(f"映射关系重建完成:")
+        logger.info("映射关系重建完成:")
         logger.info(f"   tab_to_task: {self.tab_to_task}")
         logger.info(f"   task_to_tab: {self.task_to_tab}")
 
@@ -993,7 +936,7 @@ class WorkflowTabWidget(QTabWidget):
 
         # 关键：直接重建映射，不要手动删除（因为索引已经变化）
         self._rebuild_mappings()
-        logger.debug(f"映射关系已重建")
+        logger.debug("映射关系已重建")
 
         # 删除后切换到合适的标签页
         if len(self.task_views) > 0 and next_index >= 0:
@@ -1037,36 +980,6 @@ class WorkflowTabWidget(QTabWidget):
                     except Exception:
                         scene = None
 
-                # 关闭标签页时主动清理全局连线动画注册，避免残留强引用。
-                try:
-                    from ..workflow_parts.connection_line import _animated_lines, _animated_lines_lock, _unregister_animated_line
-                    lines_to_cleanup = []
-                    with _animated_lines_lock:
-                        for line in list(_animated_lines):
-                            if line is None:
-                                continue
-
-                            try:
-                                line_scene = line.scene()
-                            except RuntimeError:
-                                line_scene = None
-                            except Exception:
-                                line_scene = None
-
-                            if scene is not None and line_scene is scene:
-                                lines_to_cleanup.append(line)
-
-                    for line in lines_to_cleanup:
-                        try:
-                            if hasattr(line, "cleanup"):
-                                line.cleanup()
-                            else:
-                                _unregister_animated_line(line)
-                        except Exception:
-                            _unregister_animated_line(line)
-                except Exception as exc:
-                    logger.warning(f"清理全局连线动画注册失败: {exc}")
-
                 try:
                     workflow_widget.undo_stack.clear()
                 except Exception:
@@ -1081,10 +994,6 @@ class WorkflowTabWidget(QTabWidget):
                     pass
 
                 if scene is not None:
-                    try:
-                        scene.selectionChanged.disconnect()
-                    except Exception:
-                        pass
                     try:
                         scene.clear()
                     except Exception:
@@ -1149,72 +1058,38 @@ class WorkflowTabWidget(QTabWidget):
         """任务状态变化回调"""
         self._update_tab_status(task_id)
 
-    def _on_tab_close_requested(self, index: int):
+    def _task_has_active_close_state(self, task) -> bool:
+        """关闭标签前执行与任务管理器一致的严格活动态检查。"""
+        status = str(getattr(task, "status", "") or "").strip().lower()
+        if status in {"running", "paused", "starting", "stopping"}:
+            return True
+        if getattr(task, "executor", None) is not None or getattr(task, "executor_thread", None) is not None:
+            return True
+        return bool(self.task_manager._task_has_active_runtime(task))
+
+    def _on_tab_close_requested(self, index: int) -> bool:
         """标签页关闭请求"""
         # "+"标签页不可关闭
         if index == self.count() - 1:
-            return
+            return False
 
         if index not in self.tab_to_task:
-            return
+            return False
 
         task_id = self.tab_to_task[index]
         task = self.task_manager.get_task(task_id)
 
         if not task:
-            return
+            return False
 
-        # 检查任务是否正在运行/暂停/停止中（线程未完全退出前都视为活动态）
-        thread_running = False
-        try:
-            thread = getattr(task, "executor_thread", None)
-            thread_running = bool(thread and thread.isRunning())
-        except Exception:
-            thread_running = False
-        status = str(getattr(task, "status", "") or "").strip()
-        status_lower = status.lower()
-        stop_reason = str(getattr(task, "stop_reason", "") or "").strip()
-        stop_reason_lower = stop_reason.lower()
-        active_status_values = {
-            "running", "paused", "starting", "stopping",
-            "运行中", "暂停", "暂停中", "启动中", "正在启动", "停止中", "正在停止",
-        }
-        terminal_status_values = {
-            "idle", "completed", "failed", "stopped",
-            "空闲", "已完成", "完成", "失败", "已停止", "停止",
-        }
-        is_active_status = status in active_status_values or status_lower in active_status_values
-        is_terminal_status = status in terminal_status_values or status_lower in terminal_status_values
-        is_user_stopping = (
-            stop_reason in ("stopped", "已停止", "用户停止")
-            or stop_reason_lower == "stopped"
-            or status in ("stopped", "stopping", "已停止", "停止中", "正在停止")
-        )
-
-        if is_active_status or thread_running:
-            # 已处于终态（完成/失败/已停止）时，即使线程仍在回收，也不再误提示“仍在执行”。
-            if thread_running and (is_user_stopping or is_terminal_status):
-                logger.info(
-                    "任务 '%s' 已是终态但线程仍在退出中，跳过执行确认并继续关闭流程",
-                    task.name,
-                )
-                try:
-                    task.stop()
-                except Exception:
-                    pass
-            else:
-                reply = QMessageBox.question(
-                    self,
-                    "确认关闭",
-                    f"任务 '{task.name}' 仍在执行，确定要关闭吗？",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-
-                if reply == QMessageBox.StandardButton.No:
-                    return
-
-                # 停止任务
-                task.stop()
+        if self._task_has_active_close_state(task):
+            logger.warning("拒绝关闭活动任务标签: task_id=%s, status=%s", task_id, task.status)
+            QMessageBox.warning(
+                self,
+                "无法关闭",
+                f"任务 '{task.name}' 仍处于活动或清理状态，请先明确停止并等待清理完成。",
+            )
+            return False
 
         # 检查是否有未保存的更改
         if task.modified:
@@ -1231,13 +1106,7 @@ class WorkflowTabWidget(QTabWidget):
                 # 更新工作流数据
                 if task_id in self.task_views:
                     workflow_view = self.task_views[task_id]
-                    current_task_id = self.get_current_task_id()
-                    variables_override = pick_variables_override(
-                        target_task_id=task_id,
-                        current_task_id=current_task_id,
-                        task_workflow_data=task.workflow_data,
-                    )
-                    workflow_data = workflow_view.serialize_workflow(variables_override=variables_override)
+                    workflow_data = workflow_view.serialize_workflow()
                     task.update_workflow_data(workflow_data)
 
                 # 如果任务没有文件路径（新建的空白工作流），使用另存为
@@ -1246,63 +1115,50 @@ class WorkflowTabWidget(QTabWidget):
                     # 检查是否保存成功（用户可能取消）
                     if not task.filepath:
                         logger.info("用户取消了另存为，不关闭标签页")
-                        return
+                        return False
                 else:
                     if not task.save():
                         QMessageBox.warning(self, "保存失败", f"无法保存任务 '{task.name}'")
-                        return
+                        return False
             elif reply == QMessageBox.StandardButton.Cancel:
-                return
+                return False
 
-        # 从最近打开列表移除
-        if task.filepath:
-            self._remove_from_recent_workflows(task.filepath)
-
-        # 删除任务（仅在线程退出后会真正删除）
+        # 删除任务。失败即明确拒绝，不停止、不排队、不延迟重试。
         if self.task_manager.remove_task(task_id):
+            if task.filepath:
+                self._remove_from_recent_workflows(task.filepath)
             self.workflow_closed.emit(task_id)
-        else:
-            logger.info(f"任务 '{task.name}' 仍在停止中，已延迟删除，稍后会自动关闭标签")
+            return True
+        logger.error("关闭标签失败，任务管理器拒绝移除: task_id=%s", task_id)
+        return False
 
-    def close_tab_silent(self, index: int):
+    def close_tab_silent(self, index: int) -> bool:
         """静默关闭标签页（不弹出确认框）"""
         # "+"标签页不可关闭
         if index == self.count() - 1:
-            return
+            return False
 
         if index not in self.tab_to_task:
-            return
+            return False
 
         task_id = self.tab_to_task[index]
         task = self.task_manager.get_task(task_id)
 
         if not task:
-            return
+            return False
 
-        # 如果任务仍在执行链路中，先停止
-        thread_running = False
-        try:
-            thread = getattr(task, "executor_thread", None)
-            thread_running = bool(thread and thread.isRunning())
-        except Exception:
-            thread_running = False
-        status = str(getattr(task, "status", "") or "").strip()
-        status_lower = status.lower()
-        active_status_values = {
-            "running", "paused", "starting", "stopping",
-            "运行中", "暂停", "暂停中", "启动中", "正在启动", "停止中", "正在停止",
-        }
-        is_active_status = status in active_status_values or status_lower in active_status_values
-        if is_active_status or thread_running:
-            task.stop()
+        if self._task_has_active_close_state(task):
+            logger.warning("静默关闭被拒绝：任务仍处于活动或清理状态: task_id=%s", task_id)
+            return False
 
-        # 从最近打开列表移除
-        if task.filepath:
-            self._remove_from_recent_workflows(task.filepath)
-
-        # 删除任务（仅在线程退出后会真正删除）
+        # 静默仅表示不弹窗，不表示可以隐式改变任务运行状态。
         if self.task_manager.remove_task(task_id):
+            if task.filepath:
+                self._remove_from_recent_workflows(task.filepath)
             self.workflow_closed.emit(task_id)
+            return True
+        logger.error("静默关闭失败，任务管理器拒绝移除: task_id=%s", task_id)
+        return False
 
     def _on_tab_clicked(self, index: int):
         """标签页被点击时触发"""
@@ -1381,7 +1237,7 @@ class WorkflowTabWidget(QTabWidget):
         # 重建映射关系
         self._rebuild_mappings()
 
-        logger.info(f"标签页移动后，映射关系已更新")
+        logger.info("标签页移动后，映射关系已更新")
 
     def _show_tab_context_menu(self, pos: QPoint):
         """显示标签页右键菜单"""
@@ -1571,13 +1427,7 @@ class WorkflowTabWidget(QTabWidget):
         if task_id in self.task_views:
                 workflow_view = self.task_views[task_id]
                 # 使用 serialize_workflow() 而不是 save_workflow(filepath)
-                current_task_id = self.get_current_task_id()
-                variables_override = pick_variables_override(
-                    target_task_id=task_id,
-                    current_task_id=current_task_id,
-                    task_workflow_data=task.workflow_data,
-                )
-                workflow_data = workflow_view.serialize_workflow(variables_override=variables_override)
+                workflow_data = workflow_view.serialize_workflow()
                 task.update_workflow_data(workflow_data)
 
         # 如果任务没有文件路径（新建的空白工作流），使用另存为
@@ -1603,13 +1453,7 @@ class WorkflowTabWidget(QTabWidget):
         if task_id in self.task_views:
             workflow_view = self.task_views[task_id]
             # 使用 serialize_workflow() 而不是 save_workflow(filepath)
-            current_task_id = self.get_current_task_id()
-            variables_override = pick_variables_override(
-                target_task_id=task_id,
-                current_task_id=current_task_id,
-                task_workflow_data=task.workflow_data,
-            )
-            workflow_data = workflow_view.serialize_workflow(variables_override=variables_override)
+            workflow_data = workflow_view.serialize_workflow()
             task.update_workflow_data(workflow_data)
 
         # 选择保存路径
@@ -1899,35 +1743,35 @@ class WorkflowTabWidget(QTabWidget):
 
     def load_recent_workflows(self) -> List[str]:
         """加载最近打开的工作流列表"""
-        try:
-            config_path = get_config_path()
-
-            if not os.path.exists(config_path):
-                return []
-
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-
-            recent_workflows = config.get('recent_workflows', [])
-
-            # 过滤掉不存在的文件
-            valid_workflows = [
-                path for path in recent_workflows
-                if os.path.exists(path) and not self._is_backup_path(path)
-            ]
-
-            # 如果有文件被过滤掉，更新配置
-            if len(valid_workflows) != len(recent_workflows):
-                config['recent_workflows'] = valid_workflows
-                with open(config_path, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=4, ensure_ascii=False)
-                logger.info(f"已清理无效或备份目录的工作流路径，保留 {len(valid_workflows)} 个")
-
-            return valid_workflows
-
-        except Exception as e:
-            logger.error(f"加载最近打开列表失败: {e}")
+        config_path = get_config_path()
+        if not os.path.exists(config_path):
             return []
+
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            raise TypeError("配置文件根节点必须是字典")
+
+        recent_workflows = config.get('recent_workflows', [])
+        if not isinstance(recent_workflows, list):
+            raise TypeError("recent_workflows 必须是列表")
+
+        normalized_paths = []
+        seen_paths = set()
+        for index, filepath in enumerate(recent_workflows):
+            if not isinstance(filepath, str) or not filepath.strip():
+                raise TypeError(f"recent_workflows[{index}] 必须是非空字符串")
+            if self._is_backup_path(filepath):
+                raise ValueError(f"最近工作流不能指向备份目录: {filepath}")
+            absolute_path = os.path.abspath(os.path.normpath(filepath))
+            if not os.path.isfile(absolute_path):
+                raise FileNotFoundError(f"最近工作流不存在: {absolute_path}")
+            dedup_key = os.path.normcase(absolute_path)
+            if dedup_key in seen_paths:
+                raise ValueError(f"最近工作流存在重复路径: {absolute_path}")
+            seen_paths.add(dedup_key)
+            normalized_paths.append(absolute_path)
+        return normalized_paths
 
     def auto_load_recent_workflows(self):
         """自动加载最近打开的工作流（保持顺序）"""
@@ -1940,51 +1784,27 @@ class WorkflowTabWidget(QTabWidget):
 
             logger.info(f"开始自动加载 {len(recent_workflows)} 个最近打开的工作流")
 
+            # 整批先校验，防止格式错误导致只加载一部分标签页。
+            for filepath in recent_workflows:
+                with open(filepath, 'r', encoding='utf-8') as workflow_file:
+                    workflow_data = json.load(workflow_file)
+                self._validate_workflow_import_data(workflow_data, filepath)
+
             # 设置自动加载标志，防止重复记录
             self._is_auto_loading = True
 
             for filepath in recent_workflows:
-                try:
-                    self.import_workflow(filepath)
-                except Exception as e:
-                    logger.error(f"自动加载工作流失败 {filepath}: {e}")
-
-            # 恢复标志
-            self._is_auto_loading = False
+                task_id = self.import_workflow(filepath)
+                if task_id is None:
+                    raise RuntimeError(f"自动加载工作流失败: {filepath}")
 
             logger.info("最近打开的工作流加载完成")
 
         except Exception as e:
-            logger.error(f"自动加载工作流时出错: {e}")
+            logger.error(f"自动加载工作流已停止: {e}")
+            QMessageBox.critical(self, "自动加载失败", str(e))
+        finally:
             self._is_auto_loading = False
-
-    def _auto_start_first_execute(self, task_id: int):
-        """自动启动首个执行的工作流"""
-        task = self.task_manager.get_task(task_id)
-        if not task:
-            logger.warning(f"无法找到任务 ID={task_id}")
-            return
-
-        if not task.first_execute:
-            logger.info(f"任务 '{task.name}' 未标记为首个执行，跳过自动启动")
-            return
-
-        # 切换到对应的标签页
-        tab_index = self.task_to_tab.get(task_id)
-        if tab_index is not None:
-            self.setCurrentIndex(tab_index)
-            logger.info(f"已切换到标签页: {tab_index}")
-
-        # 触发主窗口的执行按钮
-        # 需要通过父窗口调用
-        main_window = self.window()
-        if hasattr(main_window, 'run_workflow'):
-            logger.info(f"正在自动启动工作流: {task.name}")
-            # 延迟一下确保标签页切换完成
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(300, main_window.run_workflow)
-        else:
-            logger.warning("无法找到主窗口的 run_workflow 方法")
 
     def wheelEvent(self, event: QWheelEvent):
         """

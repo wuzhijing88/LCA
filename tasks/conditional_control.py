@@ -3,7 +3,7 @@ import logging
 import time
 import threading  # 用于线程锁
 import operator # For counter comparison
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple
 import os # <-- ADDED Import
 from tasks.task_utils import coerce_bool
 
@@ -17,7 +17,6 @@ except ImportError:
 
 # Try importing pyautogui for image finding & screenshot
 try:
-    import pyautogui
     PYAUTOGUI_AVAILABLE = True
 except ImportError:
     PYAUTOGUI_AVAILABLE = False
@@ -397,7 +396,7 @@ def _execute_condition_control(params: Dict[str, Any], counters: Dict[str, int],
 
         elif condition_type == '时间判断':
             # 时间判断逻辑：检查是否到达预设时间或超过指定时长
-            logger.info(f"[时间判断] 开始检测时间条件")
+            logger.info("[时间判断] 开始检测时间条件")
             if current_card_id is None:
                 logger.error("时间判断失败，因为无法获取当前卡片ID。")
                 condition_met = False
@@ -1112,7 +1111,6 @@ if __name__ == '__main__':
     try:
         import cv2
         import numpy as np
-        import os
         from services.screenshot_pool import capture_window
         # Check pywin32 availability (assuming defined at module level)
         if PYWIN32_AVAILABLE:

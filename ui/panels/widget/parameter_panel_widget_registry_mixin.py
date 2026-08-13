@@ -82,7 +82,7 @@ class ParameterPanelWidgetRegistryMixin:
                     # 尝试断开所有信号连接
                     widget.textChanged.disconnect()
                     logger.debug(f"已断开 {name} 的textChanged信号")
-                except:
+                except Exception:
                     pass  # 如果没有连接，忽略错误
 
         while self.content_layout.count():

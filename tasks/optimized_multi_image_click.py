@@ -56,8 +56,6 @@ def execute_multi_image_click_optimized(params: Dict[str, Any], execution_mode: 
     """
     try:
         from task_workflow.workflow_context import get_workflow_context
-        from tasks.image_match_click import execute_task as execute_image_click
-        import os
 
         context = get_workflow_context()
         start_time = time.time()
@@ -559,7 +557,7 @@ def _handle_all_completed(image_paths: List[str], card_id: Optional[int], contex
                          on_success_action: str, success_jump_id: Optional[int],
                          on_failure_action: str, failure_jump_id: Optional[int]) -> Tuple[bool, str, Optional[int]]:
     """处理全部完成情况"""
-    logger.info(f"[优化多图识别] 所有图片都已处理完成")
+    logger.info("[优化多图识别] 所有图片都已处理完成")
     # 清除记忆
     context.set_card_data(card_id, 'clicked_images', set())
     context.set_card_data(card_id, 'success_images', set())
@@ -569,7 +567,7 @@ def _handle_all_failed(results: List[RecognitionResult], image_paths: List[str],
                       click_all_found: bool, card_id: Optional[int], context,
                       on_failure_action: str, failure_jump_id: Optional[int]) -> Tuple[bool, str, Optional[int]]:
     """处理全部失败情况"""
-    logger.warning(f"[优化多图识别] 所有图片识别失败")
+    logger.warning("[优化多图识别] 所有图片识别失败")
     if not click_all_found:
         # 单次点击模式：清除记忆
         context.set_card_data(card_id, 'clicked_images', set())

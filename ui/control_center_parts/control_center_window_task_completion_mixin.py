@@ -1,9 +1,7 @@
-import hashlib
 import logging
-import os
 from typing import Tuple
 
-from ..control_center_parts.control_center_runtime import TaskState, WindowTaskRunner
+from ..control_center_parts.control_center_runtime import TaskState
 
 logger = logging.getLogger(__name__)
 
@@ -11,31 +9,6 @@ logger = logging.getLogger(__name__)
 class ControlCenterWindowTaskCompletionMixin:
     def on_workflow_completed(self, window_id: str, success: bool, workflow_index: int):
         logger.info(f"窗口{window_id}的工作流{workflow_index + 1}已完成，成功={success}")
-        runners = self._get_window_runner_list(window_id)
-        runner = runners[workflow_index] if 0 <= workflow_index < len(runners) else None
-        workflow_name = ""
-        failure_message = ""
-        window_title = ""
-        window_hwnd = None
-
-        try:
-            if runner is not None:
-                workflow_name = str(runner.property("workflow_name") or "").strip()
-                failure_message = str(getattr(runner, "_last_execution_message", "") or "").strip()
-                window_info = getattr(runner, "window_info", {}) or {}
-                if isinstance(window_info, dict):
-                    window_title = str(window_info.get("title") or "").strip()
-                    window_hwnd = window_info.get("hwnd")
-        except Exception:
-            workflow_name = workflow_name
-
-        if not workflow_name:
-            workflows = self.window_workflows.get(window_id)
-            if isinstance(workflows, list) and 0 <= workflow_index < len(workflows):
-                workflow_item = workflows[workflow_index]
-                if isinstance(workflow_item, dict):
-                    workflow_name = str(workflow_item.get("name") or "").strip()
-
         result_map = self._window_workflow_results.setdefault(window_id, {})
         result_map[workflow_index] = bool(success)
         self._persist_workflow_runtime_snapshot(window_id, workflow_index)
@@ -43,60 +16,34 @@ class ControlCenterWindowTaskCompletionMixin:
         self._dispatch_pending_runner_starts()
 
     def _persist_workflow_runtime_snapshot(self, window_id: str, workflow_index: int):
+        runners = self._get_window_runner_list(window_id)
+        workflows = self.window_workflows.get(window_id)
+        if not (
+            isinstance(workflows, list)
+            and 0 <= workflow_index < len(workflows)
+            and 0 <= workflow_index < len(runners)
+            and isinstance(workflows[workflow_index], dict)
+        ):
+            return False
+        runtime_vars = getattr(runners[workflow_index], "_last_runtime_variables", None)
+        if not isinstance(runtime_vars, dict):
+            return False
         try:
-            runners = self._get_window_runner_list(window_id)
-            workflows = self.window_workflows.get(window_id)
-            if not (
-                isinstance(workflows, list)
-                and 0 <= workflow_index < len(workflows)
-                and 0 <= workflow_index < len(runners)
-                and isinstance(workflows[workflow_index], dict)
-                and isinstance(workflows[workflow_index].get("data"), dict)
-            ):
-                return
-
-            runtime_vars = getattr(runners[workflow_index], "_last_runtime_variables", None)
-            if not isinstance(runtime_vars, dict):
-                return
-
-            variables_payload = None
-            try:
-                from task_workflow.runtime_var_store import save_runtime_snapshot
-
-                workflow_item = workflows[workflow_index]
-                workflow_path = str(workflow_item.get("file_path") or "").strip()
-                if workflow_path:
-                    normalized_path = os.path.normcase(os.path.abspath(workflow_path)).replace("\\", "/")
-                else:
-                    normalized_path = f"memory:{window_id}:{workflow_index}"
-                path_digest = hashlib.sha1(normalized_path.encode("utf-8")).hexdigest()[:12]
-                task_key = f"cc:{window_id}:{workflow_index}:{path_digest}"
-                variables_payload = save_runtime_snapshot(task_key, runtime_vars)
-            except Exception as storage_err:
-                logger.warning(
-                    f"窗口{window_id}工作流{workflow_index + 1}变量外部持久化失败: {storage_err}"
-                )
-                variables_payload = None
-
-            if not isinstance(variables_payload, dict):
-                logger.warning(
-                    "窗口%s工作流%d变量持久化结果无效，已跳过回写",
-                    window_id,
-                    workflow_index + 1,
-                )
-                return
-
-            workflows[workflow_index]["data"]["variables"] = variables_payload
-            logger.info(
-                "窗口%s工作流%d变量快照已回写，变量数=%d",
-                window_id,
-                workflow_index + 1,
-                WindowTaskRunner._count_runtime_vars(runtime_vars),
+            from task_workflow.runtime_var_store import build_task_key, save_runtime_snapshot
+            workflow_item = workflows[workflow_index]
+            task_key = build_task_key(
+                filepath=workflow_item.get("file_path"),
+                task_id=workflow_index,
+                task_name=workflow_item.get("name"),
             )
-        except Exception as exc:
-            logger.warning(
-                f"回写窗口{window_id}工作流{workflow_index + 1}变量快照失败: {exc}"
-            )
+            save_runtime_snapshot(task_key, runtime_vars)
+            workflow_data = workflow_item.get("data")
+            if isinstance(workflow_data, dict):
+                workflow_data.pop("variables", None)
+            return True
+        except Exception:
+            logger.exception("控制中心运行变量写入 SQLite 失败")
+            return False
 
     def on_workflow_thread_finished(self, window_id: str, workflow_index: int):
         logger.info(f"窗口{window_id}的工作流线程{workflow_index + 1}已退出")

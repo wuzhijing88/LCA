@@ -14,6 +14,8 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+from utils.input_simulation.mode_utils import is_foreground_mode
+
 _DEFAULT_INPUT_LOCK_TIMEOUT_SEC = 30.0
 _DEFAULT_INPUT_LOCK_WARN_WAIT_MS = 200.0
 _LOCK_REGISTRY_GUARD = threading.Lock()
@@ -178,7 +180,7 @@ def _normalize_lock_scope(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"global", "window", "auto"}:
         return text
-    return "auto"
+    raise ValueError(f"未知输入锁范围: {value!r}")
 
 
 def resolve_input_lock_resource(
@@ -188,7 +190,6 @@ def resolve_input_lock_resource(
 ) -> str:
     scope = _normalize_lock_scope(os.environ.get("LCA_INPUT_LOCK_SCOPE", "auto"))
     mode_raw = str(execution_mode or "").strip()
-    mode_text = mode_raw.lower()
     hwnd_value = None
     try:
         if target_hwnd not in (None, ""):
@@ -205,9 +206,7 @@ def resolve_input_lock_resource(
 
     # auto:
     # 前台与录制回放等全局动作默认串行到全局输入资源
-    # 兼容中文模式名（如“前台一/前台二/前台驱动”）。
-    is_foreground_mode = mode_text.startswith("foreground") or mode_raw.startswith("前台")
-    if is_foreground_mode or str(task_type or "").strip() == "录制回放":
+    if is_foreground_mode(mode_raw) or str(task_type or "").strip() == "录制回放":
         return "global_input"
 
     # 只要是非前台且有目标窗口，就按窗口维度加锁，避免误回退到全局串行。
@@ -252,11 +251,7 @@ def task_requires_input_lock(
 
         fn = getattr(task_module, "requires_input_lock", None)
         if callable(fn):
-            try:
-                return bool(fn(params or {}))
-            except Exception:
-                # 判定异常时按默认策略回退
-                pass
+            return bool(fn(params or {}))
 
     if task_type in _DEFAULT_INPUT_TASK_TYPES:
         return True

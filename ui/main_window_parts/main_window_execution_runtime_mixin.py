@@ -135,8 +135,6 @@ class MainWindowExecutionRuntimeMixin:
 
         target_workflow_view = self.workflow_view
 
-        target_task_id = current_task_id
-
         # 验证卡片是否在当前视图中
 
         if target_workflow_view and card_id in target_workflow_view.cards:
@@ -151,15 +149,11 @@ class MainWindowExecutionRuntimeMixin:
 
             target_workflow_view = None
 
-            target_task_id = None
-
             for task_id, workflow_view in self.workflow_tab_widget.task_views.items():
 
                 if workflow_view and card_id in workflow_view.cards:
 
                     target_workflow_view = workflow_view
-
-                    target_task_id = task_id
 
                     logger.debug(f"[卡片状态] 找到卡片 {card_id} 所在的工作流视图: task_id={task_id}")
 
@@ -245,7 +239,7 @@ class MainWindowExecutionRuntimeMixin:
 
                         card.stop_flash()
 
-            except:
+            except Exception:
 
                 pass
 
@@ -483,7 +477,7 @@ class MainWindowExecutionRuntimeMixin:
 
                                          f"工作流执行期间有 {num_failed} 个图片文件无法找到。\n\n" 
 
-                                         f"是否现在选择一个包含这些图片的文件夹来尝试自动修复路径？",
+                                         "是否现在选择一个包含这些图片的文件夹来尝试自动修复路径？",
 
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
 
@@ -565,7 +559,7 @@ class MainWindowExecutionRuntimeMixin:
 
         if not hasattr(self, 'step_detail_label'):
 
-            logger.warning(f"[步骤显示] step_detail_label 不存在")
+            logger.warning("[步骤显示] step_detail_label 不存在")
 
             return
 
@@ -676,7 +670,7 @@ class MainWindowExecutionRuntimeMixin:
 
         if not self.workflow_view or not hasattr(self.workflow_view, 'cards'):
 
-            logger.warning(f"workflow_view不存在或没有cards属性，无法更新路径")
+            logger.warning("workflow_view不存在或没有cards属性，无法更新路径")
 
             return
 

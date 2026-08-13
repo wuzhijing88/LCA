@@ -3,8 +3,6 @@ coloredlogs==15.0.1
 comtypes==1.4.13
 cryptography==42.0.8
 dxcam==0.0.5
-fastdeploy-python==0.1.0
-fastdeploy-tools==0.0.5
 keyboard==0.13.5
 lxml==6.0.2
 mouse==0.7.1
@@ -35,6 +33,7 @@ PySide6==6.9.1
 PySide6_Addons==6.9.1
 PySide6_Essentials==6.9.1
 pytweening==1.2.0
+rapidocr==3.9.2
 pywin32==311
 pywin32-ctypes==0.2.3
 PyYAML==6.0.2

@@ -365,15 +365,7 @@ def resolve_window_client_offset(hwnd: int, log_prefix: str = '') -> Tuple[int, 
         return window_offset_x, window_offset_y
     except Exception as error:
         prefix = f'[{log_prefix}] ' if log_prefix else ''
-        logger.warning(f'{prefix}获取客户区位置失败，回退到窗口矩形: {error}')
-        rect = win32gui.GetWindowRect(hwnd)
-        window_offset_x, window_offset_y = rect[0], rect[1]
-        window_title = win32gui.GetWindowText(hwnd)
-        logger.info(
-            f'{prefix}窗口回放模式: 句柄={hwnd}, 标题={window_title}, '
-            f'窗口位置: ({window_offset_x}, {window_offset_y})'
-        )
-        return window_offset_x, window_offset_y
+        raise RuntimeError(f'{prefix}获取客户区位置失败: {error}') from error
 
 
 def resolve_replay_window_offsets_from_config(

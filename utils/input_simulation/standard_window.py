@@ -119,13 +119,10 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
             fg_manager.set_forced_modes(mouse_backend, keyboard_backend)
 
-            for attempt in range(2):
-                if fg_manager.initialize():
-                    self.driver = fg_manager.get_active_driver()
-                    self._ib_runtime_signature = runtime_signature
-                    return self.driver is not None
-                if attempt == 0:
-                    _precise_sleep(0.25)
+            if fg_manager.initialize():
+                self.driver = fg_manager.get_active_driver()
+                self._ib_runtime_signature = runtime_signature
+                return self.driver is not None
 
             self.driver = None
             self._ib_runtime_signature = None
@@ -137,15 +134,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             return False
 
     def _get_foreground_mouse_backend(self) -> str:
-        """获取当前前台鼠标后端，优先读取 execution_mode 映射。"""
-        try:
-            mouse_backend, _ = get_foreground_driver_backends(self.execution_mode)
-            backend = str(mouse_backend or "").strip().lower()
-            if backend:
-                return backend
-        except Exception:
-            pass
-        return str(self.foreground_driver or "").strip().lower()
+        mouse_backend, _ = get_foreground_driver_backends(self.execution_mode)
+        return str(mouse_backend).strip().lower()
 
     def _get_virtual_screen_bounds(self) -> Tuple[int, int, int, int]:
         """获取虚拟桌面边界，兼容负坐标多屏布局。"""
@@ -1179,10 +1169,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             if self.use_foreground:
                 if not self._ensure_driver():
                     return False
-                try:
-                    return self.driver.type_text(text)
-                except Exception:
-                    return self._sendinput_to_focused(text)
+                return self.driver.type_text(text)
             return self._find_and_send_to_input_control(text, stop_checker=stop_checker)
         except InterruptedError:
             raise
@@ -1439,8 +1426,6 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         try:
             import win32api
             import win32con
-            import win32gui
-            import time
 
             self.logger.debug("[focused_vk] start")
 
@@ -1479,65 +1464,6 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
         except Exception as e:
             self.logger.debug(f"[聚焦按键] 执行失败：{e}")
-            return False
-
-    def _sendinput_to_focused(self, text: str) -> bool:
-        """SendInput方法（全局输入，但输入框有焦点）"""
-        try:
-            import ctypes
-            from ctypes import wintypes, Structure
-            import time
-
-            self.logger.debug("[焦点SendInput] 开始尝试SendInput")
-
-            # 定义INPUT结构
-            class KEYBDINPUT(Structure):
-                _fields_ = [
-                    ("wVk", wintypes.WORD),
-                    ("wScan", wintypes.WORD),
-                    ("dwFlags", wintypes.DWORD),
-                    ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))
-                ]
-
-            class INPUT(Structure):
-                class _INPUT(ctypes.Union):
-                    _fields_ = [("ki", KEYBDINPUT)]
-                _anonymous_ = ("_input",)
-                _fields_ = [
-                    ("type", wintypes.DWORD),
-                    ("_input", _INPUT)
-                ]
-
-            INPUT_KEYBOARD = 1
-            KEYEVENTF_UNICODE = 0x0004
-
-            for char in text:
-                # 创建INPUT结构
-                inputs = (INPUT * 1)()
-                inputs[0].type = INPUT_KEYBOARD
-                inputs[0].ki.wVk = 0
-                inputs[0].ki.wScan = ord(char)
-                inputs[0].ki.dwFlags = KEYEVENTF_UNICODE
-                inputs[0].ki.time = 0
-                inputs[0].ki.dwExtraInfo = None
-
-                # 发送输入
-                result = ctypes.windll.user32.SendInput(1, inputs, ctypes.sizeof(INPUT))
-
-                if result:
-                    self.logger.debug(f"[焦点SendInput] 成功发送字符 '{char}'")
-                else:
-                    self.logger.debug(f"[焦点SendInput] 发送字符 '{char}' 失败")
-                    return False
-
-                _precise_sleep(0.05)
-
-            self.logger.info("[焦点SendInput] SendInput方法完成")
-            return True
-
-        except Exception as e:
-            self.logger.debug(f"[焦点SendInput] 失败: {e}")
             return False
 
     def _find_focused_child_control(self) -> int:
@@ -1602,14 +1528,14 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                         input_controls.append((hwnd_child, class_name, window_text))
                         self.logger.debug(f"[枚举输入控件] 找到候选控件: {hwnd_child} ({class_name}) '{window_text}'")
 
-                except:
+                except Exception:
                     pass
 
                 return True
 
             try:
                 win32gui.EnumChildWindows(self.hwnd, enum_child_proc, 0)
-            except:
+            except Exception:
                 pass
 
             # 按优先级排序
@@ -1642,9 +1568,6 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 raise InterruptedError("stop requested")
             import win32gui
             import win32con
-            import pyperclip
-            import ctypes
-            import time
 
             self.logger.debug(f"[发送到控件] 开始向控件 {control_hwnd} 发送文本: '{text}'")
 
@@ -1653,7 +1576,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 class_name = win32gui.GetClassName(control_hwnd)
                 window_text = win32gui.GetWindowText(control_hwnd)
                 self.logger.debug(f"[发送到控件] 控件信息: 类名={class_name}, 文本='{window_text}'")
-            except:
+            except Exception:
                 class_name = "Unknown"
                 window_text = ""
 
@@ -1661,7 +1584,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             control_chain = self._get_control_chain(control_hwnd)
             self.logger.debug(f"[send_to_control] control chain len: {len(control_chain)}")
 
-            # 方法1：WM_CHAR逐字符发送 - 对中文最有效
+            # WM_CHAR 逐字符发送
             try:
                 self.logger.debug("[发送到控件] 尝试WM_CHAR逐字符发送中文")
 
@@ -1682,7 +1605,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                     self.logger.debug("[文本发送] WM_CHAR 完成确认失败")
                     return False
 
-                self.logger.info(f"[发送到控件] WM_CHAR逐字符发送完成")
+                self.logger.info("[发送到控件] WM_CHAR逐字符发送完成")
                 self._last_input_control_hwnd = control_hwnd
                 return True
 
@@ -1690,66 +1613,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 raise
             except Exception as char_error:
                 self.logger.debug(f"[发送到控件] WM_CHAR方法失败: {char_error}")
-
-            # 方法2：剪贴板粘贴（备选方案）
-            try:
-                if stop_checker and stop_checker():
-                    raise InterruptedError("stop requested")
-                self.logger.debug("[发送到控件] 尝试剪贴板粘贴")
-
-                from utils.input_guard import acquire_input_guard
-
-                clipboard_owner = f"clipboard_paste:hwnd={control_hwnd}"
-                with acquire_input_guard(owner=clipboard_owner, resource="global_clipboard") as (acquired, _wait_ms):
-                    if not acquired:
-                        self.logger.debug("[文本发送] 获取剪贴板锁失败")
-                        return False
-
-                    original_clipboard = ""
-                    clipboard_snapshot_available = False
-                    try:
-                        try:
-                            original_clipboard = pyperclip.paste()
-                            clipboard_snapshot_available = True
-                        except Exception:
-                            clipboard_snapshot_available = False
-
-                        pyperclip.copy(text)
-                        _precise_sleep(0.15)
-
-                        paste_sent = False
-                        for hwnd_paste in control_chain:
-                            try:
-                                result = self._send_message(hwnd_paste, win32con.WM_PASTE, 0, 0)
-                                self.logger.debug(f"[text-send] WM_PASTE result (hwnd={hwnd_paste}): {result}")
-                                paste_sent = True
-                                break
-                            except Exception as paste_err:
-                                self.logger.debug(f"[文本发送] WM_PASTE 执行失败 (hwnd={hwnd_paste})：{paste_err}")
-
-                        if not paste_sent:
-                            return False
-                        if not self._confirm_background_message_delivery(control_chain):
-                            self.logger.debug("[文本发送] WM_PASTE 完成确认失败")
-                            return False
-
-                        _precise_sleep(0.3)
-                        self._last_input_control_hwnd = control_hwnd
-                        self.logger.debug(f"[text-send] clipboard paste path executed")
-                        return True
-                    finally:
-                        if clipboard_snapshot_available:
-                            try:
-                                pyperclip.copy(original_clipboard)
-                            except Exception:
-                                pass
-
-            except InterruptedError:
-                raise
-            except Exception as clipboard_error:
-                self.logger.debug(f"[发送到控件] 剪贴板方法失败: {clipboard_error}")
-
-            return False
+                return False
 
         except InterruptedError:
             raise
@@ -1797,7 +1661,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             # 如果没找到DocumentControl，尝试找PaneControl
             pane = window_control.PaneControl(searchDepth=5, ClassName='Chrome_RenderWidgetHostHWND')
             if pane and pane.Exists(maxSearchSeconds=1):
-                self.logger.debug(f"[元素点击] 找到Chrome RenderWidget")
+                self.logger.debug("[元素点击] 找到Chrome RenderWidget")
                 return pane
 
             return None
@@ -1854,7 +1718,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 if control_class:
                     return control_class(searchFromControl=window_control, **conditions)
             return window_control.Control(**conditions)
-        except:
+        except Exception:
             return None
 
     def _find_elements_by_traversal(self, window_control, name, automation_id, class_name, control_type, search_depth, found_index: int = None):
@@ -1893,7 +1757,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 if automation_id is not None and element.AutomationId != automation_id:
                     return False
                 return True
-            except:
+            except Exception:
                 return False
 
         if auto is None:
@@ -1924,7 +1788,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                             return True
                     if search_children(child, depth + 1):
                         return True
-            except:
+            except Exception:
                 return False
             return False
 
@@ -2303,7 +2167,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                     if control_type is not None and element.ControlTypeName != control_type.replace('Control', ''):
                         return False
                     return True
-                except:
+                except Exception:
                     return False
 
             def search_children(parent, depth: int):
@@ -2316,7 +2180,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                         if match_element(child):
                             results.append(child)
                         search_children(child, depth + 1)
-                except:
+                except Exception:
                     pass
 
             search_children(window_control, 0)
@@ -2365,7 +2229,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                     value_pattern = element.GetValuePattern()
                     if value_pattern:
                         return value_pattern.Value
-                except:
+                except Exception:
                     pass
 
                 try:
@@ -2373,7 +2237,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                     text_pattern = element.GetTextPattern()
                     if text_pattern:
                         return text_pattern.DocumentRange.GetText(-1)
-                except:
+                except Exception:
                     pass
 
                 # 回退到 Name 属性
@@ -2429,7 +2293,6 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 # 回退到模拟输入
                 try:
                     element.Click()
-                    import time
                     _precise_sleep(0.1)
 
                     # 清空现有内容

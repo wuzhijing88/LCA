@@ -60,3 +60,6 @@ jw3-auth-server-ubuntu-deploy/data/*.db*
 jw3-auth-server-ubuntu-deploy/logs/
 
 nuitka-crash-report.xml
+*.rar
+pytest-of-LS/
+universal_system_config.json

@@ -478,10 +478,10 @@ class ActionEditorDialog(QDialog):
             safe_label = html.escape(str(label))
             safe_value = html.escape(str(value))
             sections.append(
-                f"<div style='margin:0 0 6px 0;'>"
+                "<div style='margin:0 0 6px 0;'>"
                 f"<span style='color:{colors['text_secondary']};'>{safe_label}：</span>"
                 f"<span style='color:{colors['text']};'>{safe_value}</span>"
-                f"</div>"
+                "</div>"
             )
 
         sections.append(
@@ -489,7 +489,7 @@ class ActionEditorDialog(QDialog):
             f"font-weight:600; color:{colors['text_secondary']};'>原始数据</div>"
         )
         sections.append(
-            f"<pre style='margin:0; padding:10px 12px; white-space:pre-wrap; word-break:break-word; "
+            "<pre style='margin:0; padding:10px 12px; white-space:pre-wrap; word-break:break-word; "
             f"background:{colors['card']}; color:{colors['text']}; border:1px solid {colors['border']}; "
             f"border-radius:8px; font-family:Consolas, \"Courier New\", monospace;'>{json_text}</pre>"
         )

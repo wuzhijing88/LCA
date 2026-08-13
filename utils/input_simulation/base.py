@@ -4,7 +4,7 @@
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Any, List
 import logging
 from utils.input_timing import DEFAULT_KEY_HOLD_SECONDS
 
@@ -39,7 +39,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
 
     @abstractmethod
     def mouse_down(self, x: int, y: int, button: str = 'left') -> bool:
@@ -54,7 +53,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
 
     @abstractmethod
     def mouse_up(self, x: int, y: int, button: str = 'left') -> bool:
@@ -69,7 +67,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
 
     @abstractmethod
     def double_click(self, x: int, y: int, button: str = 'left') -> bool:
@@ -84,7 +81,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
 
     @abstractmethod
     def move_mouse(self, x: int, y: int) -> bool:
@@ -98,7 +94,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
 
     @abstractmethod
     def drag(self, start_x: int, start_y: int, end_x: int, end_y: int,
@@ -117,7 +112,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
     
     @abstractmethod
     def scroll(self, x: int, y: int, delta: int) -> bool:
@@ -132,7 +126,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
     
     @abstractmethod
     def send_key(self, vk_code: int, scan_code: int = 0, extended: bool = False) -> bool:
@@ -147,7 +140,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
     
     @abstractmethod
     def send_key_down(self, vk_code: int, scan_code: int = 0, extended: bool = False) -> bool:
@@ -162,7 +154,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
     
     @abstractmethod
     def send_key_up(self, vk_code: int, scan_code: int = 0, extended: bool = False) -> bool:
@@ -177,7 +168,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
     
     @abstractmethod
     def send_text(self, text: str, stop_checker=None) -> bool:
@@ -191,7 +181,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
     
     @abstractmethod
     def send_key_combination(self, keys: list, hold_duration: float = DEFAULT_KEY_HOLD_SECONDS) -> bool:
@@ -205,7 +194,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
 
     @abstractmethod
     def press_key_combination(self, keys: list) -> bool:
@@ -218,7 +206,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
 
     @abstractmethod
     def release_key_combination(self, keys: list) -> bool:
@@ -231,7 +218,6 @@ class BaseInputSimulator(ABC):
         Returns:
             bool: 操作是否成功
         """
-        pass
 
     def click_element(
         self,
@@ -357,7 +343,6 @@ class BaseInputSimulator(ABC):
 
 class ElementNotFoundError(Exception):
     """元素未找到异常"""
-    pass
 
 
 class InputSimulatorType:

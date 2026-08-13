@@ -1,5 +1,10 @@
 from .workflow_view_common import *
 
+operation_logger = logging.getLogger("workflow.operations")
+
+# 复制粘贴只记录操作结果，不输出参数全文和逐步调试信息。
+debug_print = lambda *args, **kwargs: None
+
 
 class WorkflowViewClipboardCopyPasteMixin:
 
@@ -14,9 +19,9 @@ class WorkflowViewClipboardCopyPasteMixin:
                 'parameters': safe_parameters,
                 'custom_name': card.custom_name  # 包含卡片备注
             }
-            logger.info(f"已复制卡片 {card_id} ({card.task_type}) 的数据，包含备注: {card.custom_name}")
+            operation_logger.info("[复制] 已复制卡片 card_id=%s", card_id)
         else:
-            logger.warning(f"尝试复制不存在的卡片 ID: {card_id}")
+            operation_logger.warning("[复制] 卡片不存在 card_id=%s", card_id)
 
     def handle_copy_selected_cards(self):
         """复制当前选中的所有卡片"""
@@ -28,14 +33,13 @@ class WorkflowViewClipboardCopyPasteMixin:
         selected_cards.sort(key=lambda card: card.card_id)
 
         if not selected_cards:
-            logger.warning("没有选中的卡片可以复制")
+            operation_logger.info("[复制] 没有选中卡片")
             return
 
         # 注释已清理（原注释编码损坏）
         if len(selected_cards) == 1:
             single_card = selected_cards[0]
             self.handle_copy_card(single_card.card_id, single_card.parameters)
-            logger.info(f"已按单卡模式复制卡片 {single_card.card_id}")
             return
 
         # 创建卡片ID到索引的映射
@@ -78,7 +82,11 @@ class WorkflowViewClipboardCopyPasteMixin:
             'connections': connections_data  # 保存连接信息
         }
 
-        logger.info(f"已复制 {len(selected_cards)} 个卡片和 {len(connections_data)} 条连接到剪贴板")
+        operation_logger.info(
+            "[复制] 已复制卡片数量=%s，连线数量=%s",
+            len(selected_cards),
+            len(connections_data),
+        )
 
     def is_paste_available(self) -> bool:
         """Checks if there is card data in the clipboard to paste."""
@@ -94,7 +102,7 @@ class WorkflowViewClipboardCopyPasteMixin:
         if not type(self).copied_card_data:
             debug_print("  [调试] 粘贴失败：剪贴板中没有卡片数据。")
             QMessageBox.warning(self, "粘贴失败", "剪贴板中没有可粘贴的卡片数据。")
-            debug_print(f"--- [DEBUG] WorkflowView: handle_paste_card END (No data) ---")
+            debug_print("--- [DEBUG] WorkflowView: handle_paste_card END (No data) ---")
             return
 
         # 注释已清理（原注释编码损坏）
@@ -107,7 +115,7 @@ class WorkflowViewClipboardCopyPasteMixin:
             # 批量卡片粘贴
             self._paste_multiple_cards(scene_pos)
 
-        debug_print(f"--- [DEBUG] WorkflowView: handle_paste_card END ---")
+        debug_print("--- [DEBUG] WorkflowView: handle_paste_card END ---")
 
     def _paste_single_card(self, scene_pos: QPointF):
         """粘贴单个卡片"""
@@ -118,7 +126,6 @@ class WorkflowViewClipboardCopyPasteMixin:
         if not task_type or not self.task_modules.get(task_type):
             debug_print(f"  [调试] 粘贴失败：剪贴板数据中的任务类型无效 '{task_type}'。")
             QMessageBox.critical(self, "粘贴失败", f"剪贴板中的卡片类型 '{task_type}' 无效。")
-            type(self).copied_card_data = None # Clear invalid data
             return
 
         debug_print(f"  [DEBUG] Pasting single card: Type='{task_type}', Params={parameters_to_paste}")
@@ -126,9 +133,11 @@ class WorkflowViewClipboardCopyPasteMixin:
         # 设置粘贴标志，防止add_task_card保存撤销状态
         self._pasting_card = True
         # Add the new card at the specified position
-        new_card = self.add_task_card(scene_pos.x(), scene_pos.y(), task_type, card_id=None)
+        try:
+            new_card = self.add_task_card(scene_pos.x(), scene_pos.y(), task_type, card_id=None)
+        finally:
+            self._pasting_card = False
         # 重置粘贴标志
-        self._pasting_card = False
 
         if new_card:
             debug_print(f"  [DEBUG] New card created with ID: {new_card.card_id}")
@@ -155,32 +164,11 @@ class WorkflowViewClipboardCopyPasteMixin:
                 'paste_type': 'single'
             })
 
-            # Trigger update after pasting
-            affected_container_ids = set()
-            target_container = self._find_drop_container_for_card(new_card)
-            if target_container:
-                if new_card.container_id != target_container.card_id:
-                    if new_card.container_id is not None:
-                        old_container_id = self._remove_card_from_container(new_card)
-                        if old_container_id is not None:
-                            affected_container_ids.add(old_container_id)
-                    self._assign_card_to_container(new_card, target_container)
-                affected_container_ids.add(target_container.card_id)
-            else:
-                if new_card.container_id is not None:
-                    old_container_id = self._remove_card_from_container(new_card)
-                    if old_container_id is not None:
-                        affected_container_ids.add(old_container_id)
-
-            for container_id in affected_container_ids:
-                container = self.cards.get(container_id)
-                if container and getattr(container, "is_container_card", False):
-                    self._layout_container_children(container)
-
             self.update_card_sequence_display()
             if self._is_start_task_type(new_card.task_type):
                 self._refresh_thread_start_custom_names()
-            debug_print(f"  Single card pasted successfully.")
+            operation_logger.info("[粘贴] 单卡粘贴完成 card_id=%s", new_card.card_id)
+            debug_print("  Single card pasted successfully.")
         else:
             debug_print("  [调试] 粘贴失败：add_task_card 返回了 None。")
             QMessageBox.critical(self, "粘贴失败", "创建新卡片时发生错误。")
@@ -254,7 +242,33 @@ class WorkflowViewClipboardCopyPasteMixin:
             QMessageBox.warning(self, "粘贴失败", "剪贴板中没有有效的卡片数据。")
             return
 
-        debug_print(f"  [DEBUG] Pasting {len(cards_data)} cards and {len(connections_data)} connections...")
+        original_ids = set()
+        for index, card_data in enumerate(cards_data):
+            if not isinstance(card_data, dict):
+                raise TypeError(f"剪贴板卡片数据第 {index + 1} 项必须是字典")
+            task_type = card_data.get('task_type')
+            original_card_id = card_data.get('original_card_id')
+            original_pos = card_data.get('original_pos')
+            if not isinstance(task_type, str) or task_type not in self.task_modules:
+                raise ValueError(f"剪贴板包含无效任务类型: {task_type!r}")
+            if isinstance(original_card_id, bool) or not isinstance(original_card_id, int):
+                raise TypeError("剪贴板卡片原始 ID 必须是整数")
+            if original_card_id in original_ids:
+                raise ValueError(f"剪贴板卡片原始 ID 重复: {original_card_id}")
+            if not isinstance(original_pos, (list, tuple)) or len(original_pos) != 2:
+                raise TypeError(f"剪贴板卡片 {original_card_id} 的位置格式无效")
+            original_ids.add(original_card_id)
+
+        for index, connection_data in enumerate(connections_data):
+            if not isinstance(connection_data, dict):
+                raise TypeError(f"剪贴板连线数据第 {index + 1} 项必须是字典")
+            start_id = connection_data.get('start_card_id')
+            end_id = connection_data.get('end_card_id')
+            line_type = connection_data.get('line_type')
+            if start_id not in original_ids or end_id not in original_ids:
+                raise ValueError(f"剪贴板连线端点无效: {start_id} -> {end_id}")
+            if line_type not in self._VALID_CONNECTION_TYPES:
+                raise ValueError(f"剪贴板包含无效连线类型: {line_type!r}")
 
         # 计算原始卡片的边界框，用于相对定位（即使只有1张卡片也使用真实最小值）
         min_x = min(card_data['original_pos'][0] for card_data in cards_data)
@@ -278,8 +292,8 @@ class WorkflowViewClipboardCopyPasteMixin:
 
             if not task_type or not self.task_modules.get(task_type):
                 debug_print(f"  [DEBUG] Skipping invalid task type: {task_type}")
-                failed_count += 1
-                continue
+                self._pasting_card = False
+                raise ValueError(f"剪贴板包含无效任务类型: {task_type!r}")
 
             # 计算新位置（相对于点击位置）
             offset_x = original_pos[0] - min_x
@@ -306,7 +320,8 @@ class WorkflowViewClipboardCopyPasteMixin:
                     old_to_new_card_map[original_card_id] = new_card
                 debug_print(f"  [DEBUG] Created card {i+1}/{len(cards_data)}: ID {new_card.card_id} ({task_type}), mapped from old ID {original_card_id}")
             else:
-                failed_count += 1
+                self._pasting_card = False
+                raise RuntimeError(f"粘贴卡片创建失败: {task_type}")
                 debug_print(f"  [调试] 创建卡片失败 {i+1}/{len(cards_data)}：{task_type}")
 
         # 注意：不在这里重置 _pasting_card 标志，等连接重建完成后再重置
@@ -332,9 +347,14 @@ class WorkflowViewClipboardCopyPasteMixin:
                         connection_count += 1
                         debug_print(f"  [DEBUG] Recreated connection: {new_start_card.card_id} -> {new_end_card.card_id} ({line_type})")
                     else:
-                        debug_print(f"  [调试] 创建连线失败：{new_start_card.card_id} -> {new_end_card.card_id} ({line_type})")
+                        self._pasting_card = False
+                        raise RuntimeError(
+                            f"粘贴连线创建失败: {new_start_card.card_id} -> "
+                            f"{new_end_card.card_id} ({line_type})"
+                        )
                 else:
-                    debug_print(f"  [DEBUG] Skipping connection - missing cards or type: old_start={old_start_id}, old_end={old_end_id}")
+                    self._pasting_card = False
+                    raise RuntimeError(f"粘贴连线缺少端点: {old_start_id} -> {old_end_id}")
 
         # 重置粘贴标志（在连接重建完成后）
         self._pasting_card = False
@@ -433,7 +453,12 @@ class WorkflowViewClipboardCopyPasteMixin:
         else:
             logger.error("粘贴失败: 所有卡片粘贴都失败了")
 
-        debug_print(f"  [DEBUG] Multiple cards paste completed: {success_count} cards, {connection_count} connections, {failed_count} failed")
+        if success_count > 0:
+            operation_logger.info(
+                "[粘贴] 批量粘贴完成，卡片数量=%s，连线数量=%s",
+                success_count,
+                connection_count,
+            )
 
     def copy_selected_card(self):
         """复制当前选中的卡片到剪贴板（不自动粘贴）。"""

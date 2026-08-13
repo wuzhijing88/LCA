@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-import sys
 from typing import List
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QLabel, QPushButton, QStyle, QApplication, QSizePolicy, QToolButton,
     QSpacerItem # Import QSpacerItem
 )
 # Import QIcon explicitly if needed for size setting
-from PySide6.QtCore import Qt, QPoint, QSize 
-from PySide6.QtGui import QMouseEvent, QAction, QIcon, QFontMetrics
+from PySide6.QtCore import Qt, QPoint 
+from PySide6.QtGui import QMouseEvent, QAction, QFontMetrics
 from utils.window_activation_utils import show_and_raise_widget
 
 class MainWindow: pass
@@ -32,7 +31,6 @@ class CustomTitleBar(QWidget):
 
         # Stylesheet - 由主题管理器统一管理，不再使用硬编码样式
         # 标题栏样式现在由全局主题控制
-        pass
 
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(8, 0, 0, 0) 
@@ -262,7 +260,7 @@ class CustomTitleBar(QWidget):
                 delta = global_pos - self._mouse_press_pos
                 self.parent_window.move(self._window_pos_before_move + delta)
                 event.accept()
-            except Exception as e:
+            except Exception:
                 # 防止拖动时发生异常导致卡死
                 self._mouse_pressed = False
                 event.ignore()
