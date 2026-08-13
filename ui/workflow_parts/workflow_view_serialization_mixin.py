@@ -3,103 +3,109 @@ from .workflow_view_common import *
 
 class WorkflowViewSerializationMixin:
 
-    def serialize_workflow(self, variables_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Serializes the current workflow (cards, connections, view state) into a dictionary."""
-        # 【关键修复】序列化前同步连线列表，确保 self.connections 与场景中的实际连线一致
-        self._sync_connections_with_scene()
+    @staticmethod
+    def _require_finite_number(value, field_name: str):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise TypeError(f"{field_name} 必须是有限数字")
+        return value
 
-        metadata = copy.deepcopy(getattr(self, "workflow_metadata", {}) or {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata.setdefault("created_date", datetime.now().isoformat())
-        metadata["engine_version"] = "1.0.0"
-        metadata.setdefault("module_versions", {})
+    def serialize_workflow(self) -> Dict[str, Any]:
+        """按当前格式生成一份与界面运行状态隔离的工作流数据。"""
+        if not isinstance(self.cards, dict):
+            raise TypeError("工作流卡片容器必须是字典")
+        if not isinstance(self.connections, list):
+            raise TypeError("工作流连接容器必须是列表")
+        if not isinstance(self.workflow_metadata, dict):
+            raise TypeError("工作流 metadata 必须是字典")
+
+        self._sync_connections_with_scene()
+        self._validate_card_references()
+
+        for card_id in self.cards:
+            if isinstance(card_id, bool) or not isinstance(card_id, int) or card_id < 0:
+                raise TypeError("卡片字典键必须是非负整数")
+
+        cards = []
+        for card_id in sorted(self.cards):
+            card = self.cards[card_id]
+            if not isinstance(card, TaskCard):
+                raise TypeError(f"卡片 {card_id} 不是 TaskCard 对象")
+            if card.card_id != card_id:
+                raise ValueError(f"卡片字典键 {card_id} 与卡片 ID {card.card_id!r} 不一致")
+            if card.scene() is not self.scene:
+                raise ValueError(f"卡片 {card_id} 未挂载到当前场景")
+            if not isinstance(card.task_type, str) or not card.task_type.strip():
+                raise TypeError(f"卡片 {card_id} 的 task_type 必须是非空字符串")
+            if not isinstance(card.parameters, dict):
+                raise TypeError(f"卡片 {card_id} 的 parameters 必须是字典")
+            if card.custom_name is not None and not isinstance(card.custom_name, str):
+                raise TypeError(f"卡片 {card_id} 的 custom_name 必须是字符串或 None")
+
+            pos_x = self._require_finite_number(card.x(), f"卡片 {card_id} 的 pos_x")
+            pos_y = self._require_finite_number(card.y(), f"卡片 {card_id} 的 pos_y")
+            try:
+                parameters = copy.deepcopy(card.parameters)
+            except Exception as exc:
+                raise TypeError(f"卡片 {card_id} 的 parameters 无法复制: {exc}") from exc
+
+            cards.append({
+                "id": card_id,
+                "task_type": card.task_type,
+                "pos_x": pos_x,
+                "pos_y": pos_y,
+                "parameters": parameters,
+                "custom_name": card.custom_name,
+            })
+
+        for item in self.scene.items():
+            if isinstance(item, TaskCard) and self.cards.get(item.card_id) is not item:
+                raise ValueError(f"场景中存在未登记卡片: {item.card_id!r}")
+            if isinstance(item, ConnectionLine) and item not in self.connections:
+                raise ValueError("场景中存在未登记连接")
+
+        connections = []
+        for connection in self.connections:
+            start_card, end_card, line_type = self._validate_registered_connection(connection)
+            connections.append({
+                "start_card_id": start_card.card_id,
+                "end_card_id": end_card.card_id,
+                "type": line_type,
+            })
+        connections.sort(key=lambda item: (
+            item["start_card_id"],
+            item["end_card_id"],
+            item["type"],
+        ))
+
+        transform = self.transform()
+        view_transform = [
+            transform.m11(), transform.m12(), transform.m13(),
+            transform.m21(), transform.m22(), transform.m23(),
+            transform.m31(), transform.m32(), transform.m33(),
+        ]
+        for index, value in enumerate(view_transform):
+            self._require_finite_number(value, f"view_transform 第 {index + 1} 项")
+
+        viewport_center = self.viewport().rect().center()
+        scene_center = self.mapToScene(viewport_center)
+        view_center = [scene_center.x(), scene_center.y()]
+        for index, value in enumerate(view_center):
+            self._require_finite_number(value, f"view_center 第 {index + 1} 项")
+
+        try:
+            metadata = copy.deepcopy(self.workflow_metadata)
+        except Exception as exc:
+            raise TypeError(f"工作流 metadata 无法复制: {exc}") from exc
 
         workflow_data = {
-            "cards": [],
-            "connections": [],
-            "view_transform": [],
+            "cards": cards,
+            "connections": connections,
+            "view_transform": view_transform,
             "metadata": metadata,
+            "view_center": view_center,
         }
-
-        variables_payload = None
-        if isinstance(variables_override, dict):
-            variables_payload = variables_override
-        else:
-            try:
-                from task_workflow.workflow_context import export_global_vars
-                variables_payload = export_global_vars()
-            except Exception as export_err:
-                logger.warning(f"导出工作流保存所需全局变量失败：{export_err}")
-
-        if variables_payload is not None:
-            workflow_data["variables"] = variables_payload
-
-        # Serialize cards
-        for card_id, card in self.cards.items():
-            debug_print(f"--- [DEBUG] Saving Card ID: {card_id}, Type: {card.task_type} ---") # DEBUG
-            # --- ADDED: Specific log for card ID 0 ---
-            if card_id == 0:
-                logger.warning(
-                    f"    [SERIALIZE] ID 0 卡片序列化: task_type={card.task_type}, parameters={card.parameters}"
-                )
-            # --- END ADDED ---
-            debug_print(f"  Parameters to be saved: {card.parameters}") # <<< ADDED DEBUG PRINT
-            card_data = {
-                "id": card_id,
-                "task_type": card.task_type, # <<< CHANGED FROM 'type' TO 'task_type'
-                # --- UNIFIED: Save using 'pos_x' and 'pos_y' ---
-                "pos_x": card.x(), # <<< CHANGED FROM 'x' TO 'pos_x'
-                "pos_y": card.y(), # <<< CHANGED FROM 'y' TO 'pos_y'
-                # --- END UNIFICATION ---
-                "container_id": getattr(card, "container_id", None),
-                "parameters": card.parameters.copy(), # Assuming parameters are serializable
-                "custom_name": card.custom_name # 保存自定义名称
-            }
-
-            workflow_data["cards"].append(card_data)
-
-        # Serialize connections
-        # 【修复 2025-01-18】保存所有类型的连接（sequential, success, failure）
-        # 注释已清理（原注释编码损坏）
-        debug_print(f"  [SAVE_DEBUG] Serializing connections...")
-        for conn in self.connections:
-            if isinstance(conn, ConnectionLine):
-                # Ensure start/end items are valid TaskCards before accessing card_id
-                if isinstance(conn.start_item, TaskCard) and isinstance(conn.end_item, TaskCard):
-                    conn_data = {
-                        "start_card_id": conn.start_item.card_id,
-                        "end_card_id": conn.end_item.card_id,
-                        "type": conn.line_type  # 保存连接类型（sequential/success/failure）
-                    }
-                    workflow_data["connections"].append(conn_data)
-        debug_print(f"  [SAVE_DEBUG] Finished serializing connections. Saved {len(workflow_data['connections'])} lines.")
-        # --- END MODIFICATION ---
-                
-        # Serialize view transform
-        transform = self.transform()
-        workflow_data["view_transform"] = [
-            transform.m11(), transform.m12(), transform.m13(), # m13 usually 0
-            transform.m21(), transform.m22(), transform.m23(), # m23 usually 0
-            transform.m31(), transform.m32(), transform.m33()  # m31=dx, m32=dy, m33 usually 1
-        ]
-        # --- ADDED: Debug log for saved transform data ---
-        debug_print(f"  [SAVE_DEBUG] Serialized view_transform: {workflow_data['view_transform']}")
-        # --- END ADDED ---
-
-        # --- ADDED: Serialize view center point ---
-        viewport_center_view = self.viewport().rect().center()
-        scene_center_point = self.mapToScene(viewport_center_view)
-        workflow_data["view_center"] = [scene_center_point.x(), scene_center_point.y()]
-        debug_print(f"  [SAVE_DEBUG] Serialized view_center: {workflow_data['view_center']}")
-        # --- END ADDED ---
-
-        logger.info(f"序列化完成：找到 {len(workflow_data['cards'])} 个卡片，{len(workflow_data['connections'])} 个连接。")
+        try:
+            json.dumps(workflow_data, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"工作流包含无法保存为 JSON 的数据: {exc}") from exc
         return workflow_data
-
-    def save_workflow(self, filepath: str):
-        """DEPRECATED: Logic moved to MainWindow. Use serialize_workflow instead."""
-        # This method is likely no longer needed here as MainWindow handles saving.
-        # Keep it stubbed or remove it if confirmed unused.
-        logger.warning("WorkflowView.save_workflow is deprecated and should not be called.")
-        pass

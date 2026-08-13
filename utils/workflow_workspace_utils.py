@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from tasks.task_utils import get_image_path_resolver
 from utils.app_paths import normalize_workflow_image_path
@@ -124,25 +124,6 @@ def _normalize_saved_local_favorite(item: Dict[str, Any]) -> Optional[Dict[str, 
     }
 
 
-def _normalize_saved_manual_favorite(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    return None
-
-
-def _derive_workspaces_from_legacy_favorites(raw_favorites: Iterable[Dict[str, Any]]) -> List[str]:
-    workspaces: List[str] = []
-    seen = set()
-    for item in raw_favorites or []:
-        normalized_item = _normalize_saved_local_favorite(item)
-        if not normalized_item:
-            continue
-        workspace_dir = normalize_workspace_dir(os.path.dirname(normalized_item["filepath"]))
-        if not workspace_dir or workspace_dir in seen or not os.path.isdir(workspace_dir):
-            continue
-        seen.add(workspace_dir)
-        workspaces.append(workspace_dir)
-    return workspaces
-
-
 def _normalize_workspace_entries(raw_workspaces: Any) -> List[str]:
     normalized_workspaces: List[str] = []
     seen = set()
@@ -167,14 +148,8 @@ def build_workspace_favorites(
 ) -> List[Dict[str, Any]]:
     saved_favorites = saved_favorites if isinstance(saved_favorites, list) else []
     saved_state_map: Dict[str, Dict[str, Any]] = {}
-    manual_favorites: List[Dict[str, Any]] = []
 
     for item in saved_favorites:
-        manual_entry = _normalize_saved_manual_favorite(item)
-        if manual_entry:
-            manual_favorites.append(manual_entry)
-            continue
-
         normalized_item = _normalize_saved_local_favorite(item)
         if not normalized_item:
             continue
@@ -201,7 +176,6 @@ def build_workspace_favorites(
                 }
             )
 
-    favorites.extend(manual_favorites)
     return favorites
 
 
@@ -223,10 +197,6 @@ def load_workspace_favorites_snapshot(config_path: str) -> Tuple[List[str], List
 
     workspaces = _normalize_workspace_entries(raw_workspaces)
     changed = False
-    if not workspaces and isinstance(raw_favorites, list):
-        workspaces = _derive_workspaces_from_legacy_favorites(raw_favorites)
-        if workspaces:
-            changed = True
 
     favorites = build_workspace_favorites(workspaces, raw_favorites if isinstance(raw_favorites, list) else [])
 

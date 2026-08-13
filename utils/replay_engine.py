@@ -10,13 +10,8 @@ import logging
 from typing import Callable, Optional, Tuple
 from utils.relative_mouse_move import perform_timed_relative_move
 
-try:
-    import win32api
-    import win32con
-    WIN32_AVAILABLE = True
-except ImportError:
-    WIN32_AVAILABLE = False
-    logging.warning("win32api 不可用，回放功能可能受限")
+import win32api
+import win32con
 
 logger = logging.getLogger(__name__)
 
@@ -26,65 +21,14 @@ def get_vk_code_from_char(char):
     if not isinstance(char, str) or len(char) != 1:
         return None
 
-    # 优先使用当前键盘布局的系统映射
-    try:
-        layout = ctypes.windll.user32.GetKeyboardLayout(0)
-        vk_with_modifiers = ctypes.windll.user32.VkKeyScanExW(ord(char), layout)
-    except Exception:
-        vk_with_modifiers = -1
-
-    if vk_with_modifiers != -1:
-        vk_code = vk_with_modifiers & 0xFF
-        if vk_code != 0xFF:
-            return vk_code
-
-    # 系统映射失败时，回退到稳定的基础映射，防止整批按键失效
-    if 'a' <= char <= 'z' or 'A' <= char <= 'Z':
-        return ord(char.upper())
-
-    if '0' <= char <= '9':
-        return ord(char)
-
-    shifted_digits = {
-        '!': '1',
-        '@': '2',
-        '#': '3',
-        '$': '4',
-        '%': '5',
-        '^': '6',
-        '&': '7',
-        '*': '8',
-        '(': '9',
-        ')': '0',
-    }
-    if char in shifted_digits:
-        return ord(shifted_digits[char])
-
-    punctuation_vk_map = {
-        ';': win32con.VK_OEM_1,
-        ':': win32con.VK_OEM_1,
-        '=': win32con.VK_OEM_PLUS,
-        '+': win32con.VK_OEM_PLUS,
-        ',': win32con.VK_OEM_COMMA,
-        '<': win32con.VK_OEM_COMMA,
-        '-': win32con.VK_OEM_MINUS,
-        '_': win32con.VK_OEM_MINUS,
-        '.': win32con.VK_OEM_PERIOD,
-        '>': win32con.VK_OEM_PERIOD,
-        '/': win32con.VK_OEM_2,
-        '?': win32con.VK_OEM_2,
-        '`': win32con.VK_OEM_3,
-        '~': win32con.VK_OEM_3,
-        '[': win32con.VK_OEM_4,
-        '{': win32con.VK_OEM_4,
-        '\\': win32con.VK_OEM_5,
-        '|': win32con.VK_OEM_5,
-        ']': win32con.VK_OEM_6,
-        '}': win32con.VK_OEM_6,
-        "'": win32con.VK_OEM_7,
-        '"': win32con.VK_OEM_7,
-    }
-    return punctuation_vk_map.get(char)
+    layout = ctypes.windll.user32.GetKeyboardLayout(0)
+    vk_with_modifiers = ctypes.windll.user32.VkKeyScanExW(ord(char), layout)
+    if vk_with_modifiers == -1:
+        return None
+    vk_code = vk_with_modifiers & 0xFF
+    if vk_code == 0xFF:
+        return None
+    return vk_code
 
 
 class ReplayEngine:
@@ -151,20 +95,8 @@ class ReplayEngine:
 
     def _get_cursor_pos(self) -> Tuple[int, int]:
         """获取当前鼠标坐标。"""
-        try:
-            point = wintypes.POINT()
-            if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
-                return int(point.x), int(point.y)
-        except Exception:
-            pass
-
-        if WIN32_AVAILABLE:
-            try:
-                x, y = win32api.GetCursorPos()
-                return int(x), int(y)
-            except Exception:
-                pass
-        return 0, 0
+        x, y = win32api.GetCursorPos()
+        return int(x), int(y)
 
     def _set_cursor_pos_with_retry(
         self,
@@ -203,11 +135,6 @@ class ReplayEngine:
 
     def _send_key_with_sendinput(self, vk_code, key_up=False):
         """使用SendInput发送按键（更可靠，支持扫描码）"""
-        if not WIN32_AVAILABLE:
-            logger.error("[回放引擎] win32api 不可用，无法发送按键")
-            return
-
-        # 定义INPUT结构（如果还没有定义）
         if not self._INPUT_KEYBOARD_defined:
             class KEYBDINPUT(ctypes.Structure):
                 _fields_ = [
@@ -271,8 +198,6 @@ class ReplayEngine:
 
     def _get_vk_code(self, key_name):
         """将按键名称转换为虚拟键码"""
-        if not WIN32_AVAILABLE:
-            return None
         if key_name is None:
             return None
 
@@ -338,7 +263,7 @@ class ReplayEngine:
                 f_num = int(normalized_key[1:])
                 if 1 <= f_num <= 24:
                     return win32con.VK_F1 + (f_num - 1)
-            except:
+            except Exception:
                 pass
 
         # 检查特殊键
@@ -363,10 +288,6 @@ class ReplayEngine:
             window_offset_y: 窗口Y偏移
             recording_mode: 录制模式（'绝对坐标' 或 '相对位移'）
         """
-        if not WIN32_AVAILABLE:
-            logger.error("[回放引擎] win32api 不可用")
-            return False
-
         action_type = action.get('type')
 
         try:
@@ -499,10 +420,6 @@ class ReplayEngine:
         Returns:
             bool: 是否成功完成
         """
-        if not WIN32_AVAILABLE:
-            logger.error("[回放引擎] win32api 不可用，无法回放")
-            return False
-
         try:
             self._stop_requested = False
             logger.info(f"[回放引擎] 开始回放 - 动作数: {len(actions)}, 速度: {speed}x, 循环: {loop_count}")

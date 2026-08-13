@@ -245,7 +245,7 @@ class OCRRegionSelectorOverlay(QWidget):
                             'is_ldplayer': True,
                         })
 
-                        logger.info(f" [窗口调试] 混合策略设置完成")
+                        logger.info(" [窗口调试] 混合策略设置完成")
                         logger.info(f" [窗口调试] TheRender窗口矩形: {window_rect}")
                         logger.info(f" [窗口调试] TheRender客户区矩形: {client_rect}")
                         logger.info(f" [窗口调试] TheRender客户区屏幕位置(逻辑坐标): {client_screen_pos}")
@@ -555,7 +555,6 @@ class OCRRegionSelectorOverlay(QWidget):
 
     def _save_selection_debug_image(self, x: int, y: int, width: int, height: int):
         """调试图像保存功能已禁用"""
-        pass
 
     def _is_point_in_target_window(self, qt_screen_pos: QPoint) -> bool:
         """Check whether a point is inside the target window client area in Qt logical coordinates."""
@@ -685,9 +684,9 @@ class OCRRegionSelectorOverlay(QWidget):
                         event.accept()
                         return
 
-                    logger.info(f"===== 区域选择完成诊断 =====")
+                    logger.info("===== 区域选择完成诊断 =====")
                     logger.info(f"区域选择完成: ({relative_rect.x()}, {relative_rect.y()}, {relative_rect.width()}, {relative_rect.height()})")
-                    logger.info(f"这些坐标应该是相对于客户区左上角的物理像素坐标")
+                    logger.info("这些坐标应该是相对于客户区左上角的物理像素坐标")
 
                     # 打印窗口信息用于验证
                     if self.window_info:

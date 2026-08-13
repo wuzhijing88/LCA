@@ -8,13 +8,11 @@
 
 import logging
 import os
-import time
-import ctypes
 from datetime import datetime
 from typing import Optional, Tuple
-from PySide6.QtWidgets import QWidget, QMessageBox, QFileDialog, QPushButton
-from PySide6.QtCore import Signal, QPoint, QRect, Qt, QTimer
-from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QPixmap, QCursor, QPalette, QFontMetrics
+from PySide6.QtWidgets import QWidget, QMessageBox, QPushButton
+from PySide6.QtCore import Signal, QPoint, QRect, Qt
+from PySide6.QtGui import QPainter, QPen, QColor, QPixmap, QFontMetrics
 from PIL import Image
 import numpy as np
 import cv2
@@ -23,7 +21,6 @@ logger = logging.getLogger(__name__)
 from utils.window_coordinate_common import (
     get_qt_virtual_desktop_rect,
     build_window_info,
-    qt_global_to_native_point,
 )
 from ui.system_parts.message_box_translator import show_critical_box
 from utils.window_overlay_utils import (
@@ -44,17 +41,9 @@ from utils.window_activation_utils import (
 
 def _get_default_images_dir() -> str:
     """Get default images directory."""
-    try:
-        from utils.app_paths import get_images_dir
+    from utils.app_paths import get_images_dir
 
-        return get_images_dir("LCA")
-    except Exception:
-        fallback = os.path.abspath("images")
-        try:
-            os.makedirs(fallback, exist_ok=True)
-        except Exception:
-            pass
-        return fallback
+    return get_images_dir("LCA")
 
 
 def _get_context_images_dir(context) -> str:
@@ -73,36 +62,14 @@ def _normalize_screenshot_save_dir(save_dir: str) -> str:
         return default_images_dir
 
     if os.path.isabs(raw_save_dir):
-        normalized_dir = raw_save_dir
-    else:
-        try:
-            from utils.app_paths import get_app_root
+        return raw_save_dir
 
-            normalized_dir = os.path.abspath(os.path.join(get_app_root(), raw_save_dir))
-        except Exception:
-            normalized_dir = os.path.abspath(raw_save_dir)
+    from utils.app_paths import get_app_root
 
-    try:
-        from utils.app_paths import get_legacy_user_data_dir
-
-        legacy_images_dir = os.path.abspath(os.path.join(get_legacy_user_data_dir("LCA"), "images"))
-        normalized_abs = os.path.abspath(normalized_dir)
-        legacy_norm = os.path.normcase(legacy_images_dir)
-        normalized_norm = os.path.normcase(normalized_abs)
-        legacy_prefix = legacy_norm + os.sep
-        if normalized_norm == legacy_norm:
-            return default_images_dir
-        if normalized_norm.startswith(legacy_prefix):
-            relative_suffix = os.path.relpath(normalized_abs, legacy_images_dir)
-            return os.path.join(default_images_dir, relative_suffix)
-    except Exception:
-        pass
-
-    return normalized_dir
+    return os.path.abspath(os.path.join(get_app_root(), raw_save_dir))
 
 try:
     import win32gui
-    import win32api
     PYWIN32_AVAILABLE = True
 except ImportError:
     PYWIN32_AVAILABLE = False
@@ -1212,7 +1179,7 @@ class ScreenshotOverlay(QWidget):
             client_screen_pos = self._snapshot_client_pos
             sel_physical_x = int(client_screen_pos[0]) + int(relative_physical_x)
             sel_physical_y = int(client_screen_pos[1]) + int(relative_physical_y)
-            logger.info(f"==== 坐标转换详细诊断 ====")
+            logger.info("==== 坐标转换详细诊断 ====")
             logger.info(f"框选区域Qt逻辑: ({sel_x}, {sel_y}) {sel_width}x{sel_height}")
             logger.info(f"客户区Qt逻辑: ({self.client_qt_rect.x()}, {self.client_qt_rect.y()}) {self.client_qt_rect.width()}x{self.client_qt_rect.height()}")
             logger.info(f"客户区物理坐标(快照): {client_screen_pos}")
@@ -1221,7 +1188,7 @@ class ScreenshotOverlay(QWidget):
             logger.info(f"物理尺寸: {physical_width}x{physical_height}")
 
             if self.screenshot_image is not None and isinstance(self.screenshot_image, np.ndarray):
-                import cv2
+                pass
 
                 # 边界检查
                 img_h, img_w = self.screenshot_image.shape[:2]

@@ -210,7 +210,6 @@ class ForegroundInputManager:
         self._ib_driver_arg = ""
         self._ib_ahk_path = ""
         self._ib_ahk_dir = ""
-        self._allow_fallback = False  # 严格隔离，不自动降级
         self._last_failure_time = 0.0
         self._retry_cooldown_seconds = 0.0
         self._ib_missing_prompt_signatures = set()
@@ -219,20 +218,6 @@ class ForegroundInputManager:
         """根据执行模式选择驱动类型（严格隔离，不降级）"""
         if not (execution_mode and is_foreground_mode(execution_mode)):
             return
-
-        normalized_mode = str(execution_mode or "").strip().lower()
-        native_modes = {"interception", "ibinputsimulator"}
-        current_mouse_mode = str(self._mouse_forced_mode or "").strip().lower()
-        current_keyboard_mode = str(self._keyboard_forced_mode or "").strip().lower()
-
-        # 前台一模式下，若运行时已存在分离后的鼠标/键盘驱动设置，则沿用当前设置。
-        # 这样可避免被旧配置文件回写覆盖导致“键盘驱动回退到鼠标驱动”。
-        if normalized_mode in ("foreground_driver", "foreground"):
-            if current_mouse_mode in native_modes and current_keyboard_mode in native_modes:
-                logger.debug(
-                    f"前台驱动模式沿用当前运行时设置: mouse={current_mouse_mode}, keyboard={current_keyboard_mode}"
-                )
-                return
 
         mouse_mode, keyboard_mode = get_foreground_driver_backends(execution_mode)
         self.set_forced_modes(mouse_mode, keyboard_mode)
@@ -272,8 +257,7 @@ class ForegroundInputManager:
     def _normalize_forced_mode(mode: str) -> str:
         normalized_mode = str(mode or "").strip().lower()
         if normalized_mode not in ('interception', 'pyautogui', 'ibinputsimulator'):
-            logger.warning(f"不支持的驱动模式: {mode}，将使用 interception")
-            return 'interception'
+            raise ValueError(f"不支持的驱动模式: {mode!r}")
         return normalized_mode
 
     @staticmethod
@@ -380,7 +364,6 @@ class ForegroundInputManager:
         self._mouse_forced_mode = normalized_mouse_mode
         self._keyboard_forced_mode = normalized_keyboard_mode
         self._forced_mode = unified_mode
-        self._allow_fallback = False
         self._release_runtime_drivers()
 
     def set_forced_mode(self, mode: str) -> None:
@@ -416,15 +399,10 @@ class ForegroundInputManager:
         mouse_mode = self._mouse_forced_mode
         keyboard_mode = self._keyboard_forced_mode
 
-        if not mouse_mode and not keyboard_mode:
-            base_mode = self._normalize_forced_mode(self._forced_mode or 'interception')
-            mouse_mode = base_mode
-            keyboard_mode = base_mode
-
-        if not mouse_mode:
-            mouse_mode = self._normalize_forced_mode(self._forced_mode or keyboard_mode or 'interception')
-        if not keyboard_mode:
-            keyboard_mode = self._normalize_forced_mode(self._forced_mode or mouse_mode or 'interception')
+        if not mouse_mode or not keyboard_mode:
+            cfg_mouse, cfg_keyboard = get_foreground_driver_backends("foreground_driver")
+            mouse_mode = mouse_mode or cfg_mouse
+            keyboard_mode = keyboard_mode or cfg_keyboard
 
         mouse_mode = self._normalize_forced_mode(mouse_mode)
         keyboard_mode = self._normalize_forced_mode(keyboard_mode)
@@ -461,10 +439,6 @@ class ForegroundInputManager:
 
         if self._initialize_interception(set_active=set_active):
             return self._interception_driver
-        if self._allow_fallback and normalized_mode == 'interception':
-            logger.info("Interception驱动初始化失败，自动降级到PyAutoGUI")
-            if self._initialize_pyautogui(set_active=set_active):
-                return self._pyautogui_driver
         return None
     def _initialize_interception(self, set_active: bool = True) -> bool:
         """尝试初始化Interception驱动"""
@@ -987,7 +961,6 @@ class ForegroundInputManager:
         try:
             from PySide6.QtWidgets import QMessageBox, QApplication
             from PySide6.QtCore import QTimer
-            import sys
 
             # 确保有QApplication实例
             app = QApplication.instance()
@@ -1156,7 +1129,7 @@ class ForegroundInputManager:
 
         try:
             return self._active_driver.get_mouse_position()
-        except:
+        except Exception:
             return (0, 0)
 
     def get_driver_type(self) -> Optional[str]:

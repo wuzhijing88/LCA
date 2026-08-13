@@ -14,36 +14,23 @@ class ParameterPanelRecordingCaptureEditorMixin:
                 return
     
             try:
-                # 获取当前录制数据
+                # 获取当前录制数据（统一走回放载荷解析器，兼容新旧格式）
                 recorded_data = self.current_parameters.get('recorded_actions', '')
                 actions = []
-                recording_area = '全屏录制'  # 默认值
-                recording_mode = '绝对坐标'  # 默认值
+                recording_area = self._REPLAY_AREA_DEFAULT
+                recording_mode = self._REPLAY_MODE_DEFAULT
     
                 if recorded_data:
-                    import json
                     try:
-                        data = json.loads(recorded_data)
-    
-                        # 兼容新旧格式
-                        if isinstance(data, dict) and 'actions' in data:
-                            # 新格式：包含元数据
-                            actions = data['actions']
-                            recording_area = data.get('recording_area', '全屏录制')  # 获取录制区域
-                            recording_mode = data.get('recording_mode', '绝对坐标')  # 获取录制模式
-                        elif isinstance(data, list):
-                            # 旧格式：纯动作列表
-                            actions = data
-                        else:
-                            logger.error("录制数据格式错误")
-                            from PySide6.QtWidgets import QMessageBox
-                            QMessageBox.warning(self, "错误", "录制数据格式错误")
-                            return
+                        payload = self._parse_recorded_actions_payload(recorded_data)
                     except Exception as e:
                         logger.error(f"解析录制数据失败: {e}")
                         from PySide6.QtWidgets import QMessageBox
                         QMessageBox.warning(self, "错误", f"无法解析录制数据: {e}")
                         return
+                    actions = payload['actions']
+                    recording_area = payload['recording_area']
+                    recording_mode = payload['recording_mode']
     
                 # 导入步骤编辑器对话框
                 from ui.dialogs.action_editor_dialog import ActionEditorDialog

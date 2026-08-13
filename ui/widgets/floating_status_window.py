@@ -8,10 +8,10 @@ import re
 from utils.app_paths import get_config_path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QPlainTextEdit, QTextEdit, QFrame, QGraphicsDropShadowEffect, QSizePolicy
+    QPushButton, QTextEdit, QFrame, QGraphicsDropShadowEffect, QSizePolicy
 )
 from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QSize
-from PySide6.QtGui import QFont, QColor, QPainter, QBrush, QIcon, QPixmap, QPen, QPalette
+from PySide6.QtGui import QColor, QPainter, QBrush, QIcon, QPixmap, QPen, QPalette
 from utils.window_activation_utils import show_and_activate_overlay, show_and_raise_widget
 from utils.window_coordinate_common import get_available_geometry_for_widget
 

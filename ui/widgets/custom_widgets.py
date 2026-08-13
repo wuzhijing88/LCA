@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QFrame,
     QHBoxLayout,
-    QVBoxLayout,
     QAbstractItemView,
     QSizePolicy,
     QStyledItemDelegate,

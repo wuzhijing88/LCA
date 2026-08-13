@@ -59,22 +59,11 @@ except Exception as e:
     DXCAM_AVAILABLE = False
     logger.warning("[ERROR] DXGI 不可用: %s", e)
 
-# Win32 API
-try:
-    import win32gui
-    import win32api
-    WIN32_AVAILABLE = True
-except ImportError:
-    WIN32_AVAILABLE = False
-    logger.error("[ERROR] Win32 API 不可用")
+import cv2
+import win32api
+import win32gui
 
-# OpenCV
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-    logger.error("[ERROR] OpenCV 不可用")
+from utils.hwnd_capture_utils import CaptureStats
 
 
 @dataclass
@@ -86,23 +75,6 @@ class MonitorInfo:
     width: int
     height: int
     is_primary: bool = False
-
-
-@dataclass
-class CaptureStats:
-    """截图统计信息"""
-    total_captures: int = 0
-    success_captures: int = 0
-    failed_captures: int = 0
-    total_time_ms: float = 0.0
-
-    @property
-    def avg_time_ms(self) -> float:
-        return self.total_time_ms / self.total_captures if self.total_captures > 0 else 0.0
-
-    @property
-    def success_rate(self) -> float:
-        return (self.success_captures / self.total_captures * 100) if self.total_captures > 0 else 0.0
 
 
 class DXGICapture:
@@ -281,27 +253,26 @@ class DXGICapture:
         monitors: List[MonitorInfo] = []
         try:
             # 优先使用 pywin32 获取显示器信息（可靠、无需手动解析结构体）
-            if WIN32_AVAILABLE:
-                try:
-                    for i, (hmon, _hdc, _rect) in enumerate(win32api.EnumDisplayMonitors()):
-                        info = win32api.GetMonitorInfo(hmon) or {}
-                        mon_rect = info.get("Monitor")
-                        if not mon_rect or len(mon_rect) != 4:
-                            continue
-                        left, top, right, bottom = mon_rect
-                        width = int(right - left)
-                        height = int(bottom - top)
-                        flags = int(info.get("Flags", 0) or 0)
-                        monitors.append(MonitorInfo(
-                            index=i,
-                            left=int(left),
-                            top=int(top),
-                            width=width,
-                            height=height,
-                            is_primary=bool(flags & 1),
-                        ))
-                except Exception as e:
-                    logger.error(f"使用 win32api 获取显示器列表失败: {e}")
+            try:
+                for i, (hmon, _hdc, _rect) in enumerate(win32api.EnumDisplayMonitors()):
+                    info = win32api.GetMonitorInfo(hmon) or {}
+                    mon_rect = info.get("Monitor")
+                    if not mon_rect or len(mon_rect) != 4:
+                        continue
+                    left, top, right, bottom = mon_rect
+                    width = int(right - left)
+                    height = int(bottom - top)
+                    flags = int(info.get("Flags", 0) or 0)
+                    monitors.append(MonitorInfo(
+                        index=i,
+                        left=int(left),
+                        top=int(top),
+                        width=width,
+                        height=height,
+                        is_primary=bool(flags & 1),
+                    ))
+            except Exception as e:
+                logger.error(f"使用 win32api 获取显示器列表失败: {e}")
 
             # 兜底：如果枚举失败，至少用 camera 的输出尺寸构造一个主显示器
             if not monitors and self._camera is not None:
@@ -335,9 +306,6 @@ class DXGICapture:
         """获取窗口所在的显示器"""
         if not self._monitors:
             self._refresh_monitors()
-
-        if not WIN32_AVAILABLE:
-            return self._monitors[0] if self._monitors else None
 
         try:
             rect = win32gui.GetWindowRect(hwnd)
@@ -551,10 +519,6 @@ class DXGICapture:
         Returns:
             BGR 格式的 numpy 数组，失败返回 None
         """
-        if not WIN32_AVAILABLE:
-            logger.error("Win32 API 不可用")
-            return None
-
         try:
             # 检查窗口有效性
             if not win32gui.IsWindow(hwnd):
@@ -589,7 +553,7 @@ class DXGICapture:
 
             # 获取窗口所在显示器
             monitor = self._get_monitor_for_window(hwnd)
-            if monitor is None and WIN32_AVAILABLE:
+            if monitor is None:
                 try:
                     hmon = win32api.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
                     info = win32api.GetMonitorInfo(hmon) or {}
@@ -629,7 +593,7 @@ class DXGICapture:
             if rel_left < 0 or rel_top < 0 or rel_left + width > monitor.width or rel_top + height > monitor.height:
                 _set_last_failure_reason("window_out_of_monitor_bounds")
                 raise ValueError(
-                    f"窗口区域跨屏/越界，DXGI 无法裁剪: "
+                    "窗口区域跨屏/越界，DXGI 无法裁剪: "
                     f"abs=({left},{top},{width},{height}), "
                     f"rel=({rel_left},{rel_top},{width},{height}), "
                     f"monitor={monitor.index}@({monitor.left},{monitor.top}) {monitor.width}x{monitor.height}"
@@ -718,7 +682,7 @@ class DXGICapture:
                         try:
                             if hasattr(self._camera, 'release'):
                                 self._camera.release()
-                        except:
+                        except Exception:
                             pass
                         self._camera = None
                     self._camera_output_idx = None
@@ -856,74 +820,3 @@ def get_dxgi_monitors() -> List[MonitorInfo]:
         return []
     capture = get_global_capture()
     return capture.get_monitors()
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-
-    logger.info("=" * 60)
-    logger.info("DXGI 截图引擎测试")
-    logger.info("=" * 60)
-
-    if not is_dxgi_available():
-        logger.info("[ERROR] DXGI 不可用")
-        logger.info("请安装: pip install dxcam")
-        exit(1)
-
-    # 显示显示器信息
-    monitors = get_dxgi_monitors()
-    logger.info(f"\n检测到 {len(monitors)} 个显示器:")
-    for mon in monitors:
-        logger.info(f"  显示器 {mon.index}: {mon.width}x{mon.height} @ ({mon.left}, {mon.top})")
-
-    # 查找窗口
-    if WIN32_AVAILABLE:
-        hwnd = win32gui.FindWindow(None, "二重螺旋")
-        if hwnd:
-            logger.info(f"\n目标窗口: HWND={hwnd}")
-
-            # 测试窗口截图
-            logger.info("\n开始窗口截图测试...")
-            start = time.time()
-
-            frame = capture_window_dxgi(hwnd, client_area_only=True)
-
-            elapsed = (time.time() - start) * 1000
-            logger.info(f"截图耗时: {elapsed:.1f}ms")
-
-            if frame is not None:
-                logger.info(f"帧尺寸: {frame.shape}")
-                if CV2_AVAILABLE:
-                    cv2.imwrite("dxgi_window_test.png", frame)
-                    logger.info("已保存: dxgi_window_test.png")
-            else:
-                logger.info("[ERROR] 窗口截图失败")
-        else:
-            logger.info("\n未找到测试窗口")
-
-    # 测试全屏截图
-    logger.info("\n开始全屏截图测试...")
-    start = time.time()
-
-    frame = capture_screen_dxgi(0)
-
-    elapsed = (time.time() - start) * 1000
-    logger.info(f"截图耗时: {elapsed:.1f}ms")
-
-    if frame is not None:
-        logger.info(f"帧尺寸: {frame.shape}")
-        if CV2_AVAILABLE:
-            cv2.imwrite("dxgi_screen_test.png", frame)
-            logger.info("已保存: dxgi_screen_test.png")
-    else:
-        logger.info("[ERROR] 全屏截图失败")
-
-    # 统计信息
-    capture = get_global_capture()
-    stats = capture.get_stats()
-    logger.info("\n统计信息:")
-    for key, value in stats.items():
-        logger.info(f"  {key}: {value}")
-
-    cleanup_dxgi()
-    logger.info("\n测试完成")

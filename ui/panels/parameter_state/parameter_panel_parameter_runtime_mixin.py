@@ -22,12 +22,12 @@ class ParameterPanelParameterRuntimeMixin:
                     current_task_id = self.main_window.workflow_tab_widget.get_current_task_id()
                     if current_task_id is not None and current_task_id in self.main_window.workflow_tab_widget.task_views:
                         current_workflow_view = self.main_window.workflow_tab_widget.task_views[current_task_id]
-                        logger.debug(f"[实时参数] 从主窗口标签页获取workflow_view")
+                        logger.debug("[实时参数] 从主窗口标签页获取workflow_view")
 
                 # 回退到旧系统
                 if current_workflow_view is None and hasattr(self.main_window, 'workflow_view'):
                     current_workflow_view = self.main_window.workflow_view
-                    logger.debug(f"[实时参数] 从主窗口旧系统获取workflow_view")
+                    logger.debug("[实时参数] 从主窗口旧系统获取workflow_view")
 
             # 在获取的workflow_view中查找卡片
             if current_workflow_view and hasattr(current_workflow_view, 'cards'):

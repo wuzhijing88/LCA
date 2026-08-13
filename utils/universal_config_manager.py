@@ -6,12 +6,11 @@
 import json
 import logging
 import os
-import shutil
 import threading
 from typing import Dict, Any, Optional, Union, Tuple
 from pathlib import Path
 
-from utils.app_paths import get_user_data_dir
+from utils.app_paths import get_app_root
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +24,8 @@ class UniversalConfigManager:
         self._load_config()
     
     def _get_default_config_file(self) -> str:
-        """获取默认配置文件路径"""
-        user_config_file = Path(get_user_data_dir("LCA")) / "config" / "universal_system_config.json"
-        legacy_config_file = Path(__file__).resolve().parent.parent / "config" / "universal_system_config.json"
-
-        if not user_config_file.exists() and legacy_config_file.exists():
-            try:
-                user_config_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(legacy_config_file), str(user_config_file))
-            except Exception as e:
-                logger.warning(f"迁移通用配置到用户目录失败: {e}")
-
-        return str(user_config_file)
+        """配置文件在程序根目录，不再从旧路径拷贝。"""
+        return str(Path(get_app_root()) / "universal_system_config.json")
     
     def _load_config(self):
         """加载配置文件"""
@@ -51,8 +40,7 @@ class UniversalConfigManager:
                 # 自动创建并保存默认配置文件
                 self.save_config()
         except Exception as e:
-            logger.error(f"加载配置文件失败: {e}")
-            self._config_data = self._get_default_config()
+            raise RuntimeError(f"加载配置文件失败: {self._config_file}: {e}") from e
     
     def _get_default_config(self) -> Dict[str, Any]:
         """获取默认配置"""
@@ -217,15 +205,7 @@ class UniversalConfigManager:
     # 便捷方法：任务集成配置
     def is_universal_processing_enabled(self, task_type: str) -> bool:
         """检查指定任务类型是否启用通用处理"""
-        return self.get(f'task_integration.{task_type}.enable_universal_processing', True)
-    
-    def is_legacy_fallback_enabled(self, task_type: str = None) -> bool:
-        """检查是否启用传统方法回退"""
-        if task_type:
-            return self.get(f'task_integration.{task_type}.fallback_to_legacy', True)
-        else:
-            return self.get('compatibility.enable_legacy_fallback', True)
-    
+        return self.get(f'task_integration.{task_type}.enable_universal_processing', True) 
     # 便捷方法：调试配置
     def is_detailed_logging_enabled(self) -> bool:
         """检查是否启用详细日志"""

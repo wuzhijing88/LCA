@@ -4,15 +4,6 @@ import sys
 from PySide6.QtCore import QPointF, QRect, Qt
 from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 
-from .main_window_dropdown_helpers import (
-    CenteredTextDelegate,
-    FullBleedListWidget,
-    NoWheelDoubleSpinBox,
-    NoWheelSpinBox,
-    RoundedPopupFrame,
-)
-from .main_window_dropdown_widget import CustomDropdown, QComboBox
-from utils.window_coordinate_common import native_point_to_qt_global
 
 if sys.platform.startswith("win"):
 
@@ -122,7 +113,7 @@ def get_theme_color(color_key: str, default: str = '#000000') -> str:
 
         return theme_manager.get_color(color_key)
 
-    except:
+    except Exception:
 
         return default
 
@@ -138,7 +129,7 @@ def is_dark_theme() -> bool:
 
         return theme_manager.is_dark_mode()
 
-    except:
+    except Exception:
 
         return False
 

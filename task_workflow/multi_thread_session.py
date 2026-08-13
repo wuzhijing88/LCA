@@ -1,11 +1,9 @@
 ﻿"""多起点并发执行会话（线程级调度器）。"""
 
-import copy
 import gc
 import logging
 import os
 import threading
-import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
@@ -16,17 +14,11 @@ from task_workflow.workflow_identity import (
     normalize_workflow_filepath,
     normalize_workflow_id,
 )
-
-try:
-    from task_workflow.workflow_context import clear_workflow_context
-except Exception:  # pragma: no cover - runtime fallback
-    clear_workflow_context = None
-
-try:
-    from task_workflow.workflow_context import get_workflow_context, import_global_vars
-except Exception:  # pragma: no cover - runtime fallback
-    get_workflow_context = None
-    import_global_vars = None
+from task_workflow.workflow_context import (
+    clear_workflow_context,
+    get_workflow_context,
+    import_global_vars,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +57,20 @@ class WorkflowMultiThreadSession(QObject):
         parent=None,
     ):
         super().__init__(parent)
-        self.cards_data = cards_data if isinstance(cards_data, dict) else {}
-        self.connections_data = connections_data if isinstance(connections_data, list) else []
-        self.task_modules = task_modules if isinstance(task_modules, dict) else {}
+        if not isinstance(cards_data, dict) or not cards_data:
+            raise ValueError("cards_data 必须是非空字典")
+        if not isinstance(connections_data, list):
+            raise TypeError("connections_data 必须是列表")
+        if not isinstance(task_modules, dict):
+            raise TypeError("task_modules 必须是字典")
+        if not isinstance(start_card_ids, list) or len(start_card_ids) < 2:
+            raise ValueError("多线程会话至少需要两个线程起点")
+        if thread_labels is not None and not isinstance(thread_labels, dict):
+            raise TypeError("thread_labels 必须是字典")
+
+        self.cards_data = cards_data
+        self.connections_data = connections_data
+        self.task_modules = task_modules
         self.target_window_title = target_window_title
         self.execution_mode = execution_mode or "foreground"
         self.images_dir = images_dir
@@ -92,30 +95,50 @@ class WorkflowMultiThreadSession(QObject):
 
         # 线程表：key 为线程ID（这里使用起点卡片ID）
         self._entries: Dict[int, Dict[str, Any]] = {}
-        start_ids = []
-        for raw_id in start_card_ids or []:
-            try:
-                start_ids.append(int(raw_id))
-            except Exception:
-                continue
-        unique_start_ids = sorted(set(start_ids))
-        cpu_thread_limit = self._detect_cpu_logical_threads()
-        if len(unique_start_ids) > cpu_thread_limit:
-            logger.warning(
-                "线程起点数量(%d)超过CPU逻辑线程上限(%d)，将裁剪为前 %d 个",
-                len(unique_start_ids),
-                cpu_thread_limit,
-                cpu_thread_limit,
-            )
-            unique_start_ids = unique_start_ids[:cpu_thread_limit]
+        start_ids: List[int] = []
+        seen_start_ids: Set[int] = set()
+        for index, raw_id in enumerate(start_card_ids):
+            if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+                raise TypeError(f"线程起点ID必须是整数: index={index}, value={raw_id!r}")
+            if raw_id in seen_start_ids:
+                raise ValueError(f"线程起点ID重复: {raw_id}")
+            if raw_id not in self.cards_data:
+                raise ValueError(f"线程起点卡片不存在: {raw_id}")
+            seen_start_ids.add(raw_id)
+            start_ids.append(raw_id)
 
-        for idx, start_id in enumerate(unique_start_ids, 1):
+        cpu_thread_limit = self._detect_cpu_logical_threads()
+        if len(start_ids) > cpu_thread_limit:
+            raise ValueError(
+                f"线程起点数量({len(start_ids)})超过CPU逻辑线程上限({cpu_thread_limit})"
+            )
+
+        labels = dict(thread_labels or {})
+        unknown_label_ids = set(labels) - seen_start_ids
+        if unknown_label_ids:
+            raise ValueError(f"线程标签引用了未知起点: {sorted(unknown_label_ids)}")
+        unknown_window_config_ids = set(self.thread_window_configs) - seen_start_ids
+        if unknown_window_config_ids:
+            raise ValueError(
+                f"线程窗口配置引用了未知起点: {sorted(unknown_window_config_ids)}"
+            )
+
+        for idx, start_id in enumerate(start_ids, 1):
             label = str((thread_labels or {}).get(start_id) or f"线程起点{idx}")
-            thread_window_config = self.thread_window_configs.get(start_id) or {}
-            entry_target_hwnd = thread_window_config.get("target_hwnd")
-            if entry_target_hwnd is None:
+            thread_window_config = self.thread_window_configs.get(start_id)
+            if thread_window_config is None:
                 entry_target_hwnd = self.target_hwnd
-            entry_target_window_title = thread_window_config.get("target_window_title") or self.target_window_title
+                entry_target_window_title = self.target_window_title
+                entry_window_index = None
+                entry_window_source_card_id = None
+            else:
+                entry_target_hwnd = thread_window_config["target_hwnd"]
+                entry_target_window_title = thread_window_config.get(
+                    "target_window_title",
+                    "",
+                )
+                entry_window_index = thread_window_config.get("window_index")
+                entry_window_source_card_id = thread_window_config.get("source_card_id")
             self._entries[start_id] = {
                 "thread_id": start_id,
                 "label": label,
@@ -132,8 +155,8 @@ class WorkflowMultiThreadSession(QObject):
                 "runtime_variables": {},
                 "target_hwnd": entry_target_hwnd,
                 "target_window_title": entry_target_window_title,
-                "window_index": thread_window_config.get("window_index"),
-                "window_source_card_id": thread_window_config.get("source_card_id"),
+                "window_index": entry_window_index,
+                "window_source_card_id": entry_window_source_card_id,
             }
 
         logger.info(
@@ -152,17 +175,22 @@ class WorkflowMultiThreadSession(QObject):
 
     @staticmethod
     def _detect_cpu_logical_threads() -> int:
-        try:
-            return max(1, int(os.cpu_count() or 1))
-        except Exception:
-            return 1
+        cpu_count = os.cpu_count()
+        if not isinstance(cpu_count, int) or isinstance(cpu_count, bool) or cpu_count <= 0:
+            raise RuntimeError(f"无法确定CPU逻辑线程数: {cpu_count!r}")
+        return cpu_count
 
     @staticmethod
     def _read_bool_env(name: str, default: bool = False) -> bool:
         raw = os.getenv(name)
         if raw is None:
             return default
-        return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+        normalized = str(raw).strip().lower()
+        if normalized in {"1", "true", "yes", "on", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "n"}:
+            return False
+        raise ValueError(f"环境变量 {name} 必须是布尔值: {raw!r}")
 
     @staticmethod
     def _read_int_env(name: str, default: int, min_value: int, max_value: int) -> int:
@@ -171,32 +199,35 @@ class WorkflowMultiThreadSession(QObject):
             return default
         try:
             value = int(raw)
-        except Exception:
-            value = default
-        return max(min_value, min(max_value, value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"环境变量 {name} 必须是整数: {raw!r}") from exc
+        if value < min_value or value > max_value:
+            raise ValueError(
+                f"环境变量 {name} 超出范围: {value}, 要求 {min_value}..{max_value}"
+            )
+        return value
 
     @staticmethod
     def _normalize_thread_window_configs(raw_configs: Optional[Dict[int, Dict[str, Any]]]) -> Dict[int, Dict[str, Any]]:
-        normalized: Dict[int, Dict[str, Any]] = {}
+        if raw_configs is None:
+            return {}
         if not isinstance(raw_configs, dict):
-            return normalized
+            raise TypeError("thread_window_configs 必须是字典")
 
+        normalized: Dict[int, Dict[str, Any]] = {}
         for raw_start_id, raw_config in raw_configs.items():
+            if isinstance(raw_start_id, bool) or not isinstance(raw_start_id, int):
+                raise TypeError(f"线程窗口配置起点ID必须是整数: {raw_start_id!r}")
             if not isinstance(raw_config, dict):
-                continue
-            try:
-                start_id = int(raw_start_id)
-            except Exception:
-                continue
+                raise TypeError(f"线程窗口配置必须是字典: start_card_id={raw_start_id}")
 
             config = dict(raw_config)
-            try:
-                target_hwnd = config.get("target_hwnd")
-                if target_hwnd is not None:
-                    config["target_hwnd"] = int(target_hwnd)
-            except Exception:
-                config.pop("target_hwnd", None)
-            normalized[start_id] = config
+            target_hwnd = config.get("target_hwnd")
+            if isinstance(target_hwnd, bool) or not isinstance(target_hwnd, int) or target_hwnd <= 0:
+                raise ValueError(
+                    f"线程窗口配置句柄无效: start_card_id={raw_start_id}, hwnd={target_hwnd!r}"
+                )
+            normalized[raw_start_id] = config
         return normalized
 
     def _resolve_runtime_screenshot_limit(self) -> int:
@@ -204,7 +235,7 @@ class WorkflowMultiThreadSession(QObject):
         hard_limit = self._detect_cpu_logical_threads()
         configured_limit = self._read_int_env(
             "LCA_MT_SCREENSHOT_LIMIT",
-            3,
+            min(3, hard_limit),
             1,
             hard_limit,
         )
@@ -212,14 +243,13 @@ class WorkflowMultiThreadSession(QObject):
 
     def _apply_screenshot_worker_limit_for_run(self) -> None:
         target_limit = self._resolve_runtime_screenshot_limit()
-        applied_limit = target_limit
-        try:
-            from services.screenshot_pool import set_screenshot_worker_limit
+        from services.screenshot_pool import set_screenshot_worker_limit
 
-            applied_limit = int(set_screenshot_worker_limit(target_limit))
-        except Exception as exc:
-            logger.warning("设置截图并发上限失败，回退会话内限制: %s", exc)
-            applied_limit = target_limit
+        applied_limit = int(set_screenshot_worker_limit(target_limit))
+        if applied_limit != target_limit:
+            raise RuntimeError(
+                f"截图并发上限应用不一致: requested={target_limit}, applied={applied_limit}"
+            )
         self._applied_screenshot_worker_limit = applied_limit
         logger.info(
             "多线程会话截图并发上限(同进程模式): limit=%d, threads=%d",
@@ -228,12 +258,9 @@ class WorkflowMultiThreadSession(QObject):
         )
 
     def _restore_screenshot_worker_limit_after_run(self) -> None:
-        try:
-            from services.screenshot_pool import set_screenshot_worker_limit
+        from services.screenshot_pool import set_screenshot_worker_limit
 
-            set_screenshot_worker_limit(None)
-        except Exception:
-            pass
+        set_screenshot_worker_limit(None)
         self._applied_screenshot_worker_limit = None
 
     def _collect_memory_diag_snapshot(self, force_gc: bool = False) -> Dict[str, Any]:
@@ -293,7 +320,7 @@ class WorkflowMultiThreadSession(QObject):
         runtime_vars: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if not isinstance(runtime_vars, dict):
-            return {}, {}
+            raise TypeError("线程运行变量快照必须是字典")
 
         global_vars = runtime_vars.get("global_vars")
         if isinstance(global_vars, dict):
@@ -302,28 +329,18 @@ class WorkflowMultiThreadSession(QObject):
                 var_sources = {}
             return dict(global_vars), dict(var_sources)
 
-        try:
-            from task_workflow.runtime_var_store import is_storage_manifest, load_runtime_snapshot
+        from task_workflow.runtime_var_store import is_storage_manifest, load_runtime_snapshot
 
-            if is_storage_manifest(runtime_vars):
-                task_key = str(runtime_vars.get("task_key") or "").strip()
-                if task_key:
-                    loaded_vars, loaded_sources = load_runtime_snapshot(task_key)
-                    if not isinstance(loaded_vars, dict):
-                        loaded_vars = {}
-                    if not isinstance(loaded_sources, dict):
-                        loaded_sources = {}
-                    return dict(loaded_vars), dict(loaded_sources)
-        except Exception as exc:
-            logger.warning("从存储清单加载运行时变量失败：%s", exc)
+        if is_storage_manifest(runtime_vars):
+            task_key = str(runtime_vars.get("task_key") or "").strip()
+            if not task_key:
+                raise ValueError("运行变量存储清单缺少 task_key")
+            loaded_vars, loaded_sources = load_runtime_snapshot(task_key)
+            if not isinstance(loaded_vars, dict) or not isinstance(loaded_sources, dict):
+                raise TypeError("运行变量存储返回格式无效")
+            return dict(loaded_vars), dict(loaded_sources)
 
-        legacy_vars: Dict[str, Any] = {}
-        for key, value in runtime_vars.items():
-            name = str(key or "").strip()
-            if not name:
-                continue
-            legacy_vars[name] = value
-        return legacy_vars, {}
+        raise ValueError("线程运行变量快照格式无效")
 
     @staticmethod
     def _read_runtime_task_key(context: Any) -> Optional[str]:
@@ -440,8 +457,7 @@ class WorkflowMultiThreadSession(QObject):
         """启动会话（被主窗口放入线程调用）。"""
         with self._lock:
             if self._is_running:
-                logger.warning("多线程会话已在运行中，忽略重复 run()")
-                return
+                raise RuntimeError("多线程会话已在运行中")
             self._is_running = True
             self._stop_requested = False
             self._force_stop = False
@@ -461,14 +477,15 @@ class WorkflowMultiThreadSession(QObject):
                 entry["last_success"] = False
                 entry["runtime_variables"] = {}
 
-        self._apply_screenshot_worker_limit_for_run()
-        self._log_memory_diag("session_start", force_gc=False)
-        self.execution_started.emit()
-        self.step_details.emit(f"多线程执行开始，共 {len(self._entries)} 个线程")
-
         success = False
         message = "会话异常终止"
+        screenshot_limit_applied = False
         try:
+            self._apply_screenshot_worker_limit_for_run()
+            screenshot_limit_applied = True
+            self._log_memory_diag("session_start", force_gc=False)
+            self.execution_started.emit()
+            self.step_details.emit(f"多线程执行开始，共 {len(self._entries)} 个线程")
             self._process_pending_launches()
             with self._lock:
                 self._check_done_locked()
@@ -504,7 +521,13 @@ class WorkflowMultiThreadSession(QObject):
                     fg_manager.release_all_inputs()
             except Exception as exc:
                 logger.debug("多线程会话结束时统一释放输入失败: %s", exc)
-            self._restore_screenshot_worker_limit_after_run()
+            if screenshot_limit_applied:
+                try:
+                    self._restore_screenshot_worker_limit_after_run()
+                except Exception as exc:
+                    success = False
+                    message = f"恢复截图并发上限失败: {exc}"
+                    logger.error(message, exc_info=True)
             self._log_memory_diag("session_end", force_gc=True)
 
         self.execution_finished.emit(success, message)
@@ -560,6 +583,7 @@ class WorkflowMultiThreadSession(QObject):
             self._check_done_locked()
 
     def pause(self):
+        errors = []
         with self._lock:
             for entry in self._entries.values():
                 executor = entry.get("executor")
@@ -567,9 +591,12 @@ class WorkflowMultiThreadSession(QObject):
                     try:
                         executor.pause()
                     except Exception as e:
-                        logger.warning("暂停线程失败: %s", e)
+                        errors.append(str(e))
+        if errors:
+            raise RuntimeError("暂停线程失败: " + "; ".join(errors))
 
     def resume(self):
+        errors = []
         with self._lock:
             for entry in self._entries.values():
                 executor = entry.get("executor")
@@ -577,7 +604,9 @@ class WorkflowMultiThreadSession(QObject):
                     try:
                         executor.resume()
                     except Exception as e:
-                        logger.warning("恢复线程失败: %s", e)
+                        errors.append(str(e))
+        if errors:
+            raise RuntimeError("恢复线程失败: " + "; ".join(errors))
 
     def control_thread(
         self,
@@ -705,10 +734,7 @@ class WorkflowMultiThreadSession(QObject):
                 self._check_done_locked()
                 return True, f"[{label}] 已停止"
             try:
-                try:
-                    executor.request_stop(force=True)
-                except TypeError:
-                    executor.request_stop()
+                executor.request_stop(force=True)
                 entry["status"] = "stopped"
                 return True, f"[{label}] 停止中"
             except Exception as e:
@@ -737,10 +763,7 @@ class WorkflowMultiThreadSession(QObject):
             executor = entry.get("executor")
             if executor and hasattr(executor, "request_stop"):
                 try:
-                    try:
-                        executor.request_stop(force=True)
-                    except TypeError:
-                        executor.request_stop()
+                    executor.request_stop(force=True)
                 except Exception as e:
                     return False, f"[{label}] 重启请求失败: {e}"
             return True, f"[{label}] 重启中，将从卡片 {requested_start} 开始"
@@ -781,10 +804,8 @@ class WorkflowMultiThreadSession(QObject):
 
         workflow_id = self._make_thread_workflow_id_locked(entry, start_card_id)
         launch_token = int(entry.get("launch_seq", 0) or 0)
-        entry_target_window_title = entry.get("target_window_title") or self.target_window_title
-        entry_target_hwnd = entry.get("target_hwnd")
-        if entry_target_hwnd is None:
-            entry_target_hwnd = self.target_hwnd
+        entry_target_window_title = entry["target_window_title"]
+        entry_target_hwnd = entry["target_hwnd"]
         self._clear_executor_workflow_context(workflow_id)
         executor = WorkflowExecutor(
             cards_data=cards_data,
@@ -961,10 +982,7 @@ class WorkflowMultiThreadSession(QObject):
                         executor.resume()
                     except Exception:
                         pass
-                try:
-                    executor.request_stop(force=force)
-                except TypeError:
-                    executor.request_stop()
+                executor.request_stop(force=force)
             except Exception as e:
                 logger.warning("停止线程失败: %s", e)
 
@@ -1157,7 +1175,10 @@ class WorkflowMultiThreadSession(QObject):
             self._check_done_locked()
 
         self._clear_executor_workflow_context(workflow_id_to_clear)
-        self.step_details.emit(f"[{label}] {message}")
+        if success:
+            logger.debug("[%s] %s", label, message)
+        else:
+            logger.error("[%s] %s", label, message)
 
     def _build_final_result_locked(self) -> Tuple[bool, str]:
         if not self._entries:

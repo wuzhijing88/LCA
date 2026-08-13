@@ -21,6 +21,10 @@ import threading
 import time
 from typing import Optional, Tuple
 
+import cv2
+import win32gui
+from PIL import Image
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,17 +47,8 @@ except Exception:
 # 当前使用的截图引擎 (可通过 set_screenshot_engine 切换)
 _current_engine = 'wgc'
 _engine_lock = threading.Lock()
-
-# 窗口句柄管理器
-try:
-    from utils.window_handle_manager import WindowHandleManager
-    _window_manager = None
-    WINDOW_MANAGER_AVAILABLE = True
-    logger.info("[OK] 窗口句柄管理器已加载")
-except ImportError as e:
-    WINDOW_MANAGER_AVAILABLE = False
-    _window_manager = None
-    logger.warning(f"[ERROR] 窗口句柄管理器不可用: {e}")
+_window_manager = None
+SUPPORTED_SCREENSHOT_ENGINES = ("wgc", "printwindow", "gdi", "dxgi")
 
 def set_window_manager(manager):
     """设置全局窗口管理器实例（由 main.py 调用）"""
@@ -548,31 +543,6 @@ DXGI_AVAILABLE = bool(caps.get("dxgi", False))
 logger.info("[OK] 截图引擎本地模式已启用")
 atexit.register(cleanup_screenshot_runtime)
 
-# OpenCV
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-    logger.error("[ERROR] OpenCV 不可用，请安装: pip install opencv-python")
-
-# PIL
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-    logger.error("[ERROR] PIL 不可用，请安装: pip install pillow")
-
-# Windows API
-try:
-    import win32gui
-    import win32con
-    WIN32_AVAILABLE = True
-except ImportError:
-    WIN32_AVAILABLE = False
-    logger.error("[ERROR] win32gui 不可用，请安装: pip install pywin32")
-
 
 # ==================== 截图引擎管理 ====================
 
@@ -586,7 +556,7 @@ def set_screenshot_engine(engine: str) -> bool:
     global _current_engine
     global WGC_AVAILABLE, PRINTWINDOW_AVAILABLE, GDI_AVAILABLE, DXGI_AVAILABLE
     requested_engine = str(engine or "").strip().lower()
-    if requested_engine not in ['wgc', 'printwindow', 'gdi', 'dxgi']:
+    if requested_engine not in SUPPORTED_SCREENSHOT_ENGINES:
         raise ValueError(f"未知的截图引擎: {engine}")
 
     # 只在短时间内持锁读取当前状态，避免能力探测长期占用锁导致 UI 卡顿。
@@ -671,21 +641,6 @@ def get_screenshot_engine() -> str:
         return _current_engine
 
 
-def _should_fallback_engine(hwnd: int, engine: str) -> bool:
-    if engine not in ('gdi', 'dxgi'):
-        return False
-    if not WIN32_AVAILABLE:
-        return False
-    try:
-        if win32gui.IsIconic(hwnd):
-            return True
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
-        return win32gui.GetForegroundWindow() != hwnd
-    except Exception:
-        return False
-
-
 def _capture_with_engine(
     hwnd: int,
     client_area_only: bool,
@@ -714,8 +669,7 @@ def _capture_with_engine(
         elif engine == 'dxgi':
             captured = capture_window_dxgi(hwnd, client_area_only, timeout=timeout)
         else:
-            logger.error(f"未知的引擎: {engine}")
-            return None
+            raise ValueError(f"未知的截图引擎: {engine}")
         if captured is None:
             try:
                 last_error = str(get_last_screenshot_error(engine=engine) or "").strip()
@@ -724,6 +678,8 @@ def _capture_with_engine(
             if last_error:
                 logger.warning(f"引擎 {engine} 捕获失败: {last_error}")
         return captured
+    except ValueError:
+        raise
     except Exception as e:
         logger.error(f"引擎 {engine} 捕获失败: {e}")
         return None
@@ -759,8 +715,9 @@ def _get_pixel_color_with_engine(
         elif engine == 'dxgi':
             return get_pixel_color_dxgi(hwnd, x, y, client_coords)
         else:
-            logger.error(f"未知的引擎: {engine}")
-            return None
+            raise ValueError(f"未知的截图引擎: {engine}")
+    except ValueError:
+        raise
     except Exception as e:
         logger.error(f"引擎 {engine} 取色失败: {e}")
         return None
@@ -808,41 +765,7 @@ def is_multi_monitor():
     from utils.multi_monitor_manager import get_multi_monitor_manager
     return get_multi_monitor_manager().is_multi_monitor()
 
-def take_screenshot(region=None):
-    """
-    截取屏幕区域截图（已废弃）
-
-    Args:
-        region: (left, top, right, bottom) 或 None 表示全屏
-
-    Returns:
-        PIL.Image: 截图图像，失败返回 None
-
-    注意:
-        新版 WGC 基于 HWND，不支持屏幕区域捕获
-        请使用 take_window_screenshot() 捕获窗口
-    """
-    logger.warning("屏幕区域捕获已废弃，请使用 take_window_screenshot() 捕获窗口")
-    return None
-
-def take_screenshot_opencv(region=None):
-    """
-    使用 OpenCV 截取屏幕区域（已废弃）
-
-    Args:
-        region: (left, top, right, bottom) 或 None 表示全屏
-
-    Returns:
-        numpy.ndarray: BGR 格式图像，失败返回 None
-
-    注意:
-        新版 WGC 基于 HWND，不支持屏幕区域捕获
-        请使用 take_window_screenshot() 捕获窗口
-    """
-    logger.warning("屏幕区域捕获已废弃，请使用 take_window_screenshot() 捕获窗口")
-    return None
-
-def take_window_screenshot(hwnd, client_area_only=True, use_enhanced=True, auto_fix_dpi=True, return_format="pil"):
+def take_window_screenshot(hwnd, client_area_only=True, return_format="pil"):
     """
     截取指定窗口的截图 - 支持多种截图引擎
 
@@ -855,27 +778,14 @@ def take_window_screenshot(hwnd, client_area_only=True, use_enhanced=True, auto_
     Args:
         hwnd: 窗口句柄
         client_area_only: 是否只截取客户区
-        use_enhanced: 已弃用(保留兼容性)
-        auto_fix_dpi: 已弃用(保留兼容性)
+        return_format: "pil" 或 "bgr"
 
     Returns:
-        PIL.Image: 截图图像，失败返回 None
+        PIL.Image 或 BGR numpy 数组，失败返回 None
     """
-    return_format = (return_format or "pil").lower()
+    return_format = (return_format or "").strip().lower()
     if return_format not in ("pil", "bgr"):
-        logger.warning(f"Unknown return_format: {return_format}, fallback to pil")
-        return_format = "pil"
-    if return_format == "bgr" and not CV2_AVAILABLE:
-        logger.error("CV2 not available")
-        return None
-
-    if return_format == "pil" and (not PIL_AVAILABLE or not CV2_AVAILABLE):
-        logger.error("PIL 或 CV2 不可用")
-        return None
-
-    if not WIN32_AVAILABLE:
-        logger.error("win32gui 不可用")
-        return None
+        raise ValueError(f"未知的截图返回格式: {return_format!r}")
 
     # 检查窗口句柄是否有效
     if hwnd is None or hwnd == 0:
@@ -922,7 +832,7 @@ def take_window_screenshot(hwnd, client_area_only=True, use_enhanced=True, auto_
         logger.exception(f"窗口截图失败: {e}")
         return None
 
-def get_window_pixel_color(hwnd, x, y, client_coords=True, auto_fix_dpi=True):
+def get_window_pixel_color(hwnd, x, y, client_coords=True):
     """
     获取窗口指定位置的颜色 - 使用当前截图引擎
 
@@ -931,7 +841,6 @@ def get_window_pixel_color(hwnd, x, y, client_coords=True, auto_fix_dpi=True):
         x: X 坐标
         y: Y 坐标
         client_coords: 是否为客户区坐标
-        auto_fix_dpi: 已弃用(保留兼容性)
 
     Returns:
         tuple: (R, G, B) 颜色值，失败返回 None
@@ -995,9 +904,6 @@ def get_screenshot_info():
         'printwindow_available': PRINTWINDOW_AVAILABLE,
         'gdi_available': GDI_AVAILABLE,
         'dxgi_available': DXGI_AVAILABLE,
-        'cv2_available': CV2_AVAILABLE,
-        'pil_available': PIL_AVAILABLE,
-        'win32_available': WIN32_AVAILABLE,
         'features': engine_features.get(engine, [])
     }
     try:
@@ -1185,11 +1091,6 @@ if __name__ == "__main__":
         if key != 'stats':
             logger.info(f"  {key}: {value}")
 
-    # 查找测试窗口
-    if not WIN32_AVAILABLE:
-        logger.info("\n[ERROR] pywin32 不可用")
-        exit(1)
-
     logger.info("\n可用窗口:")
     windows = []
 
@@ -1208,7 +1109,7 @@ if __name__ == "__main__":
     try:
         choice = int(input("\n选择窗口编号 (直接回车选择第1个): ") or "1")
         test_hwnd, title = windows[choice - 1]
-    except:
+    except Exception:
         test_hwnd, title = windows[0]
 
     logger.info(f"\n测试窗口: {title}")
@@ -1224,13 +1125,13 @@ if __name__ == "__main__":
     elapsed_ms = (time.time() - start) * 1000
 
     if screenshot is not None:
-        logger.info(f"[OK] 截图成功")
+        logger.info("[OK] 截图成功")
         logger.info(f"  尺寸: {screenshot.size}")
         logger.info(f"  耗时: {elapsed_ms:.1f}ms")
         screenshot.save("screenshot_test.png")
         logger.info("  已保存: screenshot_test.png")
     else:
-        logger.info(f"✗ 截图失败")
+        logger.info("✗ 截图失败")
 
     # 测试取色
     logger.info("\n" + "=" * 80)
@@ -1241,7 +1142,7 @@ if __name__ == "__main__":
     if color:
         logger.info(f"[OK] 坐标 (100, 100) 的颜色: R={color[0]}, G={color[1]}, B={color[2]}")
     else:
-        logger.info(f"[ERROR] 获取颜色失败")
+        logger.info("[ERROR] 获取颜色失败")
 
     # 统计信息
     logger.info("\n" + "=" * 80)

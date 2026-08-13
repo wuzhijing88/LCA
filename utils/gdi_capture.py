@@ -19,46 +19,15 @@ import threading
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-from utils.hwnd_capture_utils import crop_frame_by_hwnd, get_window_rect_with_dwm, resolve_capture_target
+from utils.hwnd_capture_utils import CaptureStats, crop_frame_by_hwnd, get_window_rect_with_dwm, resolve_capture_target
 from utils.multi_monitor_manager import get_virtual_screen_bounds
 
 logger = logging.getLogger(__name__)
 
-# Win32 API
-try:
-    import win32gui
-    import win32ui
-    import win32con
-    WIN32_AVAILABLE = True
-    logger.info("[OK] Win32 API 已加载")
-except ImportError as e:
-    WIN32_AVAILABLE = False
-    logger.error(f"[ERROR] Win32 API 不可用: {e}")
-
-# OpenCV
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-    logger.error("[ERROR] OpenCV 不可用")
-
-
-@dataclass
-class CaptureStats:
-    """截图统计信息"""
-    total_captures: int = 0
-    success_captures: int = 0
-    failed_captures: int = 0
-    total_time_ms: float = 0.0
-
-    @property
-    def avg_time_ms(self) -> float:
-        return self.total_time_ms / self.total_captures if self.total_captures > 0 else 0.0
-
-    @property
-    def success_rate(self) -> float:
-        return (self.success_captures / self.total_captures * 100) if self.total_captures > 0 else 0.0
+import cv2
+import win32con
+import win32gui
+import win32ui
 
 
 class GDICapture:
@@ -66,9 +35,6 @@ class GDICapture:
 
     def __init__(self):
         """初始化"""
-        if not WIN32_AVAILABLE:
-            raise ImportError("Win32 API 不可用，请安装 pywin32")
-
         self.stats = CaptureStats()
         self.lock = threading.Lock()
         self._capture_lock = threading.Lock()
@@ -195,25 +161,25 @@ class GDICapture:
             try:
                 if bitmap:
                     win32gui.DeleteObject(bitmap.GetHandle())
-            except:
+            except Exception:
                 pass
 
             try:
                 if dc_compatible:
                     dc_compatible.DeleteDC()
-            except:
+            except Exception:
                 pass
 
             try:
                 if dc_mem:
                     dc_mem.DeleteDC()
-            except:
+            except Exception:
                 pass
 
             try:
                 if dc_window:
                     win32gui.ReleaseDC(capture_hwnd, dc_window)
-            except:
+            except Exception:
                 pass
             if capture_lock_acquired:
                 try:
@@ -464,53 +430,4 @@ def clear_gdi_runtime_cache(hwnd: int = None):
 
 def is_gdi_available() -> bool:
     """检查 GDI 是否可用"""
-    return WIN32_AVAILABLE and CV2_AVAILABLE
-
-
-if __name__ == "__main__":
-    import time
-
-    logging.basicConfig(level=logging.DEBUG)
-
-    logger.info("=" * 60)
-    logger.info("GDI 截图引擎测试")
-    logger.info("=" * 60)
-
-    if not is_gdi_available():
-        logger.info("[ERROR] GDI 不可用")
-        exit(1)
-
-    # 查找窗口
-    hwnd = win32gui.FindWindow(None, "二重螺旋")
-    if not hwnd:
-        logger.info("[ERROR] 未找到测试窗口")
-        exit(1)
-
-    logger.info(f"\n目标窗口: HWND={hwnd}")
-
-    # 测试截图
-    logger.info("\n开始截图测试...")
-    start = time.time()
-
-    frame = capture_window_gdi(hwnd, client_area_only=True)
-
-    elapsed = (time.time() - start) * 1000
-    logger.info(f"截图耗时: {elapsed:.1f}ms")
-
-    if frame is not None:
-        logger.info(f"帧尺寸: {frame.shape}")
-        if CV2_AVAILABLE:
-            cv2.imwrite("gdi_test.png", frame)
-            logger.info("已保存: gdi_test.png")
-    else:
-        logger.info("[ERROR] 截图失败")
-
-    # 统计信息
-    capture = get_global_capture()
-    stats = capture.get_stats()
-    logger.info("\n统计信息:")
-    for key, value in stats.items():
-        logger.info(f"  {key}: {value}")
-
-    cleanup_gdi()
-    logger.info("\n测试完成")
+    return True

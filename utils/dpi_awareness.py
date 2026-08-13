@@ -2,84 +2,69 @@ import ctypes
 import os
 import threading
 from ctypes import wintypes
-from typing import Optional
 
+# DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = wintypes.HANDLE(-4)
+_ERROR_ACCESS_DENIED = 5
 
 _state_lock = threading.Lock()
 _setup_attempted = False
+_user32 = None
 
 
-def get_process_dpi_awareness() -> Optional[int]:
-    """返回当前进程 DPI 感知级别。0=unaware,1=system,2=per-monitor,3=per-monitor-v2。"""
-    if getattr(ctypes, "windll", None) is None:
-        return None
-
-    try:
-        shcore = ctypes.windll.shcore
-        kernel32 = ctypes.windll.kernel32
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        shcore.GetProcessDpiAwareness.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_int)]
-        shcore.GetProcessDpiAwareness.restype = getattr(ctypes, "HRESULT", ctypes.c_long)
-        awareness = ctypes.c_int(-1)
-        hr = shcore.GetProcessDpiAwareness(kernel32.GetCurrentProcess(), ctypes.byref(awareness))
-        if hr == 0:
-            return int(awareness.value)
-    except Exception:
-        pass
-
-    try:
-        user32 = ctypes.windll.user32
+def _load_user32():
+    global _user32
+    if _user32 is None:
+        if os.name != "nt":
+            raise RuntimeError("DPI awareness is only available on Windows")
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetProcessDpiAwarenessContext.argtypes = [wintypes.HANDLE]
+        user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
         user32.GetThreadDpiAwarenessContext.restype = wintypes.HANDLE
         user32.GetAwarenessFromDpiAwarenessContext.argtypes = [wintypes.HANDLE]
         user32.GetAwarenessFromDpiAwarenessContext.restype = ctypes.c_int
-        awareness = int(user32.GetAwarenessFromDpiAwarenessContext(user32.GetThreadDpiAwarenessContext()))
-        if awareness >= 0:
-            return awareness
-    except Exception:
-        pass
-
-    return None
+        user32.AreDpiAwarenessContextsEqual.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        user32.AreDpiAwarenessContextsEqual.restype = wintypes.BOOL
+        _user32 = user32
+    return _user32
 
 
-def enable_process_dpi_awareness() -> Optional[int]:
-    """尽早启用进程 DPI 感知。多次调用安全，只保留一条实现链路。"""
+def get_process_dpi_awareness() -> int:
+    """Return 0=unaware, 1=system, 2=per-monitor (including per-monitor v2)."""
+    user32 = _load_user32()
+    awareness = int(user32.GetAwarenessFromDpiAwarenessContext(user32.GetThreadDpiAwarenessContext()))
+    if awareness < 0:
+        raise OSError("GetAwarenessFromDpiAwarenessContext failed")
+    return awareness
+
+
+def _is_per_monitor_v2() -> bool:
+    user32 = _load_user32()
+    return bool(
+        user32.AreDpiAwarenessContextsEqual(
+            user32.GetThreadDpiAwarenessContext(),
+            _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+    )
+
+
+def enable_process_dpi_awareness() -> int:
+    """Request per-monitor v2. If the host already locked DPI, keep that level."""
     global _setup_attempted
-
-    if os.name != "nt":
-        return None
 
     with _state_lock:
         if _setup_attempted:
             return get_process_dpi_awareness()
         _setup_attempted = True
 
-    user32 = None
-    try:
-        user32 = ctypes.windll.user32
-    except Exception:
-        user32 = None
+    user32 = _load_user32()
+    if user32.SetProcessDpiAwarenessContext(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2):
+        return get_process_dpi_awareness()
+    if _is_per_monitor_v2():
+        return get_process_dpi_awareness()
 
-    if user32 is not None:
-        try:
-            dpi_context_per_monitor_v2 = ctypes.c_void_p(-4)
-            if user32.SetProcessDpiAwarenessContext(dpi_context_per_monitor_v2):
-                return get_process_dpi_awareness()
-        except Exception:
-            pass
-
-    try:
-        shcore = ctypes.windll.shcore
-        process_per_monitor_dpi_aware = 2
-        hr = shcore.SetProcessDpiAwareness(process_per_monitor_dpi_aware)
-        if hr in (0, -2147024891):
-            return get_process_dpi_awareness()
-    except Exception:
-        pass
-
-    if user32 is not None:
-        try:
-            user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
-    return get_process_dpi_awareness()
+    error_code = ctypes.get_last_error()
+    if error_code == _ERROR_ACCESS_DENIED:
+        # python.exe / packaged manifest already locked process DPI; it cannot be changed.
+        return get_process_dpi_awareness()
+    raise OSError(error_code, "SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) failed")

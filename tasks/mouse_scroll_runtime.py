@@ -1,44 +1,26 @@
 ﻿# -*- coding: utf-8 -*-
 import pyautogui
 import logging
-import time
 from typing import Dict, Any, Optional, Tuple
 
-# Try importing Windows specific modules
-try:
-    import win32api
-    import win32gui
-    import win32con
-    WHEEL_DELTA = 120 # Standard value for mouse wheel delta
-    WINDOWS_AVAILABLE = True
-except ImportError:
-    WINDOWS_AVAILABLE = False
-    # Log warning only once at module level if needed, or let execution fail gracefully
-    # print("Warning: pywin32 library not found. Background mode and foreground window activation are unavailable.")
+import win32api
+import win32con
+import win32gui
 
-# --- 新增导入 ---
+WHEEL_DELTA = 120  # Standard value for mouse wheel delta
+
 import cv2
 import numpy as np
 import os # For path checking if needed, though imdecode handles paths
 import traceback # For detailed error logging
 from app_core.mouse_runtime import mouse_move_fixer
 from utils.smart_image_matcher import normalize_match_image
+from tasks.task_utils import (
+    capture_window_smart as capture_window_wgc,
+    capture_and_match_template_smart,
+)
 
 logger = logging.getLogger(__name__)
-
-try:
-    from tasks.task_utils import capture_window_smart as capture_window_wgc, capture_and_match_template_smart
-except ImportError:
-    try:
-        import sys
-        import os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from tasks.task_utils import capture_window_smart as capture_window_wgc, capture_and_match_template_smart
-    except ImportError:
-        logger.warning("无法导入截图功能，后台模式可能不可用")
-        capture_window_wgc = None
-        capture_and_match_template_smart = None
-# --------------
 
 def _find_image_background(target_hwnd, full_image_path, template_match_image, confidence_val, params, kwargs, counters) -> Tuple[bool, Optional[int], Optional[int], Optional[int]]:
     """Helper to find image in background mode. Returns (found, client_x, client_y, specific_scroll_hwnd).
@@ -49,18 +31,11 @@ def _find_image_background(target_hwnd, full_image_path, template_match_image, c
     found_client_x, found_client_y = None, None
     specific_scroll_hwnd = target_hwnd
 
-    if not WINDOWS_AVAILABLE:
-        logger.error("后台图片定位需要 pywin32")
-        return False, None, None, target_hwnd
     if not target_hwnd or not win32gui.IsWindow(target_hwnd):
         logger.error(f"后台模式错误：目标窗口句柄 {target_hwnd} 无效或已销毁")
         return False, None, None, target_hwnd
 
     logger.debug("[后台模式] 使用截图子进程执行截图+匹配")
-
-    if capture_and_match_template_smart is None:
-        logger.error("后台子进程匹配不可用：缺少统一匹配调用函数")
-        return False, None, None, target_hwnd
 
     match_response = capture_and_match_template_smart(
         target_hwnd=target_hwnd,
@@ -138,12 +113,8 @@ def _find_image_foreground(target_hwnd, full_image_path, template_match_image, c
     image_found_fg = False
     found_screen_x, found_screen_y = None, None
 
-    if target_hwnd and WINDOWS_AVAILABLE and win32gui.IsWindow(target_hwnd):
+    if target_hwnd and win32gui.IsWindow(target_hwnd):
         logger.debug("[前台模式] 使用截图子进程执行截图+匹配")
-        if capture_and_match_template_smart is None:
-            logger.error("前台子进程匹配不可用：缺少统一匹配调用函数")
-            return False, None, None
-
         match_response = capture_and_match_template_smart(
             target_hwnd=target_hwnd,
             template=template_match_image,
@@ -252,15 +223,10 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
         scroll_value_per_unit = -scroll_value_per_unit
 
     # 新增：根据执行模式设置前台输入管理器的强制模式（在标准化之前）
-    try:
-        from utils.foreground_input_manager import get_foreground_input_manager
-        FOREGROUND_INPUT_AVAILABLE = True
-        foreground_input = get_foreground_input_manager()
-    except ImportError:
-        FOREGROUND_INPUT_AVAILABLE = False
-        foreground_input = None
+    from utils.foreground_input_manager import get_foreground_input_manager
 
-    if FOREGROUND_INPUT_AVAILABLE and foreground_input and execution_mode and execution_mode.startswith('foreground'):
+    foreground_input = get_foreground_input_manager()
+    if foreground_input and execution_mode and execution_mode.startswith('foreground'):
         foreground_input.set_execution_mode(execution_mode)
         logger.info(f"[鼠标模式] 前台模式 - {execution_mode}（滚动）")
 
@@ -340,12 +306,11 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
                     if not target_hwnd:
                         logger.error("后台图片定位需要目标窗口句柄。")
                         return False, '执行下一步', None
-                    image_found_flag, found_cx, found_cy, specific_hwnd = _find_image_background(
+                    image_found_flag, found_cx, found_cy, _specific_hwnd = _find_image_background(
                         target_hwnd, full_image_path, template_match_image, confidence_val, params, kwargs, counters
                     )
                     if image_found_flag:
                         target_x, target_y = found_cx, found_cy
-                        current_scroll_target_hwnd = specific_hwnd
                 else: # Foreground
                     image_found_flag, found_sx, found_sy = _find_image_foreground(
                         target_hwnd, full_image_path, template_match_image, confidence_val, params, kwargs, counters
@@ -395,7 +360,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
 
         elif location_mode == "窗口中心":
             logger.info("起始位置模式：窗口中心。计算窗口中心...")
-            if target_hwnd and WINDOWS_AVAILABLE:
+            if target_hwnd:
                 try:
                     if not win32gui.IsWindow(target_hwnd):
                         logger.warning(f"无法移至中心：目标窗口句柄 {target_hwnd} 无效。将在当前位置滚动。")
@@ -413,10 +378,8 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
                 except Exception as move_err: # Corrected indent for this except
                     logger.warning(f"计算窗口中心时出错: {move_err}。将在当前位置滚动。")
                     target_x, target_y = None, None
-            elif not target_hwnd:
+            else:
                 logger.warning("请求移至中心，但未提供目标窗口句柄。将在当前位置滚动。")
-            elif not WINDOWS_AVAILABLE:
-                logger.warning("无法移至中心：缺少 'pywin32' 库。将在当前位置滚动。")
         # else: location_mode == "当前位置" (or default if "当前位置" was an option)
             # target_x, target_y remain None, scrolling happens at current mouse pos
     
@@ -428,8 +391,8 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
     # --- 执行滚动 ---
     try:
         if normalized_mode == 'background':
-            if not WINDOWS_AVAILABLE or not target_hwnd:
-                logger.error("无法执行后台滚动：缺少 pywin32 或有效的目标窗口句柄。")
+            if not target_hwnd:
+                logger.error("无法执行后台滚动：缺少有效的目标窗口句柄。")
                 return False, '执行下一步', None
             if not win32gui.IsWindow(target_hwnd):
                 logger.error(f"后台滚动错误：目标滚动窗口句柄 {target_hwnd} 无效。")
@@ -445,7 +408,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
                     target_x = (rect[0] + rect[2]) // 2
                     target_y = (rect[1] + rect[3]) // 2
                     postmessage_coords_are_screen = True
-                except:
+                except Exception:
                     target_x, target_y = 0, 0
                     postmessage_coords_are_screen = True
 
@@ -603,7 +566,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
                                     if class_name:
                                         logger.info(f"[后台] 目标控件类名: {class_name}")
                                     else:
-                                        logger.info(f"[后台] 目标控件类名: <unknown>")
+                                        logger.info("[后台] 目标控件类名: <unknown>")
                                     logged_hwnds.add(target_hwnd)
                                 else:
                                     try:
@@ -734,7 +697,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
             logger.info(f"执行{mode_description}鼠标滚轮: 目标屏幕坐标={(target_x, target_y) if target_x is not None else '当前'}, 方向='{direction}', 次数={scroll_count}")
             
             # 前台模式：激活目标窗口确保滚轮生效
-            if target_hwnd and WINDOWS_AVAILABLE:
+            if target_hwnd:
                 try:
                     if win32gui.IsWindow(target_hwnd):
                         logger.debug(f"前台模式：激活目标窗口 {target_hwnd}")
@@ -753,22 +716,18 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
 
                     # 使用统一的鼠标移动器（客户区坐标）
                     if coordinate_mode == '客户区坐标':
-                        success = mouse_move_fixer.safe_move_to_client_coord(target_hwnd, target_x, target_y, duration=0.1)
+                        mouse_move_fixer.move_to_client_coord(target_hwnd, target_x, target_y)
                         logger.info(f"前台滚轮移动: 客户区坐标({target_x}, {target_y})")
                     else:
                         pyautogui.moveTo(target_x, target_y, duration=0.1)
-                        success = True
                         logger.info(f"前台滚轮移动: 屏幕坐标({target_x}, {target_y})")
-
-                    if not success:
-                        logger.warning("使用修复器移动鼠标失败，回退到pyautogui")
-                        pyautogui.moveTo(target_x, target_y, duration=0.1)
 
                     sleep_ok, stop_result = _sleep_with_control(0.05, "[前台鼠标滚轮] 鼠标移动收尾等待期间检测到暂停/停止请求")
                     if not sleep_ok:
                         return stop_result
                 except Exception as move_err:
-                     logger.warning(f"前台移动鼠标时出错: {move_err}。将在当前位置滚动。")
+                     logger.error(f"前台移动鼠标失败: {move_err}")
+                     return False, f'前台移动鼠标失败: {move_err}', None
 
             logger.debug(
                 f"前台滚轮参数: 方向={direction}, 单刻度值={scroll_value_per_unit}, "

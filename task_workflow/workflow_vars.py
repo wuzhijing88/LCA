@@ -5,11 +5,9 @@ from typing import Any, Dict, Optional, Union
 
 from task_workflow.workflow_context import (
     clear_workflow_context,
-    export_global_vars,
     get_workflow_context,
     import_global_vars,
 )
-from task_workflow.runtime_var_store import is_storage_manifest
 
 
 WorkflowSelector = Union[int, str]
@@ -86,64 +84,4 @@ def clear_context_for_task(task_id: Any) -> None:
     clear_workflow_context(key)
 
 
-def has_runtime_variables(variables_data: Optional[Dict[str, Any]]) -> bool:
-    """判断变量快照里是否包含有效变量。"""
-    if not isinstance(variables_data, dict):
-        return False
-
-    if is_storage_manifest(variables_data):
-        count = variables_data.get("count")
-        try:
-            return int(count) > 0
-        except Exception:
-            return True
-
-    global_vars = variables_data.get("global_vars")
-    if isinstance(global_vars, dict):
-        return bool(global_vars)
-
-    # 兼容旧格式（平铺变量字典）
-    return bool(variables_data)
-
-
-def pick_variables_override(
-    target_task_id: Any,
-    current_task_id: Any,
-    task_workflow_data: Optional[Dict[str, Any]],
-    runtime_variables_data: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    为序列化选择变量覆盖来源。
-    规则：
-    1. 非当前标签页任务：优先使用任务自身持久化变量。
-    2. 当前标签页任务：优先使用运行时变量快照。
-    3. 当前标签页任务若运行时变量为空：回退到任务持久化变量。
-    4. 其余情况：不覆盖，使用当前上下文变量。
-    """
-    persisted_vars = None
-    if isinstance(task_workflow_data, dict):
-        candidate = task_workflow_data.get("variables")
-        if isinstance(candidate, dict):
-            persisted_vars = candidate
-
-    normalized_target = normalize_workflow_task_id(target_task_id)
-    normalized_current = normalize_workflow_task_id(current_task_id)
-    if normalized_target != normalized_current:
-        return persisted_vars
-
-    runtime_snapshot = runtime_variables_data
-    if runtime_snapshot is None:
-        try:
-            runtime_workflow_id = workflow_context_key(current_task_id) or "default"
-            runtime_snapshot = export_global_vars(runtime_workflow_id)
-        except Exception:
-            runtime_snapshot = None
-
-    if has_runtime_variables(runtime_snapshot):
-        return runtime_snapshot
-
-    if persisted_vars is not None:
-        return persisted_vars
-
-    return None
 

@@ -27,23 +27,11 @@ from utils.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
 )
-try:
-    from tasks.task_utils import (
-        precise_sleep,
-        coerce_int,
-        get_standard_click_offset_params,
-    )
-except Exception:
-    from utils.precise_sleep import precise_sleep
-
-    def coerce_int(value: Any, default: int = 0) -> int:
-        try:
-            return int(float(value))
-        except Exception:
-            return default
-
-    def get_standard_click_offset_params() -> Dict[str, Dict[str, Any]]:
-        return {}
+from tasks.task_utils import (
+    precise_sleep,
+    coerce_int,
+    get_standard_click_offset_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -501,8 +489,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             iou_threshold=iou_threshold,
             input_size=input_size,
         )
-        if engine is None:
-            raise RuntimeError("引擎不可用")
 
         detections, screenshot = engine.detect_from_hwnd(
             target_hwnd,
@@ -635,14 +621,16 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                     success = _execute_action(
                         selected, target_hwnd, execution_mode, action_type, approach_mode, params,
                         screenshot_shape,
-                        virtual_mouse, virtual_mouse_position
+                        virtual_mouse, virtual_mouse_position,
+                        stop_checker=kwargs.get('stop_checker'),
                     )
                     break
         else:
             success = _execute_action(
                 selected, target_hwnd, execution_mode, action_type, approach_mode, params,
                 screenshot_shape,
-                virtual_mouse, virtual_mouse_position
+                virtual_mouse, virtual_mouse_position,
+                stop_checker=kwargs.get('stop_checker'),
             )
 
         if success:
@@ -795,7 +783,8 @@ def _select_target(detections: List, strategy: str, shape: Optional[Tuple],
 def _execute_action(detection, hwnd: int, exec_mode: str, action: str,
                     approach: str, params: Dict, shape: Optional[Tuple],
                     virtual_mouse: Optional[Any] = None,
-                    virtual_mouse_position: str = "左上角") -> bool:
+                    virtual_mouse_position: str = "左上角",
+                    stop_checker=None) -> bool:
     """执行动作"""
     logger.debug(f"YOLO执行动作: action={action}, approach={approach}, exec_mode={exec_mode}")
     if action == 'none' and approach == 'none':
@@ -2650,7 +2639,7 @@ class Win32OverlayWindow:
 def _draw_detections_with_qt(hwnd: int, detections: List, frame_shape: Tuple) -> bool:
     try:
         from PySide6.QtWidgets import QApplication, QWidget
-        from PySide6.QtCore import Qt, QTimer, QThread, QObject, Signal, QPoint
+        from PySide6.QtCore import Qt, QTimer, QThread, QObject, Signal
         from PySide6.QtGui import QPainter, QPen, QColor, QFont
     except Exception:
         return False

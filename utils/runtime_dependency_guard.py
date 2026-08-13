@@ -11,35 +11,40 @@ import threading
 logger = logging.getLogger(__name__)
 
 _PRELOADED_MODULES: set[str] = set()
-_PRELOAD_LOCK = threading.Lock()
+_PRELOAD_LOCK = threading.RLock()
+
+
+def _normalize_module_name(module_name: str) -> str:
+    if not isinstance(module_name, str):
+        raise TypeError("module_name must be a string")
+
+    normalized_name = module_name.strip()
+    if not normalized_name:
+        raise ValueError("module_name cannot be empty")
+
+    parts = normalized_name.split(".")
+    if any(not part.isidentifier() for part in parts):
+        raise ValueError(f"invalid module name: {module_name!r}")
+    return normalized_name
 
 
 def preload_optional_module(module_name: str) -> bool:
-    """幂等预热可选模块，固定依赖初始化顺序。"""
-    normalized_name = str(module_name or "").strip()
-    if not normalized_name:
-        return False
+    """幂等预热可选模块。模块不存在时返回 False，非法名称直接抛错。"""
+    normalized_name = _normalize_module_name(module_name)
 
     with _PRELOAD_LOCK:
         if normalized_name in _PRELOADED_MODULES:
             return True
+        try:
+            importlib.import_module(normalized_name)
+        except ImportError as exc:
+            logger.debug("可选模块预热失败: %s -> %s", normalized_name, exc)
+            return False
 
-    try:
-        importlib.import_module(normalized_name)
-    except Exception as exc:
-        logger.debug("可选模块预热失败: %s -> %s", normalized_name, exc)
-        return False
-
-    with _PRELOAD_LOCK:
         _PRELOADED_MODULES.add(normalized_name)
-    return True
+        return True
 
 
 def preload_onnxruntime() -> bool:
-    """
-    在截图链路初始化前预热 ONNX Runtime。
-
-    部分截图底层在首次导入后会影响后续 DLL 初始化顺序，这里统一固定导入顺序。
-    """
-
+    """在截图链路初始化前预热 ONNX Runtime，固定 DLL 导入顺序。"""
     return preload_optional_module("onnxruntime")

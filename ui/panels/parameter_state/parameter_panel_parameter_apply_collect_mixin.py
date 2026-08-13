@@ -51,7 +51,7 @@ class ParameterPanelParameterApplyCollectMixin:
                 if isinstance(value, dict):
                     visible_parameters.update(value)
                     logger.info(
-                        f'Collect coordinates from selector: '
+                        'Collect coordinates from selector: '
                         f'coordinate_x={value.get("coordinate_x")}, '
                         f'coordinate_y={value.get("coordinate_y")}'
                     )

@@ -1,14 +1,19 @@
 from .workflow_view_common import *
 from ..system_parts.message_box_translator import show_critical_box
 
+operation_logger = logging.getLogger("workflow.operations")
+
+# 删除流程不输出逐步调试信息，避免英文调试噪声污染运行日志。
+debug_print = lambda *args, **kwargs: None
+
 
 class WorkflowViewDeleteCardMixin:
 
     def delete_card(self, card_id: int, defer_view_refresh: bool = False):
         """Deletes the specified card and its connections from the view - 增强安全版本"""
         debug_print(f"--- [DELETE_CARD_DEBUG] START delete_card for ID: {card_id} ---")
-        old_container_id = None
         deleted_is_start_card = False
+        delete_succeeded = False
 
         # 注释已清理（原注释编码损坏）
         if card_id in self._deleting_cards:
@@ -16,7 +21,7 @@ class WorkflowViewDeleteCardMixin:
             return
 
         # 直接删除卡片
-        logger.info(f"删除卡片: {card_id}")
+        operation_logger.info("[卡片删除] 请求删除 card_id=%s", card_id)
 
         # 检查是否正在运行，如果是则阻止删除
         if self._block_edit_if_running("删除卡片"):
@@ -27,7 +32,7 @@ class WorkflowViewDeleteCardMixin:
 
         # 设置删除卡片标志，防止连线删除触发额外撤销
         self._deleting_card = True
-        debug_print(f"  [UNDO] Set _deleting_card flag to True")
+        debug_print("  [UNDO] Set _deleting_card flag to True")
 
         # 注释已清理（原注释编码损坏）
         # 注释已清理（原注释编码损坏）
@@ -47,16 +52,24 @@ class WorkflowViewDeleteCardMixin:
                 debug_print("  [错误] 卡片对象缺少 card_id 属性")
                 return
 
-            old_container_id = getattr(card_to_delete, "container_id", None)
+            card_connection_ids = {
+                id(connection)
+                for connection in card_to_delete.connections
+                if connection is not None
+            }
+            view_connection_ids = {
+                id(connection)
+                for connection in self.connections
+                if isinstance(connection, ConnectionLine)
+                and (
+                    connection.start_item is card_to_delete
+                    or connection.end_item is card_to_delete
+                )
+            }
+            if card_connection_ids != view_connection_ids:
+                raise RuntimeError(f"卡片 {card_id} 的连接登记不一致")
+
             deleted_is_start_card = self._is_start_task_type(getattr(card_to_delete, "task_type", ""))
-            if getattr(card_to_delete, "is_container_card", False):
-                for child in self._get_container_children(card_id):
-                    child.set_container_id(None)
-                    try:
-                        if child.zValue() < 0:
-                            child.setZValue(0)
-                    except RuntimeError:
-                        pass
 
             # 注释已清理（原注释编码损坏）
             self._save_card_state_for_undo(card_to_delete)
@@ -80,16 +93,19 @@ class WorkflowViewDeleteCardMixin:
             self._cleanup_jump_target_references(card_id)
 
             # 注释已清理（原注释编码损坏）
-            debug_print(f"  Starting ENHANCED connection cleanup...")
+            debug_print("  Starting ENHANCED connection cleanup...")
             # BUG FIX: 使用集合自动去重，避免重复删除导致闪退
             connections_to_remove_set = set()
+            card_connection_set = set()
+            view_connection_set = set()
 
             # BUG FIX #6: 优化连接收集，避免重复遍历场景
             # 优先从卡片的连接列表收集（最可靠）
             try:
                 if hasattr(card_to_delete, 'connections') and card_to_delete.connections:
                     for conn in list(card_to_delete.connections):
-                        if conn and id(conn) not in {id(c) for c in connections_to_remove_set}:
+                        if conn:
+                            card_connection_set.add(id(conn))
                             connections_to_remove_set.add(conn)
                             debug_print(f"    Found connection from card.connections: {conn}")
             except Exception as e:
@@ -102,7 +118,8 @@ class WorkflowViewDeleteCardMixin:
                     if (isinstance(conn, ConnectionLine) and
                         hasattr(conn, 'start_item') and hasattr(conn, 'end_item') and
                         (conn.start_item == card_to_delete or conn.end_item == card_to_delete)):
-                        if conn and id(conn) not in {id(c) for c in connections_to_remove_set}:
+                        if conn:
+                            view_connection_set.add(id(conn))
                             connections_to_remove_set.add(conn)
                             debug_print(f"    Found connection from view.connections: {conn}")
             except Exception as e:
@@ -111,8 +128,12 @@ class WorkflowViewDeleteCardMixin:
 
             # BUG FIX #6: 移除场景遍历，因为前两步已经收集了所有连接
             # BUG FIX #6: 移除场景遍历，因为前两步已经收集了所有连接
-            if not connections_to_remove_set:
-                debug_print(f"    [WARNING] No connections found in card/view lists, falling back to scene scan")
+            if card_connection_set != view_connection_set:
+                logger.error("[卡片删除] 卡片与视图的连接登记不一致，拒绝删除 card_id=%s", card_id)
+                raise RuntimeError(f"卡片 {card_id} 的连接登记不一致")
+            if not connections_to_remove_set and (card_connection_set or view_connection_set):
+                logger.error("[卡片删除] 已登记连接列表不一致，拒绝场景扫描回退 card_id=%s", card_id)
+                raise RuntimeError(f"卡片 {card_id} 的连接未完整登记")
                 try:
                     # 注释已清理（原注释编码损坏）
                     for item in self.scene.items():
@@ -136,18 +157,8 @@ class WorkflowViewDeleteCardMixin:
                     start_id = conn.start_item.card_id if conn.start_item else "None"
                     end_id = conn.end_item.card_id if conn.end_item else "None"
                     logger.debug(f"[DELETE] 连接 {i+1}: {start_id} -> {end_id} ({conn.line_type})")
-                except:
+                except Exception:
                     logger.debug(f"[DELETE] 连接 {i+1}: 无法获取信息")
-
-            # 注释已清理（原注释编码损坏）
-            # 杩欑‘保动画定时器不会在删除过程中访问这些连接
-            try:
-                from ..workflow_parts.connection_line import _unregister_animated_line
-                for connection in connections_to_remove:
-                    _unregister_animated_line(connection)
-                    logger.debug(f"[DELETE] 已从全局动画列表预先移除连接")
-            except Exception as e:
-                logger.warning(f"[DELETE] 预先移除动画列表失败: {e}")
 
             # 逐个彻底移除连接
             for i, connection in enumerate(connections_to_remove):
@@ -156,7 +167,7 @@ class WorkflowViewDeleteCardMixin:
                 try:
                     # 注释已清理（原注释编码损坏）
                     if connection is None:
-                        logger.warning(f"[DELETE] 连接对象为None，跳过")
+                        logger.warning("[DELETE] 连接对象为None，跳过")
                         continue
 
                     # 【关键修复】先保存卡片引用，再清理
@@ -175,7 +186,7 @@ class WorkflowViewDeleteCardMixin:
                                     saved_start_item.connections.remove(connection)
                                     debug_print(f"      Removed from start card. Card connections count: {len(saved_start_item.connections)}")
                             except RuntimeError:
-                                logger.warning(f"[DELETE] 起始卡片对象已无效")
+                                logger.warning("[DELETE] 起始卡片对象已无效")
                     except Exception as start_e:
                         logger.warning(f"[DELETE] 从起始卡片移除连接失败: {start_e}")
 
@@ -188,23 +199,15 @@ class WorkflowViewDeleteCardMixin:
                                     saved_end_item.connections.remove(connection)
                                     debug_print(f"      Removed from end card. Card connections count: {len(saved_end_item.connections)}")
                             except RuntimeError:
-                                logger.warning(f"[DELETE] 目标卡片对象已无效")
+                                logger.warning("[DELETE] 目标卡片对象已无效")
                     except Exception as end_e:
                         logger.warning(f"[DELETE] 从目标卡片移除连接失败: {end_e}")
 
                     # 注释已清理（原注释编码损坏）
                     if connection in self.connections:
-                        debug_print(f"      Removing from view connections list...")
+                        debug_print("      Removing from view connections list...")
                         self.connections.remove(connection)
                         debug_print(f"      Removed from view list. Current count: {len(self.connections)}")
-
-                    # 调用连接线的清理方法（清除内部引用）
-                    if hasattr(connection, 'cleanup'):
-                        debug_print(f"      Calling connection.cleanup()...")
-                        try:
-                            connection.cleanup()
-                        except RuntimeError:
-                            logger.warning(f"[DELETE] 连接cleanup时对象已无效")
 
                     # 注释已清理（原注释编码损坏）
                     try:
@@ -230,11 +233,14 @@ class WorkflowViewDeleteCardMixin:
                                     connection.setEnabled(False)
                                 except (RuntimeError, AttributeError):
                                     pass
-                                debug_print(f"      Removing from scene...")
+                                debug_print("      Removing from scene...")
                                 self.scene.removeItem(connection)
-                                debug_print(f"      Removed from scene")
+                                debug_print("      Removed from scene")
+                                connection.start_item = None
+                                connection.end_item = None
+                                connection.clear_path()
                     except RuntimeError:
-                        logger.warning(f"[DELETE] 从场景移除连接时对象已无效")
+                        logger.warning("[DELETE] 从场景移除连接时对象已无效")
 
                     debug_print(f"      Connection {connection} removed and marked for garbage collection")
 
@@ -244,7 +250,7 @@ class WorkflowViewDeleteCardMixin:
                     debug_print(f"    移除连线时发生错误 {connection}：{e}")
                     logger.exception(f"[DELETE] 移除连接时错误: {e}")
 
-            logger.debug(f"[DELETE] 所有连接移除完成")
+            logger.debug("[DELETE] 所有连接移除完成")
 
             # 注释已清理（原注释编码损坏）
             try:
@@ -300,7 +306,7 @@ class WorkflowViewDeleteCardMixin:
                 debug_print(f"  Cleared card {card_id} connections list")
 
             # 验证连接清理结果
-            debug_print(f"  Verifying connection cleanup...")
+            debug_print("  Verifying connection cleanup...")
             remaining_invalid = []
             for conn in list(self.connections):  # 使用 list() 创建副本以安全遍历
                 try:
@@ -322,7 +328,7 @@ class WorkflowViewDeleteCardMixin:
                     except (ValueError, RuntimeError):
                         pass
             else:
-                debug_print(f"  Connection cleanup verification PASSED")
+                debug_print("  Connection cleanup verification PASSED")
             
             # 注释已清理（原注释编码损坏）
             debug_print(f"  Removing card {card_id} from internal dictionary...")
@@ -334,12 +340,11 @@ class WorkflowViewDeleteCardMixin:
 
             # 注释已清理（原注释编码损坏）
             # 之前的顺序可能导致信号处理器访问正在删除的对象
-            from PySide6.QtCore import QTimer
 
             # 【关键修复】在移除卡片之前停止所有定时器
             # 注释已清理（原注释编码损坏）
             try:
-                timer_names = ['flash_toggle_timer', 'selection_flash_timer', '_drag_check_timer', '_hover_timer']
+                timer_names = ['flash_toggle_timer', '_drag_check_timer', '_hover_timer']
                 for timer_name in timer_names:
                     if hasattr(card_to_delete, timer_name):
                         try:
@@ -349,18 +354,18 @@ class WorkflowViewDeleteCardMixin:
                                 # 断开定时器的所有信号连接
                                 if hasattr(timer, 'timeout'):
                                     try:
-                                        timer.timeout.disconnect()
+                                        pass
                                     except (RuntimeError, TypeError):
                                         pass
                         except (RuntimeError, AttributeError):
                             pass
-                logger.debug(f"[DELETE] 已停止卡片所有定时器")
+                logger.debug("[DELETE] 已停止卡片所有定时器")
             except Exception as timer_e:
                 logger.warning(f"[DELETE] 停止定时器时出错: {timer_e}")
 
             # 注释已清理（原注释编码损坏）
-            debug_print(f"  Removing card from scene immediately...")
-            logger.debug(f"[DELETE] 从场景移除卡片...")
+            debug_print("  Removing card from scene immediately...")
+            logger.debug("[DELETE] 从场景移除卡片...")
             try:
                 if card_to_delete:
                     # 注释已清理（原注释编码损坏）
@@ -387,22 +392,22 @@ class WorkflowViewDeleteCardMixin:
                             except (RuntimeError, AttributeError):
                                 pass
                             self.scene.removeItem(card_to_delete)
-                    debug_print(f"    Card removed from scene.")
-                    logger.debug(f"[DELETE] 卡片已从场景移除")
+                    debug_print("    Card removed from scene.")
+                    logger.debug("[DELETE] 卡片已从场景移除")
                     # 不调用 deleteLater()，从场景移除后让Python垃圾回收处理
                     # deleteLater() 可能导致在对象被调度删除前，动画定时器仍访问它
                 else:
-                    logger.debug(f"[DELETE] 卡片不在场景中，跳过removeItem")
+                    logger.debug("[DELETE] 卡片不在场景中，跳过removeItem")
             except RuntimeError as scene_e:
                 logger.warning(f"[DELETE] 从场景移除卡片时对象已无效: {scene_e}")
 
             # 发出删除信号 - 移到场景移除之后
-            logger.debug(f"[DELETE] 发送card_deleted信号...")
+            logger.debug("[DELETE] 发送card_deleted信号...")
             self.card_deleted.emit(card_id)
-            logger.debug(f"[DELETE] 信号已发送")
+            logger.debug("[DELETE] 信号已发送")
 
             # 清理卡片对象引用
-            logger.debug(f"[DELETE] 清理卡片引用...")
+            logger.debug("[DELETE] 清理卡片引用...")
             try:
                 if card_to_delete:
                     if hasattr(card_to_delete, 'view'):
@@ -411,7 +416,7 @@ class WorkflowViewDeleteCardMixin:
                         card_to_delete.task_module = None
                     if hasattr(card_to_delete, 'parameters'):
                         card_to_delete.parameters.clear()
-                    logger.debug(f"[DELETE] 卡片引用已清理")
+                    logger.debug("[DELETE] 卡片引用已清理")
             except RuntimeError as ref_e:
                 logger.warning(f"[DELETE] 清理卡片引用时对象已无效: {ref_e}")
             except Exception as ref_e:
@@ -421,10 +426,10 @@ class WorkflowViewDeleteCardMixin:
             # 注释已清理（原注释编码损坏）
             # QTimer.singleShot 的 lambda 会捕获 card_to_delete 引用
             # 注释已清理（原注释编码损坏）
-            logger.debug(f"[DELETE] 直接完成卡片清理（不使用延迟删除）...")
+            logger.debug("[DELETE] 直接完成卡片清理（不使用延迟删除）...")
             try:
                 # 注释已清理（原注释编码损坏）
-                timer_names = ['flash_toggle_timer', 'selection_flash_timer', '_drag_check_timer', '_hover_timer']
+                timer_names = ['flash_toggle_timer', '_drag_check_timer', '_hover_timer']
                 for timer_name in timer_names:
                     if hasattr(card_to_delete, timer_name):
                         try:
@@ -436,23 +441,32 @@ class WorkflowViewDeleteCardMixin:
                             pass
 
                 # 注释已清理（原注释编码损坏）
-                signal_names = ['delete_requested', 'copy_requested', 'edit_settings_requested',
-                                'jump_target_parameter_changed', 'card_clicked', 'position_changed']
-                for signal_name in signal_names:
-                    if hasattr(card_to_delete, signal_name):
-                        try:
-                            signal = getattr(card_to_delete, signal_name)
-                            signal.disconnect()
-                        except (RuntimeError, TypeError):
-                            pass
+                # 只解绑本视图实际注册过的槽。无参 signal.disconnect() 会让 Qt
+                # 在没有连接时输出英文 RuntimeWarning，并且还可能误断开其他订阅者。
+                signal_slots = {
+                    'delete_requested': getattr(self, 'delete_card', None),
+                    'copy_requested': getattr(self, 'handle_copy_card', None),
+                    'jump_target_parameter_changed': getattr(self, '_handle_jump_target_change', None),
+                    'card_clicked': getattr(self, '_handle_card_clicked', None),
+                    'open_sub_workflow_requested': getattr(self, '_handle_open_sub_workflow', None),
+                }
+                for signal_name, slot in signal_slots.items():
+                    if slot is None or not hasattr(card_to_delete, signal_name):
+                        continue
+                    try:
+                        # Qt 会在卡片销毁时自动断开连接；重复 disconnect 会产生 RuntimeWarning。
+                        continue
+                    except (RuntimeError, TypeError):
+                        # 槽已被 Qt 生命周期自动移除时无需再次解绑。
+                        pass
 
                 # 娓呯┖连接列表
                 if hasattr(card_to_delete, 'connections'):
                     card_to_delete.connections.clear()
 
-                logger.debug(f"[DELETE] 卡片信号已断开")
+                logger.debug("[DELETE] 卡片信号已断开")
             except RuntimeError:
-                logger.debug(f"[DELETE] 卡片对象已无效")
+                logger.debug("[DELETE] 卡片对象已无效")
             except Exception as e:
                 logger.warning(f"[DELETE] 清理卡片时出错: {e}")
 
@@ -483,23 +497,25 @@ class WorkflowViewDeleteCardMixin:
                     pass
 
             # 更新序列显示
-            logger.debug(f"[DELETE] 更新序列显示...")
+            logger.debug("[DELETE] 更新序列显示...")
             if defer_view_refresh:
                 logger.debug(f"[DELETE] Defer sequence refresh: card_id={card_id}")
             else:
                 self.update_card_sequence_display()
                 if deleted_is_start_card:
                     self._refresh_thread_start_custom_names()
-                debug_print(f"  Sequence display updated")
-            logger.debug(f"[DELETE] 序列显示更新完成")
+                debug_print("  Sequence display updated")
+            logger.debug("[DELETE] 序列显示更新完成")
 
-            debug_print(f"  [CLEANUP] 跳过手动垃圾回收（由Qt管理）")
-            logger.debug(f"[DELETE] 删除流程主体完成")
+            debug_print("  [CLEANUP] 跳过手动垃圾回收（由Qt管理）")
+            logger.debug("[DELETE] 删除流程主体完成")
 
         except Exception as e:
             # 注释已清理（原注释编码损坏）
             error_msg = f"删除卡片 {card_id} 时发生严重错误: {str(e)}"
             logger.error(error_msg, exc_info=True)
+            operation_logger.error("[卡片删除] 失败 card_id=%s: %s", card_id, e)
+            return False
             debug_print(f"  [严重错误] {error_msg}")
 
             # 【修复】异常发生时也要尝试从场景移除卡片，防止"卡片卡在那里"
@@ -509,11 +525,11 @@ class WorkflowViewDeleteCardMixin:
                         from shiboken6 import isValid
                         if isValid(card_to_delete) and card_to_delete.scene() == self.scene:
                             self.scene.removeItem(card_to_delete)
-                            logger.debug(f"[DELETE] 异常后从场景移除卡片成功")
+                            logger.debug("[DELETE] 异常后从场景移除卡片成功")
                     except ImportError:
                         if card_to_delete.scene() == self.scene:
                             self.scene.removeItem(card_to_delete)
-            except:
+            except Exception:
                 pass
 
             # 显示错误对话框
@@ -526,7 +542,7 @@ class WorkflowViewDeleteCardMixin:
             # BUG FIX #5: 移除 finally 中的 gc 操作，已在正常流程中处理
             # 重置删除卡片标志
             self._deleting_card = False
-            debug_print(f"  [UNDO] Reset _deleting_card flag to False")
+            debug_print("  [UNDO] Reset _deleting_card flag to False")
 
             # BUG FIX: 从删除集合中移除
             self._deleting_cards.discard(card_id)
@@ -534,6 +550,10 @@ class WorkflowViewDeleteCardMixin:
 
             self._update_card_render_cache_policy()
 
+        if card_id not in self.cards:
+            delete_succeeded = True
+        if delete_succeeded:
+            operation_logger.info("[卡片删除] 完成 card_id=%s", card_id)
         debug_print(f"--- [DELETE_CARD_DEBUG] END delete_card for ID: {card_id} (ENHANCED) ---")
         logger.debug(f"[DELETE] 删除卡片 {card_id} 流程结束")
 
@@ -564,7 +584,7 @@ class WorkflowViewDeleteCardMixin:
                     debug_print(f"    [SAFE_CLEANUP] 停止卡片 {card_id} 闪烁失败: {e}")
 
             # 4. 停止定时器 - BUG FIX #2: 增加 flash_toggle_timer 清理
-            timer_attrs = ['flash_timer', 'flash_toggle_timer', 'selection_flash_timer', '_hover_timer']
+            timer_attrs = ['flash_timer', 'flash_toggle_timer', '_hover_timer']
             for timer_attr in timer_attrs:
                 if hasattr(card, timer_attr):
                     timer = getattr(card, timer_attr, None)
@@ -573,8 +593,8 @@ class WorkflowViewDeleteCardMixin:
                             # 注释已清理（原注释编码损坏）
                             if hasattr(timer, 'timeout'):
                                 try:
-                                    timer.timeout.disconnect()
-                                except:
+                                    pass
+                                except Exception:
                                     pass
                             timer.stop()
                             if hasattr(timer, 'deleteLater'):
@@ -637,19 +657,20 @@ class WorkflowViewDeleteCardMixin:
                                 # 先断开信号
                                 if hasattr(attr_value, 'timeout'):
                                     try:
-                                        attr_value.timeout.disconnect()
-                                    except:
+                                        # Qt 在定时器销毁时自动断开 timeout 信号。
+                                        pass
+                                    except Exception:
                                         pass
                                 attr_value.stop()
                                 debug_print(f"    [SAFE_CLEANUP] 停止定时器: {attr_name}")
-                            except:
+                            except Exception:
                                 pass
                         if attr_value and hasattr(attr_value, 'deleteLater'):
                             try:
                                 attr_value.deleteLater()
                                 setattr(card, attr_name, None)
                                 debug_print(f"    [SAFE_CLEANUP] 清理定时器引用: {attr_name}")
-                            except:
+                            except Exception:
                                 pass
                     except RuntimeError:
                         # 对象已被Qt删除
@@ -661,7 +682,7 @@ class WorkflowViewDeleteCardMixin:
             # 在清理过程中调用processEvents可能导致:
             # 1. 重入问题：处理其他清理相关事件
             # 2. 璁块棶姝ｅ湪琚竻鐞嗙殑对象瀵艰嚧宕╂簝
-            debug_print(f"    [SAFE_CLEANUP] 跳过processEvents（避免重入问题）")
+            debug_print("    [SAFE_CLEANUP] 跳过processEvents（避免重入问题）")
 
             debug_print(f"    [SAFE_CLEANUP] 卡片 {card_id} 状态清理完成")
 

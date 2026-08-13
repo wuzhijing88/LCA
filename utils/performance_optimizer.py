@@ -4,7 +4,6 @@
 """
 
 import os
-import sys
 import logging
 import platform
 from typing import Optional
@@ -164,7 +163,7 @@ class PerformanceOptimizer:
                     'process_priority': self.process.nice(),
                     'priority_elevated': self.priority_elevated,
                 })
-            except:
+            except Exception:
                 pass
 
         return info
@@ -253,8 +252,7 @@ class PerformanceOptimizer:
             logger.warning("  ⚠ 如果系统变慢，请结束程序")
         else:
             logger.error("✗ 极致性能优化应用失败")
-            logger.info("  降级使用高优先级模式...")
-            self.elevate_priority('high')
+            raise RuntimeError("极致性能优化失败：无法设置实时优先级")
 
 
 # 全局性能优化器实例

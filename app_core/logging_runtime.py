@@ -18,8 +18,10 @@ LOG_RETENTION_DAYS = 7
 MAX_LOG_MESSAGE_CHARS = 512
 MAX_LOG_DIR_SIZE_MB = 50
 LOG_MAINTENANCE_INTERVAL_SEC = 300
+MAX_LOG_FILE_SIZE_BYTES = MAX_LOG_FILE_SIZE_MB * 1024 * 1024
 
 logger = logging.getLogger(__name__)
+logging.getLogger("workflow.operations").setLevel(logging.INFO)
 
 
 def _truncate_log_file_if_oversized(filepath: str, max_bytes: int, verbose: bool = False) -> int:
@@ -58,6 +60,7 @@ def cleanup_log_files_and_temp(
     deleted_count = 0
     deleted_size = 0
     truncated_count = 0
+    truncated_size_total = 0
     max_log_dir_size = MAX_LOG_DIR_SIZE_MB * 1024 * 1024
 
     for filepath in glob.glob(log_pattern):
@@ -79,10 +82,27 @@ def cleanup_log_files_and_temp(
                 logger.warning(f"检查或删除日志文件 {filepath} 时出错: {e}")
 
     log_files_with_time = []
+    current_filename = datetime.date.today().strftime(LOG_FILENAME_FORMAT)
     for filepath in glob.glob(log_pattern):
         try:
             file_stat = os.stat(filepath)
-            log_files_with_time.append((filepath, file_stat.st_mtime, file_stat.st_size))
+            # The active file is managed by RotatingFileHandler. Older files
+            # can be truncated here without racing the open handler stream.
+            effective_size = file_stat.st_size
+            if (
+                os.path.basename(filepath) != current_filename
+                and effective_size > MAX_LOG_FILE_SIZE_BYTES
+            ):
+                truncated_size = _truncate_log_file_if_oversized(
+                    filepath,
+                    MAX_LOG_FILE_SIZE_BYTES,
+                    verbose=verbose,
+                )
+                if truncated_size:
+                    truncated_count += 1
+                    truncated_size_total += truncated_size
+                    effective_size = max(0, effective_size - truncated_size)
+            log_files_with_time.append((filepath, file_stat.st_mtime, effective_size))
         except OSError:
             pass
 
@@ -108,11 +128,15 @@ def cleanup_log_files_and_temp(
                     logger.warning(f"清理失败: {os.path.basename(filepath)}: {e}")
 
     if callable(cleanup_temp_files_cb):
-        cleanup_temp_files_cb()
+        try:
+            cleanup_temp_files_cb()
+        except Exception as error:
+            logger.warning(f"临时文件清理失败: {error}")
 
     if verbose and (deleted_count > 0 or truncated_count > 0):
+        released_size = deleted_size + truncated_size_total
         logger.info(
-            f"日志清理完成：删除 {deleted_count} 个文件，截断 {truncated_count} 个文件，释放 {deleted_size // 1024 // 1024}MB"
+            f"日志清理完成：删除 {deleted_count} 个文件，截断 {truncated_count} 个文件，释放 {released_size // 1024 // 1024}MB"
         )
 
 
@@ -167,7 +191,12 @@ def setup_logging_and_cleanup(cleanup_temp_files_cb: Optional[Callable[[], None]
 
     logger_instance = logging.getLogger()
     if logger_instance.hasHandlers():
-        logger_instance.handlers.clear()
+        for existing_handler in logger_instance.handlers[:]:
+            logger_instance.removeHandler(existing_handler)
+            try:
+                existing_handler.close()
+            except Exception:
+                pass
 
     logger_instance.setLevel(logging.INFO)
     formatter = logging.Formatter(
@@ -175,41 +204,38 @@ def setup_logging_and_cleanup(cleanup_temp_files_cb: Optional[Callable[[], None]
     )
     handlers_to_filter = []
 
-    try:
-        from logging.handlers import RotatingFileHandler
+    from logging.handlers import RotatingFileHandler
 
-        class SafeRotatingFileHandler(RotatingFileHandler):
-            def doRollover(self):
+    class SafeRotatingFileHandler(RotatingFileHandler):
+        def doRollover(self):
+            try:
+                if self.stream:
+                    self.stream.close()
+                    self.stream = None
+                original_mode = self.mode
                 try:
-                    if self.stream:
-                        self.stream.close()
-                        self.stream = None
-                    original_mode = self.mode
-                    try:
-                        self.mode = "w"
-                        stream = self._open()
-                        stream.close()
-                    finally:
-                        self.mode = original_mode
-                    if not self.delay:
-                        self.stream = self._open()
-                except (OSError, PermissionError):
-                    pass
+                    self.mode = "w"
+                    stream = self._open()
+                    stream.close()
+                finally:
+                    self.mode = original_mode
+                if not self.delay:
+                    self.stream = self._open()
+            except (OSError, PermissionError):
+                pass
 
-        file_handler = SafeRotatingFileHandler(
-            current_log_filepath,
-            mode="a",
-            maxBytes=MAX_LOG_FILE_SIZE_MB * 1024 * 1024,
-            backupCount=MAX_LOG_BACKUP_COUNT,
-            encoding="utf-8",
-            delay=False,
-        )
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(formatter)
-        logger_instance.addHandler(file_handler)
-        handlers_to_filter.append(file_handler)
-    except Exception as e:
-        logger.error(f"无法设置日志文件处理器 {current_log_filepath}: {e}")
+    file_handler = SafeRotatingFileHandler(
+        current_log_filepath,
+        mode="a",
+        maxBytes=MAX_LOG_FILE_SIZE_BYTES,
+        backupCount=MAX_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+        delay=False,
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger_instance.addHandler(file_handler)
+    handlers_to_filter.append(file_handler)
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO)
@@ -220,9 +246,14 @@ def setup_logging_and_cleanup(cleanup_temp_files_cb: Optional[Callable[[], None]
     install_runtime_log_filters(handlers_to_filter, MAX_LOG_MESSAGE_CHARS)
     configure_noisy_logger_levels()
 
-    try:
-        from utils.log_message_translator import install_log_message_translator
+    from utils.log_message_translator import install_log_message_translator
 
-        install_log_message_translator(logger_instance)
-    except Exception:
-        pass
+    install_log_message_translator(logger_instance)
+
+    logger.info("=" * 80)
+    logger.info(
+        "LCA SESSION | pid=%s | file=%s",
+        os.getpid(),
+        current_log_filepath,
+    )
+    logger.info("=" * 80)

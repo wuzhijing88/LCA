@@ -104,7 +104,7 @@ class MainWindowWindowBindingStateMixin:
 
                 logger.warning(f"任务 '{task.name}' 绑定的窗口 (HWND: {task.target_hwnd}, '{task.target_window_title}') 已从全局设置中移除或被禁用")
 
-                logger.warning(f"  保留任务的绑定信息，执行时将提示用户处理")
+                logger.warning("  保留任务的绑定信息，执行时将提示用户处理")
 
                 # 仍然更新执行模式（即使窗口不可用）
 
@@ -148,7 +148,7 @@ class MainWindowWindowBindingStateMixin:
 
         if hwnd == "ALL_BOUND":
 
-            logger.warning(f"检测到特殊标记ALL_BOUND，这不是有效的窗口句柄")
+            logger.warning("检测到特殊标记ALL_BOUND，这不是有效的窗口句柄")
 
             return False
 

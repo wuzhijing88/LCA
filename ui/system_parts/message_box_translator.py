@@ -100,7 +100,7 @@ class MessageBoxTranslator(QObject):
             for button in buttons:
                 self.translate_button(button)
 
-        except Exception as e:
+        except Exception:
             # 静默处理翻译错误，避免影响正常功能
             pass
 
@@ -138,7 +138,7 @@ class MessageBoxTranslator(QObject):
                     if button:
                         button.setText(chinese_text)
 
-        except Exception as e:
+        except Exception:
             pass
 
     def translate_button_box(self, button_box):
@@ -170,7 +170,7 @@ class MessageBoxTranslator(QObject):
                 if button:
                     button.setText(chinese_text)
 
-        except Exception as e:
+        except Exception:
             pass
 
     def translate_button(self, button):
@@ -179,7 +179,7 @@ class MessageBoxTranslator(QObject):
             current_text = button.text().strip()
             if current_text in self.button_translations:
                 button.setText(self.button_translations[current_text])
-        except Exception as e:
+        except Exception:
             pass
 
 # 全局翻译器实例
@@ -362,7 +362,7 @@ def setup_message_box_translations():
             # 设置应用程序级别的按钮文本翻译
             app.setProperty("chinese_buttons", True)
 
-    except Exception as e:
+    except Exception:
         # 静默处理设置错误
         pass
 

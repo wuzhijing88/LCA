@@ -9,92 +9,122 @@ from task_workflow.thread_window_binding import resolve_thread_window_configs
 
 
 def _normalize_start_card_ids(
-    start_card_id: Optional[int],
-    start_card_ids: Optional[Iterable[Any]],
+    start_card_ids: Iterable[int],
 ) -> list[int]:
+    if isinstance(start_card_ids, (str, bytes)) or not isinstance(start_card_ids, Iterable):
+        raise TypeError("start_card_ids 必须是整数序列")
+
     normalized: list[int] = []
     seen: set[int] = set()
-
-    def append_one(value: Any) -> None:
-        try:
-            normalized_value = int(value)
-        except (TypeError, ValueError):
-            return
-        if normalized_value in seen:
-            return
-        seen.add(normalized_value)
-        normalized.append(normalized_value)
-
-    if start_card_ids is not None:
-        for item in start_card_ids:
-            append_one(item)
-    if start_card_id is not None:
-        append_one(start_card_id)
+    for value in start_card_ids:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"线程起点ID必须是整数: {value!r}")
+        if value in seen:
+            raise ValueError(f"线程起点ID重复: {value}")
+        seen.add(value)
+        normalized.append(value)
+    if not normalized:
+        raise ValueError("工作流至少需要一个线程起点")
     return normalized
+
+
+def _validate_payload_inputs(
+    *,
+    cards_data: Dict[Any, Any],
+    connections_data: list[Dict[str, Any]],
+    execution_mode: str,
+    screenshot_engine: str,
+    workflow_id: str,
+    start_card_ids: list[int],
+    bound_windows: Optional[list[Dict[str, Any]]],
+) -> None:
+    if not isinstance(cards_data, dict) or not cards_data:
+        raise ValueError("cards_data 必须是非空字典")
+    if not isinstance(connections_data, list):
+        raise TypeError("connections_data 必须是列表")
+    for index, connection in enumerate(connections_data):
+        if not isinstance(connection, dict):
+            raise TypeError(f"连接数据必须是字典: index={index}")
+        if connection.get("start_card_id") is None or connection.get("end_card_id") is None:
+            raise ValueError(f"连接数据缺少起点或终点: index={index}")
+
+    if not str(execution_mode or "").strip():
+        raise ValueError("execution_mode 不能为空")
+    if str(screenshot_engine or "").strip().lower() not in {"wgc", "printwindow", "gdi", "dxgi"}:
+        raise ValueError(f"不支持的 screenshot_engine: {screenshot_engine!r}")
+    if not str(workflow_id or "").strip():
+        raise ValueError("workflow_id 不能为空")
+    if bound_windows is not None:
+        if not isinstance(bound_windows, list):
+            raise TypeError("bound_windows 必须是列表")
+        if any(not isinstance(window, dict) for window in bound_windows):
+            raise TypeError("bound_windows 中的窗口配置必须是字典")
+
+    for start_card_id in start_card_ids:
+        if start_card_id not in cards_data and str(start_card_id) not in cards_data:
+            raise ValueError(f"线程起点卡片不存在: {start_card_id}")
 
 
 def build_process_workflow_payload(
     *,
-    cards_data: Dict[str, Any],
+    cards_data: Dict[Any, Any],
     connections_data: list[Dict[str, Any]],
     execution_mode: str,
-    screenshot_engine: Optional[str] = None,
+    screenshot_engine: str,
     images_dir: Optional[str],
     workflow_id: str,
     workflow_filepath: Optional[str] = None,
-    start_card_id: Optional[int] = None,
-    start_card_ids: Optional[Iterable[Any]] = None,
+    start_card_ids: Iterable[int],
     target_window_title: Optional[str] = None,
     target_hwnd: Optional[int] = None,
     thread_labels: Optional[Dict[int, str]] = None,
     bound_windows: Optional[list[Dict[str, Any]]] = None,
-    logger_obj=None,
-    enable_thread_window_binding: bool = True,
-    single_mode_overrides: Optional[Dict[str, Any]] = None,
-    multi_thread_overrides: Optional[Dict[str, Any]] = None,
+    test_mode: Any = None,
 ) -> Dict[str, Any]:
-    normalized_start_ids = _normalize_start_card_ids(start_card_id, start_card_ids)
-    primary_start_id = normalized_start_ids[0] if normalized_start_ids else None
+    normalized_start_ids = _normalize_start_card_ids(start_card_ids)
+    _validate_payload_inputs(
+        cards_data=cards_data,
+        connections_data=connections_data,
+        execution_mode=execution_mode,
+        screenshot_engine=screenshot_engine,
+        workflow_id=workflow_id,
+        start_card_ids=normalized_start_ids,
+        bound_windows=bound_windows,
+    )
+    primary_start_id = normalized_start_ids[0]
 
     single_thread_target_hwnd = target_hwnd
     single_thread_target_window_title = target_window_title
-    safe_bound_windows = bound_windows or []
+    safe_bound_windows = list(bound_windows or [])
 
-    if enable_thread_window_binding and primary_start_id is not None:
+    if len(normalized_start_ids) == 1:
         single_thread_window_configs = resolve_thread_window_configs(
             cards_data=cards_data,
             connections_data=connections_data,
             start_card_ids=[primary_start_id],
             bound_windows=safe_bound_windows,
-            logger_obj=logger_obj,
         )
         single_thread_window_config = next(iter(single_thread_window_configs.values()), {})
         if single_thread_window_config:
-            single_thread_target_hwnd = single_thread_window_config.get("target_hwnd", single_thread_target_hwnd)
-            single_thread_target_window_title = (
-                single_thread_window_config.get("target_window_title")
-                or single_thread_target_window_title
-            )
+            single_thread_target_hwnd = single_thread_window_config["target_hwnd"]
+            single_thread_target_window_title = single_thread_window_config["target_window_title"]
 
     payload: Dict[str, Any] = {
         "cards_data": cards_data,
         "connections_data": connections_data,
-        "execution_mode": execution_mode,
+        "execution_mode": str(execution_mode).strip(),
+        "screenshot_engine": str(screenshot_engine).strip().lower(),
         "images_dir": images_dir,
-        "workflow_id": workflow_id,
+        "workflow_id": str(workflow_id).strip(),
         "workflow_filepath": workflow_filepath,
     }
-    normalized_screenshot_engine = str(screenshot_engine or "").strip().lower()
-    if normalized_screenshot_engine:
-        payload["screenshot_engine"] = normalized_screenshot_engine
 
-    if enable_thread_window_binding and len(normalized_start_ids) > 1:
+    if len(normalized_start_ids) > 1:
         thread_window_configs = resolve_thread_window_configs(
             cards_data=cards_data,
             connections_data=connections_data,
             start_card_ids=normalized_start_ids,
             bound_windows=safe_bound_windows,
-            logger_obj=logger_obj,
         )
         payload.update(
             {
@@ -102,12 +132,10 @@ def build_process_workflow_payload(
                 "target_window_title": target_window_title,
                 "target_hwnd": target_hwnd,
                 "start_card_ids": normalized_start_ids,
-                "thread_labels": thread_labels or {},
+                "thread_labels": dict(thread_labels or {}),
                 "thread_window_configs": thread_window_configs,
             }
         )
-        if multi_thread_overrides:
-            payload.update(dict(multi_thread_overrides))
         return payload
 
     payload.update(
@@ -116,8 +144,7 @@ def build_process_workflow_payload(
             "target_window_title": single_thread_target_window_title,
             "target_hwnd": single_thread_target_hwnd,
             "start_card_id": primary_start_id,
+            "test_mode": test_mode,
         }
     )
-    if single_mode_overrides:
-        payload.update(dict(single_mode_overrides))
     return payload

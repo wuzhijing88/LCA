@@ -61,7 +61,7 @@ class ControlCenterWorkflowStopMixin:
         try:
             from services.multiprocess_ocr_pool import cleanup_ocr_services_on_stop
 
-            cleanup_ocr_services_on_stop(deep_cleanup=True)
+            cleanup_ocr_services_on_stop()
         except Exception as e:
             logger.warning(f"\u4e2d\u63a7\u5ef6\u8fdf\u6e05\u7406OCR\u5b50\u8fdb\u7a0b\u5931\u8d25: {e}")
 

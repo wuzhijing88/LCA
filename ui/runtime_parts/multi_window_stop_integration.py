@@ -3,42 +3,15 @@
 将增强的停止管理器集成到现有的多窗口执行器中
 """
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from PySide6.QtCore import QObject, Signal
 
 from ..runtime_parts.enhanced_multi_window_stop_manager import (
-    EnhancedMultiWindowStopManager,
-    WindowStopContext,
-    StopState
+    EnhancedMultiWindowStopManager
 )
 
 # 初始化logger
 logger = logging.getLogger(__name__)
-
-# 【内存优化】延迟导入OCR停止管理器，避免主程序启动时加载OCR模块
-OCR_STOP_MANAGER_AVAILABLE = None  # None表示尚未检测
-_ocr_stop_manager_module = None
-
-def _ensure_ocr_stop_manager():
-    """延迟检测并导入OCR停止管理器"""
-    global OCR_STOP_MANAGER_AVAILABLE, _ocr_stop_manager_module
-    if OCR_STOP_MANAGER_AVAILABLE is None:
-        try:
-            from services.enhanced_ocr_pool_stop_manager import get_ocr_stop_manager
-            _ocr_stop_manager_module = get_ocr_stop_manager
-            OCR_STOP_MANAGER_AVAILABLE = True
-        except ImportError:
-            OCR_STOP_MANAGER_AVAILABLE = False
-            logger.warning("OCR停止管理器不可用")
-    return OCR_STOP_MANAGER_AVAILABLE
-
-def get_ocr_stop_manager():
-    """获取OCR停止管理器（延迟导入）"""
-    _ensure_ocr_stop_manager()
-    if _ocr_stop_manager_module:
-        return _ocr_stop_manager_module()
-    return None
-
 
 class MultiWindowStopIntegration(QObject):
     """多窗口停止管理器集成类"""
@@ -136,24 +109,6 @@ class MultiWindowStopIntegration(QObject):
         """请求停止所有窗口"""
         def completion_callback(success: bool, message: str):
             logger.info(f"停止完成回调: 成功={success}, 消息={message}")
-
-            # 额外的OCR服务池清理（延迟检测）
-            if _ensure_ocr_stop_manager():
-                try:
-                    ocr_stop_manager = get_ocr_stop_manager()
-                    # 获取所有窗口句柄
-                    all_hwnds = []
-                    for window_id, mapped_id in self.window_mapping.items():
-                        if mapped_id in self.stop_manager.window_contexts:
-                            context = self.stop_manager.window_contexts[mapped_id]
-                            all_hwnds.append(context.hwnd)
-
-                    if all_hwnds:
-                        logger.info(f"额外清理 {len(all_hwnds)} 个窗口的OCR服务")
-                        ocr_stop_manager.request_stop_services_for_windows(all_hwnds, timeout=5.0)
-
-                except Exception as e:
-                    logger.error(f"额外OCR服务清理失败: {e}")
 
         return self.stop_manager.request_stop_all(
             timeout=timeout,

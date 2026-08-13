@@ -36,11 +36,21 @@ class RuntimeLogNoiseFilter(logging.Filter):
         "ui.panels",
         "ui.coordinate_selector",
         "ui.ocr_region_selector",
-        "ui.custom_widgets",
+        "ui.widgets.custom_widgets",
         "utils.wgc_hwnd_capture",
         "utils.screenshot_helper",
         "task_workflow.executor",
         "task_workflow.process_worker",
+    )
+
+    _QUIET_INFO_MESSAGE_FRAGMENTS = (
+        "CustomDropdown init:",
+        "输入模拟器缓存已清除",
+        "前台输入驱动管理器已关闭",
+        "DPI监控已启用",
+        "DPI监控已禁用",
+        "配置已保存到 ",
+        "已注册主题切换回调:",
     )
 
     _DEBUG_MARKERS = (
@@ -79,8 +89,21 @@ class RuntimeLogNoiseFilter(logging.Filter):
         except Exception:
             return True
 
-        if record.levelno < logging.WARNING and logger_name.startswith(self._QUIET_INFO_LOGGER_PREFIXES):
+        # 关键用户操作日志必须保留，即使来源属于默认静默的 UI 模块。
+        important_operation_log = any(
+            marker in message for marker in ("[卡片删除]", "[撤回]")
+        )
+
+        if (
+            record.levelno < logging.WARNING
+            and logger_name.startswith(self._QUIET_INFO_LOGGER_PREFIXES)
+            and not important_operation_log
+        ):
             return False
+
+        if record.levelno < logging.WARNING:
+            if any(fragment in message for fragment in self._QUIET_INFO_MESSAGE_FRAGMENTS):
+                return False
 
         if record.levelno < logging.ERROR:
             if any(marker in message for marker in self._DEBUG_MARKERS):
@@ -117,7 +140,7 @@ def configure_noisy_logger_levels() -> None:
         "ui.panels",
         "ui.coordinate_selector",
         "ui.ocr_region_selector",
-        "ui.custom_widgets",
+        "ui.widgets.custom_widgets",
         "utils.wgc_hwnd_capture",
         "utils.screenshot_helper",
         "urllib3.connectionpool",

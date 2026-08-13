@@ -8,8 +8,6 @@ v2.0 优化:
 """
 
 import win32gui
-import win32con
-import win32api
 import ctypes
 from ctypes import wintypes
 import logging
@@ -114,7 +112,7 @@ class EnhancedChildWindowFinder:
                 if self.enable_logging:
                     try:
                         class_name = win32gui.GetClassName(child)
-                    except:
+                    except Exception:
                         class_name = "Unknown"
                     logger.debug(f"[RealChildWindowFromPoint] ({client_x},{client_y}) -> 0x{child:08X} ({class_name})")
                 return child
@@ -259,7 +257,7 @@ class EnhancedChildWindowFinder:
                         wfp_cx, wfp_cy = win32gui.ScreenToClient(wfp_hwnd, (screen_x, screen_y))
                         deepest_hwnd = wfp_hwnd
                         deepest_client_xy = (wfp_cx, wfp_cy)
-                    except:
+                    except Exception:
                         pass
 
         if self.enable_logging:
@@ -283,7 +281,7 @@ class EnhancedChildWindowFinder:
                     return True
                 current = parent
             return False
-        except:
+        except Exception:
             return False
 
     def _get_window_depth(self, root_hwnd: int, hwnd: int) -> int:
@@ -301,7 +299,7 @@ class EnhancedChildWindowFinder:
                 current = parent
                 depth += 1
             return depth
-        except:
+        except Exception:
             return 0
 
     def find_simple_child(self, hwnd_parent: int, x: int, y: int) -> int:

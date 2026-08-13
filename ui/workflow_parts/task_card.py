@@ -1,141 +1,30 @@
-﻿import sys
-import logging
+﻿import logging
 import copy
-import gc
-import tracemalloc
 import math
 import time
 import weakref
-import re
 logger = logging.getLogger(__name__)
-from typing import Optional, Dict, Any, List, Tuple # For type hints
+from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple
+
+if TYPE_CHECKING:
+    from .workflow_view import WorkflowView
 
 from task_workflow.thread_window_binding import is_thread_window_limit_task_type
-from .workflow_debug_utils import debug_print
+from shiboken6 import isValid as _qt_is_valid
 
-try:
-    from shiboken6 import isValid as _qt_is_valid
-except Exception:
-    def _qt_is_valid(_obj) -> bool:
-        return True
-
-HOVER_MEM_LOG_ENABLED = False
-HOVER_MEM_LOG_SAMPLE = 1
-HOVER_DIAG_ENABLED = False
-HOVER_DIAG_SAMPLE = 10
-HOVER_TRACE_ENABLED = False
-HOVER_TRACE_SAMPLE = 50
-HOVER_TRACE_TOP = 8
-HOVER_TRACE_NFRAMES = 10
 IDLE_PORT_ANIMATION_CARD_THRESHOLD = 60
 CARD_ANIMATION_ZOOM_STOP_THRESHOLD = 0.50
 CARD_OVERVIEW_MODE_ZOOM_THRESHOLD = 0.45
 CARD_ANIMATION_VIEWPORT_MARGIN = 30.0
 CARD_OVERVIEW_MIN_BORDER_DEVICE_PX = 1.2
 CARD_OVERVIEW_MAX_BORDER_SCENE_WIDTH = 3.5
-_hover_mem_counter = 0
-_last_hover_mem_kb = None
-_last_private_kb = None
-_last_gdi_count = None
-_last_user_count = None
-_last_trace_snapshot = None
 
-
-def clear_hover_diagnostics_cache():
-    """Clear hover diagnostics/trace state to release tracing buffers."""
-    global _hover_mem_counter, _last_hover_mem_kb, _last_private_kb, _last_gdi_count, _last_user_count
-    global _last_trace_snapshot
-    _hover_mem_counter = 0
-    _last_hover_mem_kb = None
-    _last_private_kb = None
-    _last_gdi_count = None
-    _last_user_count = None
-    _last_trace_snapshot = None
-    if tracemalloc.is_tracing():
-        tracemalloc.stop()
-
-if sys.platform.startswith("win"):
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-            _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
-
-        _psapi = ctypes.WinDLL("psapi")
-        _kernel32 = ctypes.WinDLL("kernel32")
-        _user32 = ctypes.WinDLL("user32")
-        _GetProcessMemoryInfo = _psapi.GetProcessMemoryInfo
-        _GetProcessMemoryInfo.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
-            wintypes.DWORD,
-        ]
-        _GetProcessMemoryInfo.restype = wintypes.BOOL
-        _GetCurrentProcess = _kernel32.GetCurrentProcess
-        _GetCurrentProcess.restype = wintypes.HANDLE
-
-        _GetGuiResources = _user32.GetGuiResources
-        _GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        _GetGuiResources.restype = wintypes.DWORD
-
-        def _get_process_mem_kb():
-            counters = PROCESS_MEMORY_COUNTERS()
-            if not _GetProcessMemoryInfo(
-                _GetCurrentProcess(),
-                ctypes.byref(counters),
-                ctypes.sizeof(counters),
-            ):
-                return None, None
-            return int(counters.WorkingSetSize / 1024), int(counters.PagefileUsage / 1024)
-
-        def _get_gdi_count():
-            return int(_GetGuiResources(_GetCurrentProcess(), 0))
-
-        def _get_user_count():
-            return int(_GetGuiResources(_GetCurrentProcess(), 1))
-    except Exception:
-        def _get_process_mem_kb():
-            return None, None
-        def _get_gdi_count():
-            return None
-        def _get_user_count():
-            return None
-else:
-    def _get_process_mem_kb():
-        return None, None
-    def _get_gdi_count():
-        return None
-    def _get_user_count():
-        return None
-
-from PySide6.QtWidgets import (QApplication, QMenu,
-                               QGraphicsSceneContextMenuEvent, QGraphicsSceneMouseEvent,
+from PySide6.QtWidgets import (QApplication,
+                               QGraphicsSceneMouseEvent,
                                QStyleOptionGraphicsItem, QGraphicsDropShadowEffect,
-                               QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QGraphicsProxyWidget,
-                               QSpacerItem, QSizePolicy, QFrame, QPushButton, QCheckBox, QFileDialog, QDialog,
                                QGraphicsSceneHoverEvent, QGraphicsObject, QGraphicsItem, QGraphicsLineItem)
 from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, Signal, QTimer # <-- ADD Signal & QTimer
-from PySide6.QtGui import QBrush, QPen, QColor, QPainter, QFont, QPainterPath, QAction, QPolygonF, QLinearGradient, QConicalGradient, QRadialGradient # <-- ADD QAction, QPolygonF
-from ui.dialogs.parameter_dialog import ParameterDialog # <<< UNCOMMENTED Import
-from ui.system_parts.menu_style import apply_unified_menu_style
-
-# Removed direct import of TASK_MODULES to break circular dependency
-# from tasks import TASK_MODULES 
-
-# Forward declare WorkflowView for type hinting
-class WorkflowView: pass 
+from PySide6.QtGui import QBrush, QPen, QColor, QPainter, QFont, QPainterPath, QConicalGradient, QRadialGradient
 
 
 class SnapGuideLine(QGraphicsLineItem):
@@ -162,8 +51,8 @@ PORT_TYPES = [PORT_TYPE_SEQUENTIAL, PORT_TYPE_SUCCESS, PORT_TYPE_FAILURE, PORT_T
 
 # --- CHANGED Inheritance from QGraphicsRectItem to QGraphicsObject --- 
 class TaskCard(QGraphicsObject):
-# ------------------------------------------------------------------
-    """Represents a task step (SIMPLIFIED)."""
+    """工作流画布中的任务卡片。"""
+    VALID_EXECUTION_STATES = frozenset({"idle", "executing", "success", "failure"})
     # --- Signals moved back INSIDE the class ---
     delete_requested = Signal(int)
     copy_requested = Signal(int, dict) # Emit card_id and parameters
@@ -274,7 +163,7 @@ class TaskCard(QGraphicsObject):
                 if not allow_zoom_animation:
                     continue
 
-                has_ports = not getattr(card, "ports_disabled", False)
+                has_ports = True
                 is_executing = getattr(card, "execution_state", "idle") != "idle"
                 is_hovering = getattr(card, "hovered_port_side", None) is not None
                 visible_cards.append((card, has_ports, is_executing, is_hovering))
@@ -451,49 +340,22 @@ class TaskCard(QGraphicsObject):
 
     
     def _get_theme_card_color(self):
-        """Return the themed card background color."""
-        try:
-            from themes import get_theme_manager
-            theme_manager = get_theme_manager()
-            if theme_manager.is_dark_mode():
-                return QColor(45, 45, 45)  # #2d2d2d
-            else:
-                return QColor(255, 255, 255)  # #ffffff
-        except:
-            return QColor(255, 255, 255)  # 默认白色
+        """返回当前主题的卡片背景色。"""
+        return QColor(45, 45, 45) if self._is_dark_theme() else QColor(255, 255, 255)
 
     def _get_theme_title_color(self):
-        """Return the themed title area color."""
-        try:
-            from themes import get_theme_manager
-            theme_manager = get_theme_manager()
-            if theme_manager.is_dark_mode():
-                return QColor(58, 58, 58)  # #3a3a3a
-            else:
-                return QColor(240, 240, 240)  # #f0f0f0
-        except:
-            return QColor(240, 240, 240)  # 默认浅灰
+        """返回当前主题的标题区域颜色。"""
+        return QColor(58, 58, 58) if self._is_dark_theme() else QColor(240, 240, 240)
 
     def _get_theme_text_color(self):
-        """获取主题文本颜色"""
-        try:
-            from themes import get_theme_manager
-            theme_manager = get_theme_manager()
-            if theme_manager.is_dark_mode():
-                return QColor(224, 224, 224)  # #e0e0e0
-            else:
-                return QColor(20, 20, 20)  # #141414
-        except:
-                return QColor(20, 20, 20)  # 默认深色
+        """返回当前主题的文本颜色。"""
+        return QColor(224, 224, 224) if self._is_dark_theme() else QColor(20, 20, 20)
 
     def _is_dark_theme(self):
-        """Return whether dark theme is active."""
-        try:
-            from themes import get_theme_manager
-            theme_manager = get_theme_manager()
-            return theme_manager.is_dark_mode()
-        except:
-            return False  # fallback
+        """返回当前是否为深色主题。"""
+        from themes import get_theme_manager
+
+        return bool(get_theme_manager().is_dark_mode())
 
     def _apply_visual_profile(self):
         """Apply a unified visual profile for card rendering."""
@@ -611,37 +473,31 @@ class TaskCard(QGraphicsObject):
             pass
         self.shadow = None
 
-    def _cleanup_timer_attr(self, attr_name: str) -> None:
+    def _cleanup_timer_attr(self, attr_name: str, timeout_slot) -> None:
         timer = getattr(self, attr_name, None)
         if timer is None:
-            try:
-                setattr(self, attr_name, None)
-            except Exception:
-                pass
-            return
-        try:
-            timer.stop()
-        except Exception:
-            pass
-        try:
-            timer.timeout.disconnect()
-        except Exception:
-            pass
-        try:
-            if hasattr(timer, "deleteLater"):
-                timer.deleteLater()
-        except Exception:
-            pass
-        try:
             setattr(self, attr_name, None)
-        except Exception:
+            return
+        timer.stop()
+        try:
+            timer.timeout.disconnect(timeout_slot)
+        except (TypeError, RuntimeError):
             pass
+        timer.deleteLater()
+        setattr(self, attr_name, None)
 
     def _release_drag_check_timer(self) -> None:
-        self._cleanup_timer_attr("_drag_check_timer")
+        self._cleanup_timer_attr("_drag_check_timer", self._check_drag_state)
 
     def __init__(self, view: 'WorkflowView', x: float, y: float, task_type: str, card_id: int, task_module: Any, width: int = 200):
-        debug_print(f"--- [DEBUG] TaskCard __init__ START (Inherits QGraphicsObject) - ID: {card_id}, Type: '{task_type}' ---") # Updated log
+        if view is None or not callable(getattr(view, "_is_workflow_running", None)):
+            raise TypeError("任务卡片必须绑定有效的 WorkflowView")
+        if not isinstance(task_type, str) or not task_type.strip():
+            raise TypeError("任务类型必须是非空字符串")
+        if isinstance(card_id, bool) or not isinstance(card_id, int) or card_id < 0:
+            raise TypeError("卡片 ID 必须是非负整数")
+        if task_module is None or not callable(getattr(task_module, "get_params_definition", None)):
+            raise TypeError(f"任务 {task_type} 缺少参数定义入口")
         self.initial_height = 60 # Simplified height
         # --- ADJUSTED super().__init__() call for QGraphicsObject --- 
         # QGraphicsObject init doesn't take rect args directly like QGraphicsRectItem
@@ -650,17 +506,8 @@ class TaskCard(QGraphicsObject):
         # -------------------------------------------------------------
         self.view = view
         self.task_type = task_type
-        self.is_container_card = False
-        self.container_id: Optional[int] = None
-        self.ports_disabled = False
-        self._container_padding = 20
-        self._container_min_size = (240, 140)
         self._width = self._align_size_to_grid(width) # Store width for boundingRect
         self._height = self._align_size_to_grid(self.initial_height) # Store height for boundingRect
-        if self.is_container_card:
-            self._width = self._align_size_to_grid(max(self._width, self._container_min_size[0]))
-            self._height = self._align_size_to_grid(max(self._height, self._container_min_size[1]))
-            self.setZValue(-1)
         self.setPos(x, y) 
         self._last_group_pos = self.pos()
 
@@ -738,14 +585,6 @@ class TaskCard(QGraphicsObject):
         self._flash_border_on = False # Internal state for toggling appearance
         # --------------------------------------------------------
 
-        # --- ADDED: selection flash related state ---
-        self._is_selection_flashing = False  # Selection flash marker
-        self.selection_flash_timer = None  # Lazy init when selection flash starts
-        self.selection_flash_interval_ms = 300  # Same interval as next-step flashing
-        self.selection_flash_border_pen = QPen(QColor(0, 120, 255), 3)  # Blue border for selection flash
-        self._selection_flash_border_on = False  # Selection flash toggle state
-        # --- END ADDED ---
-
         self._drag_check_timer = None
 
         # --- REMOVED setBrush and setPen (QGraphicsObject doesn't have them directly) --- 
@@ -774,7 +613,6 @@ class TaskCard(QGraphicsObject):
         self._hover_timer = None  # 用于延迟显示工具提示
         # --- END ADDED ---
 
-        debug_print(f"--- [DEBUG] TaskCard __init__ END (Inherits QGraphicsObject) - ID: {card_id} ---") # Updated log
 
     # --- ADDED boundingRect method (Required by QGraphicsObject) --- 
     def boundingRect(self) -> QRectF:
@@ -784,12 +622,13 @@ class TaskCard(QGraphicsObject):
     # -------------------------------------------------------------
 
     def _get_size_grid_unit(self) -> float:
-        """Get grid spacing for size alignment."""
-        try:
-            spacing = float(getattr(self.view, "_grid_spacing", 20))
-            return spacing if spacing > 1.0 else 20.0
-        except Exception:
-            return 20.0
+        """返回当前画布的尺寸对齐网格。"""
+        spacing = self.view._grid_spacing
+        if isinstance(spacing, bool) or not isinstance(spacing, (int, float)):
+            raise TypeError("画布网格间距必须是数字")
+        if not math.isfinite(spacing) or spacing <= 1.0:
+            raise ValueError("画布网格间距必须是大于 1 的有限数字")
+        return float(spacing)
 
     def _align_size_to_grid(self, value: float, minimum: float = 0.0) -> float:
         """Align size to grid spacing, using upward rounding to avoid clipping."""
@@ -798,53 +637,61 @@ class TaskCard(QGraphicsObject):
         return float(math.ceil(safe_value / unit) * unit)
 
     def set_size(self, width: float, height: float):
-        min_width = self._container_min_size[0] if getattr(self, "is_container_card", False) else 0.0
-        min_height = self._container_min_size[1] if getattr(self, "is_container_card", False) else 0.0
-        width = self._align_size_to_grid(width, min_width)
-        height = self._align_size_to_grid(height, min_height)
+        width = self._align_size_to_grid(width)
+        height = self._align_size_to_grid(height)
         if width == self._width and height == self._height:
             return
         self.prepareGeometryChange()
         self._width = width
         self._height = height
         self.update()
-        # Ensure connection endpoints refresh when size changes (ports move).
-        for conn in self.connections[:]:
-            try:
-                try:
-                    from shiboken6 import isValid
-                    if not isValid(conn):
-                        try:
-                            self.connections.remove(conn)
-                        except ValueError:
-                            pass
-                        continue
-                except ImportError:
-                    pass
-                if conn and hasattr(conn, 'scene'):
-                    try:
-                        if conn.scene():
-                            conn.update_path()
-                    except RuntimeError:
-                        pass
-            except RuntimeError:
-                try:
-                    self.connections.remove(conn)
-                except ValueError:
-                    pass
-            except Exception:
-                pass
+        for connection in self._validated_connections():
+            connection.update_path()
 
-    def set_ports_disabled(self, disabled: bool):
-        if self.ports_disabled == disabled:
-            return
-        self.ports_disabled = disabled
-        self.update_port_restrictions()
-        self.update()
+    def _validated_connections(self):
+        """返回严格登记且属于当前场景的连接，不修改任何状态。"""
+        if not isinstance(self.connections, list):
+            raise TypeError(f"卡片 {self.card_id} 的连接容器必须是列表")
+        view_connections = self.view.connections
+        if not isinstance(view_connections, list):
+            raise TypeError("工作流连接容器必须是列表")
+        card_scene = self.scene()
+        validated = []
+        seen = set()
+        for connection in self.connections:
+            marker = id(connection)
+            if marker in seen or self.connections.count(connection) != 1:
+                raise RuntimeError(f"卡片 {self.card_id} 重复登记同一连接")
+            seen.add(marker)
+            if not _qt_is_valid(connection):
+                raise RuntimeError(f"卡片 {self.card_id} 登记了失效连接")
+            if view_connections.count(connection) != 1:
+                raise RuntimeError(f"卡片 {self.card_id} 的连接未在视图中登记一次")
+            start_item = getattr(connection, "start_item", None)
+            end_item = getattr(connection, "end_item", None)
+            if self is not start_item and self is not end_item:
+                raise RuntimeError(f"卡片 {self.card_id} 登记了不属于自己的连接")
+            if connection.scene() is not card_scene:
+                raise RuntimeError(f"卡片 {self.card_id} 的连接未挂载到同一场景")
+            if not callable(getattr(connection, "update_path", None)):
+                raise TypeError("连接对象缺少路径更新入口")
+            validated.append(connection)
+        return tuple(validated)
 
-    def set_container_id(self, container_id: Optional[int]):
-        self.container_id = container_id
-        self.set_ports_disabled(container_id is not None)
+    def _other_card_for_connection(self, connection):
+        if connection.start_item is self:
+            other_card = connection.end_item
+        elif connection.end_item is self:
+            other_card = connection.start_item
+        else:
+            raise RuntimeError(f"连接不属于卡片 {self.card_id}")
+        if other_card is self:
+            return None
+        if not isinstance(other_card, TaskCard):
+            raise TypeError("连接另一端必须是 TaskCard")
+        if other_card.scene() is not self.scene():
+            raise RuntimeError("连接另一端卡片不属于当前场景")
+        return other_card
 
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget=None):
         """Custom painting for rounded corners, title, ports, and state highlight."""
@@ -894,8 +741,6 @@ class TaskCard(QGraphicsObject):
             effective_border_pen = self.default_pen
             if self._is_flashing:
                 effective_border_pen = self._current_border_pen
-            elif self._is_selection_flashing and self._selection_flash_border_on:
-                effective_border_pen = self.selection_flash_border_pen
             else:
                 if state == 'idle':
                     effective_border_pen = self.state_border_pens.get('idle', self.default_pen)
@@ -930,7 +775,7 @@ class TaskCard(QGraphicsObject):
                     self.title,
                 )
 
-            if (not overview_mode) and (not self.ports_disabled):
+            if not overview_mode:
                 phase = TaskCard._gradient_phase
                 allow_idle_animation = self._should_animate_idle_ports()
                 for side, port_type in self._iter_render_ports():
@@ -947,47 +792,30 @@ class TaskCard(QGraphicsObject):
             pass
     # ------------------------------
     def _should_hide_title(self) -> bool:
-        if not getattr(self, "is_container_card", False):
-            return False
-        view = getattr(self, "view", None)
-        if not view:
-            return False
-        try:
-            return bool(view._get_container_children(self.card_id))
-        except Exception:
-            return False
+        return False
 
 
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent):
         """Handle clicks for port dragging and card selection/movement."""
-        debug_print(f"--- [DEBUG] TaskCard {self.card_id} ({self.task_type}): mousePressEvent START - Button: {event.button()} ---")
-
         if event.button() == Qt.MouseButton.LeftButton:
             port_info = self.get_port_at(event.pos())
             if port_info and port_info['side'] == 'output':
-                debug_print(f"  [DRAG_DEBUG] Detected click on output port: {port_info['type']} for card {self.card_id}")
-                debug_print(f"开始拖动: 从{self.title}的{port_info['type']}输出端口")
                 self.view.start_drag_line(self, port_info['type'])
                 event.accept()
                 return
 
         if event.button() == Qt.MouseButton.RightButton:
-            debug_print("  [DEBUG] TaskCard: Right mouse button pressed, accepting event for context menu.")
             event.accept()
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
             port_info = self.get_port_at(event.pos())
             if not (port_info and port_info['side'] == 'output'):
-                debug_print(f"  [CLICK_DEBUG] Emitting card_clicked for ID: {self.card_id}")
                 self.card_clicked.emit(self.card_id)
 
-        debug_print("Handling standard card selection/dragging.")
         scene = self.scene()
         if scene:
-            if self.isSelected():
-                debug_print(f"  [SELECTION] Card {self.card_id} already selected, keeping multi-selection for drag")
-            else:
+            if not self.isSelected():
                 modifiers = QApplication.keyboardModifiers()
                 if not (modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)):
                     scene.clearSelection()
@@ -1022,9 +850,9 @@ class TaskCard(QGraphicsObject):
                 }
                 for card in selected_cards:
                     card._is_dragging = True
+                    card._multi_dragging_member = True
                     card._last_connection_update_time = 0.0
                 self._dragging_multi_selection = True
-                debug_print(f"  [MULTI_DRAG] Starting multi-selection drag with {len(selected_cards) + 1} cards")
             else:
                 self._other_selected_cards_start_positions = {}
 
@@ -1044,6 +872,25 @@ class TaskCard(QGraphicsObject):
             self._update_snap_guide_lines()
 
         super().mouseMoveEvent(event)
+        if getattr(self, '_dragging_multi_selection', False):
+            self._refresh_dragged_connections()
+
+    def _refresh_dragged_connections(self):
+        """在多选卡片完成同一帧位置更新后统一刷新受影响连线。"""
+        cards = [self]
+        cards.extend(getattr(self, '_other_selected_cards_start_positions', {}).keys())
+        connections = []
+        seen = set()
+        for card in cards:
+            for connection in list(getattr(card, 'connections', [])):
+                marker = id(connection)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                connections.append(connection)
+        for connection in connections:
+            if connection.scene() is self.scene():
+                connection.update_path()
 
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent):
         """Handle mouse release and finalize dragging state."""
@@ -1067,6 +914,7 @@ class TaskCard(QGraphicsObject):
         self._is_dragging = False
         for card in partner_cards:
             card._is_dragging = False
+            card._multi_dragging_member = False
 
         self._release_drag_check_timer()
         self._clear_snap_guide_lines()
@@ -1078,8 +926,6 @@ class TaskCard(QGraphicsObject):
             self._apply_snap_alignment()
 
         self._drag_start_card_pos_for_snap = None
-        if moved_cards and getattr(self, "view", None):
-            self.view.handle_cards_dropped(moved_cards)
 
 
     def _cancel_drag_state(self):
@@ -1088,6 +934,7 @@ class TaskCard(QGraphicsObject):
         if other_cards:
             for card in list(other_cards.keys()):
                 card._is_dragging = False
+                card._multi_dragging_member = False
         self._dragging_multi_selection = False
         self._other_selected_cards_start_positions = {}
         self._drag_start_pos = None
@@ -1109,11 +956,9 @@ class TaskCard(QGraphicsObject):
             if self.task_type == "子工作流":
                 workflow_file = self.parameters.get('workflow_file')
                 if workflow_file:
-                    debug_print(f"[双击] 打开子工作流: {workflow_file}")
                     self.open_sub_workflow_requested.emit(workflow_file)
                     event.accept()
                     return
-                debug_print("[双击] 子工作流未设置文件，打开参数面板")
 
             self.edit_settings_requested.emit(self.card_id)
             event.accept()
@@ -1168,111 +1013,86 @@ class TaskCard(QGraphicsObject):
         if not hasattr(self, '_snap_guide_lines'):
             self._snap_guide_lines = []
 
-        for conn in self.connections[:]:
-            try:
-                if not _qt_is_valid(conn):
-                    try:
-                        self.connections.remove(conn)
-                    except ValueError:
-                        pass
-                    continue
+        for connection in self._validated_connections():
+            other_card = self._other_card_for_connection(connection)
+            if other_card is None:
+                continue
 
-                if not hasattr(conn, 'start_item') or not hasattr(conn, 'end_item'):
-                    continue
-                if not conn.start_item or not conn.end_item:
-                    continue
+            other_pos = other_card.pos()
+            other_rect = other_card.boundingRect()
+            other_center_x = other_pos.x() + other_rect.width() / 2
+            other_center_y = other_pos.y() + other_rect.height() / 2
 
-                other_card = None
-                if conn.start_item == self and conn.end_item:
-                    other_card = conn.end_item
-                elif conn.end_item == self and conn.start_item:
-                    other_card = conn.start_item
+            y_diff = abs(current_center_y - other_center_y)
+            x_diff = abs(current_center_x - other_center_x)
 
-                if not other_card:
-                    continue
+            guide_pen = QPen(QColor(0, 120, 215, 180), 1.0, Qt.PenStyle.DashLine)
+            guide_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            guide_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            guide_pen.setDashPattern([4, 3])
+            guide_pen.setCosmetic(True)
 
-                other_pos = other_card.pos()
-                other_rect = other_card.boundingRect()
-                other_center_x = other_pos.x() + other_rect.width() / 2
-                other_center_y = other_pos.y() + other_rect.height() / 2
+            curr_top_left = (current_pos.x(), current_pos.y())
+            curr_top_right = (current_pos.x() + current_rect.width(), current_pos.y())
+            curr_bottom_left = (current_pos.x(), current_pos.y() + current_rect.height())
+            curr_bottom_right = (current_pos.x() + current_rect.width(), current_pos.y() + current_rect.height())
 
-                y_diff = abs(current_center_y - other_center_y)
-                x_diff = abs(current_center_x - other_center_x)
+            other_top_left = (other_pos.x(), other_pos.y())
+            other_top_right = (other_pos.x() + other_rect.width(), other_pos.y())
+            other_bottom_left = (other_pos.x(), other_pos.y() + other_rect.height())
+            other_bottom_right = (other_pos.x() + other_rect.width(), other_pos.y() + other_rect.height())
 
-                guide_pen = QPen(QColor(0, 120, 215, 180), 1.0, Qt.PenStyle.DashLine)
-                guide_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-                guide_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-                guide_pen.setDashPattern([4, 3])
-                guide_pen.setCosmetic(True)
+            if y_diff < snap_threshold:
+                if current_center_x < other_center_x:
+                    line1 = SnapGuideLine()
+                    line1.setPen(guide_pen)
+                    line1.setLine(curr_top_right[0], curr_top_right[1], other_top_left[0], other_top_left[1])
+                    self.scene().addItem(line1)
+                    self._snap_guide_lines.append(line1)
 
-                curr_top_left = (current_pos.x(), current_pos.y())
-                curr_top_right = (current_pos.x() + current_rect.width(), current_pos.y())
-                curr_bottom_left = (current_pos.x(), current_pos.y() + current_rect.height())
-                curr_bottom_right = (current_pos.x() + current_rect.width(), current_pos.y() + current_rect.height())
+                    line2 = SnapGuideLine()
+                    line2.setPen(guide_pen)
+                    line2.setLine(curr_bottom_right[0], curr_bottom_right[1], other_bottom_left[0], other_bottom_left[1])
+                    self.scene().addItem(line2)
+                    self._snap_guide_lines.append(line2)
+                else:
+                    line1 = SnapGuideLine()
+                    line1.setPen(guide_pen)
+                    line1.setLine(other_top_right[0], other_top_right[1], curr_top_left[0], curr_top_left[1])
+                    self.scene().addItem(line1)
+                    self._snap_guide_lines.append(line1)
 
-                other_top_left = (other_pos.x(), other_pos.y())
-                other_top_right = (other_pos.x() + other_rect.width(), other_pos.y())
-                other_bottom_left = (other_pos.x(), other_pos.y() + other_rect.height())
-                other_bottom_right = (other_pos.x() + other_rect.width(), other_pos.y() + other_rect.height())
+                    line2 = SnapGuideLine()
+                    line2.setPen(guide_pen)
+                    line2.setLine(other_bottom_right[0], other_bottom_right[1], curr_bottom_left[0], curr_bottom_left[1])
+                    self.scene().addItem(line2)
+                    self._snap_guide_lines.append(line2)
 
-                if y_diff < snap_threshold:
-                    if current_center_x < other_center_x:
-                        line1 = SnapGuideLine()
-                        line1.setPen(guide_pen)
-                        line1.setLine(curr_top_right[0], curr_top_right[1], other_top_left[0], other_top_left[1])
-                        self.scene().addItem(line1)
-                        self._snap_guide_lines.append(line1)
+            if x_diff < snap_threshold:
+                if current_center_y < other_center_y:
+                    line1 = SnapGuideLine()
+                    line1.setPen(guide_pen)
+                    line1.setLine(curr_bottom_left[0], curr_bottom_left[1], other_top_left[0], other_top_left[1])
+                    self.scene().addItem(line1)
+                    self._snap_guide_lines.append(line1)
 
-                        line2 = SnapGuideLine()
-                        line2.setPen(guide_pen)
-                        line2.setLine(curr_bottom_right[0], curr_bottom_right[1], other_bottom_left[0], other_bottom_left[1])
-                        self.scene().addItem(line2)
-                        self._snap_guide_lines.append(line2)
-                    else:
-                        line1 = SnapGuideLine()
-                        line1.setPen(guide_pen)
-                        line1.setLine(other_top_right[0], other_top_right[1], curr_top_left[0], curr_top_left[1])
-                        self.scene().addItem(line1)
-                        self._snap_guide_lines.append(line1)
+                    line2 = SnapGuideLine()
+                    line2.setPen(guide_pen)
+                    line2.setLine(curr_bottom_right[0], curr_bottom_right[1], other_top_right[0], other_top_right[1])
+                    self.scene().addItem(line2)
+                    self._snap_guide_lines.append(line2)
+                else:
+                    line1 = SnapGuideLine()
+                    line1.setPen(guide_pen)
+                    line1.setLine(other_bottom_left[0], other_bottom_left[1], curr_top_left[0], curr_top_left[1])
+                    self.scene().addItem(line1)
+                    self._snap_guide_lines.append(line1)
 
-                        line2 = SnapGuideLine()
-                        line2.setPen(guide_pen)
-                        line2.setLine(other_bottom_right[0], other_bottom_right[1], curr_bottom_left[0], curr_bottom_left[1])
-                        self.scene().addItem(line2)
-                        self._snap_guide_lines.append(line2)
-
-                if x_diff < snap_threshold:
-                    if current_center_y < other_center_y:
-                        line1 = SnapGuideLine()
-                        line1.setPen(guide_pen)
-                        line1.setLine(curr_bottom_left[0], curr_bottom_left[1], other_top_left[0], other_top_left[1])
-                        self.scene().addItem(line1)
-                        self._snap_guide_lines.append(line1)
-
-                        line2 = SnapGuideLine()
-                        line2.setPen(guide_pen)
-                        line2.setLine(curr_bottom_right[0], curr_bottom_right[1], other_top_right[0], other_top_right[1])
-                        self.scene().addItem(line2)
-                        self._snap_guide_lines.append(line2)
-                    else:
-                        line1 = SnapGuideLine()
-                        line1.setPen(guide_pen)
-                        line1.setLine(other_bottom_left[0], other_bottom_left[1], curr_top_left[0], curr_top_left[1])
-                        self.scene().addItem(line1)
-                        self._snap_guide_lines.append(line1)
-
-                        line2 = SnapGuideLine()
-                        line2.setPen(guide_pen)
-                        line2.setLine(other_bottom_right[0], other_bottom_right[1], curr_top_right[0], curr_top_right[1])
-                        self.scene().addItem(line2)
-                        self._snap_guide_lines.append(line2)
-            except RuntimeError:
-                try:
-                    self.connections.remove(conn)
-                except ValueError:
-                    pass
-            except Exception:
-                pass
+                    line2 = SnapGuideLine()
+                    line2.setPen(guide_pen)
+                    line2.setLine(other_bottom_right[0], other_bottom_right[1], curr_top_right[0], curr_top_right[1])
+                    self.scene().addItem(line2)
+                    self._snap_guide_lines.append(line2)
 
 
     def _clear_snap_guide_lines(self):
@@ -1289,33 +1109,19 @@ class TaskCard(QGraphicsObject):
         center_y = rect.center().y()
 
         port_inset = self.port_radius + 2
-        if getattr(self, "is_container_card", False):
-            edge_padding = max(10.0, rect.height() * 0.12)
-            top_y = rect.top() + port_inset + edge_padding
-            bottom_y = rect.bottom() - port_inset - edge_padding
-            if port_type == PORT_TYPE_SUCCESS:
-                final_y = top_y
-            elif port_type == PORT_TYPE_FAILURE:
-                final_y = bottom_y
-            else:
-                final_y = center_y
+        spacing = 15
+        if port_type == PORT_TYPE_SUCCESS:
+            final_y = center_y - spacing
+        elif port_type == PORT_TYPE_FAILURE:
+            final_y = center_y + spacing
         else:
-            spacing = 15
-            if port_type == PORT_TYPE_SUCCESS:
-                final_y = center_y - spacing
-            elif port_type == PORT_TYPE_FAILURE:
-                final_y = center_y + spacing
-            else:
-                final_y = center_y
+            final_y = center_y
 
         x = rect.left() + port_inset if side == 'left' else rect.right() - port_inset
         return QPointF(x, final_y)
 
     def _iter_render_ports(self) -> List[Tuple[str, str]]:
         ports: List[Tuple[str, str]] = []
-        if self.ports_disabled:
-            return ports
-
         for side in ("left", "right"):
             if side == "left" and self.no_input_ports:
                 continue
@@ -1444,26 +1250,13 @@ class TaskCard(QGraphicsObject):
 
     def itemChange(self, change, value):
         """Override to update connections when the card moves."""
-        # debug_print(f"--- [ITEM_CHANGE_ENTRY] Card ID: {self.card_id}, Change: {change}, Value: {value} ---") # <-- Add this line # <<< MODIFIED: Commented out
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            if getattr(self, "is_container_card", False) and getattr(self, "view", None):
-                last_pos = getattr(self, "_last_group_pos", self.pos())
-                delta = self.pos() - last_pos
-                if delta.x() or delta.y():
-                    self.view.move_container_children(self, delta)
-                self._last_group_pos = self.pos()
         if change == QGraphicsItem.GraphicsItemChange.ItemSceneHasChanged:
             if value is None:
                 self._unregister_gradient_animation()
                 self._release_drag_check_timer()
                 self.stop_flash()
-                self.stop_selection_flash()
             else:
                 self._register_gradient_animation()
-
-        # 性能优化：拖拽时禁用场景矩形动态扩展，避免缩小时卡顿；
-        # 场景矩形会在移动完成后统一调整。
-        pass
 
         # Handle selection change for shadow effect
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedChange:
@@ -1473,34 +1266,11 @@ class TaskCard(QGraphicsObject):
         result = super().itemChange(change, value)
 
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            if getattr(self, '_is_dragging', False):
-                now = time.perf_counter()
-                if now - self._last_connection_update_time < self._connection_update_interval:
-                    return result
-                self._last_connection_update_time = now
+            if getattr(self, '_multi_dragging_member', False) or getattr(self, '_dragging_multi_selection', False):
+                return result
 
-            for conn in self.connections[:]:
-                try:
-                    if not _qt_is_valid(conn):
-                        try:
-                            self.connections.remove(conn)
-                        except ValueError:
-                            pass
-                        continue
-
-                    if conn and hasattr(conn, 'scene'):
-                        try:
-                            if conn.scene():
-                                conn.update_path()
-                        except RuntimeError:
-                            pass
-                except RuntimeError:
-                    try:
-                        self.connections.remove(conn)
-                    except ValueError:
-                        pass
-                except Exception:
-                    pass
+            for connection in self._validated_connections():
+                connection.update_path()
 
         return result
 
@@ -1520,52 +1290,32 @@ class TaskCard(QGraphicsObject):
         min_x_move = max_snap_distance + 1
         min_y_move = max_snap_distance + 1
 
-        for conn in self.connections[:]:
-            try:
-                if not _qt_is_valid(conn):
-                    try:
-                        self.connections.remove(conn)
-                    except ValueError:
-                        pass
-                    continue
-
-                if not hasattr(conn, 'start_item') or not hasattr(conn, 'end_item'):
-                    continue
-                if not conn.start_item or not conn.end_item:
-                    continue
-
-                other_card = None
-                if conn.start_item == self and conn.end_item:
-                    other_card = conn.end_item
-                elif conn.end_item == self and conn.start_item:
-                    other_card = conn.start_item
-
-                if not other_card:
-                    continue
-
-                other_pos = other_card.pos()
-                other_rect = other_card.boundingRect()
-                other_center_x = other_pos.x() + other_rect.width() / 2
-                other_center_y = other_pos.y() + other_rect.height() / 2
-
-                y_diff = abs(current_center_y - other_center_y)
-                x_diff = abs(current_center_x - other_center_x)
-
-                if y_diff < max_snap_distance:
-                    aligned_y = other_pos.y() + (other_rect.height() - current_rect.height()) / 2
-                    move_distance = abs(current_pos.y() - aligned_y)
-                    if move_distance < max_snap_distance and move_distance < min_y_move:
-                        min_y_move = move_distance
-                        best_snap_y = aligned_y
-
-                if x_diff < max_snap_distance:
-                    aligned_x = other_pos.x() + (other_rect.width() - current_rect.width()) / 2
-                    move_distance = abs(current_pos.x() - aligned_x)
-                    if move_distance < max_snap_distance and move_distance < min_x_move:
-                        min_x_move = move_distance
-                        best_snap_x = aligned_x
-            except (RuntimeError, AttributeError):
+        for connection in self._validated_connections():
+            other_card = self._other_card_for_connection(connection)
+            if other_card is None:
                 continue
+
+            other_pos = other_card.pos()
+            other_rect = other_card.boundingRect()
+            other_center_x = other_pos.x() + other_rect.width() / 2
+            other_center_y = other_pos.y() + other_rect.height() / 2
+
+            y_diff = abs(current_center_y - other_center_y)
+            x_diff = abs(current_center_x - other_center_x)
+
+            if y_diff < max_snap_distance:
+                aligned_y = other_pos.y() + (other_rect.height() - current_rect.height()) / 2
+                move_distance = abs(current_pos.y() - aligned_y)
+                if move_distance < max_snap_distance and move_distance < min_y_move:
+                    min_y_move = move_distance
+                    best_snap_y = aligned_y
+
+            if x_diff < max_snap_distance:
+                aligned_x = other_pos.x() + (other_rect.width() - current_rect.width()) / 2
+                move_distance = abs(current_pos.x() - aligned_x)
+                if move_distance < max_snap_distance and move_distance < min_x_move:
+                    min_x_move = move_distance
+                    best_snap_x = aligned_x
 
         final_pos = self.pos()
         new_x = best_snap_x if best_snap_x is not None else final_pos.x()
@@ -1576,23 +1326,8 @@ class TaskCard(QGraphicsObject):
 
         self.setPos(new_x, new_y)
 
-        for conn in self.connections[:]:
-            try:
-                if not _qt_is_valid(conn):
-                    try:
-                        self.connections.remove(conn)
-                    except ValueError:
-                        pass
-                    continue
-
-                if conn and hasattr(conn, 'scene'):
-                    try:
-                        if conn.scene():
-                            conn.update_path()
-                    except RuntimeError:
-                        pass
-            except (RuntimeError, AttributeError):
-                pass
+        for connection in self._validated_connections():
+            connection.update_path()
 
     def _apply_grid_snap(self):
         """Apply grid snapping to the current card position."""
@@ -1609,28 +1344,11 @@ class TaskCard(QGraphicsObject):
         if snapped_x != current_pos.x() or snapped_y != current_pos.y():
             self.setPos(snapped_x, snapped_y)
 
-            for conn in self.connections[:]:
-                try:
-                    if not _qt_is_valid(conn):
-                        try:
-                            self.connections.remove(conn)
-                        except ValueError:
-                            pass
-                        continue
-                except Exception:
-                    pass
-
-                if conn and hasattr(conn, 'scene'):
-                    try:
-                        if conn.scene():
-                            conn.update_path()
-                    except RuntimeError:
-                        pass
+            for connection in self._validated_connections():
+                connection.update_path()
 
     def _calculate_restricted_outputs(self) -> bool:
         """Calculate whether output ports should be restricted."""
-        if getattr(self, "ports_disabled", False):
-            return True
         if self.task_type == "随机跳转":
             return 'random_only'
 
@@ -1663,65 +1381,39 @@ class TaskCard(QGraphicsObject):
 
     def _calculate_no_input_ports(self) -> bool:
         """Calculate whether all input ports should be hidden."""
-        if getattr(self, "ports_disabled", False):
-            return True
         if is_thread_window_limit_task_type(self.task_type):
             return True
         no_input_types = ["附加条件"]
         return self.task_type in no_input_types
 
     def update_port_restrictions(self):
-        """Recompute port restrictions and refresh affected connections."""
+        """重新计算端口能力；状态冲突时拒绝修改，不自动删除连线。"""
         old_restricted = self.restricted_outputs
         new_restricted = self._calculate_restricted_outputs()
 
+        allowed_outputs = (
+            {PORT_TYPE_RANDOM}
+            if new_restricted == "random_only"
+            else {PORT_TYPE_SEQUENTIAL}
+            if new_restricted
+            else {PORT_TYPE_SEQUENTIAL, PORT_TYPE_SUCCESS, PORT_TYPE_FAILURE}
+        )
+        for connection in self.connections:
+            if not _qt_is_valid(connection):
+                raise RuntimeError(f"卡片 {self.card_id} 登记了失效连接")
+            if connection.start_item is self and connection.line_type not in allowed_outputs:
+                raise RuntimeError(
+                    f"卡片 {self.card_id} 的 {connection.line_type} 连线与当前端口能力冲突"
+                )
+
+        self.restricted_outputs = new_restricted
         if old_restricted != new_restricted:
-            debug_print(f"[PORT_UPDATE] Card {self.card_id} port restrictions changed: {old_restricted} -> {new_restricted}")
-            self.restricted_outputs = new_restricted
-
-            if new_restricted and not old_restricted:
-                self._cleanup_invalid_connections(['success', 'failure'])
-            elif not new_restricted and old_restricted:
-                pass
-
             self.update()
-
-            for conn in self.connections[:]:
-                try:
-                    if not _qt_is_valid(conn):
-                        try:
-                            self.connections.remove(conn)
-                        except ValueError:
-                            pass
-                        continue
-                    if conn and hasattr(conn, 'scene') and hasattr(conn, 'update_path'):
-                        try:
-                            if conn.scene():
-                                conn.update_path()
-                        except RuntimeError:
-                            pass
-                except RuntimeError:
-                    try:
-                        self.connections.remove(conn)
-                    except ValueError:
-                        pass
-                except Exception:
-                    pass
-
-    def _cleanup_invalid_connections(self, invalid_port_types: list):
-        """Remove invalid connections for restricted output modes."""
-        connections_to_remove = []
-
-        for conn in self.connections[:]:
-            if hasattr(conn, 'line_type') and conn.line_type in invalid_port_types:
-                if hasattr(conn, 'start_item') and conn.start_item == self:
-                    connections_to_remove.append(conn)
-                    debug_print(f"[PORT_CLEANUP] Marking connection for removal: {self.card_id} -> {conn.end_item.card_id if hasattr(conn, 'end_item') and conn.end_item else 'None'} ({conn.line_type})")
-
-        if connections_to_remove and self.view:
-            for conn in connections_to_remove:
-                if hasattr(self.view, 'remove_connection'):
-                    self.view.remove_connection(conn)
+        for connection in self.connections:
+            if connection.scene() is not self.scene():
+                raise RuntimeError(f"卡片 {self.card_id} 的连接未挂载到当前场景")
+            connection.update_path()
+        return old_restricted != new_restricted
     def set_shadow_rendering_enabled(self, enabled: bool) -> None:
         """Enable/disable card shadow rendering for large workflows."""
         self._shadow_rendering_enabled = bool(enabled)
@@ -1783,8 +1475,6 @@ class TaskCard(QGraphicsObject):
 
     def get_port_at(self, pos: QPointF) -> Optional[Dict[str, Any]]:
         """Checks if a point (in item coordinates) hits a port using an enlarged hit radius."""
-        if self.ports_disabled:
-            return None
         hit_radius_sq = self.port_hit_radius ** 2
 
         # --- SPECIAL HANDLING: random_only cards only have random output port ---
@@ -1824,48 +1514,33 @@ class TaskCard(QGraphicsObject):
         return None
 
     def set_execution_state(self, state: str):
-        """Sets the execution state and triggers a repaint."""
-        try:
-            if state in self.state_colors:
-                # 性能优化：如果状态未变化，直接跳过刷新
-                if self.execution_state == state:
-                    return
+        """应用卡片执行状态；状态无效或 Qt 对象失效时直接报错。"""
+        if not isinstance(state, str):
+            raise TypeError("卡片执行状态必须是字符串")
+        if state not in self.VALID_EXECUTION_STATES:
+            raise ValueError(f"无效的卡片执行状态: {state}")
+        if not _qt_is_valid(self):
+            raise RuntimeError(f"卡片 {self.card_id} 的 Qt 对象已失效")
+        if self.execution_state == state:
+            return False
 
-                self.execution_state = state
-                self._cached_bg_color = self.state_colors.get(state, self.card_color)
-                self._cached_border_pen = self.state_border_pens.get(state, self.default_pen)
-                self.update()
-            else:
-                debug_print(f"Warning: tried to set invalid state {state!r} for card {self.card_id}")
-        except RuntimeError as e:
-            debug_print(f"  [STATE] Card {self.card_id} already deleted when setting state: {e}")
-        except Exception as e:
-            debug_print(f"  [STATE] Error setting execution state for Card {self.card_id}: {e}")
+        self.execution_state = state
+        self._cached_bg_color = self.state_colors[state]
+        self._cached_border_pen = self.state_border_pens[state]
+        if self._is_flashing:
+            self._original_border_pen_before_flash = self._cached_border_pen
+            if not self._flash_border_on:
+                self._current_border_pen = self._cached_border_pen
+        self.update()
+        return True
 
     def open_parameter_dialog(self):
-        """Open the parameter panel for this card."""
-        logger.debug("TaskCard.open_parameter_dialog() called. Card ID: %s", self.card_id)
-
+        """请求打开当前卡片的参数面板。"""
         if self._is_workflow_running():
-            logger.warning("工作流正在执行中，无法进行参数设置操作")
-            return
+            return False
 
-        logger.debug("发送参数编辑请求信号: %s", self.card_id)
         self.edit_settings_requested.emit(self.card_id)
-
-    def add_connection(self, connection): # Keep connection logic
-        try:
-            if connection and connection not in self.connections:
-                self.connections.append(connection)
-        except (RuntimeError, TypeError):
-            pass
-
-    def remove_connection(self, connection): # Keep connection logic
-        try:
-            if connection in self.connections:
-                self.connections.remove(connection)
-        except (ValueError, RuntimeError, TypeError):
-            pass
+        return True
 
     def get_input_port_scene_pos(self, port_type: str = PORT_TYPE_SEQUENTIAL) -> QPointF:
         """Gets the scene coordinates of the specified input port type (left side)."""
@@ -1908,76 +1583,35 @@ class TaskCard(QGraphicsObject):
         # --- END ADDED ---
 
     def load_and_create_parameters(self):
-        """Loads parameter definitions and initializes the parameters dictionary."""
-        debug_print(f"--- [DEBUG] TaskCard {self.card_id}: load_and_create_parameters START ---") # DEBUG
-        
-        if not self.task_module or not hasattr(self.task_module, 'get_params_definition'):
-            debug_print(f"    [DEBUG] TaskCard {self.card_id}: Task module missing or no get_params_definition.") # DEBUG
-            debug_print(f"    警告: 任务类型 '{self.task_type}' 的模块无效或缺少 get_params_definition。Module: {self.task_module}")
-            self.param_definitions = {} 
-            debug_print(f"--- [DEBUG] TaskCard {self.card_id}: load_and_create_parameters END (Module Invalid/Missing Def) ---") # DEBUG
-            return
-
-        try:
-            debug_print(f"    [DEBUG] TaskCard {self.card_id}: Calling {self.task_type}.get_params_definition()...") # DEBUG
-            self.param_definitions = self.task_module.get_params_definition()
-            debug_print(f"    [DEBUG] TaskCard {self.card_id}: Received param_definitions type: {type(self.param_definitions)}") # DEBUG
-        except Exception as e:
-             debug_print(f"    [调试] TaskCard {self.card_id}：调用 get_params_definition 出错：{e}") # DEBUG
-             self.param_definitions = {}
-             debug_print(f"--- [DEBUG] TaskCard {self.card_id}: load_and_create_parameters END (Exception in get_params_definition) ---") # DEBUG
-             return
-             
-        if isinstance(self.param_definitions, list):
-            debug_print(f"    [DEBUG] TaskCard {self.card_id}: Converting list of param definitions to dict...") # DEBUG
-            try:
-                definitions_dict = {item['name']: item for item in self.param_definitions if isinstance(item, dict) and 'name' in item}
-                self.param_definitions = definitions_dict
-                debug_print(f"    [DEBUG] TaskCard {self.card_id}: Conversion successful. New type: {type(self.param_definitions)}") # DEBUG
-            except (TypeError, KeyError) as e:
-                debug_print(f"    [调试] TaskCard {self.card_id}：列表转字典出错：{e}。列表格式无效。") # DEBUG
-                self.param_definitions = {} 
-        elif not isinstance(self.param_definitions, dict):
-             debug_print(f"    [调试] TaskCard {self.card_id}：get_params_definition 返回了未预期类型：{type(self.param_definitions)}") # DEBUG
-             self.param_definitions = {} 
+        """加载当前字典格式的参数定义并填入默认值。"""
+        param_definitions = self.task_module.get_params_definition()
+        if not isinstance(param_definitions, dict):
+            raise TypeError(f"任务 {self.task_type} 的参数定义必须是字典")
+        for name, definition in param_definitions.items():
+            if not isinstance(name, str) or not name:
+                raise TypeError(f"任务 {self.task_type} 的参数名必须是非空字符串")
+            if not isinstance(definition, dict):
+                raise TypeError(f"任务 {self.task_type} 的参数定义 {name} 必须是字典")
+        self.param_definitions = copy.deepcopy(param_definitions)
 
         self._append_result_variable_params()
 
-        debug_print(f"  [DEBUG] TaskCard {self.card_id}: Initializing parameters with defaults...")
         for name, param_def in self.param_definitions.items():
             if param_def.get('type') == 'separator':
                 continue
             if name not in self.parameters:
-                default_value = copy.deepcopy(param_def.get('default'))
-                self.parameters[name] = default_value
-                debug_print(f"    [DEBUG] Set default parameter {name} = {default_value}")
-            else:
-                debug_print(f"    [DEBUG] Preserve existing parameter {name} = {self.parameters[name]}")
+                self.parameters[name] = copy.deepcopy(param_def.get('default'))
 
         self._seed_result_variable_defaults()
-        is_loading_workflow = bool(getattr(getattr(self, "view", None), "_loading_workflow", False))
-        if not is_loading_workflow:
-            self._normalize_result_variable_name_for_card_id()
+        if not self.view._loading_workflow:
             self.register_result_variable_placeholders()
-
-        debug_print(f"卡片 {self.card_id} ('{self.task_type}') 参数定义已加载，初始参数: {self.parameters}")
-        debug_print(f"--- [DEBUG] TaskCard {self.card_id}: load_and_create_parameters END (Success) ---") # DEBUG
 
     def _get_default_result_variable_name(self) -> str:
         return f"卡片{self.card_id}结果"
 
-    @staticmethod
-    def _is_default_result_variable_name(name: str) -> bool:
-        text = str(name or "").strip()
-        if not text:
-            return False
-        if re.fullmatch(r"卡片\d+结果", text):
-            return True
-        return bool(re.fullmatch(r"card_\d+_result", text, flags=re.IGNORECASE))
-
     def _append_result_variable_params(self):
         if not isinstance(self.param_definitions, dict):
-            return
+            raise TypeError("卡片参数定义必须是字典")
         if "save_result_variable_name" in self.param_definitions:
             return
 
@@ -2002,85 +1636,8 @@ class TaskCard(QGraphicsObject):
         key = "save_result_variable_name"
         current_name = str(self.parameters.get(key, "") or "").strip()
         if current_name:
-            self.parameters.pop("_save_result_variable_seeded", None)
             return
         self.parameters[key] = self._get_default_result_variable_name()
-        self.parameters.pop("_save_result_variable_seeded", None)
-
-    def _normalize_result_variable_name_for_card_id(self) -> None:
-        """仅同步自动生成的默认结果变量名，不覆盖用户自定义名称。"""
-        try:
-            name_key = "save_result_variable_name"
-            current_name = str(self.parameters.get(name_key, "") or "").strip()
-            if not current_name:
-                return
-            new_name = f"卡片{self.card_id}结果"
-
-            if current_name == new_name:
-                return
-
-            # 仅同步默认命名，保留用户自定义变量名
-            if not self._is_default_result_variable_name(current_name):
-                return
-
-            old_name = current_name
-
-            self.parameters[name_key] = new_name
-
-            if old_name:
-                self._cleanup_stale_result_variables(old_name)
-
-            logger.info(
-                f"[结果变量强制同步] 卡片{self.card_id}: save_result_variable_name "
-                f"{old_name or '<空>'} -> {new_name}"
-            )
-        except Exception as exc:
-            logger.debug(f"[结果变量强制同步] 卡片{self.card_id} 自动同步失败: {exc}")
-
-    def _cleanup_stale_result_variables(self, old_prefix: str) -> None:
-        """清理同一卡片旧前缀的结果变量，避免变量池残留混淆。"""
-        old_prefix = str(old_prefix or "").strip()
-        if not old_prefix:
-            return
-
-        try:
-            from task_workflow.workflow_context import get_workflow_context
-            context = get_workflow_context()
-            if hasattr(context, "snapshot_variable_state"):
-                state = context.snapshot_variable_state()
-                global_vars = dict((state or {}).get("global_vars", {}) or {})
-                var_sources = dict((state or {}).get("var_sources", {}) or {})
-            else:
-                global_vars = dict(getattr(context, "global_vars", {}) or {})
-                var_sources = dict(getattr(context, "var_sources", {}) or {})
-
-            to_remove = []
-            for var_name in global_vars.keys():
-                name = str(var_name or "").strip()
-                if not (name == old_prefix or name.startswith(f"{old_prefix}.")):
-                    continue
-
-                owner = var_sources.get(name)
-                try:
-                    owner_int = int(owner)
-                except (TypeError, ValueError):
-                    owner_int = None
-
-                if owner_int == self.card_id:
-                    to_remove.append(name)
-
-            for name in to_remove:
-                try:
-                    context.remove_global_var(name)
-                except Exception:
-                    pass
-
-            if to_remove:
-                logger.info(
-                    f"[结果变量迁移] 卡片{self.card_id}: 已清理旧前缀变量 {len(to_remove)} 个"
-                )
-        except Exception:
-            pass
 
     def _get_result_variable_suffixes(self) -> list:
         suffixes = [
@@ -2145,139 +1702,52 @@ class TaskCard(QGraphicsObject):
         return suffixes
 
     def register_result_variable_placeholders(self) -> None:
-        try:
-            prefix = str(self.parameters.get("save_result_variable_name", "") or "").strip()
-            if not prefix:
-                return
-            suffixes = self._get_result_variable_suffixes()
-            names = [f"{prefix}.{suffix}" for suffix in suffixes]
-            from task_workflow.workflow_context import get_workflow_context
-            context = get_workflow_context()
-            context.register_card_result_placeholders(self.card_id, names)
-        except Exception:
-            pass
+        prefix_value = self.parameters.get("save_result_variable_name", "")
+        if not isinstance(prefix_value, str):
+            raise TypeError("保存变量名必须是字符串")
+        prefix = prefix_value.strip()
+        if not prefix:
+            return False
+        suffixes = self._get_result_variable_suffixes()
+        names = [f"{prefix}.{suffix}" for suffix in suffixes]
+        from task_workflow.workflow_context import get_workflow_context
 
-    def contextMenuEvent(self, event: QGraphicsSceneContextMenuEvent):
-        """Creates and shows the right-click context menu."""
-        # 检查工作流是否正在运行
-        is_running = self._is_workflow_running()
-        menu = apply_unified_menu_style(QMenu(), frameless=True)
-        menu.setObjectName("task_card_menu")
-        
-        copy_action = QAction("复制卡片", menu)
-        copy_action.triggered.connect(self.copy_card) # Connects to method
-        copy_action.setEnabled(not is_running)
-        if is_running:
-            copy_action.setToolTip("工作流运行期间无法复制卡片")
-        menu.addAction(copy_action)
+        get_workflow_context().register_card_result_placeholders(self.card_id, names)
+        return True
 
-        menu.addSeparator()
-        
-        settings_action = QAction("参数设置", menu)
-        settings_action.triggered.connect(self.open_parameter_dialog) # Connects to method
-        settings_action.setEnabled(not is_running)
-        if is_running:
-            settings_action.setToolTip("工作流运行期间无法修改参数")
-        menu.addAction(settings_action)
-
-        menu.addSeparator()
-
-        delete_action = QAction("删除卡片", menu)
-        delete_action.triggered.connect(
-            lambda: (debug_print(f"--- [CONTEXT_MENU_DEBUG] Delete Action triggered for Card {self.card_id}. Emitting delete_requested... ---"), self.delete_requested.emit(self.card_id))
-        )
-        delete_action.setEnabled(not is_running)
-        if is_running:
-            delete_action.setToolTip("工作流运行期间无法删除卡片")
-        menu.addAction(delete_action)
-
-        debug_print(f"  [CONTEXT_DEBUG] Context menu created for card {self.card_id} at scene pos {event.scenePos()}")
-        # Show the menu at the event position
-        # --- CHANGED: Execute using mapToGlobal for correct screen positioning --- 
-        selected_action = menu.exec(event.screenPos())
-        # -----------------------------------------------------------------------
-        
-        # Handle selected action (optional, can be handled by WorkflowView via signals)
-        if selected_action:
-            debug_print(f"  [CONTEXT_DEBUG] Selected action: {selected_action.text()}")
-            # Example: emit signal based on action
-            if selected_action.text() == "编辑设置":
-                self.edit_settings_requested.emit(self.card_id)
-            elif selected_action.text() == "删除卡片":
-                self.delete_requested.emit(self.card_id)
-            elif selected_action.text() == "复制卡片":
-                self.copy_card() # Call the method WorkflowView expects
-                
-        debug_print("--- [DEBUG] TaskCard contextMenuEvent END ---")
-        
-    # --- ADDED: Method to emit copy request ---
     def copy_card(self):
-        """Emits the signal that this card should be copied."""
-        # 检查是否正在运行，如果是则阻止复制
+        """请求复制当前卡片。"""
         if self._is_workflow_running():
-            logger.warning("工作流正在执行中，无法进行复制卡片操作")
-            return
+            return False
 
-        debug_print(f"--- [DEBUG] TaskCard {self.card_id}: copy_card() method called, emitting copy_requested signal. ---")
         self.copy_requested.emit(self.card_id, copy.deepcopy(self.parameters))
-        
-    def _is_workflow_running(self) -> bool:
-        """检查工作流是否正在运行 - 检查运行按钮的文本状态"""
-        try:
-            # 直接调用view的方法，保持一致性
-            if self.view and hasattr(self.view, '_is_workflow_running'):
-                return self.view._is_workflow_running()
-        except Exception as e:
-            import logging
-            logging.error(f"TaskCard检查任务运行状态时发生错误: {e}")
+        return True
 
-        # 默认允许操作
-        return False
+    def _is_workflow_running(self) -> bool:
+        """从所属工作流读取唯一运行状态。"""
+        if self.view is None or not callable(getattr(self.view, "_is_workflow_running", None)):
+            raise RuntimeError(f"卡片 {self.card_id} 未绑定工作流运行状态入口")
+        state = self.view._is_workflow_running()
+        if not isinstance(state, bool):
+            raise TypeError("工作流运行状态必须是布尔值")
+        return state
 
     # --- ADDED: Helper method to format tooltip values ---
     def _normalize_operation_mode_for_tooltip(self, value: Any) -> str:
-        """归一化操作模式，兼容历史值，避免tooltip条件判断丢参数。"""
-        legacy_mode_by_index = [
-            "找图功能",
+        """校验并返回当前格式的鼠标操作模式。"""
+        valid_modes = {
             "坐标点击",
+            "找图功能",
             "文字点击",
             "找色功能",
             "元素点击",
             "鼠标滚轮",
             "鼠标拖拽",
             "鼠标移动",
-        ]
-        alias_map = {
-            "图片点击": "找图功能",
-            "找图点击": "找图功能",
-            "找色点击": "找色功能",
         }
-
-        mode = ""
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            idx = int(value)
-            if 0 <= idx < len(legacy_mode_by_index):
-                mode = legacy_mode_by_index[idx]
-            else:
-                mode = str(value).strip()
-        else:
-            mode = str(value or "").strip()
-            if mode.isdigit():
-                idx = int(mode)
-                if 0 <= idx < len(legacy_mode_by_index):
-                    mode = legacy_mode_by_index[idx]
-
-        mode = alias_map.get(mode, mode)
-        if mode:
-            return mode
-
-        task_type_candidates = [
-            str(getattr(self, "task_type", "") or "").strip(),
-            str((self.parameters or {}).get("task_type", "") or "").strip(),
-        ]
-        if any(t in {"图片点击", "查找图片并点击", "找图点击", "找图功能"} for t in task_type_candidates if t):
-            return "找图功能"
-        return ""
+        if not isinstance(value, str) or value not in valid_modes:
+            raise ValueError(f"无效的鼠标操作模式: {value!r}")
+        return value
 
     def _format_tooltip_value(self, value: Any) -> str:
         if value is None:
@@ -2317,108 +1787,6 @@ class TaskCard(QGraphicsObject):
         return str_value
     # --- END ADDED ---
 
-    def _log_hover_memory(self):
-        global _hover_mem_counter, _last_hover_mem_kb, _last_private_kb, _last_gdi_count, _last_user_count
-        global _last_trace_snapshot
-        if not (HOVER_MEM_LOG_ENABLED or HOVER_DIAG_ENABLED or HOVER_TRACE_ENABLED):
-            return
-        _hover_mem_counter += 1
-        self._hover_count = getattr(self, "_hover_count", 0) + 1
-
-        mem_sample_hit = HOVER_MEM_LOG_ENABLED and (
-            HOVER_MEM_LOG_SAMPLE <= 1 or _hover_mem_counter % HOVER_MEM_LOG_SAMPLE == 0
-        )
-        if mem_sample_hit:
-            ws_kb, private_kb = _get_process_mem_kb()
-            gdi_count = _get_gdi_count()
-            user_count = _get_user_count()
-            delta_ws = None if _last_hover_mem_kb is None or ws_kb is None else ws_kb - _last_hover_mem_kb
-            delta_private = None if _last_private_kb is None or private_kb is None else private_kb - _last_private_kb
-            delta_gdi = None if _last_gdi_count is None or gdi_count is None else gdi_count - _last_gdi_count
-            delta_user = None if _last_user_count is None or user_count is None else user_count - _last_user_count
-            if ws_kb is not None:
-                _last_hover_mem_kb = ws_kb
-            if private_kb is not None:
-                _last_private_kb = private_kb
-            if gdi_count is not None:
-                _last_gdi_count = gdi_count
-            if user_count is not None:
-                _last_user_count = user_count
-            logger.info(
-                "[HOVER_MEM] card_id=%s type=%s hover=%s ws_kb=%s delta_ws=%s private_kb=%s delta_private=%s gdi=%s delta_gdi=%s user=%s delta_user=%s",
-                self.card_id,
-                self.task_type,
-                self._hover_count,
-                ws_kb,
-                delta_ws,
-                private_kb,
-                delta_private,
-                gdi_count,
-                delta_gdi,
-                user_count,
-                delta_user,
-            )
-
-        diag_sample_hit = HOVER_DIAG_ENABLED and (
-            HOVER_DIAG_SAMPLE <= 1 or _hover_mem_counter % HOVER_DIAG_SAMPLE == 0
-        )
-        if diag_sample_hit:
-            widget_count = None
-            top_level_count = None
-            if QApplication.instance():
-                widget_count = len(QApplication.allWidgets())
-                top_level_count = len(QApplication.topLevelWidgets())
-            scene_items = None
-            try:
-                if self.scene():
-                    scene_items = len(self.scene().items())
-            except Exception:
-                scene_items = None
-            alloc_blocks = None
-            try:
-                alloc_blocks = sys.getallocatedblocks()
-            except AttributeError:
-                alloc_blocks = None
-            logger.info(
-                "[HOVER_DIAG] hover=%s widgets=%s top=%s scene_items=%s gc=%s alloc_blocks=%s",
-                self._hover_count,
-                widget_count,
-                top_level_count,
-                scene_items,
-                gc.get_count(),
-                alloc_blocks,
-            )
-
-        trace_sample_hit = HOVER_TRACE_ENABLED and (
-            HOVER_TRACE_SAMPLE <= 1 or _hover_mem_counter % HOVER_TRACE_SAMPLE == 0
-        )
-        if trace_sample_hit:
-            try:
-                if not tracemalloc.is_tracing():
-                    tracemalloc.start(HOVER_TRACE_NFRAMES)
-                snapshot = tracemalloc.take_snapshot()
-                if _last_trace_snapshot is None:
-                    stats = snapshot.statistics("lineno")
-                    kind = "top"
-                else:
-                    stats = snapshot.compare_to(_last_trace_snapshot, "lineno")
-                    kind = "delta"
-                stats = stats[:HOVER_TRACE_TOP]
-                parts = []
-                for stat in stats:
-                    frame = stat.traceback[0]
-                    size_kb = stat.size / 1024
-                    parts.append(f"{frame.filename}:{frame.lineno} {size_kb:.1f}KB {stat.count}")
-                logger.info(
-                    "[HOVER_TRACE] hover=%s kind=%s top=%s",
-                    self._hover_count,
-                    kind,
-                    " | ".join(parts),
-                )
-                _last_trace_snapshot = snapshot
-            except Exception as exc:
-                logger.warning("[HOVER_TRACE] hover=%s error=%s", self._hover_count, exc)
-
     def hoverEnterEvent(self, event: QGraphicsSceneHoverEvent) -> None:
         """Formats and sets the tooltip when the mouse enters the card."""
         # 拖动画布/鼠标按下期间不显示参数提示，避免误触发
@@ -2434,8 +1802,6 @@ class TaskCard(QGraphicsObject):
         if not hasattr(self, '_cached_tooltip') or self._tooltip_needs_update:
             self._cached_tooltip = self._generate_tooltip_text()
             self._tooltip_needs_update = False
-
-        self._log_hover_memory()
 
         # 先调用父类方法
         super().hoverEnterEvent(event)
@@ -2455,100 +1821,64 @@ class TaskCard(QGraphicsObject):
                 # 立即显示工具提示
                 get_tooltip_manager().show_text(self._cached_tooltip, global_pos)
 
+    def _tooltip_condition_matches(self, condition) -> bool:
+        conditions = condition if isinstance(condition, list) else [condition]
+        if not conditions:
+            raise ValueError("参数显示条件列表不能为空")
+
+        for item in conditions:
+            if not isinstance(item, dict) or set(("param", "value")).difference(item):
+                raise TypeError("参数显示条件必须包含 param 和 value")
+            parameter_name = item["param"]
+            if not isinstance(parameter_name, str) or not parameter_name:
+                raise TypeError("参数显示条件的 param 必须是非空字符串")
+
+            current_value = self.parameters.get(parameter_name)
+            expected_value = item["value"]
+            if parameter_name == "operation_mode":
+                current_value = self._normalize_operation_mode_for_tooltip(current_value)
+                if isinstance(expected_value, list):
+                    expected_value = [
+                        self._normalize_operation_mode_for_tooltip(value)
+                        for value in expected_value
+                    ]
+                else:
+                    expected_value = self._normalize_operation_mode_for_tooltip(expected_value)
+
+            matches = (
+                current_value in expected_value
+                if isinstance(expected_value, list)
+                else current_value == expected_value
+            )
+            if not matches:
+                return False
+        return True
+
     def _generate_tooltip_text(self) -> str:
-        """生成工具提示文本（优化版本）"""
-        # 快速检查：如果没有参数，直接返回简单文本
-        if not hasattr(self, 'parameters') or not self.parameters:
+        """生成当前参数格式的卡片工具提示。"""
+        if not isinstance(self.parameters, dict):
+            raise TypeError("卡片参数必须是字典")
+        if not self.parameters:
             return "详细参数:\n  (无参数)"
+        if not isinstance(self.param_definitions, dict) or not self.param_definitions:
+            raise RuntimeError("卡片参数定义缺失")
 
         param_lines = ["详细参数:"]
-
-        # 优化：如果没有参数定义，直接显示原始参数
-        if not hasattr(self, 'param_definitions') or not self.param_definitions:
-            param_lines.append("  (参数定义缺失，显示原始键值)")
-            # 限制显示的参数数量，避免工具提示过长
-            count = 0
-            for key, value in self.parameters.items():
-                if count >= 10:  # 最多显示10个参数
-                    param_lines.append("  ...")
-                    break
-                param_lines.append(f"    {key}: {repr(value)}")
-                count += 1
-            return "\n".join(param_lines)
-
-        # 优化：预先计算需要显示的参数，避免重复检查
         visible_params = []
         for name, param_def in self.param_definitions.items():
-            # 快速跳过不需要的参数类型
+            if not isinstance(param_def, dict):
+                raise TypeError(f"卡片参数定义 {name} 必须是字典")
             param_type = param_def.get('type')
-            if param_type == 'separator':
+            if param_type in {'separator', 'hidden'}:
                 continue
-
-            # 跳过所有隐藏参数
-            if param_type == 'hidden':
+            if 'condition' in param_def and not self._tooltip_condition_matches(param_def['condition']):
                 continue
-
-            # 检查条件显示（优化：只在有条件时才检查）
-            if 'condition' in param_def:
-                condition_def = param_def['condition']
-
-                # 处理多条件和单条件
-                condition_met = True
-                try:
-                    if isinstance(condition_def, list):
-                        # 多条件：所有条件都必须满足（AND逻辑）
-                        for single_condition in condition_def:
-                            if isinstance(single_condition, dict):
-                                controlling_param_name = single_condition.get('param')
-                                expected_value = single_condition.get('value')
-                                current_value = self.parameters.get(controlling_param_name)
-                                if controlling_param_name == 'operation_mode':
-                                    current_value = self._normalize_operation_mode_for_tooltip(current_value)
-                                    if isinstance(expected_value, list):
-                                        expected_value = [self._normalize_operation_mode_for_tooltip(v) for v in expected_value]
-                                    else:
-                                        expected_value = self._normalize_operation_mode_for_tooltip(expected_value)
-
-                                if isinstance(expected_value, list):
-                                    if current_value not in expected_value:
-                                        condition_met = False
-                                        break
-                                else:
-                                    if current_value != expected_value:
-                                        condition_met = False
-                                        break
-                    else:
-                        # 单条件
-                        if isinstance(condition_def, dict):
-                            controlling_param_name = condition_def.get('param')
-                            expected_value = condition_def.get('value')
-                            current_value = self.parameters.get(controlling_param_name)
-                            if controlling_param_name == 'operation_mode':
-                                current_value = self._normalize_operation_mode_for_tooltip(current_value)
-                                if isinstance(expected_value, list):
-                                    expected_value = [self._normalize_operation_mode_for_tooltip(v) for v in expected_value]
-                                else:
-                                    expected_value = self._normalize_operation_mode_for_tooltip(expected_value)
-
-                            # 检查条件是否满足
-                            if isinstance(expected_value, list):
-                                condition_met = current_value in expected_value
-                            else:
-                                condition_met = current_value == expected_value
-                except Exception as e:
-                    # 如果条件检查出错，默认显示参数
-                    debug_print(f"TaskCard条件检查出错: {e}")
-                    condition_met = True
-
-                if not condition_met:
-                    continue
-
-            # 添加到可见参数列表
             visible_params.append((name, param_def))
 
-        # 生成工具提示文本
         for name, param_def in visible_params:
             label = param_def.get('label', name)
+            if not isinstance(label, str):
+                raise TypeError(f"卡片参数 {name} 的 label 必须是字符串")
             raw_value = self.parameters.get(name)
             if name == "operation_mode":
                 raw_value = self._normalize_operation_mode_for_tooltip(raw_value)
@@ -2556,199 +1886,77 @@ class TaskCard(QGraphicsObject):
             param_lines.append(f"  {label}: {formatted_value}")
 
         return "\n".join(param_lines)
-        
-    # hoverLeaveEvent is modified above to clear the tooltip
-    # --- END ADDED --- 
 
     def _ensure_flash_timer(self):
         existing_timer = getattr(self, "flash_toggle_timer", None)
         if existing_timer is not None:
-            try:
-                existing_timer.isActive()
-                return existing_timer
-            except RuntimeError:
-                self.flash_toggle_timer = None
-        try:
-            timer = QTimer(self)
-            timer.timeout.connect(self._toggle_flash_border)
-            self.flash_toggle_timer = timer
-            return timer
-        except Exception:
-            self.flash_toggle_timer = None
-            return None
+            existing_timer.isActive()
+            return existing_timer
 
-    def _ensure_selection_flash_timer(self):
-        existing_timer = getattr(self, "selection_flash_timer", None)
-        if existing_timer is not None:
-            try:
-                existing_timer.isActive()
-                return existing_timer
-            except RuntimeError:
-                self.selection_flash_timer = None
-        try:
-            timer = QTimer(self)
-            timer.timeout.connect(self._toggle_selection_flash_border)
-            self.selection_flash_timer = timer
-            return timer
-        except Exception:
-            self.selection_flash_timer = None
-            return None
+        timer = QTimer(self)
+        timer.timeout.connect(self._toggle_flash_border)
+        self.flash_toggle_timer = timer
+        return timer
 
-    # --- ADDED Flash methods --- 
-    def flash(self, duration_ms: int = 500):
-        """ Starts persistently flashing the card border. """
-        if self._is_flashing: # Already flashing
-            return
-        debug_print(f"  [FLASH_DEBUG] Starting flash for Card {self.card_id}")
-        self._is_flashing = True
-        # Store the non-flashing border based on current execution state
-        self._original_border_pen_before_flash = self.state_border_pens.get(self.execution_state, self.default_pen)
-        self._flash_border_on = True # Start with flash border visible
-        # 橙色闪烁用于显示连线关系
-        self._current_border_pen = self.flash_border_pen
+    def flash(self):
+        """启动卡片关系闪烁。"""
+        if self._is_flashing:
+            return False
+
         timer = self._ensure_flash_timer()
-        if timer is not None:
-            timer.start(self.flash_interval_ms) # Start repeating timer
+        timer.start(self.flash_interval_ms)
+        self._original_border_pen_before_flash = self.state_border_pens[self.execution_state]
+        self._flash_border_on = True
+        self._current_border_pen = self.flash_border_pen
+        self._is_flashing = True
         if self._is_animation_visible():
-            self.update() # Trigger repaint
+            self.update()
+        return True
 
     def stop_flash(self):
-        """ Stops the persistent flashing and restores the border. """
-        try:
-            if not self._is_flashing: # Not flashing
-                return
-            debug_print(f"  [FLASH_DEBUG] Stopping flash for Card {self.card_id}")
+        """停止卡片关系闪烁并恢复当前执行状态边框。"""
+        if not self._is_flashing:
+            return False
 
-            # BUG FIX: 原子化操作 - 先设置标志，立即阻止回调执行
-            self._is_flashing = False
-
-            # 【性能优化】只停止定时器，不断开信号连接
-            # 信号连接只在__init__中建立一次，断开后会导致后续flash()失效
-            timer = getattr(self, "flash_toggle_timer", None)
-            if timer is not None:
-                try:
-                    timer.stop()
-                    debug_print(f"  [FLASH_DEBUG] Timer stopped for Card {self.card_id}")
-                except RuntimeError as e:
-                    debug_print(f"  [FLASH_DEBUG] Timer already deleted: {e}")
-
-            self._current_border_pen = self._original_border_pen_before_flash
-            self.update() # Trigger repaint
-        except RuntimeError as e:
-            # Qt对象已被删除，静默忽略
-            debug_print(f"  [FLASH_DEBUG] Card {self.card_id} already deleted when stopping flash: {e}")
-        except Exception as e:
-            debug_print(f"  [FLASH_DEBUG] Error stopping flash for Card {self.card_id}: {e}")
-        finally:
-            self._cleanup_timer_attr("flash_toggle_timer")
+        timer = self.flash_toggle_timer
+        if timer is None:
+            raise RuntimeError(f"卡片 {self.card_id} 缺少关系闪烁定时器")
+        timer.stop()
+        self._is_flashing = False
+        self._flash_border_on = False
+        self._original_border_pen_before_flash = self.state_border_pens[self.execution_state]
+        self._current_border_pen = self._original_border_pen_before_flash
+        self.update()
+        return True
 
     def _toggle_flash_border(self):
-        """ Called by the timer to toggle the visual state of the flash. """
-        try:
-            # BUG FIX: 增强安全检查，防止在停止过程中执行回调
-            if not self._is_flashing: # Safety check
-                # 只停止定时器，不断开信号
-                self._cleanup_timer_attr("flash_toggle_timer")
-                return
+        """切换卡片关系闪烁边框。"""
+        if not self._is_flashing:
+            if self.flash_toggle_timer is not None:
+                self.flash_toggle_timer.stop()
+            return False
+        if not self._is_animation_visible():
+            return False
 
-            # 检查对象是否仍然有效
-            if not hasattr(self, 'card_id'):
-                debug_print(f"  [FLASH_DEBUG] Card object invalid in toggle callback")
-                return
-
-            if not self._is_animation_visible():
-                return
-
-            self._flash_border_on = not self._flash_border_on
-            if self._flash_border_on:
-                # 橙色闪烁用于显示连线关系
-                self._current_border_pen = self.flash_border_pen
-            else:
-                # Show the original border during the "off" cycle of the flash
-                self._current_border_pen = self._original_border_pen_before_flash
-            self.update()
-        except RuntimeError as e:
-            # Qt对象已被删除，停止定时器（不断开信号）
-            debug_print(f"  [FLASH_DEBUG] Card already deleted in toggle callback: {e}")
-            self._cleanup_timer_attr("flash_toggle_timer")
-        except Exception as e:
-            debug_print(f"  [FLASH_DEBUG] Error in toggle flash: {e}")
-            # 发生错误时也尝试停止定时器
-            self._cleanup_timer_attr("flash_toggle_timer")
-    # --- END Flash methods ---
-
-    # --- ADDED: 选中闪烁方法 ---
-    def start_selection_flash(self):
-        """启动选中状态的蓝色闪烁效果"""
-        if self._is_selection_flashing:
-            return  # 已经在闪烁
-        debug_print(f"  [SELECTION_FLASH_DEBUG] Starting selection flash for Card {self.card_id}")
-        self._is_selection_flashing = True
-        self._selection_flash_border_on = True  # 开始时显示蓝色边框
-        timer = self._ensure_selection_flash_timer()
-        if timer is not None:
-            timer.start(self.selection_flash_interval_ms)
-        if self._is_animation_visible():
-            self.update()
-
-    def stop_selection_flash(self):
-        """停止选中状态的蓝色闪烁效果"""
-        try:
-            if not self._is_selection_flashing:
-                return
-            debug_print(f"  [SELECTION_FLASH_DEBUG] Stopping selection flash for Card {self.card_id}")
-            self._is_selection_flashing = False
-            self._selection_flash_border_on = False
-            timer = getattr(self, "selection_flash_timer", None)
-            if timer is not None:
-                try:
-                    timer.stop()
-                except RuntimeError:
-                    pass
-            self.update()
-        except RuntimeError as e:
-            debug_print(f"  [SELECTION_FLASH_DEBUG] Card already deleted when stopping selection flash: {e}")
-        except Exception as e:
-            debug_print(f"  [SELECTION_FLASH_DEBUG] Error stopping selection flash: {e}")
-        finally:
-            self._cleanup_timer_attr("selection_flash_timer")
-
-    def _toggle_selection_flash_border(self):
-        """选中闪烁定时器回调 - 切换蓝色边框显示状态"""
-        try:
-            if not self._is_selection_flashing:
-                self._cleanup_timer_attr("selection_flash_timer")
-                return
-
-            if not hasattr(self, 'card_id'):
-                return
-
-            if not self._is_animation_visible():
-                return
-
-            self._selection_flash_border_on = not self._selection_flash_border_on
-            self.update()
-        except RuntimeError as e:
-            debug_print(f"  [SELECTION_FLASH_DEBUG] Card already deleted in toggle callback: {e}")
-            self._cleanup_timer_attr("selection_flash_timer")
-        except Exception as e:
-            debug_print(f"  [SELECTION_FLASH_DEBUG] Error in toggle selection flash: {e}")
-            self._cleanup_timer_attr("selection_flash_timer")
-    # --- END 选中闪烁方法 ---
+        self._flash_border_on = not self._flash_border_on
+        self._current_border_pen = (
+            self.flash_border_pen
+            if self._flash_border_on
+            else self._original_border_pen_before_flash
+        )
+        self.update()
+        return True
 
     def refresh_theme(self):
-        """Refresh theme-dependent colors and cached styles."""
-        try:
-            self.card_color = self._get_theme_card_color()
-            self.title_area_color = self._get_theme_title_color()
-            self.title_color = self._get_theme_text_color()
+        """刷新依赖主题的卡片颜色和缓存样式。"""
+        self.card_color = self._get_theme_card_color()
+        self.title_area_color = self._get_theme_title_color()
+        self.title_color = self._get_theme_text_color()
 
-            self._apply_visual_profile()
-            self._cached_bg_color = self.state_colors.get(self.execution_state, self.card_color)
-            self._cached_border_pen = self.state_border_pens.get(self.execution_state, self.default_pen)
+        self._apply_visual_profile()
+        self._cached_bg_color = self.state_colors[self.execution_state]
+        self._cached_border_pen = self.state_border_pens[self.execution_state]
 
-            self.update_selection_effect(self.isSelected())
-            self.update()
-        except Exception as e:
-            debug_print(f"  [THEME_REFRESH] Error refreshing theme for Card {self.card_id}: {e}")
+        self.update_selection_effect(self.isSelected())
+        self.update()
 

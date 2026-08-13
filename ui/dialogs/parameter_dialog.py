@@ -12,18 +12,17 @@ from typing import Dict, Any, Optional, Tuple, List, Set
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QSpinBox, QDoubleSpinBox, QPushButton, QDialogButtonBox, QWidget,
-    QFrame, QCheckBox, QFileDialog, QApplication,
-    QRadioButton, QButtonGroup, QPlainTextEdit, QColorDialog, QListWidget,
-    QMenu
+    QFrame, QCheckBox, QFileDialog, QRadioButton,
+    QButtonGroup, QPlainTextEdit, QColorDialog, QListWidget, QMenu,
+    QSizePolicy
 )
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QBrush, QIcon
+from PySide6.QtGui import QColor, QPixmap, QPainter, QBrush, QIcon
 import numpy as np
 import cv2
 from ..widgets.custom_widgets import CustomDropdown as QComboBox
 from ..system_parts.menu_style import apply_unified_menu_style
 from utils.thread_start_utils import is_thread_start_task_type
-from services.screenshot_pool import capture_window
 from utils.window_binding_utils import (
     get_active_bound_window_hwnd,
     get_active_bound_windows,
@@ -1166,7 +1165,7 @@ class ParameterDialog(QDialog):
                     widget = ocr_selector
                     interactive_widget = ocr_selector
 
-                except Exception as e:
+                except Exception:
                     # 创建占位符按钮
                     widget = QPushButton("OCR区域选择器加载失败")
                     widget.setEnabled(False)
@@ -1198,7 +1197,7 @@ class ParameterDialog(QDialog):
                     self._apply_bound_window_to_selector(coord_selector)
                     widget = coord_selector
                     interactive_widget = coord_selector
-                except Exception as e:
+                except Exception:
                     # 创建一个简单的按钮作为备选
                     widget = QPushButton("坐标选择器 (创建失败)")
                     interactive_widget = widget
@@ -1227,7 +1226,7 @@ class ParameterDialog(QDialog):
 
                     widget = motion_region_selector
                     interactive_widget = motion_region_selector
-                except Exception as e:
+                except Exception:
                     # 创建一个简单的按钮作为备选
                     widget = QPushButton("移动检测区域选择器 (创建失败)")
                     interactive_widget = widget
@@ -1262,7 +1261,7 @@ class ParameterDialog(QDialog):
 
                     widget = image_region_selector
                     interactive_widget = image_region_selector
-                except Exception as e:
+                except Exception:
                     # 创建一个简单的按钮作为备选
                     widget = QPushButton("图片识别区域选择器 (创建失败)")
                     interactive_widget = widget
@@ -2645,7 +2644,6 @@ class ParameterDialog(QDialog):
             self.current_parameters[param_name] = color_string
         except Exception as e:
             logger.error(f"颜色选择器启动失败: {e}")
-            preview_label.clear()
 
     def _browse_file(self, line_edit_widget: QLineEdit):
         """Opens a file dialog to select a file."""
@@ -2762,7 +2760,7 @@ class ParameterDialog(QDialog):
         """显示加密模块的基本信息"""
         info_text = f"模块名称: {basic_info.get('name', '未知')}\n"
         info_text += f"文件大小: {basic_info.get('file_size', 0)} 字节\n"
-        info_text += f"状态: 加密模块（需要先导入解密）"
+        info_text += "状态: 加密模块（需要先导入解密）"
 
         if hasattr(self, 'setToolTip'):
             self.setToolTip(info_text)
@@ -2775,8 +2773,8 @@ class ParameterDialog(QDialog):
 
         info_text = f"文件名: {file_name}\n"
         info_text += f"文件大小: {file_size} 字节\n"
-        info_text += f"类型: 加密模块文件\n"
-        info_text += f"状态: 解密器不可用，无法读取详细信息"
+        info_text += "类型: 加密模块文件\n"
+        info_text += "状态: 解密器不可用，无法读取详细信息"
 
         if hasattr(self, 'setToolTip'):
             self.setToolTip(info_text)
@@ -3227,7 +3225,7 @@ class ParameterDialog(QDialog):
                         match = (isinstance(required_comparison_value, list) and actual_typed not in required_comparison_value)
                     else:
                         pass
-                except Exception as e:
+                except Exception:
                      pass
 
                 # Determine visibility based on match and value_not
@@ -3289,7 +3287,7 @@ class ParameterDialog(QDialog):
                         logger.warning(f"Widget for radio parameter '{name}' is type '{type(widget).__name__}' not QButtonGroup as expected. Fallback to default.")
                         values[name] = param_def.get('default')
                 # Add other widget types if needed
-            except Exception as e:
+            except Exception:
                  values[name] = None # Set to None on error
                  
         # --- ADDED: Specific debug for controller value ---

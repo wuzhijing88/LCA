@@ -1,4 +1,3 @@
-from ..parameter_panel_support import *
 from .parameter_panel_widget_factory_build_mixin import ParameterPanelWidgetFactoryBuildMixin
 from .parameter_panel_widget_factory_debug_mixin import ParameterPanelWidgetFactoryDebugMixin
 from .parameter_panel_widget_factory_focus_mixin import ParameterPanelWidgetFactoryFocusMixin

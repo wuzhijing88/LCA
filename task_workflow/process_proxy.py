@@ -11,33 +11,34 @@ import select
 import socket
 import subprocess
 import threading
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Dict, Iterable, Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from services.ocr_socket_message_utils import recv_message, send_message
+from services.socket_message_utils import SocketMessageError
+from services.worker_process_cleanup import register_worker_process, unregister_worker_process
 from task_workflow.process_payload import build_process_workflow_payload
 from utils.worker_entry import build_worker_launch_command, build_worker_process_env
 
 logger = logging.getLogger(__name__)
 
 
+class _LaunchCancelled(RuntimeError):
+    """Internal signal used when a worker launch is stopped before ready."""
+
+
 def _resolve_payload_screenshot_engine(
     *,
-    screenshot_engine: Optional[str] = None,
-    workflow_data: Optional[Dict[str, Any]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    candidates = [
-        screenshot_engine,
-        workflow_data.get("screenshot_engine") if isinstance(workflow_data, dict) else None,
-        config.get("screenshot_engine") if isinstance(config, dict) else None,
-    ]
-    for candidate in candidates:
-        normalized = str(candidate or "").strip().lower()
-        if normalized:
-            return normalized
-    return None
+    screenshot_engine: Optional[str],
+) -> str:
+    normalized = str(screenshot_engine or "").strip().lower()
+    if not normalized:
+        raise ValueError("创建工作流子进程必须显式指定 screenshot_engine")
+    if normalized not in {"wgc", "printwindow", "gdi", "dxgi"}:
+        raise ValueError(f"不支持的工作流截图引擎: {normalized}")
+    return normalized
 
 
 def _kill_process_tree(process: Optional[subprocess.Popen]) -> None:
@@ -65,6 +66,11 @@ def _kill_process_tree(process: Optional[subprocess.Popen]) -> None:
     try:
         if process.poll() is None:
             process.kill()
+    except Exception:
+        pass
+    try:
+        if process.poll() is not None and pid > 0:
+            unregister_worker_process(pid)
     except Exception:
         pass
 
@@ -156,7 +162,12 @@ class ProcessWorkflowExecutorProxy(QObject):
         self._launching = False
         self._running = False
         self._paused = False
+        self._stop_event = threading.Event()
+        self._launch_server_socket: Optional[socket.socket] = None
+        self._launch_client_socket: Optional[socket.socket] = None
+        self._launch_generation = 0
         self._received_execution_finished = False
+        self._reader_error_status: Optional[str] = None
         self._thread_handle: Optional[ProcessWorkflowThreadHandle] = None
 
         self._drain_timer = QTimer(self)
@@ -245,11 +256,26 @@ class ProcessWorkflowExecutorProxy(QObject):
         with self._state_lock:
             if self._running or self._launching:
                 return
+            launch_thread = self._launch_thread
+            if launch_thread is not None and launch_thread.is_alive():
+                logger.warning("工作流启动线程仍在退出，拒绝重复启动")
+                return
+            if self._process is not None:
+                try:
+                    if self._process.poll() is None:
+                        logger.warning("工作流子进程仍在退出，拒绝重复启动")
+                        return
+                except Exception:
+                    return
+            self._launch_generation += 1
+            launch_generation = self._launch_generation
+            self._stop_event.clear()
             self._launching = True
             self._running = True
             self._paused = False
             self._exit_event.clear()
             self._received_execution_finished = False
+            self._reader_error_status = None
             self._final_runtime_variables = {}
 
         if not self._drain_timer.isActive():
@@ -257,6 +283,7 @@ class ProcessWorkflowExecutorProxy(QObject):
 
         self._launch_thread = threading.Thread(
             target=self._launch_worker,
+            args=(launch_generation,),
             daemon=True,
             name="WorkflowProcessLaunch",
         )
@@ -269,19 +296,28 @@ class ProcessWorkflowExecutorProxy(QObject):
             module_name="task_workflow.process_worker",
             standalone_flag="--workflow-worker-standalone",
             extra_args=["--port", str(port)],
-            require_python_executable=True,
             project_root=project_root,
         )
 
-    def _launch_worker(self):
+    def _launch_cancelled(self, generation: int) -> bool:
+        with self._state_lock:
+            return generation != self._launch_generation or self._stop_event.is_set()
+
+    def _launch_worker(self, generation: int):
         server_socket: Optional[socket.socket] = None
         client_socket: Optional[socket.socket] = None
         process: Optional[subprocess.Popen] = None
+        launch_succeeded = False
         try:
+            if self._launch_cancelled(generation):
+                raise _LaunchCancelled()
+
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind(("127.0.0.1", 0))
             server_socket.listen(1)
+            with self._state_lock:
+                self._launch_server_socket = server_socket
             port = int(server_socket.getsockname()[1])
 
             project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -290,6 +326,8 @@ class ProcessWorkflowExecutorProxy(QObject):
 
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             cmd = self._build_worker_command(port)
+            if self._launch_cancelled(generation):
+                raise _LaunchCancelled()
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -298,19 +336,48 @@ class ProcessWorkflowExecutorProxy(QObject):
                 env=child_env,
                 creationflags=creation_flags,
             )
+            register_worker_process(process, "--workflow-worker")
 
-            server_socket.settimeout(8.0)
-            client_socket, _addr = server_socket.accept()
+            with self._state_lock:
+                if generation != self._launch_generation or self._stop_event.is_set():
+                    raise _LaunchCancelled()
+                self._process = process
+                self._launch_client_socket = None
+            if self._launch_cancelled(generation):
+                raise _LaunchCancelled()
+
+            server_socket.settimeout(0.2)
+            deadline = time.monotonic() + 8.0
+            while True:
+                if self._launch_cancelled(generation):
+                    raise _LaunchCancelled()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("工作流子进程连接 ready 超时")
+                try:
+                    client_socket, _addr = server_socket.accept()
+                    break
+                except socket.timeout:
+                    continue
+            with self._state_lock:
+                self._launch_client_socket = client_socket
+            if self._launch_cancelled(generation):
+                raise _LaunchCancelled()
             ready_message = recv_message(client_socket, timeout=20.0, logger=logger)
             if not isinstance(ready_message, dict) or ready_message.get("type") != "ready":
                 raise RuntimeError(f"未收到工作流子进程 ready 消息: {ready_message}")
+
+            if self._launch_cancelled(generation):
+                raise _LaunchCancelled()
 
             if not send_message(client_socket, {"command": "init", "payload": self._payload}, logger=logger):
                 raise RuntimeError("发送工作流初始化消息失败")
 
             with self._state_lock:
+                if self._launch_cancelled(generation):
+                    raise _LaunchCancelled()
                 self._process = process
                 self._socket = client_socket
+                self._launch_client_socket = None
                 self._launching = False
                 self._running = True
 
@@ -321,16 +388,20 @@ class ProcessWorkflowExecutorProxy(QObject):
                 name="WorkflowProcessReader",
             )
             self._reader_thread.start()
+            launch_succeeded = True
             return
+        except _LaunchCancelled:
+            logger.debug("工作流子进程启动已取消")
         except Exception as exc:
             logger.error("启动工作流子进程失败: %s", exc)
-            self._enqueue_message(
-                {
-                    "type": "signal",
-                    "name": "execution_finished",
-                    "args": [False, f"启动工作流子进程失败: {exc}"],
-                }
-            )
+            if not self._stop_event.is_set():
+                self._enqueue_message(
+                    {
+                        "type": "signal",
+                        "name": "execution_finished",
+                        "args": [False, f"启动工作流子进程失败: {exc}"],
+                    }
+                )
         finally:
             if server_socket is not None:
                 try:
@@ -342,9 +413,16 @@ class ProcessWorkflowExecutorProxy(QObject):
                     client_socket.close()
                 except Exception:
                     pass
-            if process is not None and process is not self._process:
+            with self._state_lock:
+                if self._launch_client_socket is client_socket:
+                    self._launch_client_socket = None
+            if process is not None and not launch_succeeded:
                 _kill_process_tree(process)
             with self._state_lock:
+                if not launch_succeeded and self._process is process:
+                    self._process = None
+                if self._launch_server_socket is server_socket:
+                    self._launch_server_socket = None
                 self._launching = False
 
     def _reader_loop(self):
@@ -368,6 +446,9 @@ class ProcessWorkflowExecutorProxy(QObject):
                     continue
                 if self._is_socket_peer_closed(sock):
                     break
+        except SocketMessageError as exc:
+            self._reader_error_status = str(exc.status or "unknown")
+            logger.warning("工作流子进程通信中断: status=%s", self._reader_error_status)
         except Exception as exc:
             logger.warning("工作流子进程读取失败: %s", exc)
         finally:
@@ -393,7 +474,9 @@ class ProcessWorkflowExecutorProxy(QObject):
             except Exception:
                 return_code = None
             message = "工作流子进程已退出"
-            if return_code not in (None, 0):
+            if self._reader_error_status:
+                message = f"工作流子进程通信中断，状态={self._reader_error_status}"
+            elif return_code not in (None, 0):
                 message = f"工作流子进程异常退出，退出码={return_code}"
             self._enqueue_message(
                 {
@@ -468,6 +551,11 @@ class ProcessWorkflowExecutorProxy(QObject):
                 process.wait(timeout=0.1)
             except Exception:
                 pass
+            try:
+                if process.poll() is not None:
+                    unregister_worker_process(process)
+            except Exception:
+                pass
 
     def _send_command(self, command: str, **kwargs) -> bool:
         with self._state_lock:
@@ -509,10 +597,30 @@ class ProcessWorkflowExecutorProxy(QObject):
     def terminate(self):
         process = None
         sock = None
+        launch_server_socket = None
+        launch_client_socket = None
+        launch_thread = None
+        self._stop_event.set()
         with self._state_lock:
             process = self._process
             sock = self._socket
+            launch_server_socket = self._launch_server_socket
+            launch_client_socket = self._launch_client_socket
+            launch_thread = self._launch_thread
+            self._launch_generation += 1
             self._paused = False
+            self._running = False
+            self._launching = False
+        if launch_server_socket is not None:
+            try:
+                launch_server_socket.close()
+            except Exception:
+                pass
+        if launch_client_socket is not None:
+            try:
+                launch_client_socket.close()
+            except Exception:
+                pass
         if sock is not None:
             try:
                 self._send_command("shutdown")
@@ -524,6 +632,12 @@ class ProcessWorkflowExecutorProxy(QObject):
                 pass
         if process is not None:
             _kill_process_tree(process)
+        if (
+            launch_thread is not None
+            and launch_thread is not threading.current_thread()
+            and launch_thread.is_alive()
+        ):
+            launch_thread.join(timeout=1.0)
         self._on_process_stopped()
 
 
@@ -535,25 +649,19 @@ def create_process_workflow_bundle(payload: Dict[str, Any], parent=None) -> tupl
 
 def create_process_workflow_runtime(
     *,
-    cards_data: Dict[str, Any],
+    cards_data: Dict[Any, Any],
     connections_data: list[Dict[str, Any]],
     execution_mode: str,
     images_dir: Optional[str],
     workflow_id: str,
     workflow_filepath: Optional[str] = None,
-    start_card_id: Optional[int] = None,
-    start_card_ids=None,
+    start_card_ids: Iterable[int],
     target_window_title: Optional[str] = None,
     target_hwnd: Optional[int] = None,
     thread_labels: Optional[Dict[int, str]] = None,
     bound_windows: Optional[list[Dict[str, Any]]] = None,
-    logger_obj=None,
-    enable_thread_window_binding: bool = True,
-    single_mode_overrides: Optional[Dict[str, Any]] = None,
-    multi_thread_overrides: Optional[Dict[str, Any]] = None,
-    screenshot_engine: Optional[str] = None,
-    workflow_data: Optional[Dict[str, Any]] = None,
-    config: Optional[Dict[str, Any]] = None,
+    screenshot_engine: str,
+    test_mode: Any = None,
     parent=None,
 ):
     payload = build_process_workflow_payload(
@@ -562,21 +670,15 @@ def create_process_workflow_runtime(
         execution_mode=execution_mode,
         screenshot_engine=_resolve_payload_screenshot_engine(
             screenshot_engine=screenshot_engine,
-            workflow_data=workflow_data,
-            config=config,
         ),
         images_dir=images_dir,
         workflow_id=workflow_id,
         workflow_filepath=workflow_filepath,
-        start_card_id=start_card_id,
         start_card_ids=start_card_ids,
         target_window_title=target_window_title,
         target_hwnd=target_hwnd,
         thread_labels=thread_labels,
         bound_windows=bound_windows,
-        logger_obj=logger_obj,
-        enable_thread_window_binding=enable_thread_window_binding,
-        single_mode_overrides=single_mode_overrides,
-        multi_thread_overrides=multi_thread_overrides,
+        test_mode=test_mode,
     )
     return create_process_workflow_bundle(payload=payload, parent=parent)

@@ -1,5 +1,4 @@
 import logging
-import os
 
 from PySide6.QtCore import QTimer
 
@@ -52,11 +51,10 @@ class WindowTaskRunnerControlMixin:
 
             # 【关键修复】清理OCR服务资源
             try:
-                from services.multiprocess_ocr_pool import get_multi_ocr_pool
-                ocr_pool = get_multi_ocr_pool()
-                if ocr_pool and hasattr(ocr_pool, 'unregister_window'):
-                    ocr_pool.unregister_window(int(self.window_id))
-                    logger.info(f"[资源清理] 已注销窗口{self.window_id}的OCR服务")
+                from services.multiprocess_ocr_pool import get_multiprocess_ocr_pool
+                ocr_pool = get_multiprocess_ocr_pool()
+                ocr_pool.unregister_window(int(self.window_id))
+                logger.info(f"[资源清理] 已注销窗口{self.window_id}的OCR服务")
             except Exception as e:
                 logger.debug(f"清理OCR服务失败: {e}")
 
@@ -93,7 +91,7 @@ class WindowTaskRunnerControlMixin:
                 if var in os.environ:
                     try:
                         del os.environ[var]
-                    except:
+                    except Exception:
                         pass
 
         except Exception as e:

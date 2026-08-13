@@ -79,10 +79,6 @@ except ImportError:
     logger.warning("主题管理器不可用，将使用默认颜色")
 
 try:
-    import win32gui
-    import win32api
-    import win32ui
-    from PIL import Image
     import numpy as np
     PYWIN32_AVAILABLE = True
 except ImportError:
@@ -1252,9 +1248,9 @@ class ColorCoordinatePickerOverlay(QWidget):
             self._is_ready_for_input = True
 
         if event.button() == Qt.MouseButton.LeftButton:
-            logger.info(f"[鼠标事件] 左键点击")
+            logger.info("[鼠标事件] 左键点击")
             if self._is_point_in_target_window(event.pos()):
-                logger.info(f"[鼠标事件] 点击位置在目标窗口内")
+                logger.info("[鼠标事件] 点击位置在目标窗口内")
                 self.click_pos = event.pos()
 
                 # 转换为相对坐标
@@ -1279,7 +1275,7 @@ class ColorCoordinatePickerOverlay(QWidget):
                     logger.warning("无法获取像素颜色")
                     self.update()
             else:
-                logger.warning(f"[鼠标事件] 点击位置不在目标窗口内")
+                logger.warning("[鼠标事件] 点击位置不在目标窗口内")
 
         elif event.button() == Qt.MouseButton.RightButton:
             logger.info("[鼠标事件] 右键点击，取消选择")
@@ -1420,7 +1416,7 @@ class ColorCoordinatePickerWidget(QWidget):
         if count == 0:
             self.select_button.setText("点击屏幕获取颜色")
         elif count == 1:
-            self.select_button.setText(f"已选择1个点")
+            self.select_button.setText("已选择1个点")
         else:
             self.select_button.setText(f"已选择{count}个点")
 

@@ -21,7 +21,7 @@ class ParameterPanelMediaFileSelectMixin:
                     self,
                     "模型格式提示",
                     f"检测到您选择的是 .{ext} 格式模型?\n\n"
-                    f"本程序仅支持 ONNX 格式模型，请先将模型转换为 .onnx 格式?"
+                    "本程序仅支持 ONNX 格式模型，请先将模型转换为 .onnx 格式?"
                 )
                 return
 

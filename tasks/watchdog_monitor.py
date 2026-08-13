@@ -250,7 +250,7 @@ def check_trigger_condition(state: Dict[str, Any], monitor_mode: str,
             else:
                 logger.debug(f"[触发条件检查] 时间未达阈值: {duration:.1f} < {duration_threshold}")
         else:
-            logger.debug(f"[触发条件检查] first_time为None，无法检查时间")
+            logger.debug("[触发条件检查] first_time为None，无法检查时间")
 
     elif monitor_mode == "按次数和时间":
         if count >= count_threshold:
@@ -262,11 +262,11 @@ def check_trigger_condition(state: Dict[str, Any], monitor_mode: str,
                 else:
                     logger.debug(f"[触发条件检查] 时间未达: {duration:.1f} < {duration_threshold}")
             else:
-                logger.debug(f"[触发条件检查] first_time为None，无法检查时间")
+                logger.debug("[触发条件检查] first_time为None，无法检查时间")
         else:
             logger.debug(f"[触发条件检查] 次数未达: {count} < {count_threshold}")
 
-    logger.debug(f"[触发条件检查] 未满足触发条件")
+    logger.debug("[触发条件检查] 未满足触发条件")
     return False, ""
 
 

@@ -2,7 +2,6 @@
 工作流执行器模块
 """
 import logging
-import os
 import re
 import time
 import copy
@@ -746,12 +745,12 @@ class WorkflowExecutor(QObject):
 
         # 获取上下文中的监控配置
         if not hasattr(self, '_workflow_context') or self._workflow_context is None:
-            logger.warning(f"[附加条件检查] 工作流上下文不存在，跳过监控检查")
+            logger.warning("[附加条件检查] 工作流上下文不存在，跳过监控检查")
             return None
 
         # 【修复闪退】检查 _monitor_configs 属性是否存在且不为 None
         if not hasattr(self._workflow_context, '_monitor_configs') or self._workflow_context._monitor_configs is None:
-            logger.warning(f"[附加条件检查] 没有监控配置属性或为空，跳过监控检查")
+            logger.warning("[附加条件检查] 没有监控配置属性或为空，跳过监控检查")
             return None
 
         logger.info(f"[附加条件检查] 所有监控配置: {self._workflow_context._monitor_configs.keys()}")
@@ -1486,23 +1485,8 @@ class WorkflowExecutor(QObject):
         if not self._is_ocr_task_type(current_task_type):
             return
 
-        def _suspend_idle_rebuild(reason: str):
-            try:
-                from services.multiprocess_ocr_pool import get_multi_ocr_pool
-                pool = get_multi_ocr_pool()
-                if pool is None:
-                    return
-                if hasattr(pool, "suspend_idle_rebuild"):
-                    suspend_until = float(pool.suspend_idle_rebuild(reason=reason))
-                    logger.debug(
-                        f"[OCR重建抑制] 卡片 {current_card_id} -> {next_card_id}，已抑制空闲重建到 {suspend_until:.3f} (reason={reason})"
-                    )
-            except Exception as e:
-                logger.debug(f"[OCR重建抑制] 设置失败: {e}")
-
         # 继续本步骤/跳回本步骤不应触发热重置
         if self._is_same_card_id(current_card_id, next_card_id):
-            _suspend_idle_rebuild("same_card")
             logger.debug(
                 f"[OCR热重置策略] 卡片 {current_card_id} 下一张仍是本步骤 ({next_card_id})，跳过热重置"
             )
@@ -1510,7 +1494,6 @@ class WorkflowExecutor(QObject):
 
         next_task_type = self._get_card_task_type(next_card_id)
         if self._is_ocr_task_type(next_task_type):
-            _suspend_idle_rebuild("next_is_ocr")
             logger.debug(
                 f"[OCR热重置策略] 卡片 {current_card_id} 下一张仍是OCR ({next_card_id})，跳过热重置"
             )
@@ -1534,15 +1517,9 @@ class WorkflowExecutor(QObject):
 
         def _hot_reset_worker():
             try:
-                from services.multiprocess_ocr_pool import get_multi_ocr_pool
-                pool = get_multi_ocr_pool()
-                if pool is None:
-                    return
-                ok = False
-                if hasattr(pool, "hot_reset_and_cleanup_idle_resources"):
-                    ok = bool(pool.hot_reset_and_cleanup_idle_resources(force=True))
-                elif hasattr(pool, "hot_reset_all_idle_workers"):
-                    ok = bool(pool.hot_reset_all_idle_workers(force=True))
+                from services.multiprocess_ocr_pool import get_multiprocess_ocr_pool
+                pool = get_multiprocess_ocr_pool()
+                ok = bool(pool.hot_reset_all_idle_workers(force=True))
 
                 if ok:
                     logger.info(
@@ -1696,7 +1673,7 @@ class WorkflowExecutor(QObject):
                 import win32gui
                 window_title = win32gui.GetWindowText(self.target_hwnd)
                 if "二重螺旋" in window_title:
-                    logger.info(f"[后台激活] 检测到二重螺旋窗口，发送一次点击激活")
+                    logger.info("[后台激活] 检测到二重螺旋窗口，发送一次点击激活")
                     self._send_erchongluoxuan_activation()
             except Exception as e:
                 logger.warning(f"[后台激活] 二重螺旋窗口激活失败: {e}")
@@ -1877,7 +1854,7 @@ class WorkflowExecutor(QObject):
                 logger.debug(f"外部停止检查失败: {exc}")
         # 检查强制停止 - 立即返回
         if self._force_stop:
-            logger.warning(f"[_check_pause_and_stop] 检测到强制停止请求，立即中断")
+            logger.warning("[_check_pause_and_stop] 检测到强制停止请求，立即中断")
             return True
 
         # WGC完整销毁重建期间，阻塞任务执行，直到重建完成
@@ -2086,7 +2063,7 @@ class WorkflowExecutor(QObject):
             # 获取窗口标题用于日志
             try:
                 window_title = win32gui.GetWindowText(self.target_hwnd)
-            except:
+            except Exception:
                 window_title = f"HWND:{self.target_hwnd}"
 
             logger.info(f"前台模式：激活目标窗口 {window_title} (HWND: {self.target_hwnd})")
@@ -2153,7 +2130,7 @@ class WorkflowExecutor(QObject):
                 rect = win32gui.GetClientRect(self.target_hwnd)
                 center_x = rect[2] // 2
                 center_y = rect[3] // 2
-            except:
+            except Exception:
                 # 如果获取失败，使用默认坐标
                 center_x, center_y = 100, 100
                 logger.debug(f"[后台激活] 无法获取窗口客户区，使用默认坐标: ({center_x}, {center_y})")
@@ -2173,11 +2150,11 @@ class WorkflowExecutor(QObject):
                 )
 
                 if result:
-                    logger.info(f"[后台激活] 二重螺旋窗口激活成功，窗口已就绪接收后台输入")
+                    logger.info("[后台激活] 二重螺旋窗口激活成功，窗口已就绪接收后台输入")
                     time.sleep(0.05)  # 短暂等待激活生效
                     return True
                 else:
-                    logger.warning(f"[后台激活] 激活序列返回失败")
+                    logger.warning("[后台激活] 激活序列返回失败")
                     return False
 
             except Exception as e:
@@ -2233,7 +2210,7 @@ class WorkflowExecutor(QObject):
 
                 # 【重试标志重置】每轮循环开始时清除重试标志
                 if self._is_retrying:
-                    logger.debug(f"[重试标志] 新轮次开始，清除 _is_retrying")
+                    logger.debug("[重试标志] 新轮次开始，清除 _is_retrying")
                     self._is_retrying = False
 
                 # 1. 循环开始立即检查暂停和停止
@@ -2254,14 +2231,14 @@ class WorkflowExecutor(QObject):
                 if self.target_hwnd and WIN32GUI_AVAILABLE:
                     try:
                         if not win32gui.IsWindow(self.target_hwnd):
-                            logger.warning(f"目标窗口已关闭，自动停止工作流")
+                            logger.warning("目标窗口已关闭，自动停止工作流")
                             self._stop_requested = True
                             self._release_all_keys()
                             try:
                                 from task_workflow.workflow_context import clear_all_ocr_data, clear_multi_image_memory
                                 clear_all_ocr_data(workflow_id=self.workflow_id)
                                 clear_multi_image_memory(workflow_id=self.workflow_id)
-                            except:
+                            except Exception:
                                 pass
                             return True, "目标窗口已关闭"
                     except Exception as e:
@@ -2386,7 +2363,7 @@ class WorkflowExecutor(QObject):
                         return False, self._compose_failure_message(
                             f"工作流在步骤 {current_card_id} ({task_type}) 处失败并停止"
                         )
-                    return True, f"工作流执行完成"
+                    return True, "工作流执行完成"
 
                 # 【测试卡片】单卡片测试模式：执行完当前卡片后立即返回，不执行任何跳转
                 # 注意：跳过虚拟起点（ID为负数），只在真正的测试卡片执行完后才停止
@@ -2395,7 +2372,7 @@ class WorkflowExecutor(QObject):
                     self.card_finished.emit(current_card_id, success)
                     # 【修复】等待一小段时间确保主线程能处理card_finished信号并更新UI
                     time.sleep(0.05)  # 等待50ms让UI完成状态更新
-                    logger.info(f"[测试卡片] card_finished信号已发送并等待UI更新")
+                    logger.info("[测试卡片] card_finished信号已发送并等待UI更新")
                     return success, f"[测试卡片] 执行{'成功' if success else '失败'}"
 
                 # 【新架构】如果是附加条件触发的跳转，立即跳转，不走后续处理逻辑（包括UI信号）
@@ -2495,7 +2472,7 @@ class WorkflowExecutor(QObject):
                         # 【防止并发重试】检查是否已有重试在进行中
                         if self._is_retrying:
                             self._maybe_hot_reset_ocr_by_next_card(current_card_id, task_type, current_card_id)
-                            logger.warning(f"检测到重复的'继续执行本步骤'信号，上一轮次尚未完成，跳过本次")
+                            logger.warning("检测到重复的'继续执行本步骤'信号，上一轮次尚未完成，跳过本次")
                             # 【关键修复】使用continue跳过本次，而不是break退出循环
                             # 这样可以继续等待下一轮，而不是直接终止工作流
                             continue
@@ -2508,7 +2485,7 @@ class WorkflowExecutor(QObject):
 
                         # 【标记重试开始】
                         self._is_retrying = True
-                        logger.debug(f"[重试标志] 设置 _is_retrying = True")
+                        logger.debug("[重试标志] 设置 _is_retrying = True")
 
                         # 双重重试机制：
                         # 1. 任务内部重试（如图片查找3次）
@@ -2542,7 +2519,7 @@ class WorkflowExecutor(QObject):
                                     logger.info("重试等待期间检测到停止请求")
                                     self._release_all_keys()
                                     self._is_retrying = False  # 【清除重试标志】
-                                    logger.debug(f"[重试标志] 停止时清除 _is_retrying = False")
+                                    logger.debug("[重试标志] 停止时清除 _is_retrying = False")
                                     return False, '工作流被用户停止'
                                 time.sleep(0.01)  # 从0.1秒改为0.01秒，更快响应
                                 sleep_time += 0.01
@@ -2567,7 +2544,7 @@ class WorkflowExecutor(QObject):
                                 logger.info("智能延迟后检测到停止请求")
                                 self._release_all_keys()
                                 self._is_retrying = False
-                                logger.debug(f"[重试标志] 停止时清除 _is_retrying = False")
+                                logger.debug("[重试标志] 停止时清除 _is_retrying = False")
                                 return False, '工作流被用户停止'
 
                         # 【关键】在重新执行当前步骤前，最后一次检查停止信号
@@ -2575,7 +2552,7 @@ class WorkflowExecutor(QObject):
                             logger.info("'继续执行本步骤'循环开始前检测到停止请求")
                             self._release_all_keys()
                             self._is_retrying = False  # 【清除重试标志】
-                            logger.debug(f"[重试标志] 停止时清除 _is_retrying = False")
+                            logger.debug("[重试标志] 停止时清除 _is_retrying = False")
                             return False, '工作流被用户停止'
 
                         # 【注意】不在这里清除标志，而是在循环开头清除
@@ -2647,16 +2624,6 @@ class WorkflowExecutor(QObject):
 
             # 工作流自然结束，执行清理
             logger.info("[工作流完成] 自然结束，执行资源清理")
-
-            # 【修改】不再由单个executor清理所有OCR子进程
-            # OCR进程的清理由中控统一管理（在所有窗口任务完成后）
-            # 这样避免多窗口场景下一个窗口完成就清理了其他窗口正在使用的OCR进程
-            # try:
-            #     from services.multiprocess_ocr_pool import cleanup_ocr_services_on_stop
-            #     cleanup_ocr_services_on_stop(deep_cleanup=True)
-            #     logger.info("[工作流完成] 已清理所有OCR子进程")
-            # except Exception as e:
-            #     logger.warning(f"[工作流完成] 清理OCR进程失败: {e}")
 
             # 2. 清理图片相关缓存
             if self._cleanup_runtime_image_on_finish:
@@ -2742,7 +2709,7 @@ class WorkflowExecutor(QObject):
                             try:
                                 actual_title = win32gui.GetWindowText(target_hwnd)
                                 logger.debug(f"成功 使用预设窗口句柄: {target_hwnd} -> '{actual_title}'")
-                            except:
+                            except Exception:
                                 # 获取标题失败但窗口存在，继续执行
                                 logger.debug(f"成功 使用预设窗口句柄: {target_hwnd} (无法获取标题)")
                         else:
@@ -3018,7 +2985,7 @@ class WorkflowExecutor(QObject):
                 logger.debug(f"  ✓ 找到 sequential 类型连接 -> 卡片 {next_card}")
                 return next_card
 
-        logger.warning(f"  ✗ 没有找到下一个卡片，工作流将结束")
+        logger.warning("  ✗ 没有找到下一个卡片，工作流将结束")
         return None
 
 

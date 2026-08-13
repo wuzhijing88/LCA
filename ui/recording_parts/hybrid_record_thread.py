@@ -7,11 +7,9 @@
 3. 绝对坐标录制 (普通操作)
 """
 
-import json
 import time
 import logging
 import threading
-from typing import Optional, List, Dict, Any
 from PySide6.QtCore import Signal, QThread
 
 logger = logging.getLogger(__name__)

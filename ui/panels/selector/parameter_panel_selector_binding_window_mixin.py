@@ -71,7 +71,7 @@ class ParameterPanelSelectorBindingWindowMixin:
                             logger.info(f"已静默切换到有效句柄: {validated_hwnd}（不修改标签页绑定）")
                             return validated_hwnd
                         else:
-                            logger.warning(f"没有可用的全局绑定窗口，继续尝试其他方式获取")
+                            logger.warning("没有可用的全局绑定窗口，继续尝试其他方式获取")
                             # 继续往下执行，尝试从全局配置获取
                 else:
                     # 如果无法验证（没有主窗口），直接返回

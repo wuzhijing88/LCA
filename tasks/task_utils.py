@@ -322,10 +322,8 @@ class ImagePathResolver:
 
     搜索顺序（优先级从高到低）：
     1. 原始路径（如果存在）
-    2. 当前工作目录下的 images/
-    3. 程序所在目录下的 images/
-    4. 打包环境下的 _MEIPASS/images/（PyInstaller）
-    5. 用户自定义的额外搜索路径
+    2. 程序目录下的 images/
+    3. 用户自定义的额外搜索路径
     """
 
     _instance = None  # 单例模式
@@ -368,64 +366,10 @@ class ImagePathResolver:
 
     def _setup_default_search_paths(self):
         """设置默认搜索路径"""
-        self._search_paths = []
+        from utils.app_paths import get_images_dir
 
-        def normalize_path(p: Path) -> Path:
-            """转换为绝对路径（避免短路径）"""
-            try:
-                # resolve() 会解析符号链接并返回绝对路径
-                return p.resolve()
-            except Exception:
-                return p.absolute()
-
-        def add_existing_path(path_value) -> None:
-            try:
-                candidate = normalize_path(Path(path_value))
-            except Exception:
-                return
-            if candidate.exists() and candidate not in self._search_paths:
-                self._search_paths.append(candidate)
-
-        # 打包环境优先使用用户数据目录，避免 CWD 漂移导致读到错误模板。
-        if getattr(sys, 'frozen', False):
-            try:
-                from utils.app_paths import get_images_dir
-                add_existing_path(get_images_dir("LCA"))
-            except Exception:
-                pass
-
-        # 当前工作目录下的 images/
-        if not getattr(sys, 'frozen', False):
-            add_existing_path(Path.cwd() / "images")
-
-        # 2. 程序所在目录下的 images/
-        if getattr(sys, 'frozen', False):
-            # 打包环境：使用可执行文件所在目录
-            exe_dir = normalize_path(Path(sys.executable).parent)
-            add_existing_path(exe_dir / "images")
-
-            try:
-                from utils.app_paths import get_legacy_user_data_dir
-                add_existing_path(Path(get_legacy_user_data_dir("LCA")) / "images")
-            except Exception:
-                pass
-
-            add_existing_path(Path.cwd() / "images")
-
-            # 3. PyInstaller 的 _MEIPASS 目录（临时解压目录）
-            if hasattr(sys, '_MEIPASS'):
-                add_existing_path(Path(sys._MEIPASS) / "images")
-        else:
-            # 开发环境：使用脚本所在目录
-            try:
-                script_dir = normalize_path(Path(__file__).parent.parent)
-                add_existing_path(script_dir / "images")
-            except NameError:
-                pass
-
-        # 确保至少有一个 images 路径
-        if not self._search_paths:
-            self._search_paths.append(normalize_path(Path.cwd() / "images"))
+        images_dir = Path(get_images_dir("LCA")).resolve()
+        self._search_paths = [images_dir]
 
     def add_search_path(self, path: str, priority: int = -1):
         """

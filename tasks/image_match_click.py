@@ -1,5 +1,4 @@
 ﻿# 图片点击任务模块
-import time
 import logging  # 导入logging模块
 import random  # 导入random模块
 import re
@@ -21,63 +20,22 @@ from utils.input_timing import (
 )
 from utils.smart_image_matcher import normalize_match_image
 
-# 安全导入 OpenCV 和 NumPy
-try:
-    import cv2
-    import numpy as np
-    CV2_AVAILABLE = True
-except ImportError as e:
-    CV2_AVAILABLE = False
-    logging.getLogger(__name__).warning(f"OpenCV或NumPy不可用，图片识别功能将被禁用: {e}")
+import cv2
+import numpy as np
+import win32con
+import win32gui
 
-# Import necessary modules for background execution (requires pywin32)
-try:
-    import win32gui
-    import win32ui
-    import win32con
-    import win32api
-    PYWIN32_AVAILABLE = True
-except ImportError:
-    PYWIN32_AVAILABLE = False
-
-# Print warning only if execution mode requires it later
-# print("警告: pywin32 模块未安装，后台模式将不可用。请运行 'pip install pywin32'")
-
-# Import screenshot helper (智能混合截图)
-try:
-    from tasks.task_utils import capture_window_smart, is_smart_capture_available, precise_sleep
-
-    # 保持兼容性 - 旧代码使用的变量名
-    capture_window_wgc = capture_window_smart
-
-    logger = logging.getLogger(__name__)
-    if is_smart_capture_available():
-        logger.info("[图片识别] 使用 WGC 通过句柄精确捕获（支持后台）")
-    else:
-        logger.warning("[图片识别] 截图引擎不可用")
-except ImportError as e:
-    logger = logging.getLogger(__name__)
-    logger.error(f"无法导入截图助手: {e}")
-    capture_window_wgc = None
-    from utils.precise_sleep import precise_sleep
-
-# Import click utilities
-try:
-    from utils.win32_utils import click_background
-except ImportError:
-    click_background = None
-    logger.warning("无法导入点击功能")
-
-# 初始化logger
+from tasks.task_utils import (
+    capture_window_smart as capture_window_wgc,
+    is_smart_capture_available,
+    precise_sleep,
+)
 logger = logging.getLogger(__name__)
 
-# 检查截图功能是否可用
-if capture_window_wgc is None or click_background is None:
-    logger.warning("无法导入截图和点击功能，后台模式可能不可用")
-
-# 高级图像处理功能已移除
-
-# import os # Import os for path normalization - Removed
+if is_smart_capture_available():
+    logger.info("[图片识别] 使用 WGC 通过句柄精确捕获（支持后台）")
+else:
+    logger.warning("[图片识别] 截图引擎不可用")
 
 TASK_NAME = "图片点击"
 
@@ -100,9 +58,6 @@ def locate_image_in_window(
     capture_timeout: Optional[float] = None,
 ) -> Tuple[bool, Optional[Tuple[int, int, int, int, int, int]], Optional[str]]:
     """使用当前正式找图链路执行一次定位。"""
-    if not CV2_AVAILABLE:
-        return False, None, None
-
     try:
         hwnd = int(target_hwnd) if target_hwnd is not None else 0
     except Exception:
@@ -244,11 +199,8 @@ def _activate_window_foreground(target_hwnd: Optional[int], logger):
         return True  # 在多窗口模式下，不激活窗口但返回成功
 
     # ... (Activation logic as defined above) ...
-    if not target_hwnd or not PYWIN32_AVAILABLE:
-        if not target_hwnd:
-             logger.debug("前台模式执行，但未提供目标窗口句柄，无法激活。")
-        elif not PYWIN32_AVAILABLE:
-             logger.warning("无法激活目标窗口：缺少 'pywin32' 库。")
+    if not target_hwnd:
+        logger.debug("前台模式执行，但未提供目标窗口句柄，无法激活。")
         return False
     try:
         if not win32gui.IsWindow(target_hwnd):
@@ -495,13 +447,6 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
 def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mode: str, target_hwnd: Optional[int], window_region: Optional[Tuple[int, int, int, int]], card_id: Optional[int], **kwargs) -> Tuple[bool, str, Optional[int]]:
     """Executes the Find Image and Click task in the specified mode."""
 
-    # 检查 OpenCV 是否可用
-    if not CV2_AVAILABLE:
-        logger.error("OpenCV 或 NumPy 不可用，无法执行图片识别任务")
-        logger.error("请安装依赖: pip install opencv-python numpy")
-        from .task_utils import handle_failure_action
-        return handle_failure_action(params, card_id)
-
     # 从 kwargs 中获取 get_image_data 函数
     get_image_data = kwargs.get('get_image_data', None)
 
@@ -586,11 +531,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                    f"宽度={recognition_region_width}, 高度={recognition_region_height}")
     # -------------------------
 
-    on_success_action = params.get('on_success', '执行下一步')
-    success_jump_id = params.get('success_jump_target_id')
-    on_failure_action = params.get('on_failure', '执行下一步')
-    failure_jump_id = params.get('failure_jump_target_id')
-    
     # --- ADDED: Construct absolute path and validate ---
     if not absolute_image_path:
         logger.error("参数错误：图片路径无效或解析失败。")
@@ -804,8 +744,8 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             # 不再区分前台后台模式，统一使用后台识别方法以提高稳定性和准确性
             logger.debug("统一使用后台识别方法 (Win32 API + OpenCV)")
             if True:  # 原来的前台和后台模式都使用后台识别方法
-                if not PYWIN32_AVAILABLE or not target_hwnd:
-                    logger.error("统一后台识别方法需要 pywin32 库和有效的窗口句柄。")
+                if not target_hwnd:
+                    logger.error("统一后台识别方法需要有效的窗口句柄。")
                     found = False; location = None
                     break # Cannot proceed
 
@@ -945,7 +885,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             # 【关键修复】在等待重试前检查停止请求
             stop_checker = kwargs.get('stop_checker')
             if stop_checker and stop_checker():
-                logger.warning(f"[停止请求] 找图重试等待前检测到停止请求，立即终止")
+                logger.warning("[停止请求] 找图重试等待前检测到停止请求，立即终止")
                 return False, '停止工作流', None
 
             logger.debug(f"等待 {retry_interval} 秒后重试...")
@@ -961,7 +901,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
 
                 # 每次短暂 sleep 后都检查停止请求
                 if stop_checker and stop_checker():
-                    logger.warning(f"[停止请求] 找图重试等待中检测到停止请求，立即终止")
+                    logger.warning("[停止请求] 找图重试等待中检测到停止请求，立即终止")
                     return False, '停止工作流', None
 
     # --- End Retry Loop ---
@@ -984,7 +924,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
 
         # 【关键修复】简化坐标计算，与文字点击保持一致
         # WGC截图返回的坐标直接作为客户区坐标使用
-        logger.info(f"=== 坐标转换开始 ===")
+        logger.info("=== 坐标转换开始 ===")
         logger.info(f"  识别到的位置(截图坐标): ({left_x}, {top_y}) [{template_w}x{template_h}]")
 
         # 直接计算中心点（识别到的坐标就是客户区坐标）
@@ -1004,7 +944,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             # 精准坐标：直接使用中心点，不应用任何偏移
             click_x = center_x
             click_y = center_y
-            logger.info(f"  [精准坐标模式] 使用中心点，无偏移")
+            logger.info("  [精准坐标模式] 使用中心点，无偏移")
         elif image_position_mode == '固定偏移':
             # 固定偏移：先应用固定偏移，再在偏移后的坐标上叠加随机偏移
             click_x = center_x + fixed_offset_x
@@ -1048,7 +988,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 logger.warning("  虚拟鼠标已启用，但未获取到当前位置，将直接按目标坐标执行")
 
         logger.info(f"  最终点击位置(客户区坐标): ({click_x}, {click_y})")
-        logger.info(f"=== 坐标转换结束 ===")
+        logger.info("=== 坐标转换结束 ===")
 
         if card_id is not None:
             try:
@@ -1073,9 +1013,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         dpi_adjusted_click_x = click_x
         dpi_adjusted_click_y = click_y
 
-        # 添加详细的点击位置诊断
-        _diagnose_click_position(target_hwnd, left_x, top_y, center_x, center_y, dpi_adjusted_click_x, dpi_adjusted_click_y, template_w, template_h)
-
         effective_execution_mode = execution_mode
         if virtual_mouse_enabled:
             logger.info(f"[虚拟鼠标] 已启用，保持执行模式: {effective_execution_mode}")
@@ -1092,10 +1029,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
 
             try:
                 # 验证窗口句柄是否有效
-                if not PYWIN32_AVAILABLE:
-                    logger.error("[前台点击] pywin32库不可用")
-                    click_success = False
-                elif not target_hwnd:
+                if not target_hwnd:
                     logger.error("[前台点击] 目标窗口句柄无效")
                     click_success = False
                 elif not win32gui.IsWindow(target_hwnd):
@@ -1184,10 +1118,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             logger.info(f"[后台点击] 执行模式: {effective_execution_mode}")
             try:
                 # 验证窗口句柄是否有效
-                if not PYWIN32_AVAILABLE:
-                    logger.error("[后台点击] pywin32库不可用")
-                    click_success = False
-                elif not target_hwnd:
+                if not target_hwnd:
                     logger.error("[后台点击] 目标窗口句柄无效")
                     click_success = False
                 elif not win32gui.IsWindow(target_hwnd):
@@ -1271,33 +1202,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             from .task_utils import handle_failure_action
             return handle_failure_action(params, card_id)
 
-        # --- ADDED: Store confidence values in counters REGARDLESS of success/failure (if matching occurred) ---
-        if card_id is not None:
-            req_conf_key = f'__required_confidence_{card_id}'
-            act_conf_key = f'__actual_confidence_{card_id}'
-
-            # Store required confidence (should always be available if task ran)
-            counters[req_conf_key] = confidence
-            logger.debug(f"  Storing required confidence to counters: {req_conf_key} = {confidence}")
-
-            # Store actual confidence IF matching was performed (max_val exists)
-            if 'max_val' in locals() or 'max_val' in globals(): # Check if max_val was defined
-                # Ensure max_val is float before storing
-                try:
-                     actual_conf_float = float(max_val)
-                     counters[act_conf_key] = actual_conf_float
-                     logger.debug(f"  Storing actual confidence to counters: {act_conf_key} = {actual_conf_float}")
-                except (ValueError, TypeError):
-                     logger.warning(f"  未能将实际置信度 ({max_val}) 转换为浮点数存储。")
-                     counters[act_conf_key] = -1.0 # Indicate conversion failure
-            else:
-                # Indicate that matching likely didn't occur or max_val wasn't found
-                counters[act_conf_key] = -1.0 # Use -1.0 to signify not available/not found
-                logger.debug(f"  本地作用域未找到实际置信度(max_val)，写入 {act_conf_key} = -1.0")
-        else:
-            logger.warning("无法存储置信度到 counters：未提供 card_id。")
-        # --- END ADDED ---
-
     finally:
         # 结束时统一释放函数级图像引用，避免跨任务残留
         needle_image_raw = None
@@ -1308,77 +1212,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         result_matrix = None
         match_result = None
 
-# Example (for testing standalone)
-if __name__ == '__main__':
-    # --- 测试后台截图 ---
-    # !!! 重要：修改为你想要测试的窗口标题 或 部分标题 !!!
-    # test_target_title = "无标题 - 记事本" # 例如：中文记事本
-    # test_target_title = "Untitled - Notepad" # 例如：英文记事本
-    test_target_title_part = "剑网3无界" # 使用部分标题查找
-
-    test_hwnd = None
-
-    if PYWIN32_AVAILABLE:
-        try:
-            # --- MODIFIED: Find window by partial title ---
-            logger.info(f"尝试通过部分标题 '{test_target_title_part}' 查找窗口...")
-            top_windows = []
-            # Define callback function inline or ensure it's defined correctly
-            def enum_window_callback(hwnd, param):
-                param.append(hwnd)
-                return True # Must return True to continue enumeration
-
-            win32gui.EnumWindows(enum_window_callback, top_windows)
-            found_title = "" # Store the title of the found window
-            for hwnd_item in top_windows:
-                window_title = win32gui.GetWindowText(hwnd_item)
-                if test_target_title_part in window_title:
-                    test_hwnd = hwnd_item
-                    found_title = window_title # Store the full title
-                    logger.info(f"找到匹配窗口: '{found_title}'，HWND: {test_hwnd}")
-                    break # Use the first match
-            # --- END MODIFICATION ---
-
-            # Ensure win32gui is imported (should be from top level) - No longer needed FindWindow call
-
-            if test_hwnd:
-                # logger.info(f"找到窗口 '{found_title}'，HWND: {test_hwnd}") # Log already happened
-
-                # 1. 执行智能截图（WGC）
-                logger.info("使用 WGC 进行窗口截图...")
-                screenshot = capture_window_wgc(test_hwnd, client_area_only=True)
-
-                # 2. 检查并保存截图
-                if screenshot is not None and isinstance(screenshot, np.ndarray):
-                    logger.info(f"后台截图成功，截图尺寸: {screenshot.shape}")
-                    save_path = "_test_find_image_click_screenshot.png"
-                    try:
-                        # Ensure cv2 and os are imported (should be from top level)
-                        cv2.imwrite(save_path, screenshot)
-                        # Use os.path.abspath for clearer path reporting
-                        # 确保 os 模块可用
-                        import os
-                        logger.info(f"截图已保存到: {os.path.abspath(save_path)}")
-                    except Exception as e:
-                        logger.error(f"保存截图 '{save_path}' 失败: {e}", exc_info=True)
-                else:
-                    logger.error("后台截图失败或返回无效结果 (None 或非 NumPy 数组)。")
-
-            else:
-                logger.error(f"找不到标题包含 '{test_target_title_part}' 的窗口。请确保窗口已打开。") # Updated error message
-        except Exception as e:
-            logger.error(f"查找窗口 '{test_target_title_part}' 或执行截图时发生错误: {e}", exc_info=True) # Updated error message
-    else:
-        logger.error("pywin32 库未安装，无法执行后台截图测试。请运行: pip install pywin32")
-
-    logger.info("image_match_click.py 模块测试结束。")
-
-def _diagnose_click_position(target_hwnd: int, left_x: int, top_y: int, center_x: int, center_y: int,
-                           click_x: int, click_y: int, template_w: int, template_h: int):
-    """
-    诊断点击位置，帮助调试点击偏移问题
-    """
-    pass
 
 def test_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
     """

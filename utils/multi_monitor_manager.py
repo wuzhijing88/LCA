@@ -119,11 +119,7 @@ class MultiMonitorManager:
 
         # Windows API
         self._user32 = ctypes.windll.user32
-        self._shcore = None
-        try:
-            self._shcore = ctypes.windll.shcore
-        except OSError:
-            logger.debug("shcore.dll 不可用，DPI感知功能受限")
+        self._shcore = ctypes.windll.shcore
 
         # 设置DPI感知
         self._set_dpi_awareness()
@@ -136,11 +132,8 @@ class MultiMonitorManager:
 
     def _set_dpi_awareness(self):
         """确保进程 DPI 感知已通过统一入口完成设置。"""
-        try:
-            awareness = enable_process_dpi_awareness()
-            logger.debug(f"统一 DPI 感知入口完成，当前 awareness={awareness}")
-        except Exception as e:
-            logger.debug(f"DPI感知设置跳过: {e}")
+        awareness = enable_process_dpi_awareness()
+        logger.debug(f"统一 DPI 感知入口完成，当前 awareness={awareness}")
 
     def refresh(self) -> None:
         """刷新显示器信息"""
@@ -208,91 +201,27 @@ class MultiMonitorManager:
                 if self._user32.GetMonitorInfoW(hMonitor, ctypes.pointer(info)):
                     is_primary = bool(info.dwFlags & 1)  # MONITORINFOF_PRIMARY = 1
 
-                    # 获取DPI（需要正确设置函数签名）
-                    dpi_x, dpi_y = 96, 96
-                    scale_factor = 1.0
-                    dpi_source = "default"
+                    self._shcore.GetDpiForMonitor.argtypes = [
+                        wintypes.HMONITOR, ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)
+                    ]
+                    self._shcore.GetDpiForMonitor.restype = ctypes.c_long
 
-                    # 方法1：优先使用GetDpiForMonitor（Per-Monitor DPI Aware模式下最准确）
-                    if self._shcore:
-                        try:
-                            # 设置正确的函数签名
-                            self._shcore.GetDpiForMonitor.argtypes = [
-                                wintypes.HMONITOR, ctypes.c_int,
-                                ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)
-                            ]
-                            self._shcore.GetDpiForMonitor.restype = ctypes.c_long
-
-                            dpi_x_val = ctypes.c_uint()
-                            dpi_y_val = ctypes.c_uint()
-                            # MDT_EFFECTIVE_DPI = 0
-                            hr = self._shcore.GetDpiForMonitor(
-                                hMonitor, 0,
-                                ctypes.byref(dpi_x_val),
-                                ctypes.byref(dpi_y_val)
-                            )
-                            if hr == 0:  # S_OK
-                                dpi_x = dpi_x_val.value
-                                dpi_y = dpi_y_val.value
-                                if dpi_x > 0 and dpi_y > 0:
-                                    scale_factor = dpi_x / 96.0
-                                    dpi_source = "GetDpiForMonitor"
-                        except Exception as e:
-                            logger.debug(f"GetDpiForMonitor失败: {e}")
-
-                    # 方法2：如果GetDpiForMonitor未能获取到有效DPI，尝试通过分辨率推算
-                    # 这种情况可能发生在：进程未设置DPI感知 或 GetDpiForMonitor失败
-                    if dpi_x == 96 and scale_factor == 1.0:
-                        try:
-                            # 使用 EnumDisplaySettings 获取物理分辨率
-                            class DEVMODE(ctypes.Structure):
-                                _fields_ = [
-                                    ("dmDeviceName", wintypes.WCHAR * 32),
-                                    ("dmSpecVersion", wintypes.WORD),
-                                    ("dmDriverVersion", wintypes.WORD),
-                                    ("dmSize", wintypes.WORD),
-                                    ("dmDriverExtra", wintypes.WORD),
-                                    ("dmFields", wintypes.DWORD),
-                                    ("dmPositionX", wintypes.LONG),
-                                    ("dmPositionY", wintypes.LONG),
-                                    ("dmDisplayOrientation", wintypes.DWORD),
-                                    ("dmDisplayFixedOutput", wintypes.DWORD),
-                                    ("dmColor", wintypes.SHORT),
-                                    ("dmDuplex", wintypes.SHORT),
-                                    ("dmYResolution", wintypes.SHORT),
-                                    ("dmTTOption", wintypes.SHORT),
-                                    ("dmCollate", wintypes.SHORT),
-                                    ("dmFormName", wintypes.WCHAR * 32),
-                                    ("dmLogPixels", wintypes.WORD),
-                                    ("dmBitsPerPel", wintypes.DWORD),
-                                    ("dmPelsWidth", wintypes.DWORD),
-                                    ("dmPelsHeight", wintypes.DWORD),
-                                    ("dmDisplayFlags", wintypes.DWORD),
-                                    ("dmDisplayFrequency", wintypes.DWORD),
-                                ]
-
-                            devmode = DEVMODE()
-                            devmode.dmSize = ctypes.sizeof(DEVMODE)
-                            # ENUM_CURRENT_SETTINGS = -1
-                            if self._user32.EnumDisplaySettingsW(
-                                info.szDevice, -1, ctypes.byref(devmode)
-                            ):
-                                physical_width = devmode.dmPelsWidth
-                                physical_height = devmode.dmPelsHeight
-                                logical_width = info.rcMonitor.right - info.rcMonitor.left
-                                logical_height = info.rcMonitor.bottom - info.rcMonitor.top
-
-                                if logical_width > 0 and logical_height > 0:
-                                    scale_x = physical_width / logical_width
-                                    scale_y = physical_height / logical_height
-                                    # 只有当缩放比例明显不为1时才使用
-                                    if abs(scale_x - 1.0) > 0.01 or abs(scale_y - 1.0) > 0.01:
-                                        scale_factor = (scale_x + scale_y) / 2
-                                        dpi_x = int(96 * scale_factor)
-                                        dpi_y = dpi_x
-                                        dpi_source = "EnumDisplaySettings"
-                        except Exception as e:
-                            logger.debug(f"EnumDisplaySettings推算DPI失败: {e}")
+                    dpi_x_val = ctypes.c_uint()
+                    dpi_y_val = ctypes.c_uint()
+                    hr = self._shcore.GetDpiForMonitor(
+                        hMonitor, 0,
+                        ctypes.byref(dpi_x_val),
+                        ctypes.byref(dpi_y_val)
+                    )
+                    if hr != 0 or dpi_x_val.value <= 0 or dpi_y_val.value <= 0:
+                        raise RuntimeError(
+                            f"GetDpiForMonitor 失败: device={info.szDevice}, hr={hr}, "
+                            f"dpi=({dpi_x_val.value}, {dpi_y_val.value})"
+                        )
+                    dpi_x = int(dpi_x_val.value)
+                    dpi_y = int(dpi_y_val.value)
+                    scale_factor = dpi_x / 96.0
 
                     monitor_info = MonitorInfo(
                         handle=hMonitor,

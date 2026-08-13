@@ -9,8 +9,6 @@ import logging
 import os
 import random
 import math
-import threading
-import time
 from typing import Dict, Any, Optional, Tuple, List
 import cv2
 import numpy as np
@@ -23,7 +21,6 @@ logger = logging.getLogger(__name__)
 from .task_utils import (
     precise_sleep,
     coerce_bool,
-    coerce_float,
     safe_imread as _shared_safe_imread,
     capture_and_match_template_smart,
 )
@@ -39,7 +36,6 @@ from utils.input_timing import (
 )
 
 # 导入截图助手和驱动（方案三：保留截图，移除输入操作）
-from utils.screenshot_helper import get_screen_size, take_screenshot_opencv
 
 # _interruptible_sleep 函数已移至 task_utils.py
 
@@ -2668,7 +2664,7 @@ def _execute_multi_image_click(params: Dict[str, Any], execution_mode: str, targ
             logger.info(f"[多图识别] 尝试识别第{i+1}张图片: {image_name}")
 
             # 添加详细调试日志
-            logger.debug(f"[多图识别调试] 调用execute_image_click参数:")
+            logger.debug("[多图识别调试] 调用execute_image_click参数:")
             logger.debug(f"  - image_path: {single_image_params.get('image_path')}")
             logger.debug(f"  - execution_mode: {execution_mode}")
             logger.debug(f"  - target_hwnd: {target_hwnd}")
@@ -2695,7 +2691,7 @@ def _execute_multi_image_click(params: Dict[str, Any], execution_mode: str, targ
             success, action, next_id = result
 
             # 添加返回值调试日志
-            logger.debug(f"[多图识别调试] execute_image_click返回值:")
+            logger.debug("[多图识别调试] execute_image_click返回值:")
             logger.debug(f"  - success: {success}")
             logger.debug(f"  - action: {action}")
             logger.debug(f"  - next_id: {next_id}")
@@ -2794,7 +2790,7 @@ def _execute_multi_image_click(params: Dict[str, Any], execution_mode: str, targ
                     return _handle_failure(on_failure_action, failure_jump_id, card_id)
                 else:
                     # 本轮失败但之前有成功：保持记忆，按失败跳转
-                    logger.warning(f"[多图识别] 启用全部点击，本轮所有剩余图片都识别失败，保持记忆，按失败跳转")
+                    logger.warning("[多图识别] 启用全部点击，本轮所有剩余图片都识别失败，保持记忆，按失败跳转")
                     logger.info("[多图识别] 本轮失败，保持记忆等待下次重试")
                     return _handle_failure(on_failure_action, failure_jump_id, card_id)
         else:
@@ -3043,13 +3039,13 @@ def _execute_text_click(params: Dict[str, Any], execution_mode: str, target_hwnd
                             logger.error(f"【窗口HWND不匹配】OCR结果来自窗口HWND={ocr_window_hwnd}，但当前文字点击任务的目标窗口HWND={target_hwnd}")
                             logger.error(f"这是跨窗口上下文污染！窗口{target_hwnd}的点击任务不应该使用窗口{ocr_window_hwnd}的OCR结果")
                             logger.error(f"OCR来源卡片: {latest_ocr_card_id}, 当前文字点击卡片: {card_id}")
-                            logger.error(f"拒绝使用错误的OCR结果，判定为点击失败")
+                            logger.error("拒绝使用错误的OCR结果，判定为点击失败")
                             return _handle_failure(on_failure_action, failure_jump_id, card_id)
                         else:
                             logger.info(f"【窗口HWND验证通过】OCR结果和文字点击任务都在窗口HWND={target_hwnd}")
                     else:
                         logger.warning(f"OCR卡片{latest_ocr_card_id}未保存窗口HWND信息，无法验证窗口一致性")
-                        logger.warning(f"建议更新OCR识别模块以保存窗口HWND")
+                        logger.warning("建议更新OCR识别模块以保存窗口HWND")
             except Exception as e:
                 logger.error(f"验证OCR窗口HWND时发生错误: {e}")
                 import traceback
@@ -3174,7 +3170,7 @@ def _execute_text_click(params: Dict[str, Any], execution_mode: str, target_hwnd
                 logger.error("边界框应包含8个坐标值 [x1,y1,x2,y2,x3,y3,x4,y4]")
                 return _handle_failure(on_failure_action, failure_jump_id, card_id)
         else:
-            logger.error(f"文字边界框为空")
+            logger.error("文字边界框为空")
             return _handle_failure(on_failure_action, failure_jump_id, card_id)
 
         click_button, click_count, click_interval, click_action, enable_auto_release, text_hold_duration = resolve_click_params(
@@ -3733,7 +3729,7 @@ def _execute_color_click_original(params: Dict[str, Any], execution_mode: str, t
         )
         if click_position_mode == '固定偏移':
             logger.info(
-                f"找到目标颜色，应用固定偏移并叠加随机偏移后的点击坐标: "
+                "找到目标颜色，应用固定偏移并叠加随机偏移后的点击坐标: "
                 f"({click_x}, {click_y}), 总偏移量=({applied_offset_x}, {applied_offset_y})"
             )
         elif click_position_mode == '随机偏移':
@@ -4156,7 +4152,7 @@ def _perform_move_click(params: Dict[str, Any], execution_mode: str, target_hwnd
             logger.error("[鼠标移动点击] 点击执行失败")
             return False
 
-        logger.info(f"[鼠标移动点击] 点击执行成功")
+        logger.info("[鼠标移动点击] 点击执行成功")
         return True
 
     except Exception as e:
@@ -4334,7 +4330,7 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
                     offset_y_min = int(params.get('move_offset_y_min', -50))
                     offset_y_max = int(params.get('move_offset_y_max', 50))
                 except (ValueError, TypeError):
-                    logger.warning(f"[鼠标移动] 随机偏移参数无效,使用默认值")
+                    logger.warning("[鼠标移动] 随机偏移参数无效,使用默认值")
                     offset_x_min, offset_x_max = -50, 50
                     offset_y_min, offset_y_max = -50, 50
 
@@ -4351,7 +4347,7 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
                     offset_x = int(params.get('move_offset_x', 0))
                     offset_y = int(params.get('move_offset_y', 0))
                 except (ValueError, TypeError):
-                    logger.warning(f"[鼠标移动] 固定偏移参数无效,使用默认值0")
+                    logger.warning("[鼠标移动] 固定偏移参数无效,使用默认值0")
                     offset_x, offset_y = 0, 0
 
             # 获取当前鼠标位置
@@ -4369,7 +4365,7 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
                     rect = win32gui.GetClientRect(target_hwnd)
                     start_x = rect[2] // 2
                     start_y = rect[3] // 2
-                except:
+                except Exception:
                     start_x, start_y = 500, 300
 
             # 计算终点坐标（当前位置 + 偏移量）
@@ -4487,13 +4483,13 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
                     success = False
 
         if success:
-            logger.info(f"[鼠标移动] 移动成功")
+            logger.info("[鼠标移动] 移动成功")
 
             # 检查是否启用移动后点击
             move_enable_click = params.get('move_enable_click', False)
             if move_enable_click:
                 try:
-                    logger.info(f"[鼠标移动] 检测到启用移动后点击")
+                    logger.info("[鼠标移动] 检测到启用移动后点击")
                     click_client_x, click_client_y = end_x, end_y
                     logger.info("[鼠标移动] 使用终点坐标执行点击")
 
@@ -4506,10 +4502,10 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
                         stop_checker,
                     )
                     if click_result:
-                        logger.info(f"[鼠标移动] 移动后点击成功")
+                        logger.info("[鼠标移动] 移动后点击成功")
                         return _handle_success(on_success_action, success_jump_id, card_id)
                     else:
-                        logger.warning(f"[鼠标移动] 移动后点击失败，但移动已成功")
+                        logger.warning("[鼠标移动] 移动后点击失败，但移动已成功")
                         return _handle_success(on_success_action, success_jump_id, card_id)
                 except Exception as click_error:
                     logger.error(f"[鼠标移动] 执行移动后点击时出错: {click_error}")
@@ -4517,7 +4513,7 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
 
             return _handle_success(on_success_action, success_jump_id, card_id)
         else:
-            logger.error(f"[鼠标移动] 移动失败")
+            logger.error("[鼠标移动] 移动失败")
             return _handle_failure(on_failure_action, failure_jump_id, card_id)
 
     except Exception as e:
@@ -4828,11 +4824,11 @@ def _execute_simple_drag(params: Dict[str, Any], execution_mode: str, target_hwn
                                         device_id=device_id)
 
         if success:
-            logger.info(f"[拖拽] 简单拖拽完成")
+            logger.info("[拖拽] 简单拖拽完成")
             result = _handle_success(on_success_action, success_jump_id, card_id)
             return result
         else:
-            logger.error(f"[拖拽] 简单拖拽失败")
+            logger.error("[拖拽] 简单拖拽失败")
             result = _handle_failure(on_failure_action, failure_jump_id, card_id)
             return result
 
@@ -4887,13 +4883,13 @@ def _execute_multi_point_drag(params: Dict[str, Any], execution_mode: str, targe
         )
 
         if success:
-            logger.info(f" 多点路径拖拽完成")
+            logger.info(" 多点路径拖拽完成")
             logger.info(f" 处理成功跳转: 动作={on_success_action}, 跳转ID={success_jump_id}, 卡片ID={card_id}")
             result = _handle_success(on_success_action, success_jump_id, card_id)
             logger.info(f" 成功跳转结果: {result}")
             return result
         else:
-            logger.error(f" 多点路径拖拽失败")
+            logger.error(" 多点路径拖拽失败")
             logger.info(f" 处理失败跳转: 动作={on_failure_action}, 跳转ID={failure_jump_id}, 卡片ID={card_id}")
             result = _handle_failure(on_failure_action, failure_jump_id, card_id)
             logger.info(f" 失败跳转结果: {result}")
@@ -5121,7 +5117,7 @@ def perform_mouse_drag_path_native(hwnd: int, path_points: list, duration: float
                     logger.info(f"前台模式多点路径拖拽成功，通过 {len(path_points)} 个路径点")
                     return True
                 else:
-                    logger.error(f"前台模式多点路径拖拽失败")
+                    logger.error("前台模式多点路径拖拽失败")
                     return False
 
             except Exception as foreground_error:
@@ -5341,7 +5337,7 @@ def perform_mouse_drag_path_native(hwnd: int, path_points: list, duration: float
             end_x, end_y = path_points[-1]
             end_lparam = win32api.MAKELONG(end_x, end_y)
             send_fn(hwnd, up_msg, 0, end_lparam)
-        except:
+        except Exception:
             pass
         return False
 
@@ -5522,7 +5518,7 @@ def test_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = 
         from tasks.image_match_probe import test_image_recognition as unified_test
         unified_test(params, target_hwnd, main_window, parameter_panel)
     except Exception as e:
-        logger.error(f"\u540e\u53f0\u6d88\u606f\u6a21\u5f0f\u5b8c\u6574\u8def\u5f84\u62d6\u62fd\u6267\u884c\u5931\u8d25({mode_name}): {e}", exc_info=True)
+        logger.error(f"测试图像识别失败: {e}", exc_info=True)
 
 def test_color_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
     """测试找色识别功能（复用找色执行链路，仅识别不点击）。"""

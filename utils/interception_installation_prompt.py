@@ -5,7 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Mapping, Optional
 
-from utils.input_simulation.mode_utils import requires_interception_driver
+from utils.input_simulation.mode_utils import (
+    parse_foreground_backends,
+    requires_interception_driver,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -25,15 +28,7 @@ INTERCEPTION_DEVICE_RISK_TEXT = (
 def is_interception_required_by_config(config: Optional[Mapping[str, object]]) -> bool:
     values = dict(config or {})
     execution_mode = str(values.get("execution_mode", "") or "").strip().lower()
-    legacy_backend = str(
-        values.get("foreground_driver_backend", "interception") or "interception"
-    ).strip().lower()
-    mouse_backend = str(
-        values.get("foreground_mouse_driver_backend", legacy_backend) or legacy_backend
-    ).strip().lower()
-    keyboard_backend = str(
-        values.get("foreground_keyboard_driver_backend", legacy_backend) or legacy_backend
-    ).strip().lower()
+    mouse_backend, keyboard_backend = parse_foreground_backends(values)
     return requires_interception_driver(
         execution_mode,
         mouse_backend=mouse_backend,

@@ -3,31 +3,6 @@ from typing import Any, Dict
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QMainWindow
 
-from ..global_settings_parts.global_settings_dialog import GlobalSettingsDialog
-from .main_window_support import (
-    CenteredTextDelegate,
-    CustomDropdown,
-    FullBleedListWidget,
-    NoWheelDoubleSpinBox,
-    NoWheelSpinBox,
-    QComboBox,
-    RoundedPopupFrame,
-    _safe_get_win_msg,
-    create_hourglass_icon,
-    create_media_control_icon,
-    format_time_display,
-    get_disabled_text_color,
-    get_error_color,
-    get_info_color,
-    get_secondary_text_color,
-    get_success_color,
-    get_theme_color,
-    is_dark_theme,
-    native_point_to_qt_global,
-    normalize_execution_mode,
-    normalize_execution_mode_setting,
-    parse_execution_mode,
-)
 from .main_window_timer_dialog_mixin import MainWindowTimerDialogMixin
 from .main_window_timer_runtime_mixin import MainWindowTimerRuntimeMixin
 from .main_window_hotkey_mixin import MainWindowHotkeyMixin

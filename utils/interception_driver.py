@@ -670,7 +670,7 @@ class InterceptionDriver:
             point = wintypes.POINT()
             ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
             return point.x, point.y
-        except:
+        except Exception:
             return 0, 0
 
     def _wait_mouse_reach_target(
@@ -1499,7 +1499,7 @@ class InterceptionDriver:
                 original_clipboard = None
                 try:
                     original_clipboard = pyperclip.paste()
-                except:
+                except Exception:
                     pass
 
                 try:
@@ -1515,7 +1515,7 @@ class InterceptionDriver:
                         if original_clipboard:
                             try:
                                 pyperclip.copy(original_clipboard)
-                            except:
+                            except Exception:
                                 pass
 
                         logger.debug(f"使用剪贴板粘贴输入文本: '{text[:50]}'...")
@@ -1527,7 +1527,7 @@ class InterceptionDriver:
                     if original_clipboard:
                         try:
                             pyperclip.copy(original_clipboard)
-                        except:
+                        except Exception:
                             pass
             except ImportError:
                 logger.debug("pyperclip不可用，使用按键模拟")
@@ -1826,7 +1826,7 @@ class InterceptionDriver:
                 else:
                     up_state = INTERCEPTION_MOUSE_MIDDLE_BUTTON_UP
                 self._send_mouse_event(0, 0, 0, up_state, 0)
-            except:
+            except Exception:
                 pass
             return False
 

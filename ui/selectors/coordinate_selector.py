@@ -7,7 +7,7 @@
 
 import logging
 from typing import Optional, Tuple, List
-from PySide6.QtWidgets import QWidget, QPushButton, QVBoxLayout, QMessageBox, QApplication
+from PySide6.QtWidgets import QWidget, QPushButton, QVBoxLayout, QMessageBox
 from PySide6.QtCore import Signal, QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor, QBrush
 
@@ -46,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 try:
     import win32gui
-    import win32api
     PYWIN32_AVAILABLE = True
 except ImportError:
     PYWIN32_AVAILABLE = False
@@ -875,7 +874,7 @@ class CoordinateSelectorWidget(QWidget):
                 self._selection_result_delivered = True
                 self.coordinate_selected.emit(x, y)
                 self.selection_finished.emit()
-            except:
+            except Exception:
                 pass
 
     def _get_bound_window_hwnd(self) -> Optional[int]:
@@ -1469,7 +1468,7 @@ class MultiPointCoordinateSelectorWidget(QWidget):
                 self._selection_result_delivered = True
                 self.coordinates_selected.emit(coordinates, timestamps if timestamps else [])
                 self.selection_finished.emit()
-            except:
+            except Exception:
                 pass
 
     def _cleanup_overlay(self):

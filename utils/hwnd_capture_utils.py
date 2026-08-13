@@ -16,28 +16,31 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import ctypes
+from ctypes import wintypes
+
+import cv2
 import numpy as np
-
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    cv2 = None
-    CV2_AVAILABLE = False
-
-try:
-    import ctypes
-    from ctypes import wintypes
-    import win32gui
-    WIN32_AVAILABLE = True
-except ImportError:
-    ctypes = None
-    wintypes = None
-    win32gui = None
-    WIN32_AVAILABLE = False
-
+import win32gui
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CaptureStats:
+    """截图统计信息（DXGI/GDI/PrintWindow 引擎共用）"""
+    total_captures: int = 0
+    success_captures: int = 0
+    failed_captures: int = 0
+    total_time_ms: float = 0.0
+
+    @property
+    def avg_time_ms(self) -> float:
+        return self.total_time_ms / self.total_captures if self.total_captures > 0 else 0.0
+
+    @property
+    def success_rate(self) -> float:
+        return (self.success_captures / self.total_captures * 100) if self.total_captures > 0 else 0.0
 
 
 @dataclass(frozen=True)
@@ -53,7 +56,7 @@ def resolve_capture_target(hwnd: int) -> CaptureTargetInfo:
     capture_hwnd = target_hwnd
     is_child_window = False
 
-    if not target_hwnd or not WIN32_AVAILABLE:
+    if not target_hwnd:
         return CaptureTargetInfo(target_hwnd=target_hwnd, capture_hwnd=capture_hwnd, is_child_window=False)
 
     try:
@@ -73,7 +76,7 @@ def resolve_capture_target(hwnd: int) -> CaptureTargetInfo:
 
 def get_window_rect_with_dwm(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
     """使用 DWM 获取窗口实际可见边界。"""
-    if not hwnd or not WIN32_AVAILABLE or ctypes is None or wintypes is None:
+    if not hwnd:
         return None
 
     try:
@@ -95,7 +98,7 @@ def get_window_rect_with_dwm(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
 
 def get_screen_rect(hwnd: int, client_area_only: bool) -> Optional[Tuple[int, int, int, int]]:
     """获取目标句柄在屏幕坐标系中的逻辑矩形。"""
-    if not hwnd or not WIN32_AVAILABLE:
+    if not hwnd:
         return None
 
     try:
@@ -181,8 +184,6 @@ def crop_frame_by_hwnd(
     """把 capture_hwnd 的截图，裁成 target_hwnd 对应区域。"""
     if frame is None:
         return None
-    if not WIN32_AVAILABLE:
-        return frame
 
     frame_h, frame_w = frame.shape[:2]
     if frame_h <= 0 or frame_w <= 0:
@@ -244,7 +245,7 @@ def crop_frame_by_hwnd(
         )
         return None
 
-    if (crop_w != target_w or crop_h != target_h) and CV2_AVAILABLE:
+    if crop_w != target_w or crop_h != target_h:
         cropped = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
     return cropped

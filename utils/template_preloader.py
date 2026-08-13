@@ -7,7 +7,6 @@
 
 import logging
 import os
-import sys
 import threading
 import hashlib
 from collections import OrderedDict
@@ -85,8 +84,6 @@ class TemplatePreloader:
 
     def _build_workflow_preload_key(self, workflow_data: dict) -> str:
         cards = workflow_data.get("cards", []) if isinstance(workflow_data, dict) else []
-        if isinstance(cards, dict):
-            cards = list(cards.values())
         if not isinstance(cards, list):
             cards = []
 
@@ -95,7 +92,7 @@ class TemplatePreloader:
         for card in cards:
             if not isinstance(card, dict):
                 continue
-            params = card.get("params", {})
+            params = card.get("parameters", {})
             for image_path in self._extract_paths_from_params(params):
                 normalized = self._normalize_cache_key(image_path)
                 if not normalized:
@@ -136,192 +133,27 @@ class TemplatePreloader:
         if raw.startswith("memory://"):
             return raw
 
-        # 1) 直接命中（绝对/相对）
-        try:
-            if os.path.exists(raw) and os.path.isfile(raw):
-                return raw
-        except Exception:
-            pass
+        if os.path.isfile(raw):
+            return raw
 
-        # 2) 复用统一路径解析器
-        try:
-            from tasks.task_utils import correct_single_image_path
+        from tasks.task_utils import correct_single_image_path
 
-            resolved = correct_single_image_path(raw)
-            if resolved:
-                return str(resolved)
-        except Exception:
-            pass
-
-        # 3) 兜底内置搜索，保证在开发/打包环境都可解析
-        fallback = self._resolve_file_path_builtin(raw)
-        if fallback:
-            return fallback
-
+        resolved = correct_single_image_path(raw)
+        if resolved:
+            return str(resolved)
         return None
-
-    def _resolve_file_path_builtin(self, raw_path: str) -> Optional[str]:
-        """内置路径解析兜底，避免依赖 task_utils 失败导致不可用。"""
-        raw = str(raw_path or "").strip()
-        if not raw:
-            return None
-
-        normalized = os.path.normpath(raw)
-        if os.path.isabs(normalized):
-            try:
-                if os.path.exists(normalized) and os.path.isfile(normalized):
-                    return normalized
-            except Exception:
-                pass
-
-        candidate_subpaths = self._build_candidate_subpaths(normalized)
-        search_dirs = self._build_search_dirs()
-
-        for search_dir in search_dirs:
-            for rel in candidate_subpaths:
-                if not rel:
-                    continue
-                candidate = os.path.normpath(os.path.join(search_dir, rel))
-                try:
-                    if os.path.exists(candidate) and os.path.isfile(candidate):
-                        return candidate
-                except Exception:
-                    continue
-
-            filename = os.path.basename(normalized)
-            if filename:
-                candidate = os.path.normpath(os.path.join(search_dir, filename))
-                try:
-                    if os.path.exists(candidate) and os.path.isfile(candidate):
-                        return candidate
-                except Exception:
-                    continue
-
-        return None
-
-    def _build_candidate_subpaths(self, normalized_path: str) -> List[str]:
-        """构建用于拼接搜索目录的候选相对子路径。"""
-        path_text = str(normalized_path or "").strip()
-        if not path_text:
-            return []
-
-        # 统一拆分，兼容正反斜杠
-        path_parts = [p for p in path_text.replace("\\", "/").split("/") if p]
-        if not path_parts:
-            return []
-
-        results: List[str] = []
-
-        # 路径中包含 images 时，优先取 images 之后的相对子路径
-        images_idx = -1
-        for i, part in enumerate(path_parts):
-            if str(part).lower() == "images":
-                images_idx = i
-                break
-
-        if images_idx >= 0 and images_idx + 1 < len(path_parts):
-            sub_parts = path_parts[images_idx + 1 :]
-            if sub_parts:
-                results.append(os.path.join(*sub_parts))
-
-        # 相对路径保留完整结构（例如 subdir/pic.png）
-        if not os.path.isabs(path_text) and len(path_parts) > 1:
-            results.append(os.path.join(*path_parts))
-        elif os.path.isabs(path_text) and len(path_parts) >= 2:
-            # 绝对路径兜底保留末两级（目录+文件名）
-            results.append(os.path.join(path_parts[-2], path_parts[-1]))
-
-        # 去重并保持顺序
-        deduped: List[str] = []
-        seen = set()
-        for item in results:
-            key = os.path.normcase(os.path.normpath(item))
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(item)
-
-        return deduped
-
-    def _build_search_dirs(self) -> List[str]:
-        """构建开发/打包通用搜索目录列表。"""
-        dirs: List[str] = []
-        seen = set()
-
-        def _append_dir(path: Optional[str]) -> None:
-            if not path:
-                return
-            try:
-                normalized = os.path.normcase(os.path.normpath(os.path.abspath(path)))
-            except Exception:
-                return
-            if normalized in seen:
-                return
-            if os.path.isdir(normalized):
-                seen.add(normalized)
-                dirs.append(normalized)
-
-        # 打包环境优先用户目录与可执行目录
-        if getattr(sys, "frozen", False):
-            try:
-                from utils.app_paths import get_images_dir
-
-                _append_dir(get_images_dir("LCA"))
-            except Exception:
-                pass
-            try:
-                from utils.app_paths import get_legacy_user_data_dir
-
-                _append_dir(os.path.join(get_legacy_user_data_dir("LCA"), "images"))
-            except Exception:
-                pass
-            try:
-                exe_dir = os.path.dirname(os.path.abspath(getattr(sys, "executable", "")))
-                _append_dir(os.path.join(exe_dir, "images"))
-            except Exception:
-                pass
-            try:
-                meipass_dir = getattr(sys, "_MEIPASS", None)
-                if meipass_dir:
-                    _append_dir(os.path.join(str(meipass_dir), "images"))
-            except Exception:
-                pass
-
-        # 开发/运行通用目录
-        try:
-            _append_dir(os.path.join(os.getcwd(), "images"))
-        except Exception:
-            pass
-        try:
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            _append_dir(os.path.join(project_root, "images"))
-        except Exception:
-            pass
-
-        return dirs
 
     def _build_cache_keys(self, image_path: str) -> List[str]:
-        """构建缓存候选键（解析后优先，兼容旧键）。"""
+        """构建缓存键，只使用解析后的现行路径。"""
         raw = str(image_path or "").strip()
         if not raw:
             return []
 
-        keys: List[str] = []
-
         resolved = self._resolve_file_path(raw)
-        if resolved:
-            resolved_key = self._normalize_cache_key(resolved)
-            if resolved_key:
-                keys.append(resolved_key)
-
-        raw_key = self._normalize_cache_key(raw)
-        if raw_key and raw_key not in keys:
-            keys.append(raw_key)
-
-        if raw not in keys:
-            keys.append(raw)
-
-        return keys
+        if not resolved:
+            return []
+        resolved_key = self._normalize_cache_key(resolved)
+        return [resolved_key] if resolved_key else []
 
     @staticmethod
     def _parse_multiline_paths(raw_text: str) -> List[str]:
@@ -371,6 +203,17 @@ class TemplatePreloader:
 
         return results
 
+    @classmethod
+    def _split_image_path_value(cls, raw_text: str) -> List[str]:
+        text = str(raw_text or "").strip()
+        if not text:
+            return []
+        if "\n" in text or "\r" in text:
+            return cls._parse_multiline_paths(text)
+        if ";" in text:
+            return [part.strip() for part in text.split(";") if part.strip()]
+        return [text]
+
     def _extract_paths_from_params(self, params: dict) -> List[str]:
         """从卡片参数中提取所有模板路径字段。"""
         if not isinstance(params, dict):
@@ -405,17 +248,11 @@ class TemplatePreloader:
                 text_value = value.strip()
                 if not text_value:
                     continue
-                if ("\n" in text_value) or ("\r" in text_value):
-                    candidates.extend(self._parse_multiline_paths(text_value))
-                else:
-                    for item in text_value.split("|"):
-                        item = item.strip()
-                        if item:
-                            candidates.append(item)
+                candidates.extend(self._split_image_path_value(text_value))
 
         image_paths_value = params.get("image_paths")
         if isinstance(image_paths_value, str) and image_paths_value.strip():
-            candidates.extend(self._parse_multiline_paths(image_paths_value))
+            candidates.extend(self._split_image_path_value(image_paths_value))
 
         results: List[str] = []
         seen: set = set()
@@ -521,8 +358,6 @@ class TemplatePreloader:
 
         try:
             cards = workflow_data.get("cards", [])
-            if isinstance(cards, dict):
-                cards = list(cards.values())
             if not isinstance(cards, list):
                 cards = []
 
@@ -530,7 +365,7 @@ class TemplatePreloader:
             for card in cards:
                 if not isinstance(card, dict):
                     continue
-                params = card.get("params", {})
+                params = card.get("parameters", {})
                 for image_path in self._extract_paths_from_params(params):
                     cache_keys = self._build_cache_keys(image_path)
                     dedupe_key = cache_keys[0] if cache_keys else image_path

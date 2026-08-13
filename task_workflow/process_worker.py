@@ -5,16 +5,18 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import json
 import logging
 import os
+import select
 import socket
 import sys
 import threading
 from typing import Any, Dict, Optional
 
+from PySide6.QtCore import Qt
+
 from services.ocr_socket_message_utils import recv_message, send_message
-from utils.app_paths import get_config_path, get_logs_dir
+from utils.app_paths import get_logs_dir
 from utils.log_runtime_control import configure_noisy_logger_levels, install_runtime_log_filters
 from utils.worker_entry import bootstrap_current_process_virtual_environment
 
@@ -28,48 +30,25 @@ def _resolve_worker_screenshot_engine(payload: Dict[str, Any]) -> str:
     valid_engines = {"wgc", "printwindow", "gdi", "dxgi"}
 
     requested_engine = str(payload.get("screenshot_engine") or "").strip().lower()
-    if requested_engine in valid_engines:
-        return requested_engine
-
-    try:
-        config_path = get_config_path("LCA")
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as fp:
-                config_data = json.load(fp) or {}
-            requested_engine = str(config_data.get("screenshot_engine") or "").strip().lower()
-            if requested_engine in valid_engines:
-                return requested_engine
-    except Exception as exc:
-        logger.warning("工作流子进程读取截图引擎配置失败: %s", exc)
-
-    return ""
+    if not requested_engine:
+        raise ValueError("工作流子进程载荷缺少 screenshot_engine")
+    if requested_engine not in valid_engines:
+        raise ValueError(f"工作流子进程载荷包含无效 screenshot_engine: {requested_engine}")
+    return requested_engine
 
 
 def _apply_worker_runtime_preferences(payload: Dict[str, Any]) -> None:
     requested_engine = _resolve_worker_screenshot_engine(payload)
-    if not requested_engine:
-        return
+    from utils.screenshot_helper import get_screenshot_engine, set_screenshot_engine
 
-    actual_engine = ""
-    try:
-        from utils.screenshot_helper import get_screenshot_engine, set_screenshot_engine
-
-        set_screenshot_engine(requested_engine)
-        actual_engine = str(get_screenshot_engine() or "").strip().lower()
-        logger.info("工作流子进程截图引擎已应用: requested=%s, actual=%s", requested_engine, actual_engine)
-    except Exception as exc:
-        try:
-            from utils.screenshot_helper import get_screenshot_engine
-
-            actual_engine = str(get_screenshot_engine() or "").strip().lower()
-        except Exception:
-            actual_engine = ""
-        logger.warning(
-            "工作流子进程切换截图引擎失败: requested=%s, actual=%s, error=%s",
-            requested_engine,
-            actual_engine or "unknown",
-            exc,
+    set_screenshot_engine(requested_engine)
+    actual_engine = str(get_screenshot_engine() or "").strip().lower()
+    if actual_engine != requested_engine:
+        raise RuntimeError(
+            "工作流子进程截图引擎不一致: "
+            f"requested={requested_engine}, actual={actual_engine or 'unknown'}"
         )
+    logger.info("工作流子进程截图引擎已应用: requested=%s, actual=%s", requested_engine, actual_engine)
 
 
 def _configure_logging() -> None:
@@ -162,10 +141,16 @@ class _SocketSignalBridge:
         self._send_lock = threading.Lock()
         self._handlers = []
         self._finished_sent = False
+        self._send_failed = threading.Event()
 
     def _send(self, payload: Dict[str, Any]) -> bool:
+        if self._send_failed.is_set():
+            return False
         with self._send_lock:
-            return bool(send_message(self._sock, payload, logger=logger))
+            sent = bool(send_message(self._sock, payload, logger=logger))
+            if not sent:
+                self._send_failed.set()
+            return sent
 
     def send_ready(self) -> bool:
         return self._send({"type": "ready"})
@@ -177,16 +162,27 @@ class _SocketSignalBridge:
 
     def send_execution_finished(self, success: bool, message: str, runtime_variables: Optional[Dict[str, Any]]) -> bool:
         if self._finished_sent:
-            return True
-        self._finished_sent = True
-        self.send_runtime_variables(runtime_variables)
-        return self._send(
+            raise RuntimeError("execution_finished 已发送，拒绝重复发送")
+        if not self.send_runtime_variables(runtime_variables):
+            return False
+        sent = self._send(
             {
                 "type": "signal",
                 "name": "execution_finished",
                 "args": [bool(success), str(message or "")],
             }
         )
+        if sent:
+            self._finished_sent = True
+        return sent
+
+    @property
+    def finished_sent(self) -> bool:
+        return bool(self._finished_sent)
+
+    @property
+    def send_failed(self) -> bool:
+        return self._send_failed.is_set()
 
     def bind_executor(self, executor_obj: Any) -> None:
         for signal_name in self._FORWARDED_SIGNALS:
@@ -196,13 +192,19 @@ class _SocketSignalBridge:
 
             def _make_handler(name: str):
                 def _handler(*args):
-                    self._send({"type": "signal", "name": name, "args": list(args)})
+                    if self._send({"type": "signal", "name": name, "args": list(args)}):
+                        return
+                    logger.error("工作流子进程信号发送失败，停止执行器: %s", name)
+                    try:
+                        executor_obj.request_stop(force=True)
+                    except Exception as exc:
+                        logger.error("通信失败后停止执行器失败: %s", exc)
 
                 return _handler
 
             handler = _make_handler(signal_name)
             try:
-                signal_obj.connect(handler)
+                signal_obj.connect(handler, Qt.ConnectionType.DirectConnection)
                 self._handlers.append((signal_obj, handler))
             except Exception as exc:
                 logger.warning("绑定子进程信号失败: %s -> %s", signal_name, exc)
@@ -212,10 +214,13 @@ class _SocketSignalBridge:
 
             def _on_finished(success: bool, message: str):
                 runtime_variables = getattr(executor_obj, "_final_runtime_variables", None)
-                self.send_execution_finished(success, message, runtime_variables)
-
+                if not self.send_execution_finished(success, message, runtime_variables):
+                    logger.error("工作流子进程最终结果发送失败")
             try:
-                finished_signal.connect(_on_finished)
+                finished_signal.connect(
+                    _on_finished,
+                    Qt.ConnectionType.DirectConnection,
+                )
                 self._handlers.append((finished_signal, _on_finished))
             except Exception as exc:
                 logger.warning("绑定 execution_finished 失败: %s", exc)
@@ -259,15 +264,40 @@ def _create_executor(payload: Dict[str, Any]):
     )
 
 
+def _is_socket_peer_closed(sock: socket.socket) -> bool:
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+    except Exception:
+        return True
+    if not readable:
+        return False
+
+    peek_flag = getattr(socket, "MSG_PEEK", None)
+    if peek_flag is None:
+        return False
+    try:
+        return sock.recv(1, peek_flag) == b""
+    except (BlockingIOError, socket.timeout):
+        return False
+    except OSError:
+        return True
+
+
 def _control_loop(sock: socket.socket, executor_obj: Any, stop_event: threading.Event) -> None:
+    force_stop_required = False
     while not stop_event.is_set():
         try:
             message = recv_message(sock, timeout=0.2, logger=logger)
         except Exception as exc:
             logger.warning("控制消息接收失败: %s", exc)
+            force_stop_required = True
             break
 
         if message is None:
+            if _is_socket_peer_closed(sock):
+                logger.warning("工作流父进程连接已断开，停止子进程执行器")
+                force_stop_required = True
+                break
             continue
 
         command = str(message.get("command") or "").strip().lower()
@@ -288,16 +318,24 @@ def _control_loop(sock: socket.socket, executor_obj: Any, stop_event: threading.
             except Exception as exc:
                 logger.warning("子进程 resume 失败: %s", exc)
         elif command == "ping":
-            try:
-                send_message(sock, {"type": "pong"}, logger=logger)
-            except Exception:
+            if not send_message(sock, {"type": "pong"}, logger=logger):
+                logger.warning("工作流子进程发送 pong 失败")
+                force_stop_required = True
                 break
         elif command == "shutdown":
-            try:
-                executor_obj.request_stop(force=True)
-            except Exception:
-                pass
+            force_stop_required = True
             break
+        else:
+            logger.error("工作流子进程收到未知控制命令: %s", command or "<empty>")
+            force_stop_required = True
+            break
+
+    stop_event.set()
+    if force_stop_required:
+        try:
+            executor_obj.request_stop(force=True)
+        except Exception as exc:
+            logger.error("工作流子进程强制停止执行器失败: %s", exc)
 
 
 def run_workflow_worker_standalone(port: int) -> int:
@@ -334,9 +372,17 @@ def run_workflow_worker_standalone(port: int) -> int:
             logger.error("工作流子进程收到的 payload 非法")
             return 5
 
-        _apply_worker_runtime_preferences(payload)
+        try:
+            _apply_worker_runtime_preferences(payload)
+        except Exception as exc:
+            logger.error("工作流子进程运行参数无效: %s", exc)
+            return 6
 
-        executor_obj = _create_executor(payload)
+        try:
+            executor_obj = _create_executor(payload)
+        except Exception as exc:
+            logger.exception("工作流子进程创建执行器失败: %s", exc)
+            return 7
         bridge.bind_executor(executor_obj)
 
         control_thread = threading.Thread(
@@ -352,12 +398,16 @@ def run_workflow_worker_standalone(port: int) -> int:
         except Exception as exc:
             logger.exception("工作流子进程执行失败: %s", exc)
             runtime_variables = getattr(executor_obj, "_final_runtime_variables", None)
-            bridge.send_execution_finished(False, f"执行错误: {exc}", runtime_variables)
-            return 6
+            if not bridge.send_execution_finished(False, f"执行错误: {exc}", runtime_variables):
+                return 9
+            return 8
 
-        if not bridge._finished_sent:
-            runtime_variables = getattr(executor_obj, "_final_runtime_variables", None)
-            bridge.send_execution_finished(False, "执行器异常结束", runtime_variables)
+        if bridge.send_failed:
+            logger.error("工作流子进程通信发送失败")
+            return 9
+        if not bridge.finished_sent:
+            logger.error("工作流执行器违反完成协议：run() 返回前未发送 execution_finished")
+            return 10
         return 0
     finally:
         global _FAULT_HANDLER_STREAM

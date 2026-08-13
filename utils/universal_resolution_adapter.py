@@ -21,20 +21,7 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-# 导入配置管理器
-try:
-    from .universal_config_manager import get_universal_config
-except ImportError:
-    # 如果配置管理器不可用，使用默认值
-    def get_universal_config():
-        class DefaultConfig:
-            def get_reference_resolution(self):
-                return {'width': 1280, 'height': 720, 'dpi': 96, 'scale_factor': 1.0}
-            def get_cache_timeout(self):
-                return 1.0
-            def is_caching_enabled(self):
-                return True
-        return DefaultConfig()
+from .universal_config_manager import get_universal_config
 
 # 基准分辨率和DPI（从配置文件获取）
 def get_reference_config():
@@ -349,34 +336,12 @@ class UniversalResolutionAdapter:
     
     def _get_window_dpi(self, hwnd: int) -> Tuple[int, float]:
         """获取窗口DPI信息"""
-        try:
-            # 方法1: 使用GetDpiForWindow (Windows 10 1607+)
-            if hasattr(self.user32, 'GetDpiForWindow'):
-                try:
-                    dpi = self.user32.GetDpiForWindow(hwnd)
-                    if dpi > 0:
-                        scale_factor = dpi / REFERENCE_DPI
-                        return dpi, scale_factor
-                except:
-                    pass
-            
-            # 方法2: 使用系统DPI
-            hdc = self.user32.GetDC(0)
-            if hdc:
-                try:
-                    dpi = self.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
-                    if dpi > 0:
-                        scale_factor = dpi / REFERENCE_DPI
-                        return dpi, scale_factor
-                finally:
-                    self.user32.ReleaseDC(0, hdc)
-            
-            # 默认值
-            return REFERENCE_DPI, REFERENCE_SCALE
-            
-        except Exception as e:
-            logger.debug(f"获取DPI失败: {e}")
-            return REFERENCE_DPI, REFERENCE_SCALE
+        if not hasattr(self.user32, 'GetDpiForWindow'):
+            raise RuntimeError("当前系统没有 GetDpiForWindow")
+        dpi = int(self.user32.GetDpiForWindow(hwnd))
+        if dpi <= 0:
+            raise RuntimeError(f"GetDpiForWindow 返回无效 DPI: hwnd={hwnd}, dpi={dpi}")
+        return dpi, dpi / REFERENCE_DPI
     
     def convert_to_reference(self, coord_info: CoordinateInfo, source_hwnd: int) -> CoordinateInfo:
         """将坐标转换为基准坐标系"""
@@ -385,21 +350,15 @@ class UniversalResolutionAdapter:
 
         window_state = self.get_window_state(source_hwnd)
         if not window_state:
-            logger.warning(f"无法获取窗口状态，使用原始坐标: {source_hwnd}")
-            return coord_info
+            raise RuntimeError(f"无法获取窗口状态，无法转换坐标: {source_hwnd}")
 
         # 获取动态参考分辨率
         ref_width, ref_height = self.get_dynamic_reference_resolution(source_hwnd)
 
-        # 【闪退修复】检查窗口尺寸有效性，防止除零错误
         if window_state.width <= 0 or window_state.height <= 0:
-            logger.error(f"无效的窗口尺寸: {window_state.width}x{window_state.height}，无法转换坐标")
-            return coord_info
-
-        # 【闪退修复】检查参考分辨率有效性
+            raise RuntimeError(f"无效的窗口尺寸: {window_state.width}x{window_state.height}")
         if ref_width <= 0 or ref_height <= 0:
-            logger.error(f"无效的参考分辨率: {ref_width}x{ref_height}，无法转换坐标")
-            return coord_info
+            raise RuntimeError(f"无效的参考分辨率: {ref_width}x{ref_height}")
 
         # Scale by client-area size only. GetClientRect already returns logical pixels.
         width_ratio = ref_width / window_state.width
@@ -434,21 +393,15 @@ class UniversalResolutionAdapter:
 
         window_state = self.get_window_state(target_hwnd)
         if not window_state:
-            logger.warning(f"无法获取窗口状态，使用原始坐标: {target_hwnd}")
-            return coord_info
+            raise RuntimeError(f"无法获取窗口状态，无法转换坐标: {target_hwnd}")
 
         # 获取动态参考分辨率
         ref_width, ref_height = self.get_dynamic_reference_resolution(target_hwnd)
 
-        # 【闪退修复】检查参考分辨率有效性，防止除零错误
         if ref_width <= 0 or ref_height <= 0:
-            logger.error(f"无效的参考分辨率: {ref_width}x{ref_height}，无法转换坐标")
-            return coord_info
-
-        # 【闪退修复】检查窗口尺寸有效性
+            raise RuntimeError(f"无效的参考分辨率: {ref_width}x{ref_height}")
         if window_state.width <= 0 or window_state.height <= 0:
-            logger.error(f"无效的窗口尺寸: {window_state.width}x{window_state.height}，无法转换坐标")
-            return coord_info
+            raise RuntimeError(f"无效的窗口尺寸: {window_state.width}x{window_state.height}")
 
         # Scale by client-area size only. GetClientRect already returns logical pixels.
         width_ratio = window_state.width / ref_width
@@ -771,7 +724,7 @@ class UniversalResolutionAdapter:
                             target_height,
                         )
                         if retry_window_width == new_window_width and retry_window_height == new_window_height:
-                            logger.info("[retry] window size is unchanged; stop main resize loop and switch to fallback")
+                            logger.info("[retry] window size is unchanged; stop main resize loop")
                             break
                         new_window_width = retry_window_width
                         new_window_height = retry_window_height
@@ -790,8 +743,7 @@ class UniversalResolutionAdapter:
                     return True
                 else:
                     logger.warning(f"窗口分辨率调整未达到目标: 目标 {target_width}x{target_height}, 实际 {final_state.width}x{final_state.height}")
-                    # 尝试备用方法
-                    return self._adjust_window_fallback(hwnd, target_width, target_height)
+                    return False
 
             return False
 
@@ -834,219 +786,6 @@ class UniversalResolutionAdapter:
 
         except Exception as e:
             logger.debug(f"强制刷新窗口失败: {e}")
-
-    def _adjust_window_fallback(self, hwnd: int, target_width: int, target_height: int) -> bool:
-        """备用窗口调整方法（优化版）
-
-        提供多种备选方案：
-        1. 使用 win32gui（如果可用）
-        2. 使用 MoveWindow API
-        3. 使用 WM_SIZING + WM_SIZE 消息组合
-        4. 强制窗口样式重置
-        """
-        try:
-            logger.info(f"使用备用方法调整窗口: HWND={hwnd}, 目标大小={target_width}x{target_height}")
-
-            current_state = self.get_window_state(hwnd, force_refresh=True)
-            if not current_state:
-                logger.error("无法获取窗口状态")
-                return False
-
-            window_rect = current_state.window_rect
-            border_width = (window_rect[2] - window_rect[0]) - current_state.width
-            border_height = (window_rect[3] - window_rect[1]) - current_state.height
-            new_window_width = self._normalize_window_dimension(target_width + border_width)
-            new_window_height = self._normalize_window_dimension(target_height + border_height)
-
-            # 方法1: 尝试使用 win32gui（更可靠的 Python 绑定）
-            try:
-                import win32gui
-                import win32con
-
-                logger.info("[备用方法1] 尝试使用 win32gui.SetWindowPos")
-
-                # 先尝试移除最大化状态（如果有）
-                placement = win32gui.GetWindowPlacement(hwnd)
-                if placement[1] == win32con.SW_SHOWMAXIMIZED:
-                    logger.info("窗口处于最大化状态，先恢复正常")
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    time.sleep(0.2)
-
-                # 使用 SetWindowPos
-                win32gui.SetWindowPos(
-                    hwnd,
-                    win32con.HWND_TOP,
-                    window_rect[0], window_rect[1],
-                    new_window_width, new_window_height,
-                    win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED
-                )
-
-                time.sleep(0.15)
-                self._force_window_refresh(hwnd)
-                time.sleep(0.1)
-
-                # 验证
-                with self._lock:
-                    if hwnd in self._window_states:
-                        del self._window_states[hwnd]
-
-                updated_state = self.get_window_state(hwnd, force_refresh=True)
-                if updated_state:
-                    width_diff = abs(updated_state.width - target_width)
-                    height_diff = abs(updated_state.height - target_height)
-                    if width_diff <= 10 and height_diff <= 10:
-                        logger.info(f"[备用方法1] win32gui.SetWindowPos 成功: {updated_state.width}x{updated_state.height}")
-                        return True
-                    else:
-                        logger.warning(f"[备用方法1] 差值仍然较大: {width_diff}x{height_diff}")
-
-            except ImportError:
-                logger.debug("win32gui 不可用")
-            except Exception as e:
-                logger.warning(f"[备用方法1] 失败: {e}")
-
-            # 方法2: 使用 MoveWindow API
-            try:
-                logger.info("[备用方法2] 尝试使用 MoveWindow")
-
-                success = self.user32.MoveWindow(
-                    hwnd, window_rect[0], window_rect[1],
-                    new_window_width, new_window_height, True
-                )
-
-                if success:
-                    time.sleep(0.15)
-                    self._force_window_refresh(hwnd)
-                    time.sleep(0.1)
-
-                    with self._lock:
-                        if hwnd in self._window_states:
-                            del self._window_states[hwnd]
-
-                    updated_state = self.get_window_state(hwnd, force_refresh=True)
-                    if updated_state:
-                        width_diff = abs(updated_state.width - target_width)
-                        height_diff = abs(updated_state.height - target_height)
-                        if width_diff <= 10 and height_diff <= 10:
-                            logger.info(f"[备用方法2] MoveWindow 成功: {updated_state.width}x{updated_state.height}")
-                            return True
-                else:
-                    error_code = ctypes.windll.kernel32.GetLastError()
-                    logger.warning(f"[备用方法2] MoveWindow 返回失败 (错误代码: {error_code})")
-
-            except Exception as e:
-                logger.warning(f"[备用方法2] 失败: {e}")
-
-            # 方法3: 使用 WM_SIZING + WM_SIZE 消息组合
-            try:
-                logger.info("[备用方法3] 尝试使用 WM_SIZING + WM_SIZE 消息")
-
-                WM_SIZING = 0x0214
-                WM_SIZE = 0x0005
-                WM_EXITSIZEMOVE = 0x0232
-                SIZE_RESTORED = 0
-                WMSZ_BOTTOMRIGHT = 8
-
-                # 创建 RECT 结构
-                sizing_rect = wintypes.RECT()
-                sizing_rect.left = window_rect[0]
-                sizing_rect.top = window_rect[1]
-                sizing_rect.right = window_rect[0] + new_window_width
-                sizing_rect.bottom = window_rect[1] + new_window_height
-
-                # 发送 WM_SIZING 消息
-                self.user32.SendMessageW(hwnd, WM_SIZING, WMSZ_BOTTOMRIGHT, ctypes.byref(sizing_rect))
-                time.sleep(0.05)
-
-                # 发送 WM_SIZE 消息
-                lparam = wintypes.LPARAM((int(target_height) << 16) | (int(target_width) & 0xFFFF))
-                self.user32.SendMessageW(hwnd, WM_SIZE, SIZE_RESTORED, lparam)
-                time.sleep(0.05)
-
-                # 发送 WM_EXITSIZEMOVE 表示调整结束
-                self.user32.SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0)
-
-                time.sleep(0.15)
-                self._force_window_refresh(hwnd)
-                time.sleep(0.1)
-
-                with self._lock:
-                    if hwnd in self._window_states:
-                        del self._window_states[hwnd]
-
-                updated_state = self.get_window_state(hwnd, force_refresh=True)
-                if updated_state:
-                    width_diff = abs(updated_state.width - target_width)
-                    height_diff = abs(updated_state.height - target_height)
-                    if width_diff <= 10 and height_diff <= 10:
-                        logger.info(f"[备用方法3] 消息组合成功: {updated_state.width}x{updated_state.height}")
-                        return True
-
-            except Exception as e:
-                logger.warning(f"[备用方法3] 失败: {e}")
-
-            # 方法4: 强制修改窗口样式后重新调整
-            try:
-                logger.info("[备用方法4] 尝试修改窗口样式后重新调整")
-
-                GWL_STYLE = -16
-                WS_THICKFRAME = 0x00040000
-                SWP_FRAMECHANGED = 0x0020
-                SWP_NOMOVE = 0x0002
-                SWP_NOZORDER = 0x0004
-                SWP_NOACTIVATE = 0x0010
-
-                # 获取当前样式
-                current_style = self.user32.GetWindowLongW(hwnd, GWL_STYLE)
-
-                # 临时添加可调整大小的边框样式
-                new_style = current_style | WS_THICKFRAME
-                self.user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
-
-                # 通知系统样式已更改
-                self.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-                    SWP_NOMOVE | 0x0001 | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)  # SWP_NOSIZE = 0x0001
-
-                time.sleep(0.1)
-
-                # 现在尝试调整大小
-                success = self.user32.SetWindowPos(
-                    hwnd, 0, window_rect[0], window_rect[1],
-                    new_window_width, new_window_height,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
-                )
-
-                time.sleep(0.15)
-
-                # 恢复原始样式
-                self.user32.SetWindowLongW(hwnd, GWL_STYLE, current_style)
-                self.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-                    SWP_NOMOVE | 0x0001 | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
-
-                self._force_window_refresh(hwnd)
-                time.sleep(0.1)
-
-                with self._lock:
-                    if hwnd in self._window_states:
-                        del self._window_states[hwnd]
-
-                updated_state = self.get_window_state(hwnd, force_refresh=True)
-                if updated_state:
-                    width_diff = abs(updated_state.width - target_width)
-                    height_diff = abs(updated_state.height - target_height)
-                    if width_diff <= 10 and height_diff <= 10:
-                        logger.info(f"[备用方法4] 样式修改后调整成功: {updated_state.width}x{updated_state.height}")
-                        return True
-
-            except Exception as e:
-                logger.warning(f"[备用方法4] 失败: {e}")
-
-            logger.error("所有备用调整方法都失败")
-            return False
-
-        except Exception as e:
-            logger.error(f"备用窗口调整方法发生错误: {e}", exc_info=True)
-            return False
 
     def _adjust_parent_and_child_window(self, parent_hwnd: int, child_hwnd: int,
                                       target_width: int, target_height: int) -> bool:
@@ -1106,26 +845,16 @@ class UniversalResolutionAdapter:
 
             logger.info(f"新的父窗口大小: {new_parent_width}x{new_parent_height}")
 
-            # 调整父窗口大小（使用与单窗口模式相同的方法）
-            try:
-                import win32gui
-                import win32con
+            # 调整父窗口大小
+            import win32gui
+            import win32con
 
-                # 使用win32gui.SetWindowPos，与单窗口模式保持一致
-                success = win32gui.SetWindowPos(
-                    parent_hwnd, win32con.HWND_TOP,
-                    parent_window_rect.left, parent_window_rect.top,
-                    new_parent_width, new_parent_height,
-                    win32con.SWP_NOMOVE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
-                )
-            except ImportError:
-                # 如果win32gui不可用，回退到ctypes方法
-                success = self.user32.SetWindowPos(
-                    parent_hwnd, 0,  # HWND_TOP
-                    parent_window_rect.left, parent_window_rect.top,
-                    new_parent_width, new_parent_height,
-                    0x0004 | 0x0010  # SWP_NOZORDER | SWP_NOACTIVATE
-                )
+            success = win32gui.SetWindowPos(
+                parent_hwnd, win32con.HWND_TOP,
+                parent_window_rect.left, parent_window_rect.top,
+                new_parent_width, new_parent_height,
+                win32con.SWP_NOMOVE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
+            )
 
             if not success:
                 error_code = ctypes.windll.kernel32.GetLastError()

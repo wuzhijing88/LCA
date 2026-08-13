@@ -37,8 +37,7 @@ import logging
 import multiprocessing as mp
 import time
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-import traceback
+from typing import Dict, Optional, Tuple
 import gc
 
 
@@ -125,10 +124,9 @@ class OCRWorkerProcess:
         """初始化OCR引擎（在子进程中执行）"""
         self._init_error_detail = ""
         try:
-            from services.fastdeploy_ocr_service import get_fastdeploy_ocr_service
+            from services.rapidocr_ocr_service import get_rapidocr_service
 
-            # 每个进程创建自己的OCR引擎实例
-            self.ocr_engine = get_fastdeploy_ocr_service()
+            self.ocr_engine = get_rapidocr_service()
 
             if not self.ocr_engine.initialize():
                 self._init_error_detail = _extract_ocr_engine_init_detail(self.ocr_engine) or "未返回具体错误"
@@ -355,7 +353,7 @@ class OCRWorkerProcess:
                         }
                         try:
                             self.response_queue.put(error_response, timeout=1)
-                        except:
+                        except Exception:
                             pass
                         # 清理请求中的图像数据
                         if 'image' in request:
@@ -401,7 +399,7 @@ class OCRWorkerProcess:
                             if isinstance(item, dict):
                                 try:
                                     item.clear()
-                                except:
+                                except Exception:
                                     pass
                         response['results'].clear()
                     response.clear()
@@ -466,6 +464,7 @@ def ocr_worker_main(process_id: str, request_queue: mp.Queue, response_queue: mp
 
 import socket
 from services.ocr_socket_message_utils import (
+    SocketMessageError,
     recv_message as recv_ocr_socket_message,
     send_message as send_ocr_socket_message,
 )
@@ -697,8 +696,8 @@ class OCRWorkerStandalone:
         """初始化OCR引擎"""
         self._init_error_detail = ""
         try:
-            from services.fastdeploy_ocr_service import get_fastdeploy_ocr_service
-            self.ocr_engine = get_fastdeploy_ocr_service()
+            from services.rapidocr_ocr_service import get_rapidocr_service
+            self.ocr_engine = get_rapidocr_service()
 
             if not self.ocr_engine.initialize():
                 self._init_error_detail = _extract_ocr_engine_init_detail(self.ocr_engine) or "未返回具体错误"
@@ -842,7 +841,7 @@ class OCRWorkerStandalone:
             if shm is not None:
                 try:
                     shm.close()
-                except:
+                except Exception:
                     pass
 
     def _error_response(self, request_id, window_hwnd, window_title, start_time, error_msg):
@@ -1006,6 +1005,10 @@ class OCRWorkerStandalone:
                         except Exception:
                             pass
 
+                except SocketMessageError as e:
+                    logger.error(f"[{self.process_id}] socket协议错误，终止Worker: {e.status}")
+                    self.is_running = False
+                    break
                 except Exception as e:
                     logger.error(f"[{self.process_id}] 主循环异常: {e}")
                     # 清理

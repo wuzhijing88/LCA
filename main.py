@@ -87,21 +87,30 @@ def _ensure_standalone_subprocess_file_logging(log_level: int = logging.INFO) ->
 
 
 def _build_ocr_subprocess_args(argv) -> tuple[str, int]:
-    return (
-        get_cli_argument_value(argv, "--process-id", "unknown"),
-        get_cli_int_argument_value(argv, "--port", 0),
-    )
+    process_id = get_cli_argument_value(argv, "--process-id", "").strip()
+    port = get_cli_int_argument_value(argv, "--port", 0)
+    if not process_id:
+        raise ValueError("--process-id is required for OCR worker")
+    if port <= 0:
+        raise ValueError("--port must be greater than zero for OCR worker")
+    return process_id, port
 
 
 def _build_match_subprocess_args(argv) -> tuple[str, int]:
-    return (
-        get_cli_argument_value(argv, "--process-id", "unknown"),
-        get_cli_int_argument_value(argv, "--port", 0),
-    )
+    process_id = get_cli_argument_value(argv, "--process-id", "").strip()
+    port = get_cli_int_argument_value(argv, "--port", 0)
+    if not process_id:
+        raise ValueError("--process-id is required for match worker")
+    if port <= 0:
+        raise ValueError("--port must be greater than zero for match worker")
+    return process_id, port
 
 
 def _build_workflow_subprocess_args(argv) -> tuple[int]:
-    return (get_cli_int_argument_value(argv, "--port", 0),)
+    port = get_cli_int_argument_value(argv, "--port", 0)
+    if port <= 0:
+        raise ValueError("--port must be greater than zero for workflow worker")
+    return (port,)
 
 
 def _log_ocr_subprocess_start(logger, _argv, args) -> None:
@@ -165,8 +174,9 @@ _IS_STANDALONE_SUBPROCESS = is_standalone_subprocess_active(
     _STANDALONE_SUBPROCESS_SPECS,
 )
 
-if run_standalone_subprocess(sys.argv, _STANDALONE_SUBPROCESS_SPECS):
-    sys.exit(0)
+_standalone_exit_code = run_standalone_subprocess(sys.argv, _STANDALONE_SUBPROCESS_SPECS)
+if _standalone_exit_code is not None:
+    sys.exit(_standalone_exit_code)
 
 import json   # 用于JSON数据处理
 
@@ -238,13 +248,12 @@ if _IS_STANDALONE_SUBPROCESS or _mp.current_process().name != 'MainProcess':
     QIcon = _FakeQtClass
     QColor = _FakeQtClass
 
-    logging.info(f"[子进程隔离] 已创建 Qt 类占位符，避免加载 PySide6")
+    logging.info("[子进程隔离] 已创建 Qt 类占位符，避免加载 PySide6")
 else:
     _IS_SUBPROCESS = False
 # ============================================================
 
 logger = logging.getLogger(__name__)
-from app_core.mouse_runtime import mouse_move_fixer
 
 # 工具 修复：设置虚拟环境路径，确保使用 venv 中的依赖
 def setup_virtual_environment():
@@ -264,7 +273,6 @@ import glob     # <-- Import glob
 import time   # <-- Import time for sleep in listener
 import threading # <-- Import threading for async OCR initialization
 import subprocess  # <-- Used for safe Windows command-line quoting
-from typing import Optional, Dict, Tuple, Any, List
 from traceback import format_exception # <-- ADDED: For global_exception_handler
 
 # --- REMOVED: Unused import publish dialog ---
@@ -277,7 +285,6 @@ if current_dir not in sys.path:
 
 # --- ADDED: Import keyboard library ---
 try:
-    import keyboard
     KEYBOARD_LIB_AVAILABLE = True
     logging.info("keyboard 库已成功导入")
 except ImportError:
@@ -563,7 +570,7 @@ if os.name == "nt" and not _IS_SUBPROCESS and _is_existing_instance_running():
 
 if os.name == 'nt' and not is_admin():
     reason_str = "程序需要管理员权限才能确保所有功能正常运行（全局快捷键、窗口操作等）"
-    logging.warning(f"检测到程序未以管理员权限运行，正在尝试自动提权...")
+    logging.warning("检测到程序未以管理员权限运行，正在尝试自动提权...")
     logging.info(f"  提权原因: {reason_str}")
 
     # 检测系统信息
@@ -571,7 +578,7 @@ if os.name == 'nt' and not is_admin():
         import platform
         win_version = platform.win32_ver()
         logging.info(f"  Windows版本: {win_version[0]} {win_version[1]} Build {win_version[2]}")
-    except:
+    except Exception:
         logging.info("  无法检测Windows版本信息")
 
     # 添加安全检查，确保在任何情况下都能正确退出
@@ -790,20 +797,20 @@ def cleanup_all_resources():
         try:
             from services.multiprocess_ocr_pool import get_existing_multiprocess_ocr_pool
             pool = get_existing_multiprocess_ocr_pool()
-            if hasattr(pool, 'shutdown'):
+            if pool is not None:
                 pool.shutdown()
                 logging.info("OCR服务池已清理")
         except Exception as e:
             logging.debug(f"清理OCR服务池时出错: {e}")
 
-        # 统一兜底：无论池是否初始化、插件是否启用，都执行孤儿 worker 清理。
+        # 清理当前主进程仍登记的所有 worker。
         try:
-            from services.multiprocess_ocr_pool import cleanup_orphan_ocr_subprocesses
-            cleaned_count = int(cleanup_orphan_ocr_subprocesses(main_pid=os.getpid()) or 0)
+            from services.worker_process_cleanup import cleanup_all_registered_worker_processes
+            cleaned_count = int(cleanup_all_registered_worker_processes() or 0)
             if cleaned_count > 0:
-                logging.info(f"OCR孤儿子进程已清理: {cleaned_count}")
+                logging.info(f"登记子进程已清理: {cleaned_count}")
         except Exception as e:
-            logging.debug(f"OCR孤儿子进程兜底清理失败: {e}")
+            logging.error(f"登记子进程清理失败: {e}")
 
         # 主进程不加载OCR引擎模块，OCR资源只由OCR子进程管理
 
@@ -935,7 +942,7 @@ def check_resolution_and_needs_admin(config_data):
         return True # Failed to get client rect, assume need admin
 
 # --- Configuration Loading ---
-from app_core.config_store import CONFIG_FILE, load_config, save_config
+from app_core.config_store import load_config, save_config
 
 def find_enhanced_window_handle(window_title):
     """增强的窗口查找函数"""
@@ -1020,38 +1027,20 @@ class TaskStateManager(QObject):
         if target_idle < 0:
             target_idle = 0.0
 
-        try:
-            from services.multiprocess_ocr_pool import get_existing_multiprocess_ocr_pool
-            pool = get_existing_multiprocess_ocr_pool()
-            if pool is None:
-                return 0.0
-
-            # OCR池已关闭时视为空闲，避免无意义等待
-            if bool(getattr(pool, "_is_shutdown", False)) or (hasattr(pool, "_running") and not bool(getattr(pool, "_running"))):
-                return 0.0
-
-            if hasattr(pool, "get_hot_reset_remaining_idle_sec"):
-                remaining_idle = float(pool.get_hot_reset_remaining_idle_sec(target_idle))
-            else:
-                return 0.0
-
-            if remaining_idle < 0:
-                remaining_idle = 0.0
-
-            # 无OCR进程时视为空闲，避免因池状态差异导致清理线程长时间挂起
-            if remaining_idle >= target_idle and hasattr(pool, "get_stats"):
-                try:
-                    stats = pool.get_stats() or {}
-                    total_processes = int(stats.get("total_processes", 0))
-                    if total_processes <= 0:
-                        return 0.0
-                except Exception:
-                    pass
-
-            return remaining_idle
-        except Exception as e:
-            logging.warning(f"[OCR清理判定] 查询OCR空闲状态失败，按可清理处理: {e}")
+        from services.multiprocess_ocr_pool import get_existing_multiprocess_ocr_pool
+        pool = get_existing_multiprocess_ocr_pool()
+        if pool is None or not pool.is_running:
             return 0.0
+
+        remaining_idle = max(
+            0.0,
+            float(pool.get_hot_reset_remaining_idle_sec(target_idle)),
+        )
+        if remaining_idle >= target_idle:
+            stats = pool.get_stats()
+            if int(stats["total_processes"]) <= 0:
+                return 0.0
+        return remaining_idle
 
     def _prune_background_threads(self):
         with self._background_threads_lock:
@@ -1237,14 +1226,6 @@ class TaskStateManager(QObject):
             self._ocr_hot_reset_timer = self._stop_and_delete_timer(self._ocr_hot_reset_timer)
             logging.debug("[OCR热重置] 已清理之前的3秒热重置定时器")
 
-        # 清理 hover 诊断/追踪缓存，避免停止任务后继续占用内存
-        try:
-            from ui.workflow_parts.task_card import clear_hover_diagnostics_cache
-            clear_hover_diagnostics_cache()
-            logging.debug("[诊断清理] 已清理 hover 诊断/追踪缓存")
-        except Exception as e:
-            logging.debug(f"[诊断清理] 清理 hover 诊断/追踪缓存失败: {e}")
-
         # 清理Qt像素图全局缓存，释放大量卡片渲染缓存占用
         try:
             from PySide6.QtGui import QPixmapCache
@@ -1279,12 +1260,11 @@ class TaskStateManager(QObject):
                 if pool is None:
                     logging.debug("[OCR热重置] OCR池未初始化，跳过热重置")
                     return
-                if hasattr(pool, 'hot_reset_all_idle_workers'):
-                    reset_ok = bool(pool.hot_reset_all_idle_workers())
-                    if reset_ok:
-                        logging.debug("[OCR热重置] 已完成空闲子进程热重置")
-                    else:
-                        logging.debug("[OCR热重置] 当前无空闲子进程可热重置或重置未执行")
+                reset_ok = bool(pool.hot_reset_all_idle_workers())
+                if reset_ok:
+                    logging.debug("[OCR热重置] 已完成空闲子进程热重置")
+                else:
+                    logging.debug("[OCR热重置] 当前无空闲子进程可热重置或重置未执行")
             except Exception as e:
                 logging.warning(f"[OCR热重置] 停止任务后热重置失败: {e}")
 
@@ -1299,7 +1279,7 @@ class TaskStateManager(QObject):
                         self._ocr_hot_reset_timer.stop()
                     try:
                         self._ocr_hot_reset_timer.timeout.disconnect()
-                    except:
+                    except Exception:
                         pass
                     self._ocr_hot_reset_timer.deleteLater()
                 except Exception:
@@ -1330,7 +1310,7 @@ class TaskStateManager(QObject):
                 next_delay_sec = max(idle_recheck_min_sec, remaining_idle_sec)
                 schedule_hot_reset_timer(next_delay_sec)
                 logging.debug(
-                    f"[OCR热重置] 检测到近期仍有OCR活动，"
+                    "[OCR热重置] 检测到近期仍有OCR活动，"
                     f"将在空闲倒计时后重试（剩余约 {remaining_idle_sec:.2f}s）"
                 )
                 return
@@ -1357,7 +1337,7 @@ class TaskStateManager(QObject):
                         self._ocr_cleanup_timer.stop()
                     try:
                         self._ocr_cleanup_timer.timeout.disconnect()
-                    except:
+                    except Exception:
                         pass
                     self._ocr_cleanup_timer.deleteLater()
                 except Exception:
@@ -1392,7 +1372,7 @@ class TaskStateManager(QObject):
                         return
 
                     from services.multiprocess_ocr_pool import (
-                        cleanup_orphan_ocr_subprocesses,
+                        cleanup_registered_ocr_subprocesses,
                         get_existing_multiprocess_ocr_pool,
                     )
                     logging.debug("[后台清理] 开始强制清理所有OCR子进程...")
@@ -1400,15 +1380,15 @@ class TaskStateManager(QObject):
                     if pool is not None:
                         stats = pool.get_stats()
                         logging.debug(f"[后台清理] 当前OCR进程数: {stats.get('total_processes', 0)}")
-                        pool.cleanup_all_processes_force()
+                        pool.cleanup_all_processes()
                         stats = pool.get_stats()
                         logging.debug(f"[后台清理] 清理后OCR进程数: {stats.get('total_processes', 0)}")
 
-                    cleaned_count = int(cleanup_orphan_ocr_subprocesses(main_pid=os.getpid()) or 0)
+                    cleaned_count = int(cleanup_registered_ocr_subprocesses() or 0)
                     if cleaned_count > 0:
-                        logging.info(f"[后台清理] OCR孤儿子进程已清理: {cleaned_count}")
+                        logging.info(f"[后台清理] OCR登记子进程已清理: {cleaned_count}")
                     else:
-                        logging.debug("[后台清理] 未发现需要清理的OCR孤儿子进程")
+                        logging.debug("[后台清理] 未发现需要清理的OCR登记子进程")
                 except Exception as e:
                     logging.error(f"[后台清理] OCR进程清理失败: {e}")
                     import traceback
@@ -1447,7 +1427,7 @@ class TaskStateManager(QObject):
                     process = psutil.Process()
                     memory_before = process.memory_info().rss / 1024 / 1024
                     logging.debug(f"[后台清理] 清理前内存占用: {memory_before:.1f} MB")
-                except:
+                except Exception:
                     pass
 
                 if not is_cleanup_context_valid():
@@ -1917,7 +1897,7 @@ def _emergency_cleanup():
             from PySide6.QtWidgets import QApplication
             if QApplication.instance():
                 QApplication.processEvents()
-        except:
+        except Exception:
             pass
 
         logging.info("紧急清理完成")
@@ -1962,8 +1942,8 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
 
     tooltip_manager = install_global_ui_helpers(app)
 
-    configure_application_icon(app, sys, __file__)
-    configure_application_presentation(app, tooltip_manager, Qt)
+    configure_application_icon(app)
+    configure_application_presentation(app, tooltip_manager)
 
 
     # --- ADDED: Initialize State Management System ---
@@ -1974,11 +1954,8 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
     app.task_state_manager = task_state_manager
     logging.info("任务状态管理器已设置为全局可访问")
 
-    # --- MODIFIED: Disable Simple Hotkey Listener (Now handled by MainWindow) ---
     # SimpleHotkeyListener 已被 MainWindow 的统一快捷键系统替代
     # MainWindow._update_hotkeys() 现在负责所有快捷键的注册和管理
-    # 这样可以支持动态修改快捷键并立即生效
-    simple_hotkey_listener = None
     system_tray = None
 
     # 检查管理员权限
@@ -2192,7 +2169,10 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
             """检查罗技版本约束和 Interception 驱动状态。"""
             try:
                 from PySide6.QtCore import QTimer
-                from utils.input_simulation.mode_utils import requires_interception_driver
+                from utils.input_simulation.mode_utils import (
+                    parse_foreground_backends,
+                    requires_interception_driver,
+                )
                 from utils.interception_installation_prompt import (
                     request_interception_installation,
                 )
@@ -2203,9 +2183,7 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
 
                 config = getattr(main_window, "config", {}) or {}
                 execution_mode = str(config.get("execution_mode", "") or "").strip().lower()
-                legacy_backend = str(config.get("foreground_driver_backend", "interception") or "interception").strip().lower()
-                mouse_backend = str(config.get("foreground_mouse_driver_backend", legacy_backend) or legacy_backend).strip().lower()
-                keyboard_backend = str(config.get("foreground_keyboard_driver_backend", legacy_backend) or legacy_backend).strip().lower()
+                mouse_backend, keyboard_backend = parse_foreground_backends(config)
 
                 if is_logitech_ibinputsimulator_configured(config):
                     logging.info("开始检查 Logitech 输入运行时...")
@@ -2229,8 +2207,9 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
                                 msg_box.setWindowTitle("罗技输入驱动不可用")
                                 msg_box.setText(version_result.user_message())
                                 msg_box.setInformativeText(
-                                    "请按提示修复驱动后重启电脑和 LCA。\n"
-                                    "驱动状态符合要求前，罗技前台输入不会启动。"
+                                    "请安装指定版本后重启电脑和 LCA。\n"
+                                    "指定版本：Logitech G HUB 2026.4，"
+                                    "或 Logitech Gaming Software 9.02.65（二选一）。"
                                 )
                                 msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
                                 msg_box.exec()
@@ -2316,20 +2295,19 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
         # 显示错误对话框
         try:
             show_critical_box(None, "启动错误", f"程序启动失败:\n{main_window_error}")
-        except:
+        except Exception:
             pass
         sys.exit(1)
 
     # 【主程序零OCR】不在主程序中初始化OCR服务
     # OCR服务将由多进程OCR池按需创建子进程来处理
-    # 这样可以避免主程序加载FastDeploy等OCR库，降低内存占用
+    # 这样可以避免主程序加载 RapidOCR 和 ONNX Runtime，降低内存占用
     logging.info("启动 主程序不加载OCR，OCR服务将按需创建子进程处理")
 
 
     connect_main_window_runtime_bindings(
         task_state_manager=task_state_manager,
         main_window=main_window,
-        simple_hotkey_listener=simple_hotkey_listener,
         system_tray=system_tray,
         queued_connection=Qt.QueuedConnection,
     )

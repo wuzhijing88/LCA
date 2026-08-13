@@ -15,18 +15,14 @@ from ctypes import wintypes
 import threading
 import time
 import logging
-from typing import List, Dict, Callable, Optional, Deque
+from typing import List, Dict, Deque
 
 from utils.replay_engine import ReplayEngine
 
 logger = logging.getLogger(__name__)
 
-try:
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-except Exception:
-    user32 = None
-    kernel32 = None
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 # ==================== Windows API 常量 ====================
@@ -303,7 +299,7 @@ class RawInputRecorder:
             if self.hwnd:
                 try:
                     user32.DestroyWindow(self.hwnd)
-                except:
+                except Exception:
                     pass
                 self.hwnd = None
 

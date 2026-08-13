@@ -505,9 +505,11 @@ class VersionBackupCenter(tk.Tk):
             message = func()
             self.after(0, lambda: self.operation_done(message, refresh_after))
         except GitError as exc:
-            self.after(0, lambda: self.operation_failed(exc.output or str(exc), refresh_after))
+            error_message = exc.output or str(exc)
+            self.after(0, lambda: self.operation_failed(error_message, refresh_after))
         except Exception as exc:  # noqa: BLE001 - GUI boundary
-            self.after(0, lambda: self.operation_failed(str(exc), refresh_after))
+            error_message = str(exc)
+            self.after(0, lambda: self.operation_failed(error_message, refresh_after))
 
     def operation_done(self, message: str, refresh_after: bool) -> None:
         self.footer_var.set(message)

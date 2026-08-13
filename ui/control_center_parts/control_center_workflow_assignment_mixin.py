@@ -28,6 +28,8 @@ class ControlCenterWorkflowAssignmentMixin:
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     workflow_data = json.load(f)
+                if isinstance(workflow_data, dict):
+                    workflow_data.pop("variables", None)
                 workflow_entries.append({
                     'file_path': file_path,
                     'data': copy.deepcopy(workflow_data),

@@ -198,9 +198,9 @@ def build_onnxruntime_providers(available_providers):
     """Build the shared ONNX Runtime provider chain used by YOLO and map tracking.
 
     The app should not force a CPU/GPU mode here. Prefer DirectML when the runtime
-    actually exposes it, then reuse the YOLO-style stable CPU fallback. CUDA and
-    TensorRT may be listed by onnxruntime-gpu even when the matching native DLLs
-    are not usable; initializing them can terminate the worker process before
+    actually exposes it, then include CPUExecutionProvider in the same session.
+    CUDA and TensorRT may be listed by onnxruntime-gpu even when the matching native
+    DLLs are not usable; initializing them can terminate the worker process before
     Python can catch an exception, so they are intentionally ignored.
     """
     normalized_providers = tuple(str(provider) for provider in (available_providers or ()) if provider)
@@ -219,7 +219,7 @@ def build_onnxruntime_providers(available_providers):
 
     if not providers:
         raise RuntimeError(
-            f"No stable ONNX Runtime execution providers are available; "
+            "No stable ONNX Runtime execution providers are available; "
             f"available providers: {list(normalized_providers)}"
         )
 

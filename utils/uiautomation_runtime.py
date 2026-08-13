@@ -15,6 +15,8 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+from utils.app_paths import get_app_root
+
 logger = logging.getLogger(__name__)
 
 _UIAUTOMATION_RUNTIME_PREPARED = False
@@ -22,28 +24,7 @@ _DLL_DIRECTORY_HANDLES = []
 
 
 def _iter_runtime_roots():
-    roots = []
-
-    if getattr(sys, "frozen", False):
-        exe_path = os.path.abspath(sys.executable)
-        try:
-            exe_path = os.path.realpath(exe_path)
-        except Exception:
-            pass
-        roots.append(Path(exe_path).resolve().parent)
-
-    try:
-        roots.append(Path(__file__).resolve().parents[1])
-    except Exception:
-        pass
-
-    visited = set()
-    for root in roots:
-        normalized = os.path.normcase(os.path.normpath(str(root)))
-        if normalized in visited:
-            continue
-        visited.add(normalized)
-        yield root
+    yield Path(get_app_root())
 
 
 def _resolve_packaged_comtypes_gen_dir() -> Path | None:

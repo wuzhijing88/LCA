@@ -1,5 +1,7 @@
 from .workflow_view_common import *
 
+operation_logger = logging.getLogger("workflow.operations")
+
 
 class WorkflowViewRenderMixin:
 
@@ -267,173 +269,29 @@ class WorkflowViewRenderMixin:
         painter.restore()
 
     def _is_workflow_running(self) -> bool:
-        """检查工作流是否正在运行（基于运行按钮文本状态）。"""
-        try:
-            from PySide6.QtWidgets import QApplication
-            app = QApplication.instance()
+        """从主窗口任务状态管理器读取工作流运行状态。"""
+        main_window = self.main_window
+        if main_window is None:
+            raise RuntimeError("工作流视图未绑定主窗口")
 
-            # 注释已清理（原注释编码损坏）
-            # 如果按钮显示"停止"或"停止多窗口执行"，说明工作流正在运行
-            main_window = self.main_window
-            if not main_window and app:
-                # 查找主窗口
-                for widget in app.allWidgets():
-                    if hasattr(widget, 'run_action'):
-                        main_window = widget
-                        self.main_window = main_window
-                        break
+        state_manager = getattr(main_window, "task_state_manager", None)
+        if state_manager is None:
+            raise RuntimeError("主窗口未配置任务状态管理器")
 
-            if main_window and hasattr(main_window, 'run_action'):
-                button_text = main_window.run_action.text()
-                # 如果按钮显示"停止"相关文本，说明正在运行
-                if "停止" in button_text:
-                    return True
-                # 如果按钮显示"运行"相关文本，说明已停止
-                return False
-
-            # 方法2: 备用方案 - 检查task_state_manager
-            if app and hasattr(app, 'task_state_manager') and app.task_state_manager:
-                state = app.task_state_manager.get_current_state()
-                return state in ["starting", "running"]
-
-        except Exception as e:
-            logger.error(f"检查任务运行状态时发生错误: {e}")
-
-        # 如果无法确定，默认允许操作（返回False）
-        return False
+        state = state_manager.get_current_state()
+        if state not in {"starting", "running", "stopping", "stopped"}:
+            raise RuntimeError(f"未知的任务运行状态: {state}")
+        return state != "stopped"
 
     def _block_edit_if_running(self, operation_name: str) -> bool:
-        """如果工作流正在运行，阻止编辑操作并显示提示 - 增强版本（带防重入保护）
-
-        Args:
-            operation_name: 操作名称，用于错误提示
-
-        Returns:
-            bool: True如果操作被阻止，False如果可以继续
-        """
-        # 防重入检查：如果正在显示对话框，立即返回True阻止操作
-        if self._is_showing_block_dialog:
-            logger.debug(f"检测到重入调用，阻止{operation_name}操作（防止循环弹窗）")
-            return True
-
-        try:
-            # 注释已清理（原注释编码损坏）
-            if self._is_workflow_running():
-                logger.warning(f"尝试在任务运行期间执行{operation_name}操作")
-
-                # 注释已清理（原注释编码损坏）
-                if hasattr(self, 'main_window') and self.main_window:
-                    if hasattr(self.main_window, 'step_detail_label'):
-                        self.main_window.step_detail_label.setText(f"【警告】工作流正在执行中，无法进行{operation_name}操作")
-                        self.main_window.step_detail_label.setStyleSheet("""
-                            #stepDetailLabel {
-                                background-color: rgba(180, 180, 180, 180);
-                                color: #FF0000;
-                                font-weight: bold;
-                                border-radius: 5px;
-                                padding: 8px;
-                            }
-                        """)
-                        # 3秒后自动恢复
-                        from PySide6.QtCore import QTimer
-                        QTimer.singleShot(3000, lambda: self.main_window.step_detail_label.setText("任务执行中..."))
-
-                return True
-
-            # 注释已清理（原注释编码损坏）
-            if hasattr(self, 'main_window') and self.main_window:
-                if hasattr(self.main_window, 'task_state_manager'):
-                    current_state = self.main_window.task_state_manager.get_current_state()
-                    if current_state in ["starting", "running", "stopping"]:
-                        logger.warning(f"任务状态为 {current_state}，阻止 {operation_name} 操作")
-
-                        # 在底部状态栏显示警告
-                        if hasattr(self.main_window, 'step_detail_label'):
-                            self.main_window.step_detail_label.setText(f"【警告】任务{current_state}中，无法{operation_name}")
-                            self.main_window.step_detail_label.setStyleSheet("""
-                                #stepDetailLabel {
-                                    background-color: rgba(180, 180, 180, 180);
-                                    color: #FF0000;
-                                    font-weight: bold;
-                                    border-radius: 5px;
-                                    padding: 8px;
-                                }
-                            """)
-                            from PySide6.QtCore import QTimer
-                            QTimer.singleShot(3000, lambda: self.main_window.step_detail_label.setText("任务执行中..."))
-
-                        return True
-
-                    # 注释已清理（原注释编码损坏）
-                    if self.main_window.task_state_manager.is_state_changing():
-                        logger.warning(f"任务状态正在改变，阻止 {operation_name} 操作")
-
-                        # 在底部状态栏显示警告
-                        if hasattr(self.main_window, 'step_detail_label'):
-                            self.main_window.step_detail_label.setText(f"任务状态正在改变，无法{operation_name}")
-                            self.main_window.step_detail_label.setStyleSheet("""
-                                #stepDetailLabel {
-                                    background-color: rgba(180, 180, 180, 180);
-                                    color: #FF0000;
-                                    font-weight: bold;
-                                    border-radius: 5px;
-                                    padding: 8px;
-                                }
-                            """)
-                            from PySide6.QtCore import QTimer
-                            QTimer.singleShot(3000, lambda: self.main_window.step_detail_label.setText("任务执行中..."))
-
-                        return True
-
-            # 注释已清理（原注释编码损坏）
-            executing_cards = []
-            for card_id, card in self.cards.items():
-                if hasattr(card, 'execution_state') and card.execution_state in ['running', 'executing']:
-                    executing_cards.append(card_id)
-                    # 输出详细信息用于调试
-                    logger.warning(f"卡片 {card_id} 状态异常：execution_state={card.execution_state}")
-
-            if executing_cards:
-                # 注释已清理（原注释编码损坏）
-                is_really_running = False
-                if hasattr(self, 'executor') and self.executor:
-                    is_really_running = self.executor.isRunning()
-
-                # 如果执行器没有在运行，说明卡片状态是脏数据，强制重置
-                if not is_really_running:
-                    logger.warning(f"检测到卡片状态异常（执行器未运行但卡片状态为执行中），强制重置卡片状态: {executing_cards}")
-                    for card_id in executing_cards:
-                        card = self.cards.get(card_id)
-                        if card and hasattr(card, 'set_execution_state'):
-                            try:
-                                card.set_execution_state('idle')
-                                logger.info(f"已强制重置卡片 {card_id} 状态为 idle")
-                            except Exception as e:
-                                logger.error(f"强制重置卡片 {card_id} 状态失败: {e}")
-                    # 重置后不再阻止操作
-                    return False
-
-                # 注释已清理（原注释编码损坏）
-                logger.warning(f"发现执行中的卡片 {executing_cards}，阻止 {operation_name} 操作")
-
-                # 设置防重入标志
-                self._is_showing_block_dialog = True
-                try:
-                    from PySide6.QtWidgets import QMessageBox
-                    QMessageBox.warning(self, "操作被阻止",
-                                      f"发现正在执行的卡片，请等待完成后再进行{operation_name}操作")
-                finally:
-                    # 确保对话框关闭后重置标志
-                    self._is_showing_block_dialog = False
-                return True
-
+        """工作流非停止状态时拒绝编辑操作。"""
+        if not isinstance(operation_name, str) or not operation_name.strip():
+            raise TypeError("编辑操作名称必须是非空字符串")
+        if not self._is_workflow_running():
             return False
 
-        except Exception as e:
-            logger.error(f"检查运行状态时发生错误: {e}")
-            # 出错时采用保守策略，阻止操作（但不弹窗，避免循环）
-            logger.warning(f"由于检查失败，静默阻止{operation_name}操作（防止循环弹窗）")
-            return True
+        operation_logger.warning("[编辑拦截] 工作流运行中，已拒绝：%s", operation_name)
+        return True
 
     def _refresh_thread_start_custom_names(self):
         """按当前起点数量统一命名：线程起点/2/3..."""
@@ -502,7 +360,6 @@ class WorkflowViewRenderMixin:
         else:
             # 注释已清理（原注释编码损坏）
             self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio) # Fit to initial rect or default
-            pass
 
     def _deferred_center_view(self, center_point: QPointF):
         """Deferred function to center the view."""
@@ -518,10 +375,10 @@ class WorkflowViewRenderMixin:
 
         try:
             # --- ADDED: Force scene update before centering ---
-            debug_print(f"  [LOAD_DEBUG] Calling self.scene.update() before centerOn.")
+            debug_print("  [LOAD_DEBUG] Calling self.scene.update() before centerOn.")
             self.scene.update()
             QApplication.processEvents() # Also process events after update, before centerOn
-            debug_print(f"  [LOAD_DEBUG] Finished scene update and processEvents.")
+            debug_print("  [LOAD_DEBUG] Finished scene update and processEvents.")
             # --- END ADDED ---
 
             self.centerOn(center_point)
@@ -535,9 +392,9 @@ class WorkflowViewRenderMixin:
             # --- END Log AFTER ---
 
             # --- Verify actual center point AFTER deferred centerOn AND processEvents --- 
-            debug_print(f"  [LOAD_DEBUG] Calling processEvents...")
+            debug_print("  [LOAD_DEBUG] Calling processEvents...")
             QApplication.processEvents() # Try processing pending events again
-            debug_print(f"  [LOAD_DEBUG] Finished processEvents.")
+            debug_print("  [LOAD_DEBUG] Finished processEvents.")
             current_viewport_center_view = self.viewport().rect().center()
             actual_scene_center = self.mapToScene(current_viewport_center_view)
             debug_print(f"  [LOAD_DEBUG] VERIFY (Deferred - AFTER processEvents): Actual scene center: {actual_scene_center}")
@@ -561,11 +418,8 @@ class WorkflowViewRenderMixin:
             debug_print(f"  [VIEW_DEBUG] showEvent: Current scene center = {center_point}")
         except Exception as e:
             debug_print(f"  [VIEW_DEBUG] showEvent: Error getting center point: {e}")
-        try:
-            from ..workflow_parts.connection_line import restart_animation_timer
-            restart_animation_timer()
-        except Exception:
-            pass
+        from ..workflow_parts.connection_line import refresh_line_animation_state
+        refresh_line_animation_state()
         try:
             self._update_card_render_cache_policy()
         except Exception:
@@ -582,18 +436,9 @@ class WorkflowViewRenderMixin:
         self._notify_zoom_level_changed()
 
     def _notify_zoom_level_changed(self):
-        """通知连线动画系统当前缩放级别，用于性能优化"""
-        try:
-            # 注释已清理（原注释编码损坏）
-            transform = self.transform()
-            # m11() 是 x 方向的缩放比例
-            zoom_level = transform.m11()
-            # 通知连线动画系统
-            from ..workflow_parts.connection_line import update_zoom_level
-            update_zoom_level(zoom_level)
-        except Exception as e:
-            # 忽略错误，不影响正常功能
-            pass
+        """通知连线动画系统当前缩放级别。"""
+        from ..workflow_parts.connection_line import update_zoom_level
+        update_zoom_level(self.transform().m11())
 
     def refresh_all_cards_theme(self):
         """刷新所有卡片的主题颜色"""
@@ -604,7 +449,7 @@ class WorkflowViewRenderMixin:
                 if hasattr(card, 'refresh_theme'):
                     card.refresh_theme()
                     logging.debug(f"[THEME_REFRESH] 已刷新卡片 {card_id}")
-            logging.info(f"[THEME_REFRESH] 完成刷新所有卡片的主题")
+            logging.info("[THEME_REFRESH] 完成刷新所有卡片的主题")
         except Exception as e:
             logging.error(f"[THEME_REFRESH] 刷新卡片主题时出错: {e}", exc_info=True)
 
@@ -651,66 +496,70 @@ class WorkflowViewRenderMixin:
             self.scene.setSceneRect(new_scene_rect)
 
     def _handle_card_clicked(self, clicked_card_id: int):
-        """Handles card clicks: stops previous flashing, starts new flashing."""
-        logger.debug(f"_handle_card_clicked: Received click from Card ID {clicked_card_id}")
+        """点击卡片后仅闪烁与其直接相连的卡片。"""
+        if isinstance(clicked_card_id, bool) or not isinstance(clicked_card_id, int) or clicked_card_id < 0:
+            raise TypeError("被点击的卡片 ID 必须是非负整数")
 
-        # 1. Stop any currently flashing cards
         self._stop_all_flashing()
-
-        # 2. Find neighbors of the clicked card
         clicked_card = self.cards.get(clicked_card_id)
-        if not clicked_card:
-            logger.warning("  在视图中未找到被点击的卡片。")
-            return
+        if clicked_card is None:
+            operation_logger.warning("[卡片关系] 点击被拒绝，卡片不存在 card_id=%s", clicked_card_id)
+            return False
+        if clicked_card.scene() is not self.scene:
+            raise RuntimeError(f"卡片 {clicked_card_id} 不属于当前工作流场景")
 
-        connected_card_ids_to_flash = set()
-
-        # Iterate through connections in the view to find connected cards
+        connected_card_ids = set()
         for conn in self.connections:
-            if isinstance(conn, ConnectionLine):
-                target_card_to_flash = None
-                if conn.start_item == clicked_card and conn.end_item:
-                    target_card_to_flash = conn.end_item
-                elif conn.end_item == clicked_card and conn.start_item:
-                    target_card_to_flash = conn.start_item
-                
-                if target_card_to_flash and target_card_to_flash.card_id != clicked_card_id:
-                    connected_card_ids_to_flash.add(target_card_to_flash.card_id)
-
-        if not connected_card_ids_to_flash:
-             logger.debug(f"  Card {clicked_card_id} has no connected cards to flash.")
-             return
-
-        # 3. Start flashing neighbors and track them
-        logger.info(f"  Starting flash for {len(connected_card_ids_to_flash)} cards connected to Card {clicked_card_id}: {connected_card_ids_to_flash}")
-        for card_id_to_flash in connected_card_ids_to_flash:
-            card_to_flash = self.cards.get(card_id_to_flash)
-            if card_to_flash and hasattr(card_to_flash, 'flash'):
-                card_to_flash.flash() # Call the persistent flash start
-                self.flashing_card_ids.add(card_id_to_flash) # Add to tracking set
+            if not isinstance(conn, ConnectionLine):
+                raise TypeError("工作流连线清单包含无效对象")
+            if conn.start_item == clicked_card:
+                target_card = conn.end_item
+            elif conn.end_item == clicked_card:
+                target_card = conn.start_item
             else:
-                 logger.warning(f"    Could not find card {card_id_to_flash} or it has no flash method.")
+                continue
+            if target_card is None or target_card.card_id == clicked_card_id:
+                continue
+            if target_card.scene() is not self.scene:
+                raise RuntimeError(f"连线目标卡片 {target_card.card_id} 不属于当前工作流场景")
+            if target_card.card_id not in self.cards or self.cards[target_card.card_id] is not target_card:
+                raise RuntimeError(f"连线目标卡片 {target_card.card_id} 未登记在当前工作流视图")
+            connected_card_ids.add(target_card.card_id)
+
+        for card_id in sorted(connected_card_ids):
+            card = self.cards[card_id]
+            card.flash()
+            self.flashing_card_ids.add(card_id)
+
+        if connected_card_ids:
+            operation_logger.info(
+                "[卡片关系] 已闪烁相连卡片，起点=%s，数量=%s",
+                clicked_card_id,
+                len(connected_card_ids),
+            )
+        return True
 
     def _stop_all_flashing(self):
-        """Stops flashing on all currently tracked flashing cards."""
+        """停止所有已登记的关系闪烁卡片。"""
         if not self.flashing_card_ids:
-            return
-        debug_print(f"  [FLASH_DEBUG] Stopping flash for cards: {self.flashing_card_ids}")
-        ids_to_stop = list(self.flashing_card_ids) # Iterate a copy
-        self.flashing_card_ids.clear() # Clear the set immediately
+            return 0
+
+        ids_to_stop = sorted(self.flashing_card_ids)
+        cards_to_stop = []
         for card_id in ids_to_stop:
-            try:
-                card = self.cards.get(card_id)
-                if card and hasattr(card, 'stop_flash'):
-                    card.stop_flash()
-                    debug_print(f"    [FLASH_DEBUG] 成功停止卡片 {card_id} 的闪烁")
-                elif card_id not in self.cards:
-                    debug_print(f"    [FLASH_DEBUG] 卡片 {card_id} 已不存在，跳过停止闪烁")
-                else:
-                    debug_print(f"    [FLASH_DEBUG] 卡片 {card_id} 没有 stop_flash 方法")
-            except Exception as e:
-                debug_print(f"    [FLASH_DEBUG] 停止卡片 {card_id} 闪烁时出错: {e}")
-                logger.warning(f"停止卡片 {card_id} 闪烁时出错: {e}")
+            card = self.cards.get(card_id)
+            if card is None:
+                raise RuntimeError(f"闪烁卡片 {card_id} 未登记在当前工作流视图")
+            if card.scene() is not self.scene:
+                raise RuntimeError(f"闪烁卡片 {card_id} 不属于当前工作流场景")
+            cards_to_stop.append(card)
+
+        self.flashing_card_ids.clear()
+        for card in cards_to_stop:
+            card.stop_flash()
+
+        operation_logger.info("[卡片关系] 已停止闪烁，数量=%s", len(ids_to_stop))
+        return len(ids_to_stop)
 
     def _handle_open_sub_workflow(self, workflow_file: str):
         """处理子工作流打开请求 - 转发信号给上层处理。"""

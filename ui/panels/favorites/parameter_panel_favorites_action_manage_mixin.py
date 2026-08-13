@@ -187,41 +187,23 @@ class ParameterPanelFavoritesActionManageMixin:
 
                 self.workflow_open_requested.emit(filepath)
 
-        def _on_favorites_select_all(self):
-
-            """全选。"""
-
+        def _set_all_favorites_checked(self, checked: bool):
+            """统一设置收藏列表所有条目的勾选状态。"""
             for i in range(self._favorites_list.count()):
-
                 item = self._favorites_list.item(i)
-
                 widget = self._favorites_list.itemWidget(item)
-
                 if widget:
-
                     checkbox = widget.findChild(QCheckBox)
-
                     if checkbox:
+                        checkbox.setChecked(checked)
 
-                        checkbox.setChecked(True)
+        def _on_favorites_select_all(self):
+            """全选。"""
+            self._set_all_favorites_checked(True)
 
         def _on_favorites_deselect_all(self):
-
             """取消全选。"""
-
-            for i in range(self._favorites_list.count()):
-
-                item = self._favorites_list.item(i)
-
-                widget = self._favorites_list.itemWidget(item)
-
-                if widget:
-
-                    checkbox = widget.findChild(QCheckBox)
-
-                    if checkbox:
-
-                        checkbox.setChecked(False)
+            self._set_all_favorites_checked(False)
 
         def _on_favorites_check_changed(self, filepath: str, state):
 

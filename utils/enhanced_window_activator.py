@@ -14,7 +14,6 @@ import win32gui
 import win32con
 import win32api
 import ctypes
-from ctypes import wintypes
 import time
 import logging
 from typing import Optional, Tuple
@@ -82,11 +81,11 @@ class EnhancedWindowActivator:
 
             if error_code == 87:  # ERROR_INVALID_PARAMETER - 已附加
                 if self.enable_logging:
-                    logger.debug(f"[线程附加] 已附加 (错误码87)")
+                    logger.debug("[线程附加] 已附加 (错误码87)")
                 return True, current_tid, target_tid
             elif error_code == 5:  # ERROR_ACCESS_DENIED
                 if self.enable_logging:
-                    logger.debug(f"[线程附加] 权限不足 (错误码5)")
+                    logger.debug("[线程附加] 权限不足 (错误码5)")
                 return False, current_tid, target_tid
             else:
                 if self.enable_logging:
@@ -171,13 +170,13 @@ class EnhancedWindowActivator:
             # 获取屏幕坐标用于命中测试
             try:
                 screen_x, screen_y = win32gui.ClientToScreen(parent_hwnd, (client_x, client_y))
-            except:
+            except Exception:
                 screen_x, screen_y = client_x, client_y
 
             # ========== 步骤1: WM_NCHITTEST - 命中测试 ==========
             try:
                 if self.enable_logging:
-                    logger.debug(f"[激活序列] 步骤1: WM_NCHITTEST")
+                    logger.debug("[激活序列] 步骤1: WM_NCHITTEST")
                 hit_result = self._send_nchittest(parent_hwnd, screen_x, screen_y)
             except Exception as e:
                 if self.enable_logging:
@@ -187,7 +186,7 @@ class EnhancedWindowActivator:
             # ========== 步骤2: WM_NCACTIVATE - 非客户区激活 ==========
             try:
                 if self.enable_logging:
-                    logger.debug(f"[激活序列] 步骤2: WM_NCACTIVATE")
+                    logger.debug("[激活序列] 步骤2: WM_NCACTIVATE")
                 # wParam=TRUE 表示激活（标题栏高亮）
                 send_fn(parent_hwnd, WM_NCACTIVATE, True, 0)
             except Exception as e:
@@ -197,7 +196,7 @@ class EnhancedWindowActivator:
             # ========== 步骤3: WM_ACTIVATEAPP - 应用程序激活 ==========
             try:
                 if self.enable_logging:
-                    logger.debug(f"[激活序列] 步骤3: WM_ACTIVATEAPP")
+                    logger.debug("[激活序列] 步骤3: WM_ACTIVATEAPP")
                 # wParam=TRUE 表示激活，lParam=目标线程ID
                 send_fn(parent_hwnd, WM_ACTIVATEAPP, True, target_tid if target_tid else 0)
             except Exception as e:
@@ -207,7 +206,7 @@ class EnhancedWindowActivator:
             # ========== 步骤4: WM_ACTIVATE (WA_CLICKACTIVE) ==========
             try:
                 if self.enable_logging:
-                    logger.debug(f"[激活序列] 步骤4: WM_ACTIVATE (WA_CLICKACTIVE)")
+                    logger.debug("[激活序列] 步骤4: WM_ACTIVATE (WA_CLICKACTIVE)")
                 # 使用 WA_CLICKACTIVE (2) 更精确模拟鼠标点击激活
                 send_fn(parent_hwnd, win32con.WM_ACTIVATE, win32con.WA_CLICKACTIVE, 0)
                 time.sleep(0.005)  # 5ms 延迟
@@ -228,7 +227,7 @@ class EnhancedWindowActivator:
             # ========== 步骤6: WM_MOUSEACTIVATE ==========
             try:
                 if self.enable_logging:
-                    logger.debug(f"[激活序列] 步骤6: WM_MOUSEACTIVATE")
+                    logger.debug("[激活序列] 步骤6: WM_MOUSEACTIVATE")
                 if button == 'left':
                     mouse_msg = win32con.WM_LBUTTONDOWN
                 elif button == 'right':
@@ -247,7 +246,7 @@ class EnhancedWindowActivator:
             # ========== 步骤7: WM_SETCURSOR ==========
             try:
                 if self.enable_logging:
-                    logger.debug(f"[激活序列] 步骤7: WM_SETCURSOR")
+                    logger.debug("[激活序列] 步骤7: WM_SETCURSOR")
                 lparam_cursor = self._makelong(hit_result, win32con.WM_MOUSEMOVE)
                 send_fn(target_hwnd, WM_SETCURSOR, target_hwnd, lparam_cursor)
             except Exception as e:
@@ -343,7 +342,7 @@ class EnhancedWindowActivator:
                 time.sleep(0.05)
 
                 if self.enable_logging:
-                    logger.info(f"[键盘激活] 完成键盘激活序列，窗口已就绪接收键盘输入")
+                    logger.info("[键盘激活] 完成键盘激活序列，窗口已就绪接收键盘输入")
 
                 return True
 
@@ -392,13 +391,13 @@ class EnhancedWindowActivator:
             # 获取屏幕坐标
             try:
                 screen_x, screen_y = win32gui.ClientToScreen(parent_hwnd, (client_x, client_y))
-            except:
+            except Exception:
                 screen_x, screen_y = client_x, client_y
 
             # 步骤1: WM_NCHITTEST - 命中测试
             try:
                 if self.enable_logging:
-                    logger.debug(f"[拖拽激活] 步骤1: WM_NCHITTEST")
+                    logger.debug("[拖拽激活] 步骤1: WM_NCHITTEST")
                 self._send_nchittest(parent_hwnd, screen_x, screen_y)
             except Exception as e:
                 if self.enable_logging:
@@ -407,7 +406,7 @@ class EnhancedWindowActivator:
             # 步骤2: WM_NCACTIVATE - 非客户区激活
             try:
                 if self.enable_logging:
-                    logger.debug(f"[拖拽激活] 步骤2: WM_NCACTIVATE")
+                    logger.debug("[拖拽激活] 步骤2: WM_NCACTIVATE")
                 win32gui.SendMessage(parent_hwnd, WM_NCACTIVATE, True, 0)
             except Exception as e:
                 if self.enable_logging:
@@ -416,7 +415,7 @@ class EnhancedWindowActivator:
             # 步骤3: WM_ACTIVATEAPP - 应用程序激活
             try:
                 if self.enable_logging:
-                    logger.debug(f"[拖拽激活] 步骤3: WM_ACTIVATEAPP")
+                    logger.debug("[拖拽激活] 步骤3: WM_ACTIVATEAPP")
                 win32gui.SendMessage(parent_hwnd, WM_ACTIVATEAPP, True, target_tid if target_tid else 0)
             except Exception as e:
                 if self.enable_logging:
@@ -425,7 +424,7 @@ class EnhancedWindowActivator:
             # 步骤4: WM_ACTIVATE
             try:
                 if self.enable_logging:
-                    logger.debug(f"[拖拽激活] 步骤4: WM_ACTIVATE")
+                    logger.debug("[拖拽激活] 步骤4: WM_ACTIVATE")
                 win32gui.SendMessage(parent_hwnd, win32con.WM_ACTIVATE, win32con.WA_CLICKACTIVE, 0)
                 time.sleep(0.005)
             except Exception as e:
@@ -453,7 +452,7 @@ class EnhancedWindowActivator:
                     logger.debug(f"[拖拽激活] WM_MOUSEMOVE 异常: {e}")
 
             if self.enable_logging:
-                logger.info(f"[拖拽激活] 完成，窗口已激活，准备接收拖拽操作")
+                logger.info("[拖拽激活] 完成，窗口已激活，准备接收拖拽操作")
             return True
 
         except Exception as e:

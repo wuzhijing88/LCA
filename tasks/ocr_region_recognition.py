@@ -9,7 +9,6 @@ import logging
 import time
 import copy
 import threading
-import re
 import numpy as np
 from typing import Dict, Any, Optional, Tuple, List
 from tasks.task_utils import (
@@ -20,8 +19,6 @@ from tasks.task_utils import (
 # Windows API 相关导入
 try:
     import win32gui
-    import win32api
-    import win32con
     PYWIN32_AVAILABLE = True
 except ImportError:
     PYWIN32_AVAILABLE = False
@@ -293,12 +290,10 @@ def _recognize_with_multiprocess_pool(
     scope_key: Optional[Tuple[int, int, int, int]] = None,
     confidence: float = 0.1,
 ) -> List[Dict[str, Any]]:
-    from services.multiprocess_ocr_pool import get_multi_ocr_pool
+    from services.multiprocess_ocr_pool import get_multiprocess_ocr_pool
 
-    multi_ocr_pool = get_multi_ocr_pool()
-    if multi_ocr_pool is None:
-        raise RuntimeError("OCR池获取失败")
-    if hasattr(multi_ocr_pool, '_is_shutdown') and multi_ocr_pool._is_shutdown:
+    multi_ocr_pool = get_multiprocess_ocr_pool()
+    if not multi_ocr_pool.is_running:
         raise RuntimeError("OCR池已关闭")
 
     hwnd_int = int(window_hwnd) if window_hwnd else 0
@@ -408,7 +403,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             window_title = win32gui.GetWindowText(target_hwnd)
             if not window_title:
                 window_title = f"HWND_{target_hwnd}"
-        except:
+        except Exception:
             window_title = f"HWND_{target_hwnd}"
 
     # 将窗口标题添加到参数中，供OCR使用
@@ -433,10 +428,10 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             if not ocr_engine:
                 logger.error("错误 [OCR引擎] OCR引擎不可用")
                 logger.error("可能的原因:")
-                logger.error("1. PaddleOCR未正确安装")
-                logger.error("2. 打包环境缺少必要文件")
-                logger.error("3. 系统权限不足")
-                logger.error("建议: 请检查OCR依赖或使用无OCR版本")
+                logger.error("1. RapidOCR运行依赖不可用")
+                logger.error("2. 本地PP-OCRv4模型或运行库缺失")
+                logger.error("3. OCR子进程启动失败")
+                logger.error("建议: 请检查离线OCR运行时完整性")
                 return _handle_failure(
                     on_failure_action,
                     failure_jump_id,
@@ -616,7 +611,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             if roi_image is not None:
                 del roi_image
                 roi_image = None
-        except:
+        except Exception:
             pass
 
         # 根据是否有目标文字使用不同的置信度阈值
@@ -663,7 +658,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                         from task_workflow.workflow_context import get_workflow_context
                         context = get_workflow_context()
                         context.clear_card_ocr_context(card_id)
-                    except:
+                    except Exception:
                         pass
                     return _handle_failure(
                         on_failure_action,
@@ -695,7 +690,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                                     from task_workflow.workflow_context import get_workflow_context
                                     context = get_workflow_context()
                                     context.clear_card_ocr_context(card_id)
-                                except:
+                                except Exception:
                                     pass
                                 return _handle_failure(
                                     on_failure_action,
@@ -729,7 +724,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                                     from task_workflow.workflow_context import get_workflow_context
                                     context = get_workflow_context()
                                     context.clear_card_ocr_context(card_id)
-                                except:
+                                except Exception:
                                     pass
                                 return _handle_failure(
                                     on_failure_action,
@@ -843,7 +838,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             from task_workflow.workflow_context import get_workflow_context
             context = get_workflow_context()
             context.clear_card_ocr_context(card_id)
-        except:
+        except Exception:
             pass
 
         return _handle_failure(
@@ -875,7 +870,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             try:
                 if 'results' in dir() and results is not None:
                     del results
-            except:
+            except Exception:
                 pass
 
             # 清理counters中保存的历史图像
@@ -883,7 +878,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 if key in counters:
                     try:
                         del counters[key]
-                    except:
+                    except Exception:
                         pass
 
         except Exception:
@@ -1324,7 +1319,7 @@ def _handle_multi_text_recognition(ocr_results, text_groups, match_mode, card_id
     except Exception as e:
         try:
             context.clear_card_ocr_context(card_id)
-        except:
+        except Exception:
             pass
         return _handle_failure(
             on_failure_action,
@@ -1654,7 +1649,7 @@ def test_ocr_output(params: Dict[str, Any], **kwargs) -> bool:
         if PYWIN32_AVAILABLE:
             try:
                 window_title = win32gui.GetWindowText(target_hwnd)
-            except:
+            except Exception:
                 pass
 
         logger.info(f"[OCR测试] 开始测试OCR，目标窗口: {window_title} (HWND: {target_hwnd})")
@@ -1797,7 +1792,7 @@ def test_ocr_output(params: Dict[str, Any], **kwargs) -> bool:
             pool = get_existing_multiprocess_ocr_pool()
             if pool is not None:
                 try:
-                    pool.cleanup_all_processes_force()
+                    pool.cleanup_all_processes()
                 except Exception:
                     pass
         except Exception:

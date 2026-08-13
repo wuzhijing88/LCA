@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import cv2
 import json
+import numpy as np
 import socket
 import subprocess
 import sys
@@ -37,6 +39,52 @@ def _validate_ping_response(worker_name: str, response: dict) -> tuple[bool, str
         return True, ""
 
     return False, f"unknown_worker:{worker_name}"
+
+
+def _build_ocr_inference_smoke_request(request_id: str, window_hwnd: int) -> dict:
+    image = np.full((96, 320, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        image,
+        "OCR 123",
+        (20, 68),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.8,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    return {
+        "request_id": request_id,
+        "window_hwnd": window_hwnd,
+        "window_title": "packaged-ocr-smoke",
+        "use_shared_memory": False,
+        "image": image.tobytes(),
+        "image_shape": image.shape,
+        "image_dtype": str(image.dtype),
+        "confidence": 0.1,
+        "timestamp": time.time(),
+    }
+
+
+def _validate_ocr_inference_response(
+    response: dict,
+    request_id: str,
+    window_hwnd: int,
+) -> tuple[bool, str]:
+    if not isinstance(response, dict):
+        return False, f"invalid_ocr_response:{response}"
+    if response.get("request_id") != request_id:
+        return False, f"mismatch_ocr_request_id:{response}"
+    if int(response.get("window_hwnd") or 0) != int(window_hwnd):
+        return False, f"mismatch_ocr_window:{response}"
+    if not bool(response.get("success", False)):
+        return False, f"ocr_inference_failed:{response}"
+    results = response.get("results")
+    if not isinstance(results, list) or not results:
+        return False, f"ocr_inference_empty:{response}"
+    if not any(str(item.get("text") or "").strip() for item in results if isinstance(item, dict)):
+        return False, f"ocr_inference_has_no_text:{response}"
+    return True, ""
 
 
 def _recv_message_with_timeout(conn: socket.socket, timeout_sec: float) -> dict:
@@ -98,6 +146,22 @@ def _run_worker_smoke(exe_path: Path, worker_name: str, flag: str, timeout_sec: 
         ok, reason = _validate_ping_response(worker_name, pong)
         if not ok:
             return False, reason, False
+
+        if worker_name == "ocr":
+            inference_request_id = f"{process_id}_inference"
+            inference_hwnd = 987654
+            _send_message(
+                conn,
+                _build_ocr_inference_smoke_request(inference_request_id, inference_hwnd),
+            )
+            inference_response = _recv_message_with_timeout(conn, timeout_sec)
+            ok, reason = _validate_ocr_inference_response(
+                inference_response,
+                inference_request_id,
+                inference_hwnd,
+            )
+            if not ok:
+                return False, reason, False
 
         try:
             _send_message(conn, {"command": "STOP"})
@@ -250,7 +314,7 @@ def _verify_build_modules(build_dir: Path) -> tuple[bool, list[str]]:
     required = [
         "module.services.multiprocess_ocr_pool.c",
         "module.services.multiprocess_ocr_worker.c",
-        "module.services.multiprocess_match_pool.c",
+        "module.services.rapidocr_ocr_service.c",
         "module.services.multiprocess_match_worker.c",
         "module.services.screenshot_pool.c",
         "module.task_workflow.process_worker.c",

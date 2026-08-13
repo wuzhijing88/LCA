@@ -23,7 +23,6 @@ class SimulatorBackend:
 
 class BackendNotAvailableError(Exception):
     """指定的后端不可用异常"""
-    pass
 
 
 class InputSimulatorFactory:
@@ -56,41 +55,25 @@ class InputSimulatorFactory:
             BackendNotAvailableError: 指定的后端不可用
         """
         # 延迟导入避免循环依赖
-        from .standard_window import StandardWindowInputSimulator
+
+        if not hwnd:
+            logger.error("窗口句柄无效（为空）")
+            return None
 
         try:
-            # 验证窗口句柄是否有效
-            if not hwnd:
-                logger.error("窗口句柄无效（为空）")
+            if not win32gui.IsWindow(hwnd):
+                logger.error(f"窗口句柄{hwnd}无效或窗口已关闭")
                 return None
-
-            try:
-                if not win32gui.IsWindow(hwnd):
-                    logger.error(f"窗口句柄{hwnd}无效或窗口已关闭")
-                    return None
-            except Exception as e:
-                logger.error(f"验证窗口句柄时出错: {e}")
-                return None
-
-            # ===== 根据 backend 参数决定模拟器类型 =====
-
-            # 强制原生模式
-            if backend == SimulatorBackend.NATIVE:
-                logger.info(f"[强制原生模式] 创建原生输入模拟器 (hwnd={hwnd})")
-                return InputSimulatorFactory._create_native_simulator(
-                    hwnd, operation_mode, execution_mode, device_id=device_id
-                )
-
-            # 原生模式
-            return InputSimulatorFactory._create_native_simulator(
-                hwnd, operation_mode, execution_mode, device_id=device_id
-            )
-
-        except BackendNotAvailableError:
-            raise
         except Exception as e:
-            logger.error(f"创建输入模拟器失败: {e}", exc_info=True)
+            logger.error(f"验证窗口句柄时出错: {e}")
             return None
+
+        if backend not in (SimulatorBackend.AUTO, SimulatorBackend.NATIVE):
+            raise BackendNotAvailableError(f"不支持的输入后端: {backend!r}")
+
+        return InputSimulatorFactory._create_native_simulator(
+            hwnd, operation_mode, execution_mode, device_id=device_id
+        )
 
     @staticmethod
     def _create_native_simulator(

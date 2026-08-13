@@ -191,7 +191,7 @@ class WindowHandleManager:
         try:
             import win32gui
             return win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd)
-        except:
+        except Exception:
             return False
 
     def _capture_window_snapshot(self, hwnd: int, title: str = "") -> Dict[str, Any]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -14,20 +15,36 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+PROJECT_ROOT_FOR_IMPORTS = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT_FOR_IMPORTS))
+
+from app_core.ocr_runtime_contract import (
+    OCR_MODEL_DIRECTORY,
+    OCR_MODEL_FILES,
+    OCR_REQUIRED_REQUIREMENTS,
+)
+
+
 INCLUDE_PACKAGES = (
     "tasks",
     "uiautomation",
     "winrt",
     "dxcam",
+    "rapidocr",
     "app_core",
+)
+
+INCLUDE_PACKAGE_DATA = (
+    "rapidocr",
 )
 
 INCLUDE_MODULES = (
     "services.multiprocess_ocr_pool",
     "services.multiprocess_ocr_worker",
+    "services.rapidocr_ocr_service",
     "services.screenshot_pool",
     "utils.dxgi_capture",
-    "services.multiprocess_match_pool",
     "services.multiprocess_match_worker",
     "task_workflow.process_worker",
     "win32gui",
@@ -56,13 +73,16 @@ INCLUDE_MODULES = (
 NOFOLLOW_IMPORTS = (
     "comtypes.test",
     "mouseinfo",
-    "paddlepaddle",
-    "paddlepaddle-gpu",
+    "MNN",
+    "openvino",
+    "paddle",
+    "tensorrt",
+    "torch",
     "zstandard",
 )
 
 DATA_DIR_SPECS = (
-    ("models", "models"),
+    ("models/rapidocr", "models/rapidocr"),
     ("config", "config"),
     ("themes", "themes"),
     ("Interception", "Interception"),
@@ -81,8 +101,6 @@ DATA_FILE_SPECS = (
     ("AutoHotkey/AutoHotkey64.exe", "AutoHotkey/AutoHotkey64.exe"),
     ("resources/icon.ico", "resources/icon.ico"),
 )
-
-NOINCLUDE_DATA_FILES = ("fastdeploy/**/*.lib",)
 
 ONNXRUNTIME_GPU_DLL_PATTERNS = (
     "onnxruntime/capi/onnxruntime_providers_cuda.dll",
@@ -106,17 +124,7 @@ RUNTIME_DLL_REMOVE_PATTERNS = (
     *OPTIONAL_RUNTIME_DLL_PATTERNS,
 )
 
-NOINCLUDE_DLLS = (
-    "fastdeploy/libs/third_libs/opencv/build/x64/vc15/bin/*",
-    "fastdeploy/libs/third_libs/opencv/build/x64/vc14/bin/*d.dll",
-    "fastdeploy/libs/third_libs/openvino/runtime/3rdparty/tbb/bin/*debug*.dll",
-    "fastdeploy/libs/third_libs/openvino/runtime/3rdparty/tbb/bin/*preview*.dll",
-    "fastdeploy/libs/third_libs/openvino/python/python3.6/*",
-    "fastdeploy/libs/third_libs/openvino/python/python3.7/*",
-    "fastdeploy/libs/third_libs/openvino/python/python3.8/*",
-    "fastdeploy/libs/third_libs/openvino/python/python3.9/*",
-    *RUNTIME_DLL_REMOVE_PATTERNS,
-)
+NOINCLUDE_DLLS = RUNTIME_DLL_REMOVE_PATTERNS
 
 CCACHE_OWNER_PATTERN = re.compile(r"^ccache-(\d+)\.txt$", re.IGNORECASE)
 DELETE_RETRY_COUNT = 5
@@ -149,6 +157,54 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_pinned_requirements(requirements_path: Path) -> dict[str, str]:
+    pinned: dict[str, str] = {}
+    for raw_line in requirements_path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if "==" not in line:
+            continue
+        name, version = line.split("==", 1)
+        pinned[name.strip().lower()] = version.strip()
+    return pinned
+
+
+def _validate_ocr_build_inputs(project_root: Path) -> None:
+    model_dir = project_root / OCR_MODEL_DIRECTORY
+    expected_names = {filename for filename, _expected_hash in OCR_MODEL_FILES.values()}
+    actual_names = {path.name for path in model_dir.glob("*.onnx") if path.is_file()}
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        unexpected = sorted(actual_names - expected_names)
+        raise RuntimeError(
+            "OCR模型目录与PP-OCRv4打包清单不一致: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    for filename, expected_hash in OCR_MODEL_FILES.values():
+        model_path = model_dir / filename
+        actual_hash = _sha256(model_path)
+        if actual_hash.lower() != expected_hash.lower():
+            raise RuntimeError(f"OCR模型哈希校验失败: {model_path}")
+
+    requirements_path = project_root / "requirements.txt"
+    pinned = _load_pinned_requirements(requirements_path)
+    mismatches = {
+        name: {"expected": expected, "actual": pinned.get(name)}
+        for name, expected in OCR_REQUIRED_REQUIREMENTS.items()
+        if pinned.get(name) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"OCR运行依赖版本不符合打包清单: {mismatches}")
+
+
 def _validate_paths(project_root: Path) -> None:
     missing_paths: list[str] = []
 
@@ -168,6 +224,8 @@ def _validate_paths(project_root: Path) -> None:
         joined = "\n".join(f"  - {path}" for path in missing_paths)
         raise FileNotFoundError(f"Missing required Nuitka build inputs:\n{joined}")
 
+    _validate_ocr_build_inputs(project_root)
+
 
 def _build_command(output_dir: str) -> list[str]:
     command = [
@@ -182,11 +240,11 @@ def _build_command(output_dir: str) -> list[str]:
     ]
 
     command.extend(f"--include-package={package_name}" for package_name in INCLUDE_PACKAGES)
+    command.extend(f"--include-package-data={package_name}" for package_name in INCLUDE_PACKAGE_DATA)
     command.extend(f"--include-module={module_name}" for module_name in INCLUDE_MODULES)
     command.extend(f"--nofollow-import-to={module_name}" for module_name in NOFOLLOW_IMPORTS)
     command.extend(f"--include-data-dir={source}={target}" for source, target in DATA_DIR_SPECS)
     command.extend(f"--include-data-files={source}={target}" for source, target in DATA_FILE_SPECS)
-    command.extend(f"--noinclude-data-files={pattern}" for pattern in NOINCLUDE_DATA_FILES)
     command.extend(f"--noinclude-dlls={pattern}" for pattern in NOINCLUDE_DLLS)
     command.append(f"--output-dir={Path(output_dir).as_posix()}")
     command.append("main.py")

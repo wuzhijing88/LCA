@@ -167,7 +167,7 @@ class MainWindowWindowValidationMixin:
 
         if invalid_windows:
 
-            warning_msg = f"部分窗口句柄已失效:\n\n"
+            warning_msg = "部分窗口句柄已失效:\n\n"
 
             for w in invalid_windows:
 

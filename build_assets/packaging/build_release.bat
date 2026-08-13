@@ -190,6 +190,14 @@ if errorlevel 1 (
     goto fail
 )
 
+set "STEP=VERIFY_PACKAGED_OCR_RUNTIME"
+echo [5.7/6] Verify offline PP-OCRv4 runtime...
+venv\Scripts\python.exe build_assets\packaging\verify_packaged_ocr_runtime.py --dist "%DIST%"
+if errorlevel 1 (
+    set "ERRMSG=Packaged OCR runtime verification failed"
+    goto fail
+)
+
 set "STEP=VERIFY_NO_SOURCE_FILES"
 venv\Scripts\python.exe build_assets\packaging\verify_no_source_files.py --dist "%DIST%"
 if errorlevel 1 (
