@@ -1,6 +1,6 @@
 import logging
 
-from PySide6.QtCore import QSettings, Qt, Slot
+from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,7 +48,9 @@ class MainWindowCloseMixin:
                 remember_choice = False
                 close_behavior = "ask"
         try:
-            settings = QSettings("LCA", "LCA")
+            from utils.instance_runtime import create_app_settings
+
+            settings = create_app_settings()
             qs_remember = settings.value("close_behavior_remember", None)
             qs_behavior = settings.value("close_behavior", None)
             if qs_remember is not None:
@@ -83,7 +85,9 @@ class MainWindowCloseMixin:
                 except Exception as exc:
                     logger.debug("保存关闭行为失败: %s", exc)
             try:
-                settings = QSettings("LCA", "LCA")
+                from utils.instance_runtime import create_app_settings
+
+                settings = create_app_settings()
                 settings.setValue("close_behavior", self.config.get("close_behavior", "ask"))
                 settings.setValue("close_behavior_remember", bool(self.config.get("close_behavior_remember", False)))
             except Exception:
@@ -157,16 +161,7 @@ class MainWindowCloseMixin:
         # ========== 快速清理（不阻塞UI） ==========
         # 停止DPI监控
         self.stop_dpi_monitoring()
-        # 停止定时启动检查定时器
-        self._stop_schedule_timer()
-        # 停止定时停止检查定时器
-        if hasattr(self, '_stop_timer') and self._stop_timer.isActive():
-            self._stop_timer.stop()
-            logger.info("已停止定时停止检查定时器")
-        # 停止定时暂停检查定时器
-        if hasattr(self, '_timed_pause_timer') and self._timed_pause_timer.isActive():
-            self._timed_pause_timer.stop()
-            logger.info("已停止定时暂停检查定时器")
+        self._stop_main_schedule_clock()
         if hasattr(self, '_timed_pause_resume_timer') and self._timed_pause_resume_timer.isActive():
             self._timed_pause_resume_timer.stop()
             logger.info("已停止定时暂停恢复定时器")
@@ -226,15 +221,10 @@ class MainWindowCloseMixin:
         if hasattr(self, '_random_pause_timer') and self._random_pause_timer.isActive():
             self._random_pause_timer.stop()
             logger.info("已停止随机暂停定时器")
-        if hasattr(self, '_timed_pause_timer') and self._timed_pause_timer.isActive():
-            self._timed_pause_timer.stop()
-            logger.info("已停止定时暂停定时器")
         if hasattr(self, '_timed_pause_resume_timer') and self._timed_pause_resume_timer.isActive():
             self._timed_pause_resume_timer.stop()
             logger.info("已停止定时暂停恢复定时器")
-        if hasattr(self, '_global_timer') and self._global_timer.isActive():
-            self._global_timer.stop()
-            logger.info("已停止全局定时器")
+        self._stop_main_schedule_clock()
         # ========== 关闭前确定性回收（阻塞上限3秒） ==========
         if not self._shutdown_executor_on_close(timeout_ms=3000):
             logger.warning("关闭窗口时执行线程未在超时内退出")

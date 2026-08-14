@@ -37,6 +37,7 @@ class WorkflowView(
         self.images_dir = images_dir # <<< ADDED: Store images_dir
         self.workflow_metadata: Dict[str, Any] = {}
         self.main_window = None  # 主窗口引用，用于检查运行状态
+        self.task_id = None  # 所属工作流任务 ID，用于绑定变量上下文
         self.editing_enabled = True  # 是否允许编辑（运行时设为False）
 
         # 隐藏QAbstractScrollArea默认边框，只保留滚动条本体

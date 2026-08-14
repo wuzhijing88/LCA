@@ -58,7 +58,7 @@ class WindowTaskRunnerSlotsMixin:
 
     def _acquire_execution_slot(self) -> bool:
         semaphore, limit = self._get_execution_slot_semaphore()
-        self.step_updated.emit(self.window_id, f"等待执行槽位({limit})")
+        self._emit_step(f"等待执行槽位({limit})")
         while not self._should_stop:
             try:
                 if semaphore.acquire(timeout=0.05):

@@ -3,8 +3,8 @@ import os
 
 from PySide6.QtWidgets import QMessageBox
 
+from utils.hwnd_utils import as_hwnd
 from utils.thread_start_utils import is_thread_start_task_type
-from utils.window_finder import sanitize_window_lookup_title
 
 logger = logging.getLogger(__name__)
 
@@ -380,7 +380,7 @@ class MainWindowExecutionHelperMixin:
 
     def _validate_bound_windows_on_startup(self):
 
-        """启动时验证绑定窗口是否仍然有效，移除失效的窗口"""
+        """启动时按窗口特征刷新句柄。找不到也不删除绑定，避免目标进程未启动时把配置清掉。"""
 
         if not self.bound_windows:
 
@@ -388,149 +388,23 @@ class MainWindowExecutionHelperMixin:
 
         logger.info(f"启动时验证绑定窗口，配置中有 {len(self.bound_windows)} 个窗口")
 
-        try:
+        from utils.window_identity import is_window_alive, refresh_bound_windows
 
-            import win32gui
+        original_hwnds = [window_info.get('hwnd') for window_info in self.bound_windows]
+        changed = refresh_bound_windows(self.bound_windows)
 
-        except ImportError:
-
-            logger.warning("无法导入win32gui，跳过窗口验证")
-
-            return
-
-        valid_windows = []
-
-        for i, window_info in enumerate(self.bound_windows):
-
+        alive_count = 0
+        for window_info in self.bound_windows:
             window_title = window_info.get('title', '')
+            hwnd = as_hwnd(window_info.get('hwnd', 0))
+            if is_window_alive(hwnd):
+                alive_count += 1
+                logger.info(f"窗口有效: {window_title} (HWND: {hwnd})")
+            else:
+                logger.warning(f"窗口暂未重连，已保留绑定: {window_title}")
 
-            hwnd = window_info.get('hwnd', 0)
-
-            if not window_title:
-
-                logger.warning(f"窗口 {i+1} 无标题，已跳过")
-
-                continue
-
-            # 验证原句柄是否有效
-
-            if hwnd and hwnd != 0:
-
-                try:
-
-                    if win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd):
-
-                        # 检查是否重复
-
-                        duplicate = False
-
-                        for existing in valid_windows:
-
-                            if existing.get('hwnd', 0) == hwnd:
-
-                                duplicate = True
-
-                                break
-
-                        if not duplicate:
-
-                            valid_windows.append(window_info)
-
-                            logger.info(f"窗口有效: {window_title} (HWND: {hwnd})")
-
-                            continue
-
-                except Exception as e:
-
-                    logger.debug(f"验证窗口句柄时出错: {e}")
-
-            # 原句柄无效，尝试通过标题重新查找
-
-            try:
-
-                def find_window_callback(hwnd, results):
-
-                    if win32gui.IsWindowVisible(hwnd):
-
-                        try:
-
-                            title = win32gui.GetWindowText(hwnd)
-
-                            # 清理标题（移除之前可能添加的HWND信息）
-
-                            clean_title = sanitize_window_lookup_title(window_title)
-
-                            if title and clean_title in title:
-
-                                results.append(hwnd)
-
-                        except Exception:
-
-                            pass
-
-                    return True
-
-                results = []
-
-                win32gui.EnumWindows(find_window_callback, results)
-
-                if results:
-
-                    new_hwnd = results[0]
-
-                    # 检查是否重复
-
-                    duplicate = False
-
-                    for existing in valid_windows:
-
-                        if existing.get('hwnd', 0) == new_hwnd:
-
-                            duplicate = True
-
-                            break
-
-                    if not duplicate:
-
-                        window_info['hwnd'] = new_hwnd
-
-                        valid_windows.append(window_info)
-
-                        logger.info(f"重新找到窗口: {window_title} (新HWND: {new_hwnd})")
-
-                    else:
-
-                        logger.warning(f"窗口句柄重复，已跳过: {window_title}")
-
-                else:
-
-                    logger.warning(f"窗口不存在，已移除: {window_title}")
-
-            except Exception as e:
-
-                logger.warning(f"查找窗口失败: {window_title}, 错误: {e}")
-
-        # 更新绑定窗口列表
-
-        original_count = len(self.bound_windows)
-
-        self.bound_windows = valid_windows
-
-        if len(valid_windows) != original_count:
-
-            logger.info(f"窗口验证完成: {original_count} -> {len(valid_windows)} 个有效窗口")
-
-            # 同步更新配置
-
+        if changed or [window_info.get('hwnd') for window_info in self.bound_windows] != original_hwnds:
+            logger.info(f"窗口验证完成: 已刷新句柄，当前 {alive_count}/{len(self.bound_windows)} 个窗口在线")
             self._store_runtime_bound_windows_to_config()
-
-            # 根据有效窗口数量更新绑定模式
-
-            if len(valid_windows) <= 1:
-
-                self.window_binding_mode = 'single'
-
-
         else:
-
-            logger.info(f"窗口验证完成，所有 {len(valid_windows)} 个窗口均有效")
+            logger.info(f"窗口验证完成，所有 {len(self.bound_windows)} 个绑定均已保留")

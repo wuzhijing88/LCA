@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import asyncio
 import numpy as np
 import time
 import threading
@@ -10,6 +9,8 @@ import gc
 import os
 from typing import Optional, Tuple
 from dataclasses import dataclass
+
+from utils.hwnd_utils import as_hwnd
 
 logger = logging.getLogger(__name__)
 
@@ -68,29 +69,36 @@ _WGC_REQUEST_FRAME_TIMEOUT_MS = _read_env_int(
 
 _WGC_REQUEST_ACTIVE_POLL_MS = _read_env_int(
     "SCREENSHOT_WGC_REQUEST_ACTIVE_POLL_MS",
-    default=200,
-    min_value=100,
+    default=0,
+    min_value=0,
     max_value=8000,
 )
 
 _WGC_STATIC_REBUILD_RETRY_COUNT = _read_env_int(
     "SCREENSHOT_WGC_STATIC_REBUILD_RETRY_COUNT",
-    default=6,
+    default=8,
     min_value=1,
     max_value=40,
 )
 
 _WGC_STATIC_REBUILD_RETRY_INTERVAL_MS = _read_env_int(
     "SCREENSHOT_WGC_STATIC_REBUILD_RETRY_INTERVAL_MS",
-    default=50,
-    min_value=5,
+    default=8,
+    min_value=4,
     max_value=500,
+)
+
+_WGC_STATIC_REBUILD_COOLDOWN_MS = _read_env_int(
+    "SCREENSHOT_WGC_STATIC_REBUILD_COOLDOWN_MS",
+    default=0,
+    min_value=0,
+    max_value=2000,
 )
 
 _WGC_REQUEST_TIMEOUT_BUFFER_MS = _read_env_int(
     "SCREENSHOT_WGC_REQUEST_TIMEOUT_BUFFER_MS",
-    default=350,
-    min_value=50,
+    default=40,
+    min_value=10,
     max_value=2000,
 )
 
@@ -135,6 +143,20 @@ _WGC_STALE_FRAME_MAX_AGE_MS = _read_env_int(
     max_value=30000,
 )
 
+_WGC_FRAME_POOL_BUFFERS = _read_env_int(
+    "SCREENSHOT_WGC_FRAME_POOL_BUFFERS",
+    default=2,
+    min_value=1,
+    max_value=4,
+)
+
+_WGC_RECREATE_EVERY_N_FRAMES = _read_env_int(
+    "SCREENSHOT_WGC_RECREATE_EVERY_N_FRAMES",
+    default=0,
+    min_value=0,
+    max_value=10000,
+)
+
 _WGC_MAIN_MEMORY_CHECK_INTERVAL_SEC = _read_env_int(
     "SCREENSHOT_WGC_MEMORY_CHECK_INTERVAL_SEC",
     default=1,
@@ -171,15 +193,13 @@ try:
     )
     from winrt.windows.graphics.directx import DirectXPixelFormat
     from winrt.windows.graphics.directx.direct3d11 import IDirect3DDevice
-    from winrt.windows.graphics.imaging import (
-        SoftwareBitmap,
-        BitmapBufferAccessMode,
-    )
+    from utils.wgc_d3d_readback import create_staging_readback as _create_staging_readback
     WGC_AVAILABLE = True
     logger.info("[OK] WGC库已加载 (winrt)")
 except ImportError as e:
     WGC_AVAILABLE = False
     IDirect3DDevice = None  # 类型占位符
+    _create_staging_readback = None
     logger.warning(f"[ERROR] WGC库未安装: {e}")
     logger.warning("  安装: pip install winrt-Windows.Graphics winrt-Windows.Graphics.Capture winrt-Windows.Graphics.DirectX winrt-Windows.Foundation winrt-Windows.AI.MachineLearning")
 
@@ -329,6 +349,7 @@ class D3D11DeviceManager:
             return
         self.device = None
         self._learning_model_device = None
+        self._native_readback = None
         self._initialized = True
         self._init_device()
     def _init_device(self):
@@ -354,6 +375,7 @@ class D3D11DeviceManager:
                 self._learning_model_device = model_device
                 self.device = direct3d_device
                 logger.info("[成功] D3D11设备创建成功")
+                self._init_native_readback()
                 return
             try:
                 model_device.close()
@@ -363,6 +385,26 @@ class D3D11DeviceManager:
         except Exception as e:
             logger.error(f"D3D11设备创建失败: {e}")
             raise RuntimeError(f"无法创建D3D11设备: {e}")
+
+    def _init_native_readback(self) -> None:
+        self._close_native_readback()
+        if not callable(_create_staging_readback):
+            raise RuntimeError("WGC staging 读回模块不可用")
+        self._native_readback = _create_staging_readback(self.device)
+        logger.info("[成功] WGC staging 读回已启用")
+
+    def _close_native_readback(self) -> None:
+        native = getattr(self, "_native_readback", None)
+        self._native_readback = None
+        if native is None:
+            return
+        try:
+            native.close()
+        except Exception:
+            pass
+
+    def get_native_readback(self):
+        return getattr(self, "_native_readback", None)
     def get_device(self):
         """获取D3D设备（设备不可用时尝试重建）"""
         if self.device is None:
@@ -379,6 +421,7 @@ class D3D11DeviceManager:
     def cleanup(self):
         """清理D3D设备资源"""
         try:
+            self._close_native_readback()
             if self.device:
                 try:
                     self.device.close()
@@ -576,12 +619,6 @@ class WGC_HWND_Capturer:
     }
     _resource_lock = threading.Lock()
 
-    # 【内存泄漏修复】全局复用的numpy缓冲区
-    # 避免每帧都分配新的numpy数组
-    _reusable_buffer = None
-    _reusable_buffer_shape = None
-    _reusable_buffer_lock = threading.Lock()
-
     @classmethod
     def get_resource_stats(cls) -> dict:
         """获取资源统计信息"""
@@ -599,27 +636,7 @@ class WGC_HWND_Capturer:
             cls._resource_stats[key] = cls._resource_stats.get(key, 0) + 1
 
     def _flush_gpu(self) -> bool:
-        """
-        Returns:
-            bool: 是否成功执行Flush
-        """
-        if not self.device:
-            return False
-
-        try:
-            if hasattr(self.device, 'device') and self.device.device:
-                context = self.device.device.GetImmediateContext()
-                if context:
-                    # 【业界最佳实践】ClearState()确保所有GPU状态清空
-                    context.ClearState()
-                    # 【显存优化】Flush强制执行待命令
-                    context.Flush()
-                    # 交由 Python/COM 包装层自动释放，避免手动 Release 触发双重释放导致闪退
-                    context = None
-                    return True
-        except Exception as e:
-            logger.debug(f"[显存优化] GPU Flush失败(可忽略): {e}")
-
+        """WGC 占用同一 D3D 设备，不能对 immediate context 做 Flush/ClearState。"""
         return False
 
     def __init__(self, hwnd: int):
@@ -632,6 +649,7 @@ class WGC_HWND_Capturer:
         if not WGC_AVAILABLE:
             raise ImportError("WGC库未安装，请安装: pip install winrt-Windows.Graphics winrt-Windows.Graphics.Capture winrt-Windows.Graphics.DirectX winrt-Windows.Foundation winrt-Windows.AI.MachineLearning")
 
+        hwnd = as_hwnd(hwnd)
         # 【关键修复】检查是否为子窗口，WGC只能捕获顶层窗口
         self.target_hwnd = hwnd  # 保存原始目标窗口（可能是子窗口）
         self.capture_hwnd = self._get_top_level_window(hwnd)  # WGC实际捕获的窗口（必须是顶层）
@@ -650,6 +668,7 @@ class WGC_HWND_Capturer:
         self.frame_ready = threading.Event()  # 新帧就绪事件
         self._frame_request = threading.Event()  # 【新增】请求新帧信号
         self._native_frame_arrived = threading.Event()
+        self._loop_started = threading.Event()
         self._frame_seq = 0  # 【功能修复】帧序号，用于区分新旧帧
         self._frame_time = 0.0  # 【WGC静态窗口修复】帧捕获时间戳
         self._frame_is_new = False  # 【帧标签】True=新帧（未使用），False=旧帧（已使用）
@@ -661,7 +680,7 @@ class WGC_HWND_Capturer:
         self._finalizer_thread = None
         self._frame_skip_count = 0  # 【修复闪退】帧跳过计数器，用于监控
         self._last_static_rebuild_ts = 0.0
-        self._static_rebuild_cooldown_sec = 0.35
+        self._static_rebuild_cooldown_sec = _WGC_STATIC_REBUILD_COOLDOWN_MS / 1000.0
         self._last_failure_reason = ""
         self._last_failure_lock = threading.Lock()
 
@@ -680,6 +699,133 @@ class WGC_HWND_Capturer:
         WGC_HWND_Capturer._inc_stat('capturers_created')
         logger.debug(f"[资源监控] 捕获器已创建 (HWND: {hwnd}), 统计: {WGC_HWND_Capturer.get_resource_stats()}")
 
+    def _wait_for_pool_frame(self, frame_pool, attempts: int, interval_ms: int):
+        """等 FrameArrived 取帧。事件一到立刻返回，超时只是上限，不是固定 sleep。"""
+        if frame_pool is None:
+            return None
+        deadline = time.time() + (
+            max(1, int(attempts)) * max(0.001, float(interval_ms) / 1000.0)
+        )
+        while self.is_running and time.time() < deadline:
+            try:
+                frame = frame_pool.try_get_next_frame()
+            except Exception:
+                frame = None
+            if frame is not None:
+                while True:
+                    try:
+                        newer_frame = frame_pool.try_get_next_frame()
+                    except Exception:
+                        newer_frame = None
+                    if newer_frame is None:
+                        break
+                    try:
+                        frame.close()
+                    except Exception:
+                        pass
+                    frame = newer_frame
+                return frame
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self._native_frame_arrived.wait(timeout=remaining)
+            self._native_frame_arrived.clear()
+        return None
+
+    def _discard_pooled_frames(self, frame_pool) -> int:
+        """丢掉请求前积压的缓冲帧，避免把旧画面标成新帧。"""
+        if frame_pool is None:
+            return 0
+        discarded = 0
+        while True:
+            try:
+                frame = frame_pool.try_get_next_frame()
+            except Exception:
+                break
+            if frame is None:
+                break
+            try:
+                frame.close()
+            except Exception:
+                pass
+            discarded += 1
+        return discarded
+
+    def _close_capture_session(self, session) -> None:
+        if session is None:
+            return
+        try:
+            session.close()
+            WGC_HWND_Capturer._inc_stat("sessions_closed")
+        except Exception:
+            pass
+
+    def _close_frame_pool(self, frame_pool) -> None:
+        if frame_pool is None:
+            return
+        try:
+            self._detach_frame_arrived_handler(frame_pool=frame_pool)
+            frame_pool.close()
+            WGC_HWND_Capturer._inc_stat("frame_pools_closed")
+        except Exception:
+            pass
+
+    def _open_pool_and_session(self):
+        size = self.item.size
+        frame_pool = Direct3D11CaptureFramePool.create_free_threaded(
+            self.device,
+            DirectXPixelFormat.B8_G8_R8_A8_UINT_NORMALIZED,
+            int(_WGC_FRAME_POOL_BUFFERS),
+            size,
+        )
+        WGC_HWND_Capturer._inc_stat("frame_pools_created")
+        self._attach_frame_arrived_handler(frame_pool)
+        session = frame_pool.create_capture_session(self.item)
+        WGC_HWND_Capturer._inc_stat("sessions_created")
+        session.is_border_required = False
+        session.is_cursor_capture_enabled = False
+        session.start_capture()
+        with self.lock:
+            self.frame_pool = frame_pool
+            self.session = session
+        return frame_pool, session
+
+    def _force_static_window_frame(self, frame_pool, session):
+        """静态窗口无新帧时强制出帧：先 Recreate 池，仍无帧再重建 session。"""
+        if frame_pool is not None:
+            try:
+                size = self.item.size
+                frame_pool.recreate(
+                    self.device,
+                    DirectXPixelFormat.B8_G8_R8_A8_UINT_NORMALIZED,
+                    int(_WGC_FRAME_POOL_BUFFERS),
+                    size,
+                )
+                frame = self._wait_for_pool_frame(
+                    frame_pool,
+                    _WGC_STATIC_REBUILD_RETRY_COUNT,
+                    _WGC_STATIC_REBUILD_RETRY_INTERVAL_MS,
+                )
+                if frame is not None:
+                    logger.debug("[后台捕获] 静态窗口 Recreate 后取得新帧")
+                    return frame, frame_pool, session
+            except Exception as exc:
+                logger.debug(f"[后台捕获] frame_pool.recreate 强制出帧失败: {exc}")
+
+        self._close_capture_session(session)
+        session = None
+        self._close_frame_pool(frame_pool)
+        frame_pool = None
+        frame_pool, session = self._open_pool_and_session()
+        frame = self._wait_for_pool_frame(
+            frame_pool,
+            _WGC_STATIC_REBUILD_RETRY_COUNT,
+            _WGC_STATIC_REBUILD_RETRY_INTERVAL_MS,
+        )
+        if frame is None:
+            logger.debug("[后台捕获] 静态窗口重建后仍无新帧")
+        return frame, frame_pool, session
+
     def _get_top_level_window(self, hwnd: int) -> int:
         """
         获取顶层窗口句柄
@@ -689,9 +835,8 @@ class WGC_HWND_Capturer:
             if not WIN32_AVAILABLE:
                 return hwnd
             import win32gui
-            # 使用GetAncestor获取根窗口（顶层窗口）
-            # GA_ROOT = 2: 获取根窗口（向上遍历父窗口链直到顶层）
-            root_hwnd = win32gui.GetAncestor(hwnd, 2)  # GA_ROOT = 2
+            hwnd = as_hwnd(hwnd)
+            root_hwnd = as_hwnd(win32gui.GetAncestor(hwnd, 2))  # GA_ROOT = 2
             if root_hwnd and root_hwnd != hwnd:
                 return root_hwnd
             return hwnd
@@ -761,119 +906,39 @@ class WGC_HWND_Capturer:
         except Exception:
             pass
 
-
-    async def _frame_to_numpy_async(self, frame) -> Optional[np.ndarray]:
-        """
-        将D3D11帧转换为numpy数组（异步）
-
-        【内存泄漏修复 v3】
-        强制关闭中间 COM 对象，避免底层资源泄漏。
-        """
-        software_bitmap = None
-        bitmap_buffer = None
-        reference = None
+    def _frame_to_numpy(self, frame) -> Optional[np.ndarray]:
+        """将 D3D11 捕获帧转为 BGR numpy（仅 staging 读回）。"""
+        native = D3D11DeviceManager().get_native_readback()
+        if native is None:
+            self._set_last_failure_reason("staging_readback_unavailable")
+            logger.error("[WGC] staging 读回未初始化")
+            return None
         surface = None
-        mv = None
-
-        def force_release_com(obj, name):
-            """强制释放 COM 对象"""
-            if obj is None:
-                return
-            try:
-                if hasattr(obj, 'close'):
-                    obj.close()
-            except Exception:
-                pass
-            try:
-                if hasattr(obj, '__release__'):
-                    obj.__release__()
-            except Exception:
-                pass
-
         try:
             surface = frame.surface
-
-            software_bitmap = await SoftwareBitmap.create_copy_from_surface_async(surface)
-
-            if software_bitmap is None:
-                return None
-
-            height = software_bitmap.pixel_height
-            width = software_bitmap.pixel_width
-
-            if height <= 0 or width <= 0:
-                logger.error(f"无效的帧尺寸: {width}x{height}")
-                return None
-
-            if width > 65535 or height > 65535:
-                logger.error(f"帧尺寸超出合理范围: {width}x{height}")
-                return None
-
-            expected_size = height * width * 4
-
-            bitmap_buffer = software_bitmap.lock_buffer(BitmapBufferAccessMode.READ)
-            reference = bitmap_buffer.create_reference()
-
-            try:
-                mv = memoryview(reference)
-                # 【优化】零拷贝：直接从memoryview创建numpy视图，再reshape
-                # 只在最后做一次copy()，避免中间np.empty + 赋值的二次拷贝
-                result = np.frombuffer(mv, dtype=np.uint8, count=expected_size).reshape((height, width, 4)).copy()
-                mv.release()
-                mv = None
-                return result
-            except (TypeError, BufferError):
-                data_bytes = bytes(reference)
-                if len(data_bytes) != expected_size:
-                    logger.error(f"帧数据长度不匹配: 期望{expected_size}, 实际{len(data_bytes)}")
-                    del data_bytes
-                    return None
-                result = np.frombuffer(data_bytes, dtype=np.uint8).reshape((height, width, 4)).copy()
-                del data_bytes
-                return result
-
+            return native.surface_to_bgr(surface)
         except Exception as e:
-            logger.debug(f"异步帧转换失败: {e}", exc_info=True)
+            self._set_last_failure_reason(f"staging_readback_failed:{type(e).__name__}")
+            logger.error(f"[WGC] staging 读回失败: {e}", exc_info=True)
             return None
         finally:
-            if mv is not None:
+            if surface is not None:
                 try:
-                    mv.release()
+                    surface.close()
                 except Exception:
                     pass
 
-            force_release_com(reference, "reference")
-            reference = None
-
-            force_release_com(bitmap_buffer, "bitmap_buffer")
-            bitmap_buffer = None
-
-            force_release_com(software_bitmap, "software_bitmap")
-            software_bitmap = None
-
-            force_release_com(surface, "surface")
-            surface = None
-
     def request_new_frame(self, timeout_ms: float = 2000) -> Optional[np.ndarray]:
         """
-        主动请求捕获新帧
+        主动请求捕获新帧。
 
-        【帧标签系统】
-        - 优先返回带有"新帧"标签的帧
-        - 若超时且存在最近帧，则在年龄阈值内复用最近帧，避免并发窗口请求被“全量新帧”约束拖死
-
-        Args:
-            timeout_ms: 超时时间（毫秒）
-
-        Returns:
-            BGR格式的numpy数组，失败返回None
+        只返回本次请求之后新读回的帧（seq 必须前进）。不复用超时前的旧帧。
         """
         if not self.is_running:
             self._set_last_failure_reason("capturer_not_running")
             logger.error("[请求新帧] 后台捕获未运行")
             return None
 
-        # 检查窗口是否仍然有效
         if WIN32_AVAILABLE:
             try:
                 if not win32gui.IsWindow(self.hwnd):
@@ -885,57 +950,33 @@ class WGC_HWND_Capturer:
 
         try:
             logger.debug("[请求新帧] 等待新帧...")
-
-            # 记录可复用的最近帧快照（仅在本次新帧请求超时时兜底使用）
-            fallback_frame = None
-            fallback_seq = 0
-            fallback_age_ms = -1.0
             with self.lock:
-                if self.latest_frame is not None:
-                    fallback_seq = int(self._frame_seq)
-                    if self._frame_time > 0:
-                        fallback_age_ms = max(0.0, (time.time() - float(self._frame_time)) * 1000.0)
-                    if fallback_age_ms < 0.0 or fallback_age_ms <= float(_WGC_STALE_FRAME_MAX_AGE_MS):
-                        try:
-                            fallback_frame = self.latest_frame.copy()
-                        except Exception:
-                            fallback_frame = None
+                wait_seq = int(self._frame_seq)
                 self.frame_ready.clear()
-
-            # 发送请求信号，通知后台线程
             self._frame_request.set()
 
-            # 以内部轮询预算为下限，避免请求端先超时导致“明明在重建但调用已失败”
             effective_timeout_ms = max(float(timeout_ms), float(_WGC_MIN_REQUEST_TIMEOUT_MS))
-            timeout_seconds = effective_timeout_ms / 1000.0
+            deadline = time.time() + (effective_timeout_ms / 1000.0)
 
-            # 直接等待帧就绪事件，减少轮询开销
-            if self.frame_ready.wait(timeout=timeout_seconds):
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                if not self.frame_ready.wait(timeout=remaining):
+                    break
                 with self.lock:
-                    # 【帧标签】只返回"新帧"
-                    if self._frame_is_new and self.latest_frame is not None:
-                        # 返回帧的副本
+                    if (
+                        self._frame_is_new
+                        and self.latest_frame is not None
+                        and int(self._frame_seq) > wait_seq
+                    ):
                         frame_copy = self.latest_frame.copy()
-                        # 【帧标签】标记为"旧帧"
                         self._frame_is_new = False
                         self._set_last_failure_reason("")
                         logger.debug(f"[请求新帧] 获取新帧成功: seq={self._frame_seq}")
                         return frame_copy
+                self.frame_ready.clear()
 
-            # 超时但存在可复用最近帧：返回最近帧，避免多窗口同批请求被“新帧”硬约束放大为失败。
-            if fallback_frame is not None:
-                self._set_last_failure_reason("")
-                logger.warning(
-                    f"[请求新帧] 等待超时，复用最近帧 (seq={fallback_seq}, age={int(max(0.0, fallback_age_ms))}ms, "
-                    f"requested={int(timeout_ms)}ms)"
-                )
-                try:
-                    self._frame_request.clear()
-                except Exception:
-                    pass
-                return fallback_frame
-
-            # 超时
             nested_reason = self.get_last_failure_reason()
             if nested_reason:
                 self._set_last_failure_reason(f"request_timeout:{nested_reason}")
@@ -1023,22 +1064,16 @@ class WGC_HWND_Capturer:
             # 初始化所有需要在finally中清理的资源
             frame_pool = None
             session = None
-            loop = None
 
             try:
-                # 在独立线程中创建事件循环
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                self._event_loop = loop  # 保存事件循环引用
-
                 # 获取窗口尺寸
                 size = self.item.size
 
-                # 创建帧池（单缓冲低延迟）
+                # 创建帧池（缓冲数默认 2，可用 SCREENSHOT_WGC_FRAME_POOL_BUFFERS 调整）
                 frame_pool = Direct3D11CaptureFramePool.create_free_threaded(
                     self.device,
                     DirectXPixelFormat.B8_G8_R8_A8_UINT_NORMALIZED,
-                    1,
+                    int(_WGC_FRAME_POOL_BUFFERS),
                     size,
                 )
                 WGC_HWND_Capturer._inc_stat('frame_pools_created')
@@ -1056,14 +1091,13 @@ class WGC_HWND_Capturer:
                     self.frame_pool = frame_pool
                     self.session = session
                     self.is_running = True
+                self._loop_started.set()
 
                 logger.debug(f"[WGC] 后台捕获已启动 (HWND: {self.hwnd})")
 
-                # 响应请求信号；无请求时仅在尚未建立最近帧快照时做首帧引导
-                _last_frame_process_time = 0.0
-                _frames_dropped_count = 0
+                # 响应请求信号；无请求时阻塞等待，避免 5ms 空转
                 _frame_count_since_recreate = 0
-                _recreate_every_n_frames = 100
+                _recreate_every_n_frames = int(_WGC_RECREATE_EVERY_N_FRAMES)
 
                 while self.is_running:
                     try:
@@ -1072,18 +1106,70 @@ class WGC_HWND_Capturer:
                         has_request = self._frame_request.is_set() or need_bootstrap_frame
 
                         if not has_request:
-                            loop.run_until_complete(asyncio.sleep(0.005))
+                            self._frame_request.wait(timeout=0.25)
                             continue
 
-                        frame = frame_pool.try_get_next_frame()
-                        if frame is None:
-                            request_deadline = time.time() + (_WGC_REQUEST_ACTIVE_POLL_MS / 1000.0)
-                            while self.is_running and frame is None and time.time() < request_deadline:
-                                self._native_frame_arrived.wait(timeout=0.01)
-                                self._native_frame_arrived.clear()
-                                frame = frame_pool.try_get_next_frame()
+                        self._discard_pooled_frames(frame_pool)
+                        try:
+                            self._native_frame_arrived.clear()
+                        except Exception:
+                            pass
 
-                        # 积压时只保留最新帧
+                        frame = None
+                        poll_s = _WGC_REQUEST_ACTIVE_POLL_MS / 1000.0
+                        if poll_s > 0:
+                            request_deadline = time.time() + poll_s
+                            while self.is_running and frame is None and time.time() < request_deadline:
+                                self._native_frame_arrived.wait(timeout=0.004)
+                                self._native_frame_arrived.clear()
+                                try:
+                                    frame = frame_pool.try_get_next_frame()
+                                except Exception:
+                                    frame = None
+                        else:
+                            try:
+                                frame = frame_pool.try_get_next_frame()
+                            except Exception:
+                                frame = None
+
+                        if frame is None and has_request:
+                            now_ts = time.time()
+                            remaining = self._static_rebuild_cooldown_sec - (
+                                now_ts - self._last_static_rebuild_ts
+                            )
+                            if remaining > 0:
+                                self._native_frame_arrived.wait(timeout=remaining)
+                                self._native_frame_arrived.clear()
+                                try:
+                                    frame = frame_pool.try_get_next_frame()
+                                except Exception:
+                                    frame = None
+                            if frame is None:
+                                self._last_static_rebuild_ts = time.time()
+                                self._rebuild_count = getattr(self, "_rebuild_count", 0) + 1
+                                logger.debug("[后台捕获] 静态窗口，强制出帧")
+                                try:
+                                    frame, frame_pool, session = self._force_static_window_frame(
+                                        frame_pool, session
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"[后台捕获] 重建frame_pool失败: {e}")
+                                    try:
+                                        frame_pool, session = self._open_pool_and_session()
+                                        logger.info("[后台捕获] 重建失败后恢复捕获")
+                                    except Exception as recover_e:
+                                        self._set_last_failure_reason(
+                                            f"background_recover_failed:{type(recover_e).__name__}"
+                                        )
+                                        logger.error(f"[后台捕获] 恢复捕获失败: {recover_e}")
+                                        self.is_running = False
+                                        try:
+                                            self._close_frame_pool(frame_pool)
+                                            self._close_capture_session(session)
+                                        except Exception:
+                                            pass
+                                        break
+
                         if frame is not None:
                             while True:
                                 newer_frame = frame_pool.try_get_next_frame()
@@ -1094,15 +1180,10 @@ class WGC_HWND_Capturer:
 
                         if frame is not None:
                             try:
-                                np_frame = loop.run_until_complete(self._frame_to_numpy_async(frame))
+                                np_frame = self._frame_to_numpy(frame)
                                 if np_frame is not None:
-                                    if len(np_frame.shape) == 3 and np_frame.shape[2] == 4:
-                                        bgr_frame = cv2.cvtColor(np_frame, cv2.COLOR_BGRA2BGR)
-                                        del np_frame
-                                        np_frame = None
-                                    else:
-                                        bgr_frame = np_frame
-                                        np_frame = None
+                                    bgr_frame = np_frame
+                                    np_frame = None
 
                                     with self.lock:
                                         if self.latest_frame is not None:
@@ -1115,29 +1196,25 @@ class WGC_HWND_Capturer:
                                         self.frame_ready.set()
                                         # 请求完成后清除请求标记，避免重复处理同一请求
                                         self._frame_request.clear()
-                                        _last_frame_process_time = time.time()
                                         logger.debug(f"[后台捕获] 帧已更新: {bgr_frame.shape}, seq={self._frame_seq}, is_new=True")
 
-                                # 定期recreate重置frame_pool缓冲区
-                                _frame_count_since_recreate += 1
-                                if _frame_count_since_recreate >= _recreate_every_n_frames:
-                                    try:
-                                        self._flush_gpu()
-                                        size = self.item.size
-                                        frame_pool.recreate(
-                                            self.device,
-                                            DirectXPixelFormat.B8_G8_R8_A8_UINT_NORMALIZED,
-                                            1,
-                                            size,
-                                        )
-                                        _frame_count_since_recreate = 0
-                                        logger.debug(f"[显存优化] frame_pool.recreate() 完成，帧序号={self._frame_seq}")
-                                    except Exception as recreate_err:
-                                        logger.debug(f"[显存优化] recreate 失败: {recreate_err}")
-
-                                if _frames_dropped_count > 0:
-                                    logger.debug(f"[后台捕获] 帧率控制: 丢弃了 {_frames_dropped_count} 帧")
-                                    _frames_dropped_count = 0
+                                # 默认关闭定期 recreate；需要时用 SCREENSHOT_WGC_RECREATE_EVERY_N_FRAMES 打开
+                                if _recreate_every_n_frames > 0:
+                                    _frame_count_since_recreate += 1
+                                    if _frame_count_since_recreate >= _recreate_every_n_frames:
+                                        try:
+                                            self._flush_gpu()
+                                            size = self.item.size
+                                            frame_pool.recreate(
+                                                self.device,
+                                                DirectXPixelFormat.B8_G8_R8_A8_UINT_NORMALIZED,
+                                                int(_WGC_FRAME_POOL_BUFFERS),
+                                                size,
+                                            )
+                                            _frame_count_since_recreate = 0
+                                            logger.debug(f"[显存优化] frame_pool.recreate() 完成，帧序号={self._frame_seq}")
+                                        except Exception as recreate_err:
+                                            logger.debug(f"[显存优化] recreate 失败: {recreate_err}")
                             finally:
                                 try:
                                     frame.close()
@@ -1145,149 +1222,10 @@ class WGC_HWND_Capturer:
                                     frame = None
                                 except Exception:
                                     pass
-                        elif has_request:
-                            # 静态窗口：请求时无新帧，重建 frame_pool/session 强制获取
-                            now_ts = time.time()
-                            if (now_ts - self._last_static_rebuild_ts) < self._static_rebuild_cooldown_sec:
-                                loop.run_until_complete(asyncio.sleep(0.01))
-                                continue
-                            self._last_static_rebuild_ts = now_ts
-                            logger.debug("[后台捕获] 静态窗口，重建frame_pool和session获取新帧")
-                            try:
-                                self._rebuild_count = getattr(self, "_rebuild_count", 0) + 1
-
-                                if session is not None:
-                                    try:
-                                        session.close()
-                                        WGC_HWND_Capturer._inc_stat('sessions_closed')
-                                    except Exception:
-                                        pass
-                                    del session
-                                    session = None
-
-                                if frame_pool is not None:
-                                    try:
-                                        self._detach_frame_arrived_handler(frame_pool=frame_pool)
-                                        frame_pool.close()
-                                        WGC_HWND_Capturer._inc_stat('frame_pools_closed')
-                                    except Exception:
-                                        pass
-                                    del frame_pool
-                                    frame_pool = None
-
-                                self._flush_gpu()
-
-                                size = self.item.size
-                                frame_pool = Direct3D11CaptureFramePool.create_free_threaded(
-                                    self.device,
-                                    DirectXPixelFormat.B8_G8_R8_A8_UINT_NORMALIZED,
-                                    1,
-                                    size,
-                                )
-                                WGC_HWND_Capturer._inc_stat('frame_pools_created')
-                                self._attach_frame_arrived_handler(frame_pool)
-
-                                session = frame_pool.create_capture_session(self.item)
-                                WGC_HWND_Capturer._inc_stat('sessions_created')
-                                session.is_border_required = False
-                                session.is_cursor_capture_enabled = False
-                                session.start_capture()
-
-                                with self.lock:
-                                    self.frame_pool = frame_pool
-                                    self.session = session
-
-                                frame = None
-                                for _retry in range(_WGC_STATIC_REBUILD_RETRY_COUNT):
-                                    loop.run_until_complete(
-                                        asyncio.sleep(_WGC_STATIC_REBUILD_RETRY_INTERVAL_MS / 1000.0)
-                                    )
-                                    frame = frame_pool.try_get_next_frame()
-                                    if frame is not None:
-                                        break
-
-                                if frame is not None:
-                                    try:
-                                        np_frame = loop.run_until_complete(self._frame_to_numpy_async(frame))
-                                        if np_frame is not None:
-                                            if len(np_frame.shape) == 3 and np_frame.shape[2] == 4:
-                                                bgr_frame = cv2.cvtColor(np_frame, cv2.COLOR_BGRA2BGR)
-                                                del np_frame
-                                            else:
-                                                bgr_frame = np_frame
-                                            with self.lock:
-                                                if self.latest_frame is not None:
-                                                    del self.latest_frame
-                                                    self.latest_frame = None
-                                                self.latest_frame = bgr_frame
-                                                self._frame_seq += 1
-                                                self._frame_time = time.time()
-                                                self._frame_is_new = True
-                                                self.frame_ready.set()
-                                                # 请求完成后清除请求标记，避免重复处理同一请求
-                                                self._frame_request.clear()
-                                                _last_frame_process_time = time.time()
-                                                logger.debug(
-                                                    f"[后台捕获] 静态窗口重建后获取新帧: {bgr_frame.shape}, seq={self._frame_seq}, is_new=True"
-                                                )
-                                    finally:
-                                        try:
-                                            frame.close()
-                                        except Exception:
-                                            pass
-                                else:
-                                    logger.debug("[后台捕获] 静态窗口重建后仍无新帧")
-                            except Exception as e:
-                                logger.warning(f"[后台捕获] 重建frame_pool失败: {e}")
-                                try:
-                                    self._flush_gpu()
-                                    size = self.item.size
-                                    frame_pool = Direct3D11CaptureFramePool.create_free_threaded(
-                                        self.device,
-                                        DirectXPixelFormat.B8_G8_R8_A8_UINT_NORMALIZED,
-                                        1,
-                                        size,
-                                    )
-                                    WGC_HWND_Capturer._inc_stat('frame_pools_created')
-                                    session = frame_pool.create_capture_session(self.item)
-                                    WGC_HWND_Capturer._inc_stat('sessions_created')
-                                    session.is_border_required = False
-                                    session.is_cursor_capture_enabled = False
-                                    session.start_capture()
-                                    with self.lock:
-                                        self.frame_pool = frame_pool
-                                        self.session = session
-                                    logger.info("[后台捕获] 重建失败后恢复捕获")
-                                except Exception as recover_e:
-                                    self._set_last_failure_reason(
-                                        f"background_recover_failed:{type(recover_e).__name__}"
-                                    )
-                                    logger.error(f"[后台捕获] 恢复捕获失败: {recover_e}")
-                                    self.is_running = False
-                                    try:
-                                        if 'frame_pool' in locals() and frame_pool is not None:
-                                            try:
-                                                frame_pool.close()
-                                                WGC_HWND_Capturer._inc_stat('frame_pools_closed')
-                                            except Exception:
-                                                pass
-                                        if 'session' in locals() and session is not None:
-                                            try:
-                                                session.close()
-                                                WGC_HWND_Capturer._inc_stat('sessions_closed')
-                                            except Exception:
-                                                pass
-                                    except Exception:
-                                        pass
-                                    break
-
-                        # 短暂休眠（有请求时更快响应）
-                        sleep_time = 0.005 if has_request else 0.016
-                        loop.run_until_complete(asyncio.sleep(sleep_time))
 
                     except Exception as e:
                         logger.debug(f"[后台捕获] 获取帧失败: {e}")
-                        loop.run_until_complete(asyncio.sleep(0.1))
+                        self._native_frame_arrived.wait(timeout=0.1)
 
             except Exception as e:
                 self._set_last_failure_reason(f"background_start_failed:{type(e).__name__}")
@@ -1323,29 +1261,12 @@ class WGC_HWND_Capturer:
 
                     self._flush_gpu()
 
-                # 清理事件循环
-                if loop:
-                    try:
-                        if loop.is_running():
-                            loop.call_soon_threadsafe(loop.stop)
-                        loop.close()
-                        logger.debug("[WGC-Finally] 事件循环已关闭")
-                    except Exception:
-                        pass
-                    finally:
-                        self._event_loop = None
-
                 logger.debug(f"[WGC-Finally] 后台线程资源清理完成 (HWND: {self.hwnd})")
 
         self.capture_thread = threading.Thread(target=capture_loop, daemon=True, name=f"WGC-{self.hwnd}")
         self.capture_thread.start()
 
-        max_wait = 1.0
-        wait_start = time.time()
-        while not self.is_running and (time.time() - wait_start) < max_wait:
-            time.sleep(0.01)
-
-        if not self.is_running:
+        if not self._loop_started.wait(timeout=1.0) or not self.is_running:
             raise RuntimeError("WGC 后台捕获启动失败")
 
     def _mark_destroyed_once(self) -> bool:
@@ -1402,8 +1323,9 @@ class WGC_HWND_Capturer:
         thread_still_alive = False
         if self.capture_thread and self.capture_thread.is_alive():
             try:
-                # 唤醒后台循环，避免线程在无请求分支长时间停留
+                # 唤醒后台循环，避免线程在无请求 / 等帧分支长时间停留
                 self._frame_request.set()
+                self._native_frame_arrived.set()
             except Exception:
                 pass
             try:
@@ -1420,6 +1342,7 @@ class WGC_HWND_Capturer:
                         pass
                     try:
                         self._frame_request.set()
+                        self._native_frame_arrived.set()
                     except Exception:
                         pass
                     self.capture_thread.join(timeout=0.8)
@@ -1736,15 +1659,6 @@ class OptimizedWGCCapture:
         if getattr(capturer, "session", None) is None:
             return False, "session为空"
 
-        event_loop = getattr(capturer, "_event_loop", None)
-        if event_loop is None:
-            return False, "事件循环为空"
-        try:
-            if event_loop.is_closed():
-                return False, "事件循环已关闭"
-        except Exception as loop_err:
-            return False, f"事件循环状态异常: {loop_err}"
-
         return True, "ok"
 
     def _periodic_cleanup(self):
@@ -1967,6 +1881,7 @@ class OptimizedWGCCapture:
         start_time = time.time()
         capturer = None  # 用于finally块清理
         self._set_last_capture_failure_reason("")
+        hwnd = as_hwnd(hwnd)
 
         default_total_budget_ms = int(_WGC_REQUEST_FRAME_TIMEOUT_MS) * 2
         if request_timeout_ms is not None:
@@ -2145,8 +2060,6 @@ class OptimizedWGCCapture:
                         self.capturers[hwnd] = capturer
                         self.capturer_last_used[hwnd] = time.time()
 
-                    # 重试捕获
-                    time.sleep(0.03)  # 30ms等待捕获器就绪
                     if not use_cache:
                         frame = capturer.request_new_frame(timeout_ms=float(rebuild_request_timeout_ms))
                     else:
@@ -2271,7 +2184,7 @@ class OptimizedWGCCapture:
                 capture_hwnd = capturer.capture_hwnd
                 if target_hwnd != capture_hwnd:
                     # 子窗口情况：需要将子窗口的客户区映射到父窗口捕获的坐标系
-                    logger.info(f"【子窗口裁剪模式】目标窗口: {target_hwnd}, 捕获窗口: {capture_hwnd}")
+                    logger.debug(f"【子窗口裁剪模式】目标窗口: {target_hwnd}, 捕获窗口: {capture_hwnd}")
                     return self._crop_child_window(hwnd, frame, capture_hwnd)
 
             # 正常情况：裁剪到指定窗口的客户区
@@ -2295,9 +2208,9 @@ class OptimizedWGCCapture:
             import ctypes
             from ctypes import wintypes
 
-            logger.info("【子窗口裁剪开始】")
-            logger.info(f"  子窗口HWND: {child_hwnd}")
-            logger.info(f"  父窗口HWND: {capture_hwnd}")
+            logger.debug("【子窗口裁剪开始】")
+            logger.debug(f"  子窗口HWND: {child_hwnd}")
+            logger.debug(f"  父窗口HWND: {capture_hwnd}")
 
             # 获取DPI缩放因子和进程DPI感知状态
             dpi_scale = 1.0
@@ -2317,7 +2230,7 @@ class OptimizedWGCCapture:
                     dpi = user32.GetDpiForWindow(capture_hwnd)
                     if dpi > 0:
                         dpi_scale = dpi / 96.0
-                        logger.info(f"  DPI: {dpi}, 缩放因子: {dpi_scale:.2f}, DPI感知: {is_dpi_aware}")
+                        logger.debug(f"  DPI: {dpi}, 缩放因子: {dpi_scale:.2f}, DPI感知: {is_dpi_aware}")
             except Exception:
                 pass
 
@@ -2341,15 +2254,15 @@ class OptimizedWGCCapture:
             child_w_screen = max(0, int(child_screen_end[0]) - int(child_screen_pos[0]))
             child_h_screen = max(0, int(child_screen_end[1]) - int(child_screen_pos[1]))
 
-            logger.info(f"  子窗口窗口矩形(屏幕): {child_window_rect}")
-            logger.info(
+            logger.debug(f"  子窗口窗口矩形(屏幕): {child_window_rect}")
+            logger.debug(
                 f"  子窗口客户区(逻辑): {child_client_rect}, 屏幕跨度: {child_w_screen}x{child_h_screen}, "
                 f"物理估算: {child_w_physical}x{child_h_physical}"
             )
-            logger.info(f"  子窗口客户区屏幕坐标: {child_screen_pos}")
+            logger.debug(f"  子窗口客户区屏幕坐标: {child_screen_pos}")
 
             # 获取父窗口（捕获窗口）的DWM边界
-            logger.info("  【获取父窗口信息】")
+            logger.debug("  【获取父窗口信息】")
             capture_window_rect = win32gui.GetWindowRect(capture_hwnd)
             capture_client_rect = win32gui.GetClientRect(capture_hwnd)
             capture_client_pos = win32gui.ClientToScreen(capture_hwnd, (0, 0))
@@ -2360,9 +2273,9 @@ class OptimizedWGCCapture:
             capture_client_w_screen = max(0, int(capture_client_end[0]) - int(capture_client_pos[0]))
             capture_client_h_screen = max(0, int(capture_client_end[1]) - int(capture_client_pos[1]))
 
-            logger.info(f"  父窗口窗口矩形(屏幕): {capture_window_rect}")
-            logger.info(f"  父窗口客户区(本地): {capture_client_rect}")
-            logger.info(f"  父窗口客户区屏幕坐标: {capture_client_pos}")
+            logger.debug(f"  父窗口窗口矩形(屏幕): {capture_window_rect}")
+            logger.debug(f"  父窗口客户区(本地): {capture_client_rect}")
+            logger.debug(f"  父窗口客户区屏幕坐标: {capture_client_pos}")
 
             try:
                 dwmapi = ctypes.windll.dwmapi
@@ -2377,14 +2290,14 @@ class OptimizedWGCCapture:
 
                 if result == 0:
                     capture_dwm_rect = (rect.left, rect.top, rect.right, rect.bottom)
-                    logger.info(f"  父窗口DWM边界(屏幕): {capture_dwm_rect}")
-                    logger.info(f"  父窗口DWM尺寸: {rect.right-rect.left}x{rect.bottom-rect.top}")
+                    logger.debug(f"  父窗口DWM边界(屏幕): {capture_dwm_rect}")
+                    logger.debug(f"  父窗口DWM尺寸: {rect.right-rect.left}x{rect.bottom-rect.top}")
 
                     # 【关键】计算WGC捕获的基准点
                     # WGC可能捕获的是DWM边界，也可能是窗口矩形
-                    logger.info("  【计算WGC捕获基准点】")
+                    logger.debug("  【计算WGC捕获基准点】")
                     frame_h, frame_w = frame.shape[:2]
-                    logger.info(f"  WGC捕获帧尺寸: {frame_w}x{frame_h}")
+                    logger.debug(f"  WGC捕获帧尺寸: {frame_w}x{frame_h}")
 
                     # 判断WGC捕获的是什么（需要用物理像素比较）
                     dwm_w = rect.right - rect.left
@@ -2403,12 +2316,12 @@ class OptimizedWGCCapture:
                         # WGC返回逻辑像素的DWM边界
                         screenshot_base_pos = (rect.left, rect.top)
                         wgc_is_logical = True
-                        logger.info(f"  [OK] WGC捕获的是DWM边界(逻辑像素)，基准点: {screenshot_base_pos}")
+                        logger.debug(f"  [OK] WGC捕获的是DWM边界(逻辑像素)，基准点: {screenshot_base_pos}")
                     elif abs(frame_w - client_w) <= 4 and abs(frame_h - client_h) <= 4:
                         # WGC返回逻辑像素的客户区
                         screenshot_base_pos = capture_client_pos
                         wgc_is_logical = True
-                        logger.info(f"  [OK] WGC捕获的是客户区(逻辑像素)，基准点: {screenshot_base_pos}")
+                        logger.debug(f"  [OK] WGC捕获的是客户区(逻辑像素)，基准点: {screenshot_base_pos}")
                     else:
                         # 尝试物理像素比较
                         if is_dpi_aware:
@@ -2426,12 +2339,12 @@ class OptimizedWGCCapture:
                             # WGC返回物理像素的DWM边界
                             screenshot_base_pos = (rect.left, rect.top)
                             wgc_is_logical = False
-                            logger.info(f"  [OK] WGC捕获的是DWM边界(物理像素)，基准点: {screenshot_base_pos}")
+                            logger.debug(f"  [OK] WGC捕获的是DWM边界(物理像素)，基准点: {screenshot_base_pos}")
                         elif abs(frame_w - client_w_physical_cmp) <= 4 and abs(frame_h - client_h_physical_cmp) <= 4:
                             # WGC返回物理像素的客户区
                             screenshot_base_pos = capture_client_pos
                             wgc_is_logical = False
-                            logger.info(f"  [OK] WGC捕获的是客户区(物理像素)，基准点: {screenshot_base_pos}")
+                            logger.debug(f"  [OK] WGC捕获的是客户区(物理像素)，基准点: {screenshot_base_pos}")
                         else:
                             # 未知，默认使用DWM边界，假设逻辑像素
                             screenshot_base_pos = (rect.left, rect.top)
@@ -2461,11 +2374,11 @@ class OptimizedWGCCapture:
                         apply_scale=convert_to_physical,
                     )
                     if wgc_is_logical:
-                        logger.info("  WGC使用逻辑像素坐标系，按屏幕端点计算裁剪范围")
+                        logger.debug("  WGC使用逻辑像素坐标系，按屏幕端点计算裁剪范围")
                     elif is_dpi_aware:
-                        logger.info("  WGC使用物理像素坐标系，按屏幕端点计算裁剪范围")
+                        logger.debug("  WGC使用物理像素坐标系，按屏幕端点计算裁剪范围")
                     else:
-                        logger.info("  WGC使用物理像素坐标系，按屏幕端点和DPI缩放计算裁剪范围")
+                        logger.debug("  WGC使用物理像素坐标系，按屏幕端点和DPI缩放计算裁剪范围")
                 else:
                     raise Exception(f"DwmGetWindowAttribute 调用失败：{result}")
 
@@ -2473,20 +2386,20 @@ class OptimizedWGCCapture:
                 logger.error(f"DWM API 调用失败: {e}")
                 raise
 
-            logger.info(f"  父窗口WindowRect: {capture_window_rect}, wgc_is_logical: {wgc_is_logical}")
+            logger.debug(f"  父窗口WindowRect: {capture_window_rect}, wgc_is_logical: {wgc_is_logical}")
 
-            logger.info("  【开始裁剪子窗口区域】")
-            logger.info(f"  子窗口偏移(逻辑): ({offset_x}, {offset_y}), 最终偏移: ({offset_x_physical}, {offset_y_physical})")
-            logger.info(f"  子窗口尺寸(逻辑): {child_w}x{child_h}, 物理: {child_w_physical}x{child_h_physical}")
-            logger.info(f"  WGC捕获帧尺寸: {frame.shape[1]}x{frame.shape[0]}")
+            logger.debug("  【开始裁剪子窗口区域】")
+            logger.debug(f"  子窗口偏移(逻辑): ({offset_x}, {offset_y}), 最终偏移: ({offset_x_physical}, {offset_y_physical})")
+            logger.debug(f"  子窗口尺寸(逻辑): {child_w}x{child_h}, 物理: {child_w_physical}x{child_h_physical}")
+            logger.debug(f"  WGC捕获帧尺寸: {frame.shape[1]}x{frame.shape[0]}")
 
             # 【修复】边界检查：确保不会超出父窗口捕获的帧尺寸
             frame_h, frame_w = frame.shape[:2]
 
             if wgc_is_logical:
-                logger.info(f"  WGC使用逻辑像素，目标裁剪尺寸: {target_w}x{target_h}")
+                logger.debug(f"  WGC使用逻辑像素，目标裁剪尺寸: {target_w}x{target_h}")
             else:
-                logger.info(f"  WGC使用物理像素，目标裁剪尺寸: {target_w}x{target_h}")
+                logger.debug(f"  WGC使用物理像素，目标裁剪尺寸: {target_w}x{target_h}")
 
             # 确保裁剪边界不超出帧尺寸
             crop_x = max(0, min(offset_x_physical, frame_w - 1))
@@ -2494,8 +2407,8 @@ class OptimizedWGCCapture:
             crop_w = min(target_w, frame_w - crop_x)
             crop_h = min(target_h, frame_h - crop_y)
 
-            logger.info(f"  实际裁剪区域: 起点=({crop_x}, {crop_y}), 尺寸={crop_w}x{crop_h}")
-            logger.info(f"  裁剪范围: frame[{crop_y}:{crop_y + crop_h}, {crop_x}:{crop_x + crop_w}]")
+            logger.debug(f"  实际裁剪区域: 起点=({crop_x}, {crop_y}), 尺寸={crop_w}x{crop_h}")
+            logger.debug(f"  裁剪范围: frame[{crop_y}:{crop_y + crop_h}, {crop_x}:{crop_x + crop_w}]")
 
             if crop_x != offset_x_physical or crop_y != offset_y_physical or crop_w != target_w or crop_h != target_h:
                 logger.warning("  [WARNING] 子窗口边界修正发生:")
@@ -2508,7 +2421,7 @@ class OptimizedWGCCapture:
             # 裁剪子窗口区域
             # 必须复制切片，避免返回视图导致整帧内存被上层长期引用
             cropped = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w].copy()
-            logger.info(f"  [OK] 裁剪完成，输出尺寸: {cropped.shape[1]}x{cropped.shape[0]}")
+            logger.debug(f"  [OK] 裁剪完成，输出尺寸: {cropped.shape[1]}x{cropped.shape[0]}")
 
             return cropped
 
@@ -2590,10 +2503,10 @@ class OptimizedWGCCapture:
                     border_left = client_screen_pos[0] - dwm_rect[0]
                     border_top = client_screen_pos[1] - dwm_rect[1]
 
-                    logger.info("【WGC客户区裁剪 - 使用DWM】")
-                    logger.info(f"  DWM扩展frame边界: {dwm_rect}")
-                    logger.info(f"  ClientToScreen: {client_screen_pos}")
-                    logger.info(f"  边框偏移: left={border_left}, top={border_top}")
+                    logger.debug("【WGC客户区裁剪 - 使用DWM】")
+                    logger.debug(f"  DWM扩展frame边界: {dwm_rect}")
+                    logger.debug(f"  ClientToScreen: {client_screen_pos}")
+                    logger.debug(f"  边框偏移: left={border_left}, top={border_top}")
                 else:
                     raise Exception(f"DwmGetWindowAttribute 调用失败，错误码：{result}")
 
@@ -2604,20 +2517,20 @@ class OptimizedWGCCapture:
             # 【修复】边界检查：确保不会超出WGC捕获的帧尺寸
             frame_h, frame_w = frame.shape[:2]
 
-            logger.info(f"  WGC捕获尺寸: {frame_w}x{frame_h}")
-            logger.info(f"  GetClientRect: {client_w}x{client_h}, 屏幕跨度: {client_w_screen}x{client_h_screen}, DPI缩放: {dpi_scale:.2f}, DPI感知: {is_dpi_aware}")
-            logger.info(f"  客户区物理尺寸: {client_w_physical}x{client_h_physical}")
-            logger.info(f"  边框偏移(逻辑): left={border_left}, top={border_top}")
+            logger.debug(f"  WGC捕获尺寸: {frame_w}x{frame_h}")
+            logger.debug(f"  GetClientRect: {client_w}x{client_h}, 屏幕跨度: {client_w_screen}x{client_h_screen}, DPI缩放: {dpi_scale:.2f}, DPI感知: {is_dpi_aware}")
+            logger.debug(f"  客户区物理尺寸: {client_w_physical}x{client_h_physical}")
+            logger.debug(f"  边框偏移(逻辑): left={border_left}, top={border_top}")
 
             # 判断WGC返回的坐标空间（逻辑像素 vs 物理像素）
             # 先与逻辑尺寸比较
             wgc_is_logical = True  # 默认假设逻辑像素
             if abs(frame_w - client_w_screen) <= 4 and abs(frame_h - client_h_screen) <= 4:
                 wgc_is_logical = True
-                logger.info(f"  [OK] WGC捕获尺寸≈客户区逻辑尺寸({client_w_screen}x{client_h_screen})，WGC使用逻辑像素")
+                logger.debug(f"  [OK] WGC捕获尺寸≈客户区逻辑尺寸({client_w_screen}x{client_h_screen})，WGC使用逻辑像素")
             elif abs(frame_w - client_w_physical) <= 4 and abs(frame_h - client_h_physical) <= 4:
                 wgc_is_logical = False
-                logger.info(f"  [OK] WGC捕获尺寸≈客户区物理尺寸({client_w_physical}x{client_h_physical})，WGC使用物理像素")
+                logger.debug(f"  [OK] WGC捕获尺寸≈客户区物理尺寸({client_w_physical}x{client_h_physical})，WGC使用物理像素")
             else:
                 # 尝试比较DWM边界
                 try:
@@ -2627,10 +2540,10 @@ class OptimizedWGCCapture:
                     dwm_h_physical = int(dwm_h * dpi_scale) if not is_dpi_aware else dwm_h
                     if abs(frame_w - dwm_w) <= 4 and abs(frame_h - dwm_h) <= 4:
                         wgc_is_logical = True
-                        logger.info(f"  [OK] WGC捕获尺寸≈DWM逻辑尺寸({dwm_w}x{dwm_h})，WGC使用逻辑像素")
+                        logger.debug(f"  [OK] WGC捕获尺寸≈DWM逻辑尺寸({dwm_w}x{dwm_h})，WGC使用逻辑像素")
                     elif abs(frame_w - dwm_w_physical) <= 4 and abs(frame_h - dwm_h_physical) <= 4:
                         wgc_is_logical = False
-                        logger.info(f"  [OK] WGC捕获尺寸≈DWM物理尺寸({dwm_w_physical}x{dwm_h_physical})，WGC使用物理像素")
+                        logger.debug(f"  [OK] WGC捕获尺寸≈DWM物理尺寸({dwm_w_physical}x{dwm_h_physical})，WGC使用物理像素")
                     else:
                         wgc_is_logical = True
                         logger.warning("  [WARNING] WGC尺寸不匹配，默认使用逻辑像素坐标系")
@@ -2654,19 +2567,19 @@ class OptimizedWGCCapture:
                 apply_scale=convert_to_physical,
             )
             if wgc_is_logical:
-                logger.info(f"  WGC逻辑模式: 边框=({border_left_final}, {border_top_final}), 目标={target_w}x{target_h}")
+                logger.debug(f"  WGC逻辑模式: 边框=({border_left_final}, {border_top_final}), 目标={target_w}x{target_h}")
             else:
-                logger.info(f"  WGC物理模式: 边框=({border_left_final}, {border_top_final}), 目标={target_w}x{target_h}")
+                logger.debug(f"  WGC物理模式: 边框=({border_left_final}, {border_top_final}), 目标={target_w}x{target_h}")
 
             # 如果WGC已经返回了客户区内容（无边框），直接返回
             if abs(frame_w - target_w) <= 4 and abs(frame_h - target_h) <= 4:
-                logger.info("  [OK] WGC捕获尺寸≈目标尺寸，WGC已返回客户区，直接返回")
+                logger.debug("  [OK] WGC捕获尺寸≈目标尺寸，WGC已返回客户区，直接返回")
                 return frame
 
             # 如果WGC捕获尺寸<=客户区且无边框，说明WGC已返回正确内容
             if (frame_w <= target_w and frame_h <= target_h and
                 border_left_final <= 0 and border_top_final <= 0):
-                logger.info("  [OK] WGC捕获尺寸≤目标尺寸且无边框，直接返回")
+                logger.debug("  [OK] WGC捕获尺寸≤目标尺寸且无边框，直接返回")
                 return frame
 
             # WGC捕获了整个窗口（包含边框），需要裁剪到客户区
@@ -2687,7 +2600,7 @@ class OptimizedWGCCapture:
                 logger.warning("    返回完整帧由上层处理")
                 return frame
 
-            logger.info(f"  需要裁剪边框: 起点=({crop_x}, {crop_y}), 尺寸={crop_w}x{crop_h}")
+            logger.debug(f"  需要裁剪边框: 起点=({crop_x}, {crop_y}), 尺寸={crop_w}x{crop_h}")
 
             if crop_x != border_left_final or crop_y != border_top_final or crop_w != target_w or crop_h != target_h:
                 logger.warning("  [WARNING] 边界修正发生:")
@@ -2700,7 +2613,7 @@ class OptimizedWGCCapture:
             # 必须复制切片，避免返回视图导致整帧内存被上层长期引用
             cropped = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w].copy()
 
-            logger.info(f"  [OK] 裁剪完成，输出尺寸: {cropped.shape[1]}x{cropped.shape[0]}")
+            logger.debug(f"  [OK] 裁剪完成，输出尺寸: {cropped.shape[1]}x{cropped.shape[0]}")
 
             return cropped
 

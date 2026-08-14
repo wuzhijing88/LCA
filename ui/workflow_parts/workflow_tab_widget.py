@@ -9,10 +9,11 @@ import logging
 import os
 import json
 from utils.app_paths import get_config_path
+from utils.hwnd_utils import as_hwnd
 from typing import Dict, Optional, List, Any
 from PySide6.QtWidgets import (QTabWidget, QTabBar, QWidget, QPushButton,
                                QFileDialog, QMessageBox, QMenu)
-from PySide6.QtCore import Qt, Signal, QPoint, Slot, QSettings
+from PySide6.QtCore import Qt, Signal, QPoint, Slot
 from PySide6.QtGui import QWheelEvent
 
 from ..workflow_parts.workflow_view import WorkflowView
@@ -162,7 +163,9 @@ class WorkflowTabWidget(QTabWidget):
         """从 QSettings 加载画布视图持久化数据。"""
         normalized: Dict[str, Dict[str, List[float]]] = {}
         try:
-            settings = QSettings("LCA", "LCA")
+            from utils.instance_runtime import create_app_settings
+
+            settings = create_app_settings()
             raw_payload = settings.value(_VIEW_STATE_SETTINGS_KEY, "")
             if not isinstance(raw_payload, str):
                 raise TypeError("画布视图持久化状态必须是 JSON 字符串")
@@ -184,7 +187,9 @@ class WorkflowTabWidget(QTabWidget):
     def _flush_persisted_view_states(self) -> None:
         """将画布视图持久化数据写入 QSettings。"""
         try:
-            settings = QSettings("LCA", "LCA")
+            from utils.instance_runtime import create_app_settings
+
+            settings = create_app_settings()
             settings.setValue(
                 _VIEW_STATE_SETTINGS_KEY,
                 json.dumps(self._persisted_view_states, ensure_ascii=False),
@@ -519,13 +524,17 @@ class WorkflowTabWidget(QTabWidget):
                 if window_binding['bound_window_id'] is not None or window_binding['target_window_title']:
                     raise ValueError("未绑定窗口时 bound_window_id 必须为 null 且标题必须为空")
             else:
-                if isinstance(target_hwnd, bool) or not isinstance(target_hwnd, int) or target_hwnd <= 0:
+                if isinstance(target_hwnd, bool):
                     raise TypeError("工作流 target_hwnd 必须是正整数或 null")
+                normalized_hwnd = as_hwnd(target_hwnd)
+                if normalized_hwnd == 0:
+                    raise TypeError("工作流 target_hwnd 必须是正整数或 null")
+                window_binding['target_hwnd'] = normalized_hwnd
                 if not window_binding['target_window_title'].strip():
                     raise ValueError("已绑定窗口时 target_window_title 不能为空")
                 import win32gui
-                if not win32gui.IsWindow(target_hwnd):
-                    raise ValueError(f"工作流绑定窗口已失效（HWND: {target_hwnd}），请先修正配置")
+                if not win32gui.IsWindow(normalized_hwnd):
+                    raise ValueError(f"工作流绑定窗口已失效（HWND: {normalized_hwnd}），请先修正配置")
 
         return jump_config, window_binding
 
@@ -701,6 +710,7 @@ class WorkflowTabWidget(QTabWidget):
             images_dir=getattr(task, 'images_dir', self.images_dir),
             parent=self
         )
+        workflow_view.task_id = task_id
 
         metadata = task.workflow_data.get('metadata') if isinstance(task.workflow_data, dict) else {}
         workflow_view.workflow_metadata = dict(metadata) if isinstance(metadata, dict) else {}

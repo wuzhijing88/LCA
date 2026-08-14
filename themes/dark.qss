@@ -761,6 +761,7 @@ QFrame[tableCard="true"] QTableWidget {
     border-radius: 0;
 }
 
+
 /* 琛ㄥご */
 QHeaderView::section {
     background-color: #2d2d2d;

@@ -2,6 +2,9 @@ import logging
 
 from PySide6.QtWidgets import QInputDialog, QMessageBox
 
+from utils.hwnd_utils import as_hwnd
+from utils.window_identity import apply_window_identity
+
 logger = logging.getLogger(__name__)
 
 
@@ -12,8 +15,9 @@ class GlobalSettingsDialogWindowManageMixin:
             'title': window_title,
             'enabled': True
         }
-        if hwnd and hwnd != 0:
-            new_window['hwnd'] = hwnd
+        if as_hwnd(hwnd):
+            hwnd = as_hwnd(hwnd)
+            apply_window_identity(new_window, hwnd)
             try:
                 new_window['dpi_info'] = self._get_window_dpi_info(hwnd)
             except Exception as e:
@@ -50,10 +54,10 @@ class GlobalSettingsDialogWindowManageMixin:
             parent_window._update_main_window_title()
     def _find_duplicate_bound_window(self, window_title: str, hwnd: int = 0):
         safe_title = str(window_title or '').strip()
-        safe_hwnd = int(hwnd or 0)
+        safe_hwnd = as_hwnd(hwnd)
         for window_info in self.bound_windows:
             existing_title = str(window_info.get('title', '') or '').strip()
-            existing_hwnd = int(window_info.get('hwnd', 0) or 0)
+            existing_hwnd = as_hwnd(window_info.get('hwnd', 0))
             if safe_hwnd and existing_hwnd == safe_hwnd:
                 return window_info
             if existing_title == safe_title and existing_hwnd == safe_hwnd:
@@ -113,14 +117,15 @@ class GlobalSettingsDialogWindowManageMixin:
             # 获取已绑定的窗口句柄，用于过滤
             bound_hwnds = set()
             for window_info in self.bound_windows:
-                hwnd = window_info.get('hwnd')
-                if hwnd and hwnd != 0:
+                hwnd = as_hwnd(window_info.get('hwnd'))
+                if hwnd:
                     bound_hwnds.add(hwnd)
             # 准备选择列表和映射，过滤已绑定的窗口
             dialog_items = []
             window_mapping = {}  # 映射显示文本到窗口信息
             available_windows = []
             for hwnd, title, class_name in child_windows:
+                hwnd = as_hwnd(hwnd)
                 if hwnd not in bound_hwnds:  # 只显示未绑定的窗口
                     display_text = f"{title} (类名: {class_name}, 句柄: {hwnd})"
                     dialog_items.append(display_text)
@@ -140,10 +145,11 @@ class GlobalSettingsDialogWindowManageMixin:
             QMessageBox.warning(self, "错误", f"获取窗口失败:\n{e}")
     def _add_window_if_not_exists(self, window_title: str, hwnd: int = 0):
         """如果窗口不存在则添加"""
+        hwnd = as_hwnd(hwnd)
         duplicate_window = self._find_duplicate_bound_window(window_title, hwnd)
         if duplicate_window:
             existing_title = duplicate_window.get('title', '')
-            existing_hwnd = duplicate_window.get('hwnd', 0)
+            existing_hwnd = as_hwnd(duplicate_window.get('hwnd', 0))
             if hwnd and hwnd != 0 and existing_hwnd == hwnd:
                 QMessageBox.information(self, "提示", f"窗口句柄 {hwnd} 已被绑定到 '{existing_title}'")
             elif hwnd and hwnd != 0:
@@ -152,6 +158,8 @@ class GlobalSettingsDialogWindowManageMixin:
                 QMessageBox.information(self, "提示", f"窗口 '{window_title}' 已存在")
             return
         self._append_bound_window(window_title, hwnd)
+        if hasattr(self, "_schedule_wgc_desktop_engine_warning"):
+            self._schedule_wgc_desktop_engine_warning()
         # 【性能优化】不预创建OCR服务，改为按需创建（避免绑定窗口时卡顿）
         # self._preregister_window_ocr_service(new_window)
         # 工具 修复：绑定窗口时不自动激活窗口，避免干扰用户操作
@@ -164,6 +172,7 @@ class GlobalSettingsDialogWindowManageMixin:
     def _add_window_silently(self, window_title: str, hwnd: int = 0):
         """静默添加窗口（不显示对话框，全面异常保护）"""
         try:
+            hwnd = as_hwnd(hwnd)
             logger.info(f"[_add_window_silently] 开始添加窗口: {window_title}, hwnd={hwnd}")
             duplicate_window = self._find_duplicate_bound_window(window_title, hwnd)
             if duplicate_window:
@@ -179,6 +188,7 @@ class GlobalSettingsDialogWindowManageMixin:
     def _add_window_silently_batch(self, window_title: str, hwnd: int = 0):
         """批量模式静默添加窗口（跳过UI刷新和分辨率调整，避免卡顿）"""
         try:
+            hwnd = as_hwnd(hwnd)
             logger.info(f"[批量模式] 开始添加窗口: {window_title}, hwnd={hwnd}")
             duplicate_window = self._find_duplicate_bound_window(window_title, hwnd)
             if duplicate_window:
@@ -194,6 +204,7 @@ class GlobalSettingsDialogWindowManageMixin:
             logger.error(traceback.format_exc())
     def _generate_unique_window_title(self, original_title: str, hwnd: int) -> str:
         """为窗口生成唯一的显示标题"""
+        hwnd = as_hwnd(hwnd)
         try:
             # 检查是否有相同标题的窗口
             same_title_count = 0

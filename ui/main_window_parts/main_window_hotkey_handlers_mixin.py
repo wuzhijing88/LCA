@@ -7,11 +7,48 @@ logger = logging.getLogger(__name__)
 
 class MainWindowHotkeyHandlersMixin:
 
+    def _instance_should_handle_hotkey(self, notify: bool = True):
+        try:
+            from utils.instance_runtime import should_handle_hotkey
+
+            owned = should_handle_hotkey(getattr(self, "bound_windows", None))
+        except Exception:
+            return True
+        if not owned and notify:
+            self._notify_hotkey_routed_away()
+        return owned
+
+    def _notify_hotkey_routed_away(self):
+        import time
+
+        now = time.monotonic()
+        last = float(getattr(self, "_last_hotkey_route_hint_ts", 0.0) or 0.0)
+        if now - last < 4.0:
+            return
+        self._last_hotkey_route_hint_ts = now
+        message = "快捷键已由另一份 LCA 处理（当前焦点不在本实例）"
+        logger.info(message)
+        if hasattr(self, "_update_step_details"):
+            try:
+                self._update_step_details(message)
+            except Exception:
+                pass
+        if self.isVisible() and not self.isMinimized():
+            return
+        tray = getattr(self, "system_tray_manager", None)
+        if tray is not None and hasattr(tray, "show_message"):
+            try:
+                tray.show_message("LCA", message)
+            except Exception:
+                pass
+
     def _on_record_hotkey(self):
         """录制快捷键回调"""
         try:
             if QThread.currentThread() != self.thread():
                 QTimer.singleShot(0, self, self._on_record_hotkey)
+                return
+            if not self._instance_should_handle_hotkey():
                 return
             # 防抖：检查是否在短时间内重复触发
             import time
@@ -59,6 +96,8 @@ class MainWindowHotkeyHandlersMixin:
             if QThread.currentThread() != self.thread():
                 QTimer.singleShot(0, self, self._on_replay_hotkey)
                 return
+            if not self._instance_should_handle_hotkey():
+                return
             # 防抖：检查是否在短时间内重复触发
             import time
             current_time = time.time()
@@ -96,6 +135,8 @@ class MainWindowHotkeyHandlersMixin:
     def _on_start_task_hotkey(self):
         """启动任务快捷键回调 - 通过信号确保线程安全"""
         try:
+            if not self._instance_should_handle_hotkey():
+                return
             # 防抖：检查是否在短时间内重复触发
             import time
             current_time = time.time()
@@ -117,6 +158,8 @@ class MainWindowHotkeyHandlersMixin:
     def _on_stop_task_hotkey(self):
         """停止任务快捷键回调 - 通过信号确保线程安全"""
         try:
+            if not self._instance_should_handle_hotkey():
+                return
             # 防抖：检查是否在短时间内重复触发
             import time
             current_time = time.time()
@@ -141,6 +184,8 @@ class MainWindowHotkeyHandlersMixin:
     def _on_pause_workflow_hotkey(self):
         """暂停/恢复工作流快捷键回调"""
         try:
+            if not self._instance_should_handle_hotkey():
+                return
             # 防抖：检查是否在短时间内重复触发
             import time
             current_time = time.time()

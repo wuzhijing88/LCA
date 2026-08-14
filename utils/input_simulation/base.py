@@ -6,6 +6,7 @@
 from abc import ABC, abstractmethod
 from typing import Optional, Any, List
 import logging
+from utils.hwnd_utils import as_hwnd
 from utils.input_timing import DEFAULT_KEY_HOLD_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ class BaseInputSimulator(ABC):
         Args:
             hwnd: 目标窗口句柄
         """
-        self.hwnd = hwnd
+        self.hwnd = as_hwnd(hwnd)
         self.logger = logger
     
     @abstractmethod

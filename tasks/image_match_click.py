@@ -9,6 +9,7 @@ import traceback # Import traceback for printing exception details
 from tasks.task_utils import coerce_bool, coerce_float, coerce_int, capture_and_match_template_smart
 from tasks.click_action_executor import execute_simulator_click_action
 from tasks.click_param_resolver import resolve_click_params
+from utils.hwnd_utils import as_hwnd
 from tasks.virtual_mouse_state import (
     get_virtual_mouse_coords as _read_virtual_mouse_coords,
     is_virtual_mouse_enabled as _read_virtual_mouse_enabled,
@@ -59,10 +60,10 @@ def locate_image_in_window(
 ) -> Tuple[bool, Optional[Tuple[int, int, int, int, int, int]], Optional[str]]:
     """使用当前正式找图链路执行一次定位。"""
     try:
-        hwnd = int(target_hwnd) if target_hwnd is not None else 0
+        hwnd = as_hwnd(target_hwnd)
     except Exception:
         hwnd = 0
-    if hwnd <= 0:
+    if hwnd == 0:
         return False, None, None
 
     raw_image_path = str((params or {}).get('image_path') or '').strip()
@@ -848,10 +849,16 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                                 f"截图尺寸: {screenshot_w}x{screenshot_h}")
                     break
                 else:
-                    logger.info(
-                        f"[统一后台识别] 尝试 {attempt}: 未找到图片 "
-                        f"(置信度 {match_score:.4f} < 阈值 {confidence:.4f})。"
-                    )
+                    if match_score >= confidence:
+                        logger.info(
+                            f"[统一后台识别] 尝试 {attempt}: 匹配分 {match_score:.4f} 已达阈值 {confidence:.4f}，"
+                            "但未得到有效匹配位置。"
+                        )
+                    else:
+                        logger.info(
+                            f"[统一后台识别] 尝试 {attempt}: 未找到图片 "
+                            f"(置信度 {match_score:.4f} < 阈值 {confidence:.4f})。"
+                        )
 
         except Exception as find_err:
             # 显示错误详细信息
@@ -1197,7 +1204,13 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 # 确保 os 模块可用
                 import os
                 image_name = os.path.basename(absolute_image_path)
-            logger.info(f"任务 '{TASK_NAME}' (图片: '{image_name}') 执行失败 (未找到或点击失败)。")
+            if not found:
+                failure_reason = "未找到图片"
+            elif enable_click and not click_success:
+                failure_reason = "图片已找到，但点击失败"
+            else:
+                failure_reason = "执行失败"
+            logger.info(f"任务 '{TASK_NAME}' (图片: '{image_name}') 执行失败 ({failure_reason})。")
             # 使用统一的失败处理
             from .task_utils import handle_failure_action
             return handle_failure_action(params, card_id)

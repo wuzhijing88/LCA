@@ -94,35 +94,7 @@ class MainWindowGlobalSettingsMixin:
         screenshot_engine = settings.get('screenshot_engine', 'wgc')
         requested_engine = str(screenshot_engine or "").strip().lower()
         self._schedule_runtime_screenshot_engine_switch(requested_engine)
-        # 从配置更新定时启动相关变量
-        self._schedule_enabled = self.config.get('enable_schedule', False)
-        self._schedule_hour = self.config.get('schedule_hour', 9)
-        self._schedule_minute = self.config.get('schedule_minute', 0)
-        self._schedule_repeat = self.config.get('schedule_repeat', 'daily')
-        schedule_mode = str(self.config.get('schedule_mode', 'fixed_time') or '').strip().lower()
-        self._schedule_mode = 'interval' if schedule_mode == 'interval' else 'fixed_time'
-        try:
-            self._schedule_interval_value = max(1, int(self.config.get('schedule_interval_value', 5) or 5))
-        except (TypeError, ValueError):
-            self._schedule_interval_value = 5
-        schedule_interval_unit = str(self.config.get('schedule_interval_unit', '分钟') or '').strip()
-        self._schedule_interval_unit = schedule_interval_unit if schedule_interval_unit in ('秒', '分钟', '小时') else '分钟'
-        # 从配置更新定时停止相关变量
-        self._global_timer_enabled = self.config.get('timer_enabled', False)
-        self._stop_hour = self.config.get('stop_hour', 17)
-        self._stop_minute = self.config.get('stop_minute', 0)
-        self._stop_repeat = self.config.get('stop_repeat', 'daily')
-        # 从配置更新定时暂停相关变量
-        self._timed_pause_enabled = self.config.get('timed_pause_enabled', False)
-        self._timed_pause_hour = self.config.get('timed_pause_hour', 12)
-        self._timed_pause_minute = self.config.get('timed_pause_minute', 0)
-        self._timed_pause_repeat = self.config.get('timed_pause_repeat', 'daily')
-        self._timed_pause_duration_value = self.config.get('timed_pause_duration_value', 10)
-        self._timed_pause_duration_unit = self.config.get('timed_pause_duration_unit', '分钟')
-        # 更新定时设置
-        self._update_schedule_config()
-        self._update_stop_config()
-        self._update_timed_pause_config()
+        self._reload_main_schedule_from_config()
         # 更新快捷键
         self._update_hotkeys()
         logger.info("全局设置已更新:")

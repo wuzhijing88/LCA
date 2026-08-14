@@ -71,7 +71,7 @@ def _has_runtime_that_blocks_start(ctx) -> bool:
     return False
 
 
-def main_window_safe_start_tasks(ctx, reset_jump_cancel=True):
+def main_window_safe_start_tasks(ctx, reset_jump_cancel=True, interactive=True):
     self = ctx
     logger.info('received safe start request')
 
@@ -145,6 +145,7 @@ def main_window_safe_start_tasks(ctx, reset_jump_cancel=True):
             _resolve_current_canvas_task_id,
             task_state_manager,
             start_state,
+            interactive=interactive,
         )
         if prepare_result.get('should_return'):
             return
@@ -161,12 +162,14 @@ def main_window_safe_start_tasks(ctx, reset_jump_cancel=True):
             _resolve_current_canvas_task_id,
             task_state_manager,
             start_state,
+            interactive=interactive,
         )
     except Exception as exc:
         logger.error('安全启动流程失败：%s', exc)
         import traceback
         logger.error(traceback.format_exc())
-        QMessageBox.warning(self, MSG_START_FAIL_TITLE, f"{MSG_START_ERROR_TEXT}:\n{str(exc)}")
+        if interactive:
+            QMessageBox.warning(self, MSG_START_FAIL_TITLE, f"{MSG_START_ERROR_TEXT}:\n{str(exc)}")
     finally:
         if start_state['task_state_claimed'] and (not start_state['workflow_started']) and task_state_manager:
             try:

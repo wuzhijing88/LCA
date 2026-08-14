@@ -18,6 +18,7 @@ from typing import Dict, Any, Optional, Tuple, List
 import cv2
 import numpy as np
 from tasks.click_param_resolver import resolve_click_params
+from utils.hwnd_utils import as_hwnd
 from utils.input_guard import (
     acquire_input_guard,
     get_input_lock_wait_warn_ms,
@@ -1999,7 +2000,7 @@ def _overlay_drawing_loop():
                     if force_clear:
                         _overlay_force_clear = False
 
-                if not hwnd or hwnd <= 0:
+                if as_hwnd(hwnd) == 0:
                     if _overlay_instance is not None:
                         _overlay_instance.hide()
                     with _overlay_lock:
@@ -2954,8 +2955,8 @@ def _draw_detections_with_qt(hwnd: int, detections: List, frame_shape: Tuple) ->
             try:
                 import ctypes
 
-                hwnd = int(widget.winId())
-                if hwnd <= 0:
+                hwnd = as_hwnd(widget.winId())
+                if hwnd == 0:
                     return
 
                 user32 = ctypes.windll.user32
@@ -3382,16 +3383,16 @@ def _should_use_qt_overlay(hwnd: int) -> bool:
         return False
 
     try:
-        target_hwnd = int(hwnd)
+        target_hwnd = as_hwnd(hwnd)
     except Exception:
         return False
-    if target_hwnd <= 0:
+    if target_hwnd == 0:
         return False
 
     try:
         for widget in app.topLevelWidgets():
             try:
-                if int(widget.winId()) == target_hwnd:
+                if as_hwnd(widget.winId()) == target_hwnd:
                     return True
             except Exception:
                 continue

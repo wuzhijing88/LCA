@@ -7,6 +7,7 @@ from typing import Final, Mapping
 
 OCR_MODEL_NAME: Final = "PP-OCRv4 mobile"
 OCR_MODEL_DIRECTORY: Final = "models/rapidocr"
+# RapidOCR 3.9 会自带 PP-OCRv6_*.onnx，LCA 不使用。打包时必须排除，避免误装、误加载。
 
 OCR_MODEL_FILES: Final[Mapping[str, tuple[str, str]]] = MappingProxyType({
     "det": (

@@ -8,6 +8,12 @@ class MainWindowStatusMixin:
         """Updates the main window title to include the target window and unsaved status."""
 
         base_title = "自动化工作流"
+        try:
+            from utils.instance_runtime import get_instance_title_suffix
+
+            base_title += get_instance_title_suffix()
+        except Exception:
+            pass
 
         # 根据实际窗口数量显示不同的目标信息
 

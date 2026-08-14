@@ -33,9 +33,26 @@ class ControlCenterRunnerMixin:
         if not self._is_qt_runner_valid(runner):
             return ""
         try:
-            return str(getattr(runner, "window_id", "") or "")
+            return str(getattr(runner, "job_id", None) or getattr(runner, "window_id", "") or "")
         except Exception:
             return ""
+
+    def _runner_matches_filter(self, runner, target_filter) -> bool:
+        if target_filter is None:
+            return True
+        job_id = self._safe_runner_window_id(runner)
+        scheduler = getattr(self, "scheduler", None)
+        hwnd = None
+        try:
+            hwnd = getattr(runner, "hwnd", None)
+            if not hwnd:
+                window_info = getattr(runner, "window_info", None) or {}
+                hwnd = window_info.get("hwnd")
+        except Exception:
+            hwnd = None
+        if scheduler is not None:
+            return scheduler.matches_filter(job_id, target_filter, hwnd=hwnd)
+        return job_id in set(target_filter)
 
     def _safe_runner_thread_running(self, runner) -> bool:
         if not self._is_qt_runner_valid(runner):
@@ -53,7 +70,7 @@ class ControlCenterRunnerMixin:
                 runners = [runners]
             for runner in runners:
                 try:
-                    if target_filter is not None and runner.window_id not in target_filter:
+                    if target_filter is not None and not self._runner_matches_filter(runner, target_filter):
                         continue
                     if runner and runner.is_running:
                         running_count += 1
@@ -85,6 +102,8 @@ class ControlCenterRunnerMixin:
     def _is_runner_paused(self, runner) -> bool:
         if not self._is_runner_pause_controllable(runner):
             return False
+        if self._get_runner_state_value(runner) in {"已暂停", "暂停中"}:
+            return True
         try:
             executor = getattr(runner, "executor", None)
             return executor is not None and getattr(executor, "_paused", False)
@@ -99,7 +118,7 @@ class ControlCenterRunnerMixin:
                 runners = [runners]
             for runner in runners:
                 try:
-                    if target_filter is not None and runner.window_id not in target_filter:
+                    if target_filter is not None and not self._runner_matches_filter(runner, target_filter):
                         continue
                     if not self._is_runner_pause_controllable(runner):
                         continue
@@ -254,8 +273,8 @@ class ControlCenterRunnerMixin:
                 return True
             if not isinstance(entry, dict):
                 return False
-            window_id = self._resolve_window_id_by_row(entry.get("row", -1))
-            return bool(window_id and window_id in target_filter)
+            window_id = str(entry.get("job_id") or "").strip() or self._resolve_window_id_by_row(entry.get("row", -1))
+            return bool(window_id and self._job_id_in_filter(window_id, target_filter, entry))
 
         if isinstance(self._pending_windows, list):
             kept = []
@@ -290,7 +309,7 @@ class ControlCenterRunnerMixin:
                 self._batch_start_gate_event = None
             if hasattr(self, "start_all_btn") and self.start_all_btn is not None:
                 self.start_all_btn.setEnabled(True)
-                self.start_all_btn.setText("全部开始")
+                self.start_all_btn.setText("开始")
 
         self._refresh_multi_window_mode_env()
         return removed_count
@@ -302,7 +321,7 @@ class ControlCenterRunnerMixin:
                 runners = [runners]
             for runner in runners:
                 try:
-                    if target_filter is not None and runner.window_id not in target_filter:
+                    if target_filter is not None and not self._runner_matches_filter(runner, target_filter):
                         continue
                     if self._is_runner_paused(runner):
                         return True
@@ -315,13 +334,10 @@ class ControlCenterRunnerMixin:
             return
         selected_window_ids = self._get_selected_window_ids()
         target_window_ids = selected_window_ids if selected_window_ids else None
-        scope_text = "选中" if selected_window_ids else "全部"
-        if self._has_unpaused_running_runners(target_window_ids=target_window_ids):
-            self.pause_all_btn.setText(f"暂停{scope_text}")
-        elif self._is_any_runner_paused(target_window_ids=target_window_ids):
-            self.pause_all_btn.setText(f"恢复{scope_text}")
+        if self._is_any_runner_paused(target_window_ids=target_window_ids) and not self._has_unpaused_running_runners(target_window_ids=target_window_ids):
+            self.pause_all_btn.setText("恢复")
         else:
-            self.pause_all_btn.setText(f"暂停{scope_text}")
+            self.pause_all_btn.setText("暂停")
 
     def _window_has_running_runner(self, window_id: str) -> bool:
         runners = self.window_runners.get(str(window_id))
@@ -383,6 +399,10 @@ class ControlCenterRunnerMixin:
                 logger.warning(f"暂停窗口 {window_id} 失败: {exc}")
 
         if paused_any:
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None and scheduler.can_pause(window_id):
+                scheduler.request_pause(window_id)
+            self._sync_job_from_runners(window_id)
             self._sync_pause_all_button_text()
         return paused_any
 
@@ -416,6 +436,10 @@ class ControlCenterRunnerMixin:
                 logger.warning(f"恢复窗口 {window_id} 失败: {exc}")
 
         if resumed_any:
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None and scheduler.can_resume(window_id):
+                scheduler.request_resume(window_id)
+            self._sync_job_from_runners(window_id)
             self._sync_pause_all_button_text()
         return resumed_any
 
@@ -424,7 +448,7 @@ class ControlCenterRunnerMixin:
         target_filter = set(target_window_ids) if target_window_ids else None
 
         for window_id in list(self.window_runners.keys()):
-            if target_filter is not None and window_id not in target_filter:
+            if target_filter is not None and not self._job_id_in_filter(window_id, target_filter):
                 continue
             if self._pause_single_window_runners(window_id):
                 paused_window_ids.add(window_id)
@@ -438,7 +462,7 @@ class ControlCenterRunnerMixin:
         target_filter = set(target_window_ids) if target_window_ids else None
 
         for window_id in list(self.window_runners.keys()):
-            if target_filter is not None and window_id not in target_filter:
+            if target_filter is not None and not self._job_id_in_filter(window_id, target_filter):
                 continue
             if self._resume_single_window_runners(window_id):
                 resumed_window_ids.add(window_id)

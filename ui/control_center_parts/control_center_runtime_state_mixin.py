@@ -1,5 +1,7 @@
 import logging
 
+from app_core.control_plane import can_transition, default_step_for
+
 from .control_center_runtime_types import TaskState
 
 logger = logging.getLogger(__name__)
@@ -7,34 +9,33 @@ logger = logging.getLogger(__name__)
 
 class WindowTaskRunnerStateMixin:
 
-    def _set_state(self, new_state: TaskState, step_info: str = None):
+    def _emit_step(self, step_info: str):
+        text = str(step_info or "").strip()
+        self._last_status_message = text
+        self.step_updated.emit(self.window_id, text)
+
+    def _set_state(self, new_state: TaskState, step_info: str = None, *, force: bool = False):
         """设置任务状态并发送信号"""
         step_text = step_info
         if self._current_state != new_state:
+            if not force and not can_transition(self._current_state, new_state):
+                logger.warning(
+                    "窗口%s拒绝状态转换: %s -> %s",
+                    self.window_id,
+                    self._current_state.value,
+                    new_state.value,
+                )
+                return
             logger.info(f"窗口{self.window_id}状态变更: {self._current_state.value} -> {new_state.value}")
             self._current_state = new_state
-
-            # 发送状态更新信号
+            if not step_text:
+                step_text = default_step_for(new_state)
+            self._last_status_message = str(step_text or "").strip()
             self.status_updated.emit(self.window_id, new_state.value)
-
-            # 发送步骤更新信号
-            if step_text:
-                self.step_updated.emit(self.window_id, step_text)
-            else:
-                # 使用默认步骤信息
-                default_steps = {
-                    TaskState.IDLE: "等待开始",
-                    TaskState.STARTING: "正在启动工作流",
-                    TaskState.RUNNING: "工作流运行中",
-                    TaskState.STOPPING: "正在停止工作流",
-                    TaskState.STOPPED: "工作流已中断",
-                    TaskState.COMPLETED: "工作流已完成",
-                    TaskState.FAILED: "工作流执行失败"
-                }
-                step_text = default_steps.get(new_state, "未知状态")
-                self.step_updated.emit(self.window_id, step_text)
-
-        self._last_status_message = str(step_text or "").strip()
+            self.step_updated.emit(self.window_id, step_text)
+            return
+        if step_text:
+            self._last_status_message = str(step_text).strip()
 
     def _emit_task_completed_once(self, success: bool):
         """任务完成信号只允许发出一次，避免停止竞态触发重复收尾。"""
@@ -54,25 +55,13 @@ class WindowTaskRunnerStateMixin:
         """线程真正退出后再执行兜底收尾。"""
         logger.info(f"窗口{self.window_id}线程已退出，开始执行最终收尾检查")
         if self._current_state == TaskState.STOPPING and not self._task_completed_emitted:
-            self._set_state(TaskState.STOPPED, "工作流已中断")
+            self._set_state(TaskState.STOPPED, "工作流已中断", force=True)
             self._emit_task_completed_once(False)
         if self._cleanup_deferred_until_finish and not self._is_cleaned:
             self._cleanup_thread()
 
     def _can_transition_to(self, new_state: TaskState) -> bool:
-        """检查是否可以转换到新状态"""
-        valid_transitions = {
-            TaskState.IDLE: [TaskState.STARTING],
-            TaskState.STARTING: [TaskState.RUNNING, TaskState.FAILED, TaskState.STOPPING],
-            TaskState.RUNNING: [TaskState.STOPPING, TaskState.COMPLETED, TaskState.FAILED],
-            TaskState.STOPPING: [TaskState.STOPPED, TaskState.FAILED],
-            TaskState.STOPPED: [TaskState.STARTING],  # 可以重新启动
-            TaskState.COMPLETED: [TaskState.STARTING],  # 可以重新启动
-            TaskState.FAILED: [TaskState.STARTING]  # 可以重新启动
-        }
-
-        allowed = valid_transitions.get(self._current_state, [])
-        return new_state in allowed
+        return can_transition(self._current_state, new_state)
 
     @property
     def current_state(self) -> TaskState:
@@ -89,7 +78,7 @@ class WindowTaskRunnerStateMixin:
         return bool(
             thread_running
             or self._cleanup_deferred_until_finish
-            or self._current_state in [TaskState.STARTING, TaskState.RUNNING, TaskState.STOPPING]
+            or self._current_state in [TaskState.STARTING, TaskState.RUNNING, TaskState.PAUSED, TaskState.STOPPING]
         )
 
     @property
@@ -109,13 +98,13 @@ class WindowTaskRunnerStateMixin:
     @property
     def can_stop(self) -> bool:
         """检查是否可以停止"""
-        return self._current_state in [TaskState.STARTING, TaskState.RUNNING]
+        return self._current_state in [TaskState.STARTING, TaskState.RUNNING, TaskState.PAUSED]
 
     def _abort_if_stop_requested(self, step_info: str = "启动前已取消") -> bool:
         """启动阶段检测停止请求，防止竞态下继续创建执行器。"""
         if not self._should_stop:
             return False
-        self._set_state(TaskState.STOPPED, step_info)
+        self._set_state(TaskState.STOPPED, step_info, force=True)
         self._emit_task_completed_once(False)
         return True
 

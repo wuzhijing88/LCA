@@ -53,6 +53,13 @@ class ControlCenterWindowTaskCompletionMixin:
     def _try_finalize_window_workflows(self, window_id: str):
         runners = self._get_window_runner_list(window_id)
         if not runners:
+            stored = self.window_runners.get(str(window_id), self.window_runners.get(window_id))
+            if stored is None and window_id not in self._window_workflow_results:
+                return
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                scheduler.finalize_orphaned_stop(window_id)
+            self.on_window_task_completed(window_id, False)
             return
 
         any_pending = any(getattr(runner, "has_pending_work", False) for runner in runners)
@@ -79,7 +86,7 @@ class ControlCenterWindowTaskCompletionMixin:
 
     def on_window_task_completed(self, window_id, success):
         row = self.find_window_row(window_id)
-        self._update_window_completion_status(row, success)
+        self._update_window_completion_status(row, success, window_id=window_id)
         self._cleanup_window_task_runners(window_id)
         self._window_workflow_results.pop(window_id, None)
         self._refresh_multi_window_mode_env()
@@ -92,14 +99,25 @@ class ControlCenterWindowTaskCompletionMixin:
         )
         self._check_cleanup_ocr_after_window_completion()
 
-    def _update_window_completion_status(self, row: int, success: bool):
-        if row < 0:
-            return
-        current_status = self._get_window_status_text(row)
-        if current_status == "已中断":
+    def _update_window_completion_status(self, row: int, success: bool, window_id: str = ""):
+        resolved_id = str(window_id or "").strip() or (self._resolve_window_id_by_row(row) if row >= 0 else "")
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None and resolved_id:
+            job = scheduler.get_job(resolved_id)
+            if job is not None and job.state in {TaskState.STOPPED, TaskState.STOPPING}:
+                if job.state == TaskState.STOPPING:
+                    scheduler.apply_runner_state(resolved_id, TaskState.STOPPED)
+                self._paint_job_snapshot(resolved_id)
+                return
+        if row >= 0 and self._get_window_status_text(row) == "已中断":
             return
         status_text = TaskState.COMPLETED.value if success else TaskState.FAILED.value
         step_text = "工作流已完成" if success else "工作流执行失败"
+        if resolved_id:
+            self._update_single_window_table_status(resolved_id, status_text, step_text)
+            return
+        if row < 0:
+            return
         self._set_status_cell(row, status_text)
         self._set_step_cell(row, step_text)
 
@@ -125,7 +143,7 @@ class ControlCenterWindowTaskCompletionMixin:
         workflow_name = "Workflow"
         if row >= 0:
             title_item = self.window_table.item(row, 0)
-            workflow_item = self.window_table.item(row, 2)
+            workflow_item = self.window_table.item(row, 1)
             if title_item:
                 window_title = title_item.text()
             if workflow_item:

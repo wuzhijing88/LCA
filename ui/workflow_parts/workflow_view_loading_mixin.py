@@ -175,6 +175,16 @@ class WorkflowViewLoadingMixin:
 
         logger.info("[工作流加载] 完成，卡片数量=%s，连线数量=%s", len(self.cards), len(self.connections))
 
+    def get_variable_context(self):
+        """返回当前画布对应工作流的变量上下文，避免写到默认上下文。"""
+        from task_workflow.workflow_context import get_workflow_context
+        from task_workflow.workflow_vars import get_context_for_task
+
+        context = get_context_for_task(getattr(self, "task_id", None))
+        if context is not None:
+            return context
+        return get_workflow_context()
+
     def _register_result_placeholders_after_load(self):
         """按卡片当前变量名注册结果占位符，不改写卡片参数。"""
         if not self.cards:
@@ -186,13 +196,12 @@ class WorkflowViewLoadingMixin:
                 raise TypeError(f"卡片 {card.card_id} 的参数必须是字典")
             current_name = str(card.parameters.get("save_result_variable_name", "") or "").strip()
             if not current_name:
-                continue
+                current_name = f"卡片{card.card_id}结果"
             suffixes = card._get_result_variable_suffixes() if hasattr(card, "_get_result_variable_suffixes") else []
             placeholder_map[card.card_id] = [f"{current_name}.{suffix}" for suffix in suffixes]
 
         if not placeholder_map:
             return
 
-        from task_workflow.workflow_context import get_workflow_context
-        context = get_workflow_context()
+        context = self.get_variable_context()
         context.register_result_placeholders_batch(placeholder_map)

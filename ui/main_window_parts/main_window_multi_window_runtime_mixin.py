@@ -18,6 +18,8 @@ class MainWindowMultiWindowRuntimeMixin:
             logger.info("[多窗口执行前检查] 发现参数面板处于打开状态，自动应用并关闭")
             self.parameter_panel.apply_and_close()
         # =====================================
+        from utils.window_identity import refresh_bound_windows
+        refresh_bound_windows(self.bound_windows)
         # 检查是否有启用的窗口
         enabled_windows = [w for w in self.bound_windows if w.get('enabled', True)]
         if not enabled_windows:

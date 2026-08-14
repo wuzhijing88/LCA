@@ -14,6 +14,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from tasks.task_utils import coerce_bool, capture_and_match_template_smart
 import cv2
+from utils.hwnd_utils import as_hwnd
 from utils.smart_image_matcher import normalize_match_image
 
 logger = logging.getLogger(__name__)
@@ -500,8 +501,8 @@ def _draw_overlay(
             try:
                 import ctypes
 
-                hwnd = int(widget.winId())
-                if hwnd <= 0:
+                hwnd = as_hwnd(widget.winId())
+                if hwnd == 0:
                     return
 
                 user32 = ctypes.windll.user32

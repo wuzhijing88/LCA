@@ -89,7 +89,7 @@ class ControlCenterWorkflowStartMixin:
         self._pending_valid_windows = None
         self._start_all_in_progress = False
         if reenable_button:
-            self._set_start_all_button_state(True, "\u5168\u90e8\u5f00\u59cb")
+            self._set_start_all_button_state(True, "开始")
         self._refresh_multi_window_mode_env()
 
     def _start_next_window(self):
@@ -117,7 +117,7 @@ class ControlCenterWorkflowStartMixin:
         row = window_data.get("row")
         try:
             window_info = self.sorted_windows[row]
-            window_id = str(window_info.get("hwnd", row))
+            window_id = self._window_runtime_id(window_info, row)
             pending_count = 0
             for runner in self._get_window_runner_list(window_id):
                 try:
@@ -150,6 +150,6 @@ class ControlCenterWorkflowStartMixin:
         self._pending_valid_windows = None
         self._release_batch_start_gate()
         self._refresh_multi_window_mode_env()
-        self._set_start_all_button_state(True, "\u5168\u90e8\u5f00\u59cb")
+        self._set_start_all_button_state(True, "开始")
         self.log_message(f"\u5df2\u542f\u52a8 {self._started_count} \u4e2a\u7a97\u53e3\u7684\u5de5\u4f5c\u6d41")
         logger.info(f"\u6240\u6709\u7a97\u53e3\u542f\u52a8\u5b8c\u6210\uff0c\u5171\u542f\u52a8 {self._started_count} \u4e2a")

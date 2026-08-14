@@ -73,6 +73,13 @@ class WindowTaskRunner(
         self.executor = None
         self.executor_thread = None
 
-        # 窗口ID
-        self.window_id = str(window_info.get('hwnd', 'unknown'))
+        bind_id = str(self.window_info.get("bind_id") or "").strip()
+        try:
+            from utils.hwnd_utils import as_hwnd
+
+            self.hwnd = as_hwnd(self.window_info.get("hwnd"))
+        except Exception:
+            self.hwnd = 0
+        self.job_id = bind_id or (str(self.hwnd) if self.hwnd else "unknown")
+        self.window_id = self.job_id
         self.finished.connect(self._on_thread_finished, Qt.ConnectionType.QueuedConnection)

@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
 from collections import OrderedDict
+from utils.hwnd_utils import as_hwnd
 from utils.precise_sleep import precise_sleep as _shared_precise_sleep
 from utils.window_coordinate_common import (
     find_region_binding_equivalent_descendant,
@@ -173,11 +174,11 @@ def get_recorded_region_binding_mismatch_detail(
     target_hwnd: Optional[int],
 ) -> Optional[str]:
     """检查已录制区域所属窗口是否与当前执行窗口明显不一致。"""
-    current_hwnd = coerce_int(target_hwnd, 0)
-    if current_hwnd <= 0:
+    current_hwnd = as_hwnd(target_hwnd)
+    if current_hwnd == 0:
         return None
 
-    recorded_hwnd = coerce_int(params.get("region_hwnd", 0), 0)
+    recorded_hwnd = as_hwnd(params.get("region_hwnd", 0))
     recorded_title = str(params.get("region_window_title", "") or "").strip()
     recorded_class = str(params.get("region_window_class", "") or "").strip()
     recorded_client_width = coerce_int(params.get("region_client_width", 0), 0)
@@ -224,7 +225,7 @@ def get_recorded_region_binding_mismatch_detail(
             client_size_tolerance=REGION_BINDING_CLIENT_SIZE_TOLERANCE,
         )
     )
-    if normalized_current_hwnd <= 0:
+    if as_hwnd(normalized_current_hwnd) == 0:
         normalized_current_hwnd = current_hwnd
     if not normalized_current_title:
         normalized_current_title = current_title
@@ -728,8 +729,8 @@ def capture_and_match_template_smart(
         if target_hwnd is None:
             failed_response["error"] = "invalid_hwnd"
             return failed_response
-        hwnd = int(target_hwnd)
-        if hwnd <= 0:
+        hwnd = as_hwnd(target_hwnd)
+        if hwnd == 0:
             failed_response["error"] = "invalid_hwnd"
             return failed_response
 

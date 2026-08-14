@@ -25,6 +25,8 @@ import cv2
 import win32gui
 from PIL import Image
 
+from utils.hwnd_utils import as_hwnd
+
 logger = logging.getLogger(__name__)
 
 
@@ -788,7 +790,8 @@ def take_window_screenshot(hwnd, client_area_only=True, return_format="pil"):
         raise ValueError(f"未知的截图返回格式: {return_format!r}")
 
     # 检查窗口句柄是否有效
-    if hwnd is None or hwnd == 0:
+    hwnd = as_hwnd(hwnd)
+    if not hwnd:
         logger.error("无效的窗口句柄: hwnd为None或0")
         return None
 

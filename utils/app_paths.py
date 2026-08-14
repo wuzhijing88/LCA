@@ -37,8 +37,20 @@ def _ensure_dir(path: str) -> str:
     return path
 
 
+def _instance_slot() -> int:
+    try:
+        from utils.instance_runtime import get_instance_slot
+
+        return int(get_instance_slot())
+    except Exception:
+        return 1
+
+
 def get_config_path(app_name: str = "LCA") -> str:
-    return os.path.join(get_app_root(), "config.json")
+    slot = _instance_slot()
+    if slot <= 1:
+        return os.path.join(get_app_root(), "config.json")
+    return os.path.join(get_app_root(), f"config.instance-{slot}.json")
 
 
 def get_favorites_path(app_name: str = "LCA") -> str:
@@ -87,11 +99,17 @@ def get_resource_path(*parts: str) -> str:
 
 
 def get_logs_dir(app_name: str = "LCA") -> str:
-    return _ensure_dir(os.path.join(get_app_root(), "logs"))
+    slot = _instance_slot()
+    if slot <= 1:
+        return _ensure_dir(os.path.join(get_app_root(), "logs"))
+    return _ensure_dir(os.path.join(get_app_root(), "logs", f"instance-{slot}"))
 
 
 def get_runtime_data_dir(app_name: str = "LCA") -> str:
-    return _ensure_dir(os.path.join(get_app_root(), "runtime_data"))
+    slot = _instance_slot()
+    if slot <= 1:
+        return _ensure_dir(os.path.join(get_app_root(), "runtime_data"))
+    return _ensure_dir(os.path.join(get_app_root(), "runtime_data", f"instance-{slot}"))
 
 
 def get_workflows_dir(app_name: str = "LCA") -> str:
@@ -99,4 +117,7 @@ def get_workflows_dir(app_name: str = "LCA") -> str:
 
 
 def get_runtime_state_dir(app_name: str = "LCA") -> str:
-    return _ensure_dir(os.path.join(get_app_root(), "runtime", "state"))
+    slot = _instance_slot()
+    if slot <= 1:
+        return _ensure_dir(os.path.join(get_app_root(), "runtime", "state"))
+    return _ensure_dir(os.path.join(get_app_root(), "runtime", "state", f"instance-{slot}"))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from utils.hwnd_utils import as_hwnd
 from utils.thread_start_utils import is_thread_start_task_type
 
 
@@ -129,9 +130,13 @@ def _get_enabled_bound_windows(bound_windows: Any) -> List[Dict[str, Any]]:
         if not enabled:
             continue
 
-        _require_int(window_info.get("hwnd"), f"绑定窗口句柄(index={index})")
-        if window_info["hwnd"] <= 0:
+        raw_hwnd = window_info.get("hwnd")
+        if isinstance(raw_hwnd, bool):
+            raise TypeError(f"绑定窗口句柄必须是整数: index={index}")
+        hwnd = as_hwnd(raw_hwnd)
+        if hwnd == 0:
             raise ValueError(f"绑定窗口句柄必须大于0: index={index}")
+        window_info["hwnd"] = hwnd
         title = window_info.get("title", "")
         if not isinstance(title, str):
             raise TypeError(f"绑定窗口标题必须是字符串: index={index}")

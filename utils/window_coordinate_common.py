@@ -8,6 +8,7 @@ from ctypes import wintypes
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from utils.dpi_awareness import get_process_dpi_awareness
+from utils.hwnd_utils import as_hwnd
 
 _MONITORINFOF_PRIMARY = 0x00000001
 _MONITOR_DEFAULTTONEAREST = 0x00000002
@@ -1329,13 +1330,9 @@ def normalize_window_hwnd(
     try:
         import win32gui
     except Exception:
-        return int(hwnd or 0), str(title_hint or "")
+        return as_hwnd(hwnd), str(title_hint or "")
 
-    try:
-        target_hwnd = int(hwnd or 0)
-    except Exception:
-        return 0, str(title_hint or "")
-
+    target_hwnd = as_hwnd(hwnd)
     if target_hwnd == 0 or not win32gui.IsWindow(target_hwnd):
         return 0, str(title_hint or "")
 
@@ -1347,7 +1344,7 @@ def normalize_window_hwnd(
 
     def _window_size(candidate_hwnd: int) -> Tuple[int, int]:
         try:
-            left, top, right, bottom = win32gui.GetWindowRect(int(candidate_hwnd))
+            left, top, right, bottom = win32gui.GetWindowRect(as_hwnd(candidate_hwnd))
             return max(0, int(right - left)), max(0, int(bottom - top))
         except Exception:
             return 0, 0
@@ -1394,7 +1391,7 @@ def normalize_window_hwnd(
 
             enum_area = enum_width * enum_height
             if enum_area > best_area:
-                best_hwnd = int(enum_hwnd)
+                best_hwnd = as_hwnd(enum_hwnd)
                 best_area = enum_area
                 best_title = enum_title
         except Exception:
@@ -1464,14 +1461,10 @@ def _promote_region_binding_parent_hwnd(
     try:
         import win32gui
     except Exception:
-        return int(hwnd or 0)
+        return as_hwnd(hwnd)
 
-    try:
-        current_hwnd = int(hwnd or 0)
-    except Exception:
-        return 0
-
-    if current_hwnd <= 0 or not win32gui.IsWindow(current_hwnd):
+    current_hwnd = as_hwnd(hwnd)
+    if current_hwnd == 0 or not win32gui.IsWindow(current_hwnd):
         return 0
 
     current_metrics = _get_hwnd_client_metrics(current_hwnd)
@@ -1482,11 +1475,11 @@ def _promote_region_binding_parent_hwnd(
     while current_hwnd not in visited:
         visited.add(current_hwnd)
         try:
-            parent_hwnd = int(win32gui.GetParent(current_hwnd) or 0)
+            parent_hwnd = as_hwnd(win32gui.GetParent(current_hwnd))
         except Exception:
             break
 
-        if parent_hwnd <= 0 or not win32gui.IsWindow(parent_hwnd):
+        if parent_hwnd == 0 or not win32gui.IsWindow(parent_hwnd):
             break
 
         parent_metrics = _get_hwnd_client_metrics(parent_hwnd)
@@ -1513,12 +1506,8 @@ def _hwnd_matches_region_binding_metadata(
     except Exception:
         return False
 
-    try:
-        hwnd_int = int(hwnd or 0)
-    except Exception:
-        return False
-
-    if hwnd_int <= 0 or not win32gui.IsWindow(hwnd_int):
+    hwnd_int = as_hwnd(hwnd)
+    if hwnd_int == 0 or not win32gui.IsWindow(hwnd_int):
         return False
 
     title_text = str(title_hint or "").strip()
@@ -1593,21 +1582,17 @@ def normalize_region_binding_hwnd(
     try:
         import win32gui
     except Exception:
-        return int(hwnd or 0), title_text, class_text, width_hint, height_hint
+        return as_hwnd(hwnd), title_text, class_text, width_hint, height_hint
 
-    try:
-        hwnd_int = int(hwnd or 0)
-    except Exception:
-        hwnd_int = 0
-
-    if hwnd_int <= 0 or not win32gui.IsWindow(hwnd_int):
+    hwnd_int = as_hwnd(hwnd)
+    if hwnd_int == 0 or not win32gui.IsWindow(hwnd_int):
         return 0, title_text, class_text, width_hint, height_hint
 
     normalized_hwnd = _promote_region_binding_parent_hwnd(
         hwnd_int,
         tolerance=client_size_tolerance,
     )
-    if normalized_hwnd <= 0 or not win32gui.IsWindow(normalized_hwnd):
+    if as_hwnd(normalized_hwnd) == 0 or not win32gui.IsWindow(normalized_hwnd):
         normalized_hwnd = hwnd_int
 
     try:
@@ -1664,19 +1649,15 @@ def find_region_binding_equivalent_descendant(
     except Exception:
         return 0
 
-    try:
-        root_hwnd_int = int(root_hwnd or 0)
-    except Exception:
-        return 0
-
-    if root_hwnd_int <= 0 or not win32gui.IsWindow(root_hwnd_int):
+    root_hwnd_int = as_hwnd(root_hwnd)
+    if root_hwnd_int == 0 or not win32gui.IsWindow(root_hwnd_int):
         return 0
 
     normalized_root_hwnd, _, _, _, _ = normalize_region_binding_hwnd(
         root_hwnd_int,
         client_size_tolerance=client_size_tolerance,
     )
-    if normalized_root_hwnd <= 0:
+    if as_hwnd(normalized_root_hwnd) == 0:
         normalized_root_hwnd = root_hwnd_int
 
     matched_hwnd = 0
@@ -1686,12 +1667,8 @@ def find_region_binding_equivalent_descendant(
         if matched_hwnd:
             return False
 
-        try:
-            candidate_int = int(candidate_hwnd or 0)
-        except Exception:
-            return True
-
-        if candidate_int <= 0:
+        candidate_int = as_hwnd(candidate_hwnd)
+        if candidate_int == 0:
             return True
 
         if not _hwnd_matches_region_binding_metadata(
@@ -1766,7 +1743,7 @@ def build_window_info(
         return None
 
     try:
-        hwnd_int = int(hwnd)
+        hwnd_int = as_hwnd(hwnd)
         if hwnd_int == 0 or not win32gui.IsWindow(hwnd_int):
             return None
 

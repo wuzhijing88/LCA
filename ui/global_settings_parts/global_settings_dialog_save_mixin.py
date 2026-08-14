@@ -14,6 +14,9 @@ class GlobalSettingsDialogSaveMixin:
     def _on_accept(self):
         """处理确定按钮点击事件，确保配置被正确保存"""
         try:
+            if hasattr(self, "_is_wgc_desktop_combination") and self._is_wgc_desktop_combination():
+                self._warn_wgc_desktop_engine()
+                return
             # 确保绑定窗口配置被保存
             logger.info(f"全局设置对话框确定：准备保存配置，当前绑定窗口数量: {len(self.bound_windows)}")
             logger.info(f"  当前 bound_windows 内容: {[w.get('title') for w in self.bound_windows]}")

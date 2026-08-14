@@ -3,12 +3,23 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from utils.hwnd_utils import as_hwnd, normalize_bound_windows_hwnds
+from utils.window_identity import (
+    apply_window_identity,
+    is_window_alive,
+    refresh_bound_windows,
+    resolve_bound_window_hwnd,
+)
+
 
 def get_native_bound_windows(config: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not isinstance(config, dict):
         return []
     windows = config.get("bound_windows", [])
-    return windows if isinstance(windows, list) else []
+    if not isinstance(windows, list):
+        return []
+    normalize_bound_windows_hwnds(windows)
+    return windows
 
 
 def get_bound_windows_for_mode(config: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -26,6 +37,7 @@ def get_active_bound_windows(config: Optional[Dict[str, Any]]) -> List[Dict[str,
     if isinstance(config, dict):
         active = config.get("active_bound_windows")
         if isinstance(active, list):
+            normalize_bound_windows_hwnds(active)
             return active
     return get_native_bound_windows(config)
 
@@ -50,15 +62,26 @@ def get_active_bound_window(config: Optional[Dict[str, Any]]) -> Optional[Dict[s
     return get_first_enabled_bound_window(get_active_bound_windows(config))
 
 
+def refresh_bound_window_handles(windows: Optional[List[Dict[str, Any]]]) -> bool:
+    """刷新绑定列表中的 HWND，找不到也不删除记录。"""
+    if not isinstance(windows, list):
+        return False
+    normalize_bound_windows_hwnds(windows)
+    return refresh_bound_windows(windows)
+
+
 def get_active_bound_window_hwnd(config: Optional[Dict[str, Any]]) -> Optional[int]:
     window_info = get_active_bound_window(config)
     if not isinstance(window_info, dict):
         return None
-    try:
-        hwnd = int(window_info.get("hwnd", 0) or 0)
-    except Exception:
-        return None
-    return hwnd or None
+    hwnd = as_hwnd(window_info.get("hwnd"))
+    if hwnd and is_window_alive(hwnd):
+        return hwnd
+    hwnd = resolve_bound_window_hwnd(window_info)
+    if hwnd:
+        apply_window_identity(window_info, hwnd)
+        return hwnd
+    return None
 
 
 def get_active_window_binding_mode(config: Optional[Dict[str, Any]]) -> str:

@@ -120,73 +120,7 @@ class MainWindowInitStateMixin:
         self._jump_cancelled = False  # 标记跳转是否已被取消
         self._is_jumping = False  # 标记当前是否正在跳转过程中
         # ----------------------------------------------------------
-        # --- ADDED: Global timer for auto-stop ---
-        self._global_timer = QTimer(self)
-        self._global_timer.setSingleShot(True)  # 设置为单次触发
-        self._global_timer.timeout.connect(self._on_global_timer_timeout)
-        # 从配置加载定时器设置
-        self._global_timer_enabled = self.config.get('timer_enabled', False)
-        self._global_timer_duration = 0  # 秒
-        # 随机暂停功能相关变量
-        self._random_pause_enabled = self.config.get('pause_enabled', False)
-        self._random_pause_timer = QTimer(self)  # 随机暂停检查定时器
-        self._random_pause_timer.timeout.connect(self._on_random_pause_check)
-        self._is_paused = False  # 当前是否处于暂停状态
-        self._pause_probability = self.config.get('pause_probability', 20)
-        self._pause_check_interval = self.config.get('pause_check_interval', 30)
-        self._pause_check_interval_unit = self.config.get('pause_check_interval_unit', '秒')
-        self._pause_min_value = self.config.get('pause_min_value', 60)
-        self._pause_min_unit = self.config.get('pause_min_unit', '秒')
-        self._pause_max_value = self.config.get('pause_max_value', 120)
-        self._pause_max_unit = self.config.get('pause_max_unit', '秒')
-        # 定时暂停功能相关变量
-        self._timed_pause_enabled = self.config.get('timed_pause_enabled', False)
-        self._timed_pause_hour = self.config.get('timed_pause_hour', 12)
-        self._timed_pause_minute = self.config.get('timed_pause_minute', 0)
-        self._timed_pause_repeat = self.config.get('timed_pause_repeat', 'daily')
-        self._timed_pause_duration_value = self.config.get('timed_pause_duration_value', 10)
-        self._timed_pause_duration_unit = self.config.get('timed_pause_duration_unit', '分钟')
-        self._timed_pause_timer = QTimer(self)
-        self._timed_pause_timer.timeout.connect(self._check_timed_pause_time)
-        self._timed_pause_executed = False
-        self._timed_pause_last_exec_date = None
-        self._timed_pause_resume_timer = QTimer(self)
-        self._timed_pause_resume_timer.setSingleShot(True)
-        self._timed_pause_resume_timer.timeout.connect(self._on_timed_pause_resume_timeout)
-        self._auto_pause_source = None  # random / timed
-        # ------------------------------------------
-        # --- 定时启动功能相关变量 ---
-        self._schedule_enabled = self.config.get('enable_schedule', False)
-        self._schedule_hour = self.config.get('schedule_hour', 9)
-        self._schedule_minute = self.config.get('schedule_minute', 0)
-        self._schedule_repeat = self.config.get('schedule_repeat', 'daily')
-        schedule_mode = str(self.config.get('schedule_mode', 'fixed_time') or '').strip().lower()
-        self._schedule_mode = 'interval' if schedule_mode == 'interval' else 'fixed_time'
-        try:
-            self._schedule_interval_value = max(1, int(self.config.get('schedule_interval_value', 5) or 5))
-        except (TypeError, ValueError):
-            self._schedule_interval_value = 5
-        schedule_interval_unit = str(self.config.get('schedule_interval_unit', '分钟') or '').strip()
-        self._schedule_interval_unit = schedule_interval_unit if schedule_interval_unit in ('秒', '分钟', '小时') else '分钟'
-        self._schedule_next_trigger_monotonic = None
-        self._schedule_timer = QTimer(self)
-        self._schedule_timer.timeout.connect(self._check_schedule_time)
-        self._schedule_executed = False  # 标记当天定时任务是否已执行
-        self._schedule_last_exec_date = None  # 上次执行日期
-        # ------------------------------------------
-        # --- 定时停止功能相关变量 ---
-        self._stop_hour = self.config.get('stop_hour', 17)
-        self._stop_minute = self.config.get('stop_minute', 0)
-        self._stop_repeat = self.config.get('stop_repeat', 'daily')
-        self._stop_timer = QTimer(self)
-        self._stop_timer.timeout.connect(self._check_stop_time)
-        self._stop_executed = False  # 标记当天定时停止是否已执行
-        self._stop_last_exec_date = None  # 上次执行日期
-        # 同一分钟内多种定时动作冲突时，按优先级处理：停止 > 定时暂停 > 定时启动
-        self._timer_slot_key = None
-        self._timer_slot_priority = -1
-        self._timer_slot_action = None
-        # ------------------------------------------
+        self._setup_main_schedule_runtime()
         # --- 运行时窗口监控定时器 ---
         self._window_monitor_timer = QTimer(self)
         self._window_monitor_timer.timeout.connect(self._check_window_validity_runtime)

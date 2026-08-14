@@ -5,9 +5,13 @@ import time
 from collections.abc import Mapping
 from copy import deepcopy
 
+from app_core.scheduling.store import OLD_SCHEDULE_KEYS, apply_schedule_schema, default_control_schedule_dict, default_main_schedule_dict
 from utils.app_paths import get_config_path
+from utils.hwnd_utils import normalize_bound_windows_hwnds
 
-CONFIG_FILE = get_config_path()
+
+def _config_file() -> str:
+    return get_config_path()
 
 _DEFAULT_CONFIG = {
     "target_window_title": None,
@@ -35,9 +39,8 @@ _DEFAULT_CONFIG = {
     "close_behavior_remember": False,
     "start_task_hotkey": "F9",
     "stop_task_hotkey": "F10",
-    "schedule_mode": "fixed_time",
-    "schedule_interval_value": 5,
-    "schedule_interval_unit": "分钟",
+    "main_schedule": default_main_schedule_dict(),
+    "control_schedule": default_control_schedule_dict(),
     "multi_window_delay": 500,
     "recent_workflows": [],
 }
@@ -46,7 +49,7 @@ _REMOVED_CONFIG_KEYS = (
     "start_hotkey",
     "stop_hotkey",
     "foreground_driver_backend",
-)
+) + OLD_SCHEDULE_KEYS
 
 
 def _build_default_config() -> dict:
@@ -64,6 +67,9 @@ def _normalize_config(config: Mapping) -> dict:
         normalized.pop(key, None)
     for key, value in _build_default_config().items():
         normalized.setdefault(key, value)
+    apply_schedule_schema(normalized)
+    normalize_bound_windows_hwnds(normalized.get("bound_windows"))
+    normalize_bound_windows_hwnds(normalized.get("active_bound_windows"))
     return normalized
 
 
@@ -71,19 +77,21 @@ def load_config() -> dict:
     defaults = _build_default_config()
 
     def _repair_corrupted_config_file(cause: Exception):
-        if os.path.exists(CONFIG_FILE):
-            backup_path = f"{CONFIG_FILE}.corrupt.{int(time.time())}.bak"
+        config_file = _config_file()
+        if os.path.exists(config_file):
+            backup_path = f"{config_file}.corrupt.{int(time.time())}.bak"
             try:
-                os.replace(CONFIG_FILE, backup_path)
+                os.replace(config_file, backup_path)
                 logging.warning(f"检测到配置文件损坏，已备份到: {backup_path}")
             except OSError as backup_err:
                 raise RuntimeError(f"备份损坏配置文件失败: {backup_err}") from backup_err
         save_config(defaults)
-        logging.info(f"已重建默认配置文件: {CONFIG_FILE}")
+        logging.info(f"已重建默认配置文件: {config_file}")
 
-    if os.path.exists(CONFIG_FILE):
+    config_file = _config_file()
+    if os.path.exists(config_file):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(config_file, "r", encoding="utf-8") as f:
                 loaded_config = json.load(f)
             normalized = _normalize_config(loaded_config)
             needs_rewrite = any(key in loaded_config for key in _REMOVED_CONFIG_KEYS) or any(
@@ -93,7 +101,7 @@ def load_config() -> dict:
                 save_config(normalized)
             return normalized
         except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError) as e:
-            logging.error(f"无法加载配置文件 {CONFIG_FILE}: {e}")
+            logging.error(f"无法加载配置文件 {config_file}: {e}")
             _repair_corrupted_config_file(e)
 
     return defaults
@@ -102,12 +110,13 @@ def load_config() -> dict:
 def save_config(config_to_save: Mapping):
     """Persist a config atomically, leaving the caller's mapping untouched."""
     config_to_save = _normalize_config(config_to_save)
+    config_file = _config_file()
 
-    config_dir = os.path.dirname(CONFIG_FILE)
+    config_dir = os.path.dirname(config_file)
     if config_dir:
         os.makedirs(config_dir, exist_ok=True)
 
-    tmp_path = f"{CONFIG_FILE}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+    tmp_path = f"{config_file}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(config_to_save, f, indent=4, ensure_ascii=False)
@@ -116,10 +125,10 @@ def save_config(config_to_save: Mapping):
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp_path, CONFIG_FILE)
-        logging.info(f"配置已保存到 {CONFIG_FILE}")
+        os.replace(tmp_path, config_file)
+        logging.info(f"配置已保存到 {config_file}")
     except OSError as e:
-        raise RuntimeError(f"无法保存配置文件 {CONFIG_FILE}: {e}") from e
+        raise RuntimeError(f"无法保存配置文件 {config_file}: {e}") from e
     finally:
         try:
             if os.path.exists(tmp_path):

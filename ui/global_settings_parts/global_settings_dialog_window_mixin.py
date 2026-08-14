@@ -9,7 +9,9 @@ except ImportError:
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QMessageBox
+from utils.hwnd_utils import as_hwnd
 from utils.window_binding_utils import sync_runtime_window_binding_state
+from utils.window_identity import is_window_alive, refresh_bound_windows
 from utils.window_activation_utils import (
     schedule_overlay_activation_boost,
     show_and_activate_overlay,
@@ -84,14 +86,24 @@ class GlobalSettingsDialogWindowMixin:
             return
         self.bound_windows_combo.setEnabled(True)
         self.remove_window_button.setEnabled(True)
+        title_counts = {}
+        for window_info in self.bound_windows:
+            raw_title = str(window_info.get('title') or '')
+            title_counts[raw_title] = title_counts.get(raw_title, 0) + 1
+        title_seen = {}
         for i, window_info in enumerate(self.bound_windows):
             title = window_info['title']
-            hwnd = window_info.get('hwnd', 0)
-            # 构建显示文本
-            if hwnd and hwnd != 0:
-                display_text = f"✓ {title} (句柄: {hwnd})"
+            hwnd = as_hwnd(window_info.get('hwnd', 0))
+            if hwnd:
+                window_info['hwnd'] = hwnd
+            title_seen[title] = title_seen.get(title, 0) + 1
+            label = f"{title} #{title_seen[title]}" if title_counts.get(title, 0) > 1 else title
+            if hwnd and is_window_alive(hwnd):
+                display_text = f"✓ {label} (句柄: {hwnd})"
+            elif hwnd:
+                display_text = f"✗ {label} (待确认重连)"
             else:
-                display_text = f"✓ {title}"
+                display_text = f"✗ {label} (未连接)"
             self.bound_windows_combo.addItem(display_text)
             # 保存窗口信息到item data
             self.bound_windows_combo.setItemData(i, window_info)
@@ -111,8 +123,7 @@ class GlobalSettingsDialogWindowMixin:
         try:
             # 判断itemData是句柄还是标题
             if isinstance(item_data, int):
-                # itemData 可以直接保存窗口句柄
-                window_hwnd = item_data
+                window_hwnd = as_hwnd(item_data)
                 original_title = selected_text
                 logger.info(f"[插件模式] 直接使用窗口句柄: {window_hwnd}, 标题: {original_title}")
             else:
@@ -230,6 +241,7 @@ class GlobalSettingsDialogWindowMixin:
     def _on_window_picked(self, hwnd: int, title: str):
         """窗口选择完成的回调"""
         try:
+            hwnd = as_hwnd(hwnd)
             safe_title = title.strip() if isinstance(title, str) else ""
             if not safe_title and hwnd:
                 try:
@@ -272,6 +284,8 @@ class GlobalSettingsDialogWindowMixin:
             if hasattr(self, '_sync_parent_window_binding_preview'):
                 self._sync_parent_window_binding_preview()
             logger.info(f"窗口绑定成功：{title}")
+            if hasattr(self, "_schedule_wgc_desktop_engine_warning"):
+                self._schedule_wgc_desktop_engine_warning()
             # 【新增】绑定成功后检查并调整分辨率
             self._check_and_adjust_window_resolution(hwnd, title)
             # 注意：窗口恢复显示由 WindowPickerOverlay.closeEvent 自动处理
@@ -461,11 +475,24 @@ class GlobalSettingsDialogWindowMixin:
                             if ("启动器" not in title and
                                 "系列启动器" not in title and
                                 "launcher" not in title.lower()):
-                                pc_windows.append((title, hwnd))
+                                pc_windows.append((title, as_hwnd(hwnd)))
                 except Exception:
                     pass
                 return True
             win32gui.EnumWindows(enum_windows_callback, None)
+            try:
+                from utils.window_identity import is_desktop_window
+                desktop_hwnd = 0
+                if hasattr(win32gui, "GetShellWindow"):
+                    desktop_hwnd = as_hwnd(win32gui.GetShellWindow())
+                if not desktop_hwnd:
+                    desktop_hwnd = as_hwnd(win32gui.GetDesktopWindow())
+                if desktop_hwnd and is_desktop_window(desktop_hwnd):
+                    desktop_title = (win32gui.GetWindowText(desktop_hwnd) or "").strip() or "桌面"
+                    if not any(as_hwnd(hwnd) == desktop_hwnd for _, hwnd in pc_windows):
+                        pc_windows.insert(0, (desktop_title, desktop_hwnd))
+            except Exception as e:
+                logger.debug(f"补充桌面绑定项失败: {e}")
             logger.info(f"找到 {len(pc_windows)} 个PC窗口")
             return pc_windows
         except Exception as e:
@@ -473,12 +500,13 @@ class GlobalSettingsDialogWindowMixin:
             return []
     def _update_bound_window_from_picker(self, title: str, hwnd: int) -> bool:
         """窗口选择工具：更新已绑定窗口的句柄或标题"""
-        if not self.bound_windows or not hwnd or hwnd == 0:
+        if not self.bound_windows or as_hwnd(hwnd) == 0:
             return False
+        hwnd = as_hwnd(hwnd)
         # 先按句柄匹配，更新标题/DPI信息
         for window_info in self.bound_windows:
             existing_title = str(window_info.get('title', '') or '').strip()
-            existing_hwnd = window_info.get('hwnd', 0)
+            existing_hwnd = as_hwnd(window_info.get('hwnd', 0))
             if existing_hwnd == hwnd:
                 updated = False
                 if title and window_info.get('title') != title:
@@ -495,8 +523,8 @@ class GlobalSettingsDialogWindowMixin:
             same_title_windows = [w for w in self.bound_windows if w.get('title') == title]
             if len(same_title_windows) == 1:
                 target = same_title_windows[0]
-                existing_hwnd = target.get('hwnd', 0)
-                should_update = not existing_hwnd or existing_hwnd == 0
+                existing_hwnd = as_hwnd(target.get('hwnd', 0))
+                should_update = existing_hwnd == 0
                 if not should_update:
                     try:
                         import win32gui
@@ -505,7 +533,8 @@ class GlobalSettingsDialogWindowMixin:
                         should_update = False
                 updated = False
                 if should_update and existing_hwnd != hwnd:
-                    target['hwnd'] = hwnd
+                    from utils.window_identity import apply_window_identity
+                    apply_window_identity(target, hwnd)
                     updated = True
                 if updated:
                     try:
@@ -516,12 +545,13 @@ class GlobalSettingsDialogWindowMixin:
         return False
     def _is_window_already_bound(self, title: str, hwnd: int) -> bool:
         """检查窗口是否已经绑定"""
+        hwnd = as_hwnd(hwnd)
         for window_info in self.bound_windows:
             existing_title = str(window_info.get('title', '') or '').strip()
-            existing_hwnd = window_info.get('hwnd', 0)
-            if hwnd and hwnd != 0 and existing_hwnd == hwnd:
+            existing_hwnd = as_hwnd(window_info.get('hwnd', 0))
+            if hwnd and existing_hwnd == hwnd:
                 return True
-            if (not hwnd or hwnd == 0) and title and existing_title == title:
+            if not hwnd and title and existing_title == title:
                 return True
         return False
     def _save_bound_windows_config(self):
@@ -547,56 +577,14 @@ class GlobalSettingsDialogWindowMixin:
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
     def _cleanup_invalid_windows(self):
-        """清理失效的窗口（句柄无效或窗口不可见）"""
+        """刷新失效句柄。窗口重启后按特征重连，不再删除绑定记录。"""
         try:
-            import win32gui
-            logger.info(f"开始清理失效窗口，当前绑定窗口数量: {len(self.bound_windows)}")
-            valid_windows = []
-            removed_count = 0
-            for window_info in self.bound_windows:
-                window_title = window_info.get('title', '')
-                hwnd = window_info.get('hwnd', 0)
-                # 检查窗口是否仍然有效
-                is_valid = False
-                try:
-                    if hwnd and hwnd != 0:
-                        # 更严格的窗口验证
-                        window_exists = win32gui.IsWindow(hwnd)
-                        window_visible = win32gui.IsWindowVisible(hwnd) if window_exists else False
-                        # 尝试获取窗口标题来进一步验证
-                        current_title = ""
-                        if window_exists:
-                            try:
-                                current_title = win32gui.GetWindowText(hwnd)
-                            except Exception:
-                                pass
-                        # PC窗口验证：只要窗口存在就认为有效，不要求特定窗口标题，允许最小化
-                        if window_exists:
-                            is_valid = True
-                            if window_visible:
-                                logger.debug(f"窗口有效(可见): {window_title} (HWND: {hwnd})")
-                            else:
-                                logger.debug(f"窗口有效(最小化): {window_title} (HWND: {hwnd})")
-                        else:
-                            logger.info(f"窗口失效: {window_title} (HWND: {hwnd}) - 窗口不存在")
-                    else:
-                        logger.info(f"窗口失效: {window_title} - 无有效句柄")
-                except Exception as e:
-                    logger.warning(f"检查窗口失败: {window_title} (HWND: {hwnd}) - {e}")
-                    # 检查失败也认为是失效窗口
-                    is_valid = False
-                if is_valid:
-                    valid_windows.append(window_info)
-                else:
-                    removed_count += 1
-                    logger.info(f"移除失效窗口: {window_title} (HWND: {hwnd})")
-            # 更新绑定窗口列表
-            self.bound_windows = valid_windows
-            logger.info(f"清理完成: 移除 {removed_count} 个失效窗口，剩余 {len(valid_windows)} 个有效窗口")
-            # 如果有窗口被移除，刷新界面并保存配置
-            if removed_count > 0:
+            logger.info(f"开始刷新绑定窗口句柄，当前绑定窗口数量: {len(self.bound_windows)}")
+            changed = refresh_bound_windows(self.bound_windows)
+            logger.info(f"句柄刷新完成，仍保留 {len(self.bound_windows)} 个绑定窗口")
+            if changed:
                 self._refresh_bound_windows_combo()
                 self._save_bound_windows_config()
-                logger.info("已保存清理后的配置")
+                logger.info("已保存重连后的窗口句柄")
         except Exception as e:
-            logger.error(f"清理失效窗口失败: {e}")
+            logger.error(f"刷新绑定窗口句柄失败: {e}")

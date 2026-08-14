@@ -175,6 +175,13 @@ class GlobalSettingsDialogRuntimeMixin:
                         old_title = window_info.get('title', '')
                         # 更新句柄
                         window_info['hwnd'] = new_hwnd
+                        try:
+                            from utils.window_identity import apply_window_identity
+                            apply_window_identity(window_info, new_hwnd)
+                        except Exception as e:
+                            logger.debug(f"更新窗口特征失败: {e}")
+                        if hasattr(self, '_save_bound_windows_config'):
+                            self._save_bound_windows_config()
                         # 同步OCR服务的句柄绑定，避免旧句柄残留导致OCR进程堆积
                         try:
                             import threading

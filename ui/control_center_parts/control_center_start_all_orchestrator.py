@@ -17,7 +17,7 @@ def _control_center_has_ocr_workflow(self, valid_windows: list) -> bool:
         try:
             row = int(item.get("row"))
             window_info = self.sorted_windows[row]
-            window_id = str(window_info.get("hwnd", row))
+            window_id = self._window_runtime_id(window_info, row)
             workflows = self.window_workflows.get(window_id)
             if not workflows:
                 continue
@@ -36,18 +36,21 @@ def _control_center_has_ocr_workflow(self, valid_windows: list) -> bool:
     return False
 
 
-def _check_parent_window_running_conflict(self) -> bool:
+def _check_parent_window_running_conflict(self, interactive=True) -> bool:
     if not self.parent_window or not hasattr(self.parent_window, "_is_any_workflow_running"):
         return False
     if not self.parent_window._is_any_workflow_running():
         return False
-    logger.warning("\u4e3b\u7a97\u53e3\u6709\u4efb\u52a1\u6b63\u5728\u8fd0\u884c\uff0c\u4e2d\u63a7\u62d2\u7edd\u542f\u52a8\u65b0\u4efb\u52a1")
-    QMessageBox.warning(
-        self,
-        "\u65e0\u6cd5\u542f\u52a8",
-        "\u4e3b\u7a97\u53e3\u6b63\u5728\u6267\u884c\u4efb\u52a1\uff0c\u8bf7\u7b49\u5f85\u4e3b\u7a97\u53e3\u4efb\u52a1\u5b8c\u6210\u6216\u505c\u6b62\u540e\u518d\u4ece\u4e2d\u63a7\u542f\u52a8\u3002\n\n"
-        "\u4e2d\u63a7\u548c\u4e3b\u7a97\u53e3\u7684\u6267\u884c\u5668\u4e0d\u80fd\u540c\u65f6\u8fd0\u884c\uff0c\u5426\u5219\u53ef\u80fd\u5bfc\u81f4\u7a0b\u5e8f\u5361\u6b7b\u3002"
-    )
+    logger.warning("主窗口有任务正在运行，中控拒绝启动新任务")
+    if interactive:
+        QMessageBox.warning(
+            self,
+            "无法启动",
+            "主窗口正在执行任务，请等待主窗口任务完成或停止后再从中控启动。\n\n"
+            "中控和主窗口的执行器不能同时运行，否则可能导致程序卡死。",
+        )
+    else:
+        self.log_message("中控定时启动跳过：主窗口正在执行任务")
     return True
 
 
@@ -68,8 +71,8 @@ def _collect_start_candidate_windows(self, target_window_ids):
     for row in range(self.window_table.rowCount()):
         try:
             window_info = self.sorted_windows[row]
-            window_id = str(window_info.get("hwnd", row))
-            if target_window_ids is not None and window_id not in target_window_ids:
+            window_id = self._window_runtime_id(window_info, row)
+            if target_window_ids is not None and not self._job_id_in_filter(window_id, target_window_ids, window_info):
                 continue
             hwnd = window_info.get("hwnd")
             title = window_info.get("title", "\u672a\u77e5\u7a97\u53e3")
@@ -77,7 +80,7 @@ def _collect_start_candidate_windows(self, target_window_ids):
                 continue
             if is_valid_window_handle(hwnd):
                 logger.debug(f"\u7a97\u53e3 {title} (HWND: {hwnd}) \u53e5\u67c4\u6709\u6548")
-                valid_windows.append({"hwnd": hwnd, "title": title, "row": row})
+                valid_windows.append({"hwnd": hwnd, "title": title, "row": row, "job_id": window_id})
             else:
                 invalid_windows.append(f"{title} (HWND: {hwnd})")
         except Exception as e:
@@ -85,15 +88,18 @@ def _collect_start_candidate_windows(self, target_window_ids):
     return valid_windows, invalid_windows
 
 
-def _confirm_invalid_windows_start(self, invalid_windows) -> bool:
+def _confirm_invalid_windows_start(self, invalid_windows, interactive=True) -> bool:
     if not invalid_windows:
         return True
-    warning_message = "\u4ee5\u4e0b\u7a97\u53e3\u53e5\u67c4\u65e0\u6548\uff0c\u70b9\u51fb\u64cd\u4f5c\u53ef\u80fd\u5931\u8d25\uff1a\n\n"
+    if not interactive:
+        self.log_message(f"中控定时启动已跳过 {len(invalid_windows)} 个无效句柄窗口")
+        return True
+    warning_message = "以下窗口句柄无效，点击操作可能失败：\n\n"
     warning_message += "\n".join(f"  - {item}" for item in invalid_windows)
-    warning_message += "\n\n\u5efa\u8bae\uff1a\u5728\u5168\u5c40\u8bbe\u7f6e\u4e2d\u91cd\u65b0\u7ed1\u5b9a\u8fd9\u4e9b\u7a97\u53e3\u3002\n\n\u662f\u5426\u4ecd\u7136\u7ee7\u7eed\u542f\u52a8\uff1f"
+    warning_message += "\n\n建议：在全局设置中重新绑定这些窗口。\n\n是否仍然继续启动？"
     reply = QMessageBox.warning(
         self,
-        "\u7a97\u53e3\u53e5\u67c4\u9a8c\u8bc1\u8b66\u544a",
+        "窗口句柄验证警告",
         warning_message,
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         QMessageBox.StandardButton.No,
@@ -104,7 +110,7 @@ def _confirm_invalid_windows_start(self, invalid_windows) -> bool:
     return True
 
 
-def _filter_yolo_blocked_windows(self, valid_windows, target_window_ids):
+def _filter_yolo_blocked_windows(self, valid_windows, target_window_ids, interactive=True):
     blocked_windows = {}
     collect_blocked_windows = getattr(self, "_collect_yolo_blocked_windows", None)
     if callable(collect_blocked_windows):
@@ -117,10 +123,17 @@ def _filter_yolo_blocked_windows(self, valid_windows, target_window_ids):
         return valid_windows
 
     blocked_window_ids = set(blocked_windows.keys())
-    filtered_windows = [
-        item for item in valid_windows
-        if str(item.get("hwnd", item.get("row"))) not in blocked_window_ids
-    ]
+    filtered_windows = []
+    for item in valid_windows:
+        job_id = str(item.get("job_id") or "")
+        if not job_id:
+            try:
+                row = int(item.get("row"))
+                job_id = self._window_runtime_id(self.sorted_windows[row], row)
+            except Exception:
+                job_id = str(item.get("hwnd", item.get("row")))
+        if job_id not in blocked_window_ids:
+            filtered_windows.append(item)
     preview_lines = []
     for window_id, info in blocked_windows.items():
         title = str((info or {}).get("title") or window_id)
@@ -130,13 +143,14 @@ def _filter_yolo_blocked_windows(self, valid_windows, target_window_ids):
             preview_workflows += f" \u7b49{len(workflow_names)}\u4e2a"
         preview_lines.append(f"  - {title}: {preview_workflows}")
 
-    warning_message = "\u4ee5\u4e0b\u7a97\u53e3\u5305\u542b YOLO \u5de5\u4f5c\u6d41\uff0c\u5df2\u4ece\u4e2d\u63a7\u542f\u52a8\u961f\u5217\u79fb\u9664\uff1a\n\n"
-    warning_message += "\n".join(preview_lines[:8])
-    if len(preview_lines) > 8:
-        warning_message += f"\n  - \u5176\u4f59 {len(preview_lines) - 8} \u4e2a\u7a97\u53e3"
-    warning_message += "\n\n\u8bf7\u5728\u4e3b\u7a97\u53e3\u5355\u5f00\u6267\u884c\u8fd9\u4e9b YOLO \u5de5\u4f5c\u6d41\u3002"
-    QMessageBox.warning(self, "\u5df2\u8fc7\u6ee4YOLO\u7a97\u53e3", warning_message)
-    self.log_message(f"\u5df2\u8fc7\u6ee4 {len(blocked_windows)} \u4e2a\u5305\u542bYOLO\u4efb\u52a1\u7684\u7a97\u53e3")
+    if interactive:
+        warning_message = "以下窗口包含 YOLO 工作流，已从中控启动队列移除：\n\n"
+        warning_message += "\n".join(preview_lines[:8])
+        if len(preview_lines) > 8:
+            warning_message += f"\n  - 其余 {len(preview_lines) - 8} 个窗口"
+        warning_message += "\n\n请在主窗口单开执行这些 YOLO 工作流。"
+        QMessageBox.warning(self, "已过滤YOLO窗口", warning_message)
+    self.log_message(f"已过滤 {len(blocked_windows)} 个包含YOLO任务的窗口")
     logger.warning("\u4e2d\u63a7\u542f\u52a8\u8fc7\u6ee4YOLO\u7a97\u53e3: %s", sorted(blocked_window_ids))
     return filtered_windows
 
@@ -157,20 +171,27 @@ def _handle_control_center_batch_start(self, valid_windows):
     self._start_windows_sequentially(valid_windows)
 
 
-def control_center_start_all_tasks(ctx):
+def control_center_start_all_tasks(ctx, interactive=True):
     self = ctx
-    logger.info("\u5f00\u59cb\u542f\u52a8\u6240\u6709\u5de5\u4f5c\u6d41")
-    self.log_message("\u6b63\u5728\u542f\u52a8\u6240\u6709\u5de5\u4f5c\u6d41...")
+    logger.info("开始启动所有工作流")
+    self.log_message("正在启动所有工作流...")
     target_window_ids = getattr(self, "_cc_active_start_window_filter", None)
     if target_window_ids:
-        logger.info(f"\u4e2d\u63a7\u542f\u52a8\u8fc7\u6ee4\u7a97\u53e3: {sorted(target_window_ids)}")
-    if _check_parent_window_running_conflict(self):
+        logger.info(f"中控启动过滤窗口: {sorted(target_window_ids)}")
+    if _check_parent_window_running_conflict(self, interactive=interactive):
         return
     _cancel_control_center_ocr_cleanup(self)
+    if hasattr(self, "_refresh_bound_window_handles"):
+        try:
+            self._refresh_bound_window_handles()
+        except Exception as refresh_error:
+            logger.warning(f"中控启动前刷新绑定句柄失败: {refresh_error}")
     valid_windows, invalid_windows = _collect_start_candidate_windows(self, target_window_ids)
-    if not _confirm_invalid_windows_start(self, invalid_windows):
+    if not _confirm_invalid_windows_start(self, invalid_windows, interactive=interactive):
         return
-    valid_windows = _filter_yolo_blocked_windows(self, valid_windows, target_window_ids)
+    valid_windows = _filter_yolo_blocked_windows(
+        self, valid_windows, target_window_ids, interactive=interactive
+    )
     if not valid_windows:
         self.log_message("\u6ca1\u6709\u53ef\u542f\u52a8\u7684\u76ee\u6807\u7a97\u53e3\uff08\u8bf7\u68c0\u67e5\u7a97\u53e3\u9009\u62e9\u548c\u5de5\u4f5c\u6d41\u5206\u914d\uff09")
         return

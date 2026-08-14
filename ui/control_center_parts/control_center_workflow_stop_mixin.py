@@ -7,7 +7,7 @@ class ControlCenterWorkflowStopMixin:
     def _iter_target_window_runners(self, target_window_ids=None):
         target_filter = set(target_window_ids) if target_window_ids else None
         for window_id in list(self.window_runners.keys()):
-            if target_filter is not None and window_id not in target_filter:
+            if target_filter is not None and not self._job_id_in_filter(window_id, target_filter):
                 continue
             for runner in self._get_window_runner_list(window_id):
                 yield window_id, runner
@@ -107,10 +107,15 @@ class ControlCenterWorkflowStopMixin:
         previous_dispatch_state = self._runner_dispatch_suspended
         self._runner_dispatch_suspended = True
         try:
+            requested_job_ids = set()
             for window_id, runner in self._iter_target_window_runners(target_window_ids=target_window_ids):
                 try:
                     self._remove_runner_from_start_queue(runner)
                     if self._can_request_stop_runner(runner):
+                        scheduler = getattr(self, "scheduler", None)
+                        if scheduler is not None and window_id not in requested_job_ids:
+                            scheduler.request_stop(window_id)
+                            requested_job_ids.add(window_id)
                         runner.stop()
                         stopped_count += 1
                         stopping_window_ids.add(window_id)
@@ -128,16 +133,31 @@ class ControlCenterWorkflowStopMixin:
             self._runner_dispatch_suspended = previous_dispatch_state
 
         if stopping_window_ids:
-            self._update_window_table_status(
-                stopping_window_ids,
-                "\u6b63\u5728\u505c\u6b62",
-                "\u6b63\u5728\u505c\u6b62\u5de5\u4f5c\u6d41",
-            )
+            for window_id in stopping_window_ids:
+                self._sync_job_from_runners(window_id)
+        self._finalize_orphaned_active_jobs(target_window_ids)
 
         self.log_message(f"\u5df2\u505c\u6b62 {stopped_count} \u4e2a\u5de5\u4f5c\u6d41")
         if target_filter is not None:
             self._dispatch_pending_runner_starts()
         self._refresh_multi_window_mode_env()
+
+    def _finalize_orphaned_active_jobs(self, target_window_ids=None):
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is None:
+            return
+        for snapshot in scheduler.list_jobs():
+            if not snapshot.is_active:
+                continue
+            if not self._job_id_in_filter(snapshot.job_id, target_window_ids):
+                continue
+            if self._get_window_runner_list(snapshot.job_id):
+                continue
+            scheduler.request_stop(snapshot.job_id)
+            scheduler.finalize_orphaned_stop(snapshot.job_id)
+            self._cleanup_window_task_runners(snapshot.job_id)
+            self._window_workflow_results.pop(snapshot.job_id, None)
+            self._paint_job_snapshot(snapshot.job_id)
 
     def _force_stop_all_completion(self, target_window_ids=None):
         logger.info("\u5f3a\u5236\u5b8c\u6210\u6240\u6709\u505c\u6b62\u64cd\u4f5c")

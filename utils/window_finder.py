@@ -11,6 +11,7 @@ import re
 from typing import Iterable, Optional, Sequence, Tuple
 import win32gui
 
+from utils.hwnd_utils import as_hwnd
 from utils.window_coordinate_common import normalize_window_hwnd
 
 logger = logging.getLogger(__name__)
@@ -22,10 +23,7 @@ def _normalize_hwnd_list(handles: Optional[Iterable[int]]) -> list[int]:
     seen: set[int] = set()
 
     for handle in handles or []:
-        try:
-            hwnd = int(handle or 0)
-        except Exception:
-            continue
+        hwnd = as_hwnd(handle)
         if not hwnd or hwnd in seen:
             continue
         normalized.append(hwnd)
@@ -62,7 +60,7 @@ def find_all_exact_window_hwnds(window_title: str) -> list[int]:
             if win32gui.IsWindowVisible(hwnd):
                 current_title = win32gui.GetWindowText(hwnd)
                 if current_title == window_title:
-                    windows.append(int(hwnd))
+                    windows.append(as_hwnd(hwnd))
         except Exception as error:
             logger.debug(f"枚举精确匹配窗口失败: {error}")
         return True
@@ -124,7 +122,7 @@ def list_all_windows():
 
                     if title.strip():
                         windows.append({
-                            'hwnd': hwnd,
+                            'hwnd': as_hwnd(hwnd),
                             'title': title,
                             'class_name': class_name.value
                         })
@@ -217,8 +215,8 @@ def find_window_with_parent_info(
                 nonlocal found_hwnd, parent_hwnd
                 try:
                     if win32gui.GetWindowText(child_hwnd) == window_title:
-                        found_hwnd = int(child_hwnd)
-                        parent_hwnd = int(hwnd)
+                        found_hwnd = as_hwnd(child_hwnd)
+                        parent_hwnd = as_hwnd(hwnd)
                         logger.info(
                             f"找到匹配的子窗口: {window_title} "
                             f"(HWND: {found_hwnd}, 父窗口: {parent_hwnd})"

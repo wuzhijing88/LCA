@@ -12,6 +12,7 @@ import ctypes
 from typing import Any, Callable, Optional
 
 from .task_utils import interruptible_sleep, precise_sleep
+from utils.hwnd_utils import as_hwnd
 from utils.input_guard import (
     acquire_input_guard,
     get_current_input_guard_resource,
@@ -334,10 +335,10 @@ def _wait_cursor_reach_target(
 def _is_target_window_foreground(target_hwnd: Any) -> bool:
     """校验目标窗口是否在前台（支持根窗口一致）。"""
     try:
-        hwnd = int(target_hwnd or 0)
+        hwnd = as_hwnd(target_hwnd)
     except Exception:
         return False
-    if hwnd <= 0:
+    if hwnd == 0:
         return False
 
     try:
@@ -347,14 +348,14 @@ def _is_target_window_foreground(target_hwnd: Any) -> bool:
         return False
 
     try:
-        fg_hwnd = int(win32gui.GetForegroundWindow() or 0)
-        if fg_hwnd <= 0:
+        fg_hwnd = as_hwnd(win32gui.GetForegroundWindow())
+        if fg_hwnd == 0:
             return False
         if fg_hwnd == hwnd:
             return True
-        fg_root = int(win32gui.GetAncestor(fg_hwnd, win32con.GA_ROOT) or 0)
-        target_root = int(win32gui.GetAncestor(hwnd, win32con.GA_ROOT) or 0)
-        return fg_root > 0 and target_root > 0 and fg_root == target_root
+        fg_root = as_hwnd(win32gui.GetAncestor(fg_hwnd, win32con.GA_ROOT))
+        target_root = as_hwnd(win32gui.GetAncestor(hwnd, win32con.GA_ROOT))
+        return fg_root != 0 and target_root != 0 and fg_root == target_root
     except Exception:
         return False
 

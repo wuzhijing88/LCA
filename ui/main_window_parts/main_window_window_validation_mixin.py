@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindowWindowValidationMixin:
-    def _check_window_binding(self) -> bool:
+    def _check_window_binding(self, interactive=True) -> bool:
 
         """
 
@@ -23,22 +23,16 @@ class MainWindowWindowValidationMixin:
 
         """
 
-        import win32gui
-
         # 检查是否有绑定窗口
 
         if not hasattr(self, 'bound_windows') or not self.bound_windows:
-
-            QMessageBox.warning(
-
-                self,
-
-                "未绑定窗口",
-
-                "还没有绑定任何窗口！\n\n请先在 '全局设置' 中绑定目标窗口。"
-
-            )
-
+            logger.warning("定时/启动检查：还没有绑定任何窗口")
+            if interactive:
+                QMessageBox.warning(
+                    self,
+                    "未绑定窗口",
+                    "还没有绑定任何窗口！\n\n请先在 '全局设置' 中绑定目标窗口。"
+                )
             return False
 
         # 检查是否有启用的窗口
@@ -46,103 +40,43 @@ class MainWindowWindowValidationMixin:
         enabled_windows = [w for w in self.bound_windows if w.get('enabled', True)]
 
         if not enabled_windows:
-
-            QMessageBox.warning(
-
-                self,
-
-                "没有启用的窗口",
-
-                "所有窗口都已禁用！\n\n请在 '全局设置' 中至少启用一个窗口。"
-
-            )
-
+            logger.warning("定时/启动检查：所有窗口都已禁用")
+            if interactive:
+                QMessageBox.warning(
+                    self,
+                    "没有启用的窗口",
+                    "所有窗口都已禁用！\n\n请在 '全局设置' 中至少启用一个窗口。"
+                )
             return False
 
-        # 验证窗口句柄有效性并尝试自动恢复
+        from utils.window_identity import is_window_alive, refresh_bound_windows
+
+        old_hwnds = [window_info.get('hwnd') for window_info in enabled_windows]
+        recovered = refresh_bound_windows(self.bound_windows)
 
         valid_windows = []
-
         invalid_windows = []
-
         recovered_windows = []
 
-        for window_info in enabled_windows:
-
+        for index, window_info in enumerate(enabled_windows):
             window_title = window_info.get('title', '')
-
             hwnd = window_info.get('hwnd', 0)
-
-            # 检查句柄是否有效
-
-            is_valid = False
-
-            if hwnd and hwnd != 0:
-
-                try:
-
-                    if win32gui.IsWindow(hwnd):
-
-                        # 窗口存在，进一步验证
-
-                        if win32gui.IsWindowVisible(hwnd):
-
-                            is_valid = True
-
-                            valid_windows.append(window_title)
-
-                            logger.debug(f"窗口句柄有效: {window_title} (HWND: {hwnd})")
-
-                        else:
-
-                            # 窗口存在但不可见，可能最小化，仍视为有效
-
-                            is_valid = True
-
-                            valid_windows.append(window_title)
-
-                            logger.debug(f"窗口句柄有效(不可见): {window_title} (HWND: {hwnd})")
-
-                except Exception as e:
-
-                    logger.warning(f"验证窗口句柄异常: {window_title} - {e}")
-
-            # 句柄无效，尝试自动恢复
-
-            if not is_valid:
-
-                logger.warning(f"窗口句柄无效: {window_title} (HWND: {hwnd})，尝试自动恢复...")
-
-                new_hwnd = self._try_recover_window_handle(window_info)
-
-                if new_hwnd:
-
-                    window_info['hwnd'] = new_hwnd
-
+            if is_window_alive(hwnd):
+                valid_windows.append(window_title)
+                if recovered and index < len(old_hwnds) and old_hwnds[index] != hwnd:
                     recovered_windows.append(window_title)
-
-                    valid_windows.append(window_title)
-
-                    logger.info(f"窗口句柄已恢复: {window_title} (新HWND: {new_hwnd})")
-
+                    logger.info(f"窗口句柄已恢复: {window_title} (新HWND: {hwnd})")
                 else:
-
-                    invalid_windows.append(window_title)
-
-                    logger.error(f"窗口句柄恢复失败: {window_title}")
-
-        # 如果有恢复的窗口，保存配置
+                    logger.debug(f"窗口句柄有效: {window_title} (HWND: {hwnd})")
+            else:
+                invalid_windows.append(window_title)
+                logger.error(f"窗口句柄恢复失败: {window_title}")
 
         if recovered_windows:
-
             try:
-
                 self._save_config_silent()
-
                 logger.info(f"已保存恢复的窗口句柄配置: {recovered_windows}")
-
             except Exception as e:
-
                 logger.warning(f"保存恢复的窗口配置失败: {e}")
 
         # 检查是否有有效窗口
@@ -159,36 +93,31 @@ class MainWindowWindowValidationMixin:
 
             error_msg += "\n请检查目标窗口是否已打开，然后在 '全局设置' 中重新绑定。"
 
-            QMessageBox.warning(self, "窗口句柄失效", error_msg)
-
+            logger.warning("定时/启动检查：所有绑定窗口句柄都已失效")
+            if interactive:
+                QMessageBox.warning(self, "窗口句柄失效", error_msg)
             return False
 
         # 部分窗口失效，给出警告但允许继续
 
         if invalid_windows:
-
+            if not interactive:
+                logger.warning(
+                    "定时启动：部分窗口句柄失效，仅在有效窗口继续: %s",
+                    invalid_windows,
+                )
+                return True
             warning_msg = "部分窗口句柄已失效:\n\n"
-
             for w in invalid_windows:
-
                 warning_msg += f"  - {w}\n"
-
             warning_msg += f"\n有效窗口: {len(valid_windows)} 个\n"
-
             warning_msg += "是否继续执行？（仅在有效窗口上执行）"
-
             reply = QMessageBox.question(
-
                 self, "部分窗口失效", warning_msg,
-
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-
                 QMessageBox.StandardButton.Yes
-
             )
-
             if reply != QMessageBox.StandardButton.Yes:
-
                 return False
 
         return True
@@ -209,34 +138,27 @@ class MainWindowWindowValidationMixin:
 
         """
 
-        import win32gui
+        from utils.hwnd_utils import as_hwnd
+        from utils.window_identity import apply_window_identity, resolve_bound_window_hwnd
 
         window_title = window_info.get('title', '')
-
-        window_class = window_info.get('class_name', '')
-
-        if not window_title:
-
+        if not window_title and not window_info.get('class_name') and not window_info.get('process_name'):
             return 0
 
         try:
-
-            # 方法1: 通过标题精确查找
-
-            new_hwnd = self._find_window_by_title(window_title)
-
-            if new_hwnd and win32gui.IsWindow(new_hwnd):
-
-                logger.info(f"通过标题精确匹配恢复窗口: {window_title} -> {new_hwnd}")
-
+            occupied = {
+                as_hwnd(item.get('hwnd'))
+                for item in getattr(self, 'bound_windows', []) or []
+                if item is not window_info and as_hwnd(item.get('hwnd'))
+            }
+            new_hwnd = resolve_bound_window_hwnd(window_info, occupied)
+            if new_hwnd:
+                apply_window_identity(window_info, new_hwnd)
+                logger.info(f"通过窗口特征恢复窗口: {window_title} -> {new_hwnd}")
                 return new_hwnd
-
-            logger.warning(f"未找到可唯一确认的目标窗口，拒绝模糊恢复: {window_title}")
-
+            logger.warning(f"未找到可确认的目标窗口，拒绝模糊恢复: {window_title}")
         except Exception as e:
-
             logger.error(f"恢复窗口句柄异常: {e}")
-
         return 0
 
     def _save_config_silent(self):

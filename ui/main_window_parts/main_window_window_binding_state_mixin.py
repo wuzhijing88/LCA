@@ -6,6 +6,7 @@ from utils.window_binding_utils import (
     get_window_binding_mode,
     sync_runtime_window_binding_state,
 )
+from utils.window_identity import match_bound_window, refresh_bound_windows
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class MainWindowWindowBindingStateMixin:
         self.window_binding_mode = self.native_window_binding_mode
 
         sync_runtime_window_binding_state(self.config)
+        self._publish_instance_bound_hwnds()
 
         if self.window_binding_mode == 'multiple':
 
@@ -55,6 +57,15 @@ class MainWindowWindowBindingStateMixin:
         self.config['window_binding_mode'] = self.native_window_binding_mode
 
         sync_runtime_window_binding_state(self.config)
+        self._publish_instance_bound_hwnds()
+
+    def _publish_instance_bound_hwnds(self):
+        try:
+            from utils.instance_runtime import publish_bound_hwnds
+
+            publish_bound_hwnds(getattr(self, "bound_windows", None))
+        except Exception:
+            pass
 
     def _update_task_window_binding(self, task):
 
@@ -72,23 +83,27 @@ class MainWindowWindowBindingStateMixin:
 
         # 如果窗口绑定失效，让 _create_executor 中的逻辑来处理
 
-        if task.target_hwnd:
+        if task.target_hwnd or task.target_window_title or getattr(task, 'bound_window_id', None):
 
-            # 验证hwnd是否仍在全局设置的bound_windows列表中
-
-            hwnd_still_bound = any(
-
-                w.get('hwnd') == task.target_hwnd and w.get('enabled', True)
-
-                for w in self.bound_windows
-
+            refresh_bound_windows(self.bound_windows)
+            matched_window = match_bound_window(
+                self.bound_windows,
+                hwnd=task.target_hwnd,
+                title=task.target_window_title,
+                bind_id=getattr(task, 'bound_window_id', None),
             )
 
-            if hwnd_still_bound:
+            if matched_window:
 
+                new_hwnd = matched_window.get('hwnd')
+                if new_hwnd and new_hwnd != task.target_hwnd:
+                    logger.info(
+                        f"任务 '{task.name}' 绑定窗口句柄已重连: {task.target_hwnd} => {new_hwnd}"
+                    )
+                    task.target_hwnd = new_hwnd
+                if matched_window.get('title'):
+                    task.target_window_title = matched_window.get('title')
                 logger.info(f"任务 '{task.name}' 已绑定窗口 (HWND: {task.target_hwnd}, '{task.target_window_title}')，且窗口仍在全局设置中")
-
-                # 仍然需要检查执行模式
 
                 self._update_task_execution_mode(task)
 
@@ -96,17 +111,9 @@ class MainWindowWindowBindingStateMixin:
 
             else:
 
-                # 窗口已从全局设置中移除或被禁用
-
-                # [注意] 不清除任务的绑定，保留用户的选择
-
-                # 执行时会在 _create_executor 中检测并阻止
-
                 logger.warning(f"任务 '{task.name}' 绑定的窗口 (HWND: {task.target_hwnd}, '{task.target_window_title}') 已从全局设置中移除或被禁用")
 
                 logger.warning("  保留任务的绑定信息，执行时将提示用户处理")
-
-                # 仍然更新执行模式（即使窗口不可用）
 
                 self._update_task_execution_mode(task)
 

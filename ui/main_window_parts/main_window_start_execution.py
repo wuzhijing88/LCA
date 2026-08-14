@@ -16,6 +16,7 @@ def execute_main_window_start(
     resolve_current_canvas_task_id,
     task_state_manager,
     start_state,
+    interactive=True,
 ):
     self = ctx
 
@@ -49,7 +50,10 @@ def execute_main_window_start(
                 error_message = detailed_error
         except Exception:
             pass
-        QMessageBox.warning(self, MSG_START_FAIL_TITLE, error_message)
+        if interactive:
+            QMessageBox.warning(self, MSG_START_FAIL_TITLE, error_message)
+        else:
+            logger.error("[定时启动] %s", error_message)
         return
 
     try:

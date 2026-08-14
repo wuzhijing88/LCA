@@ -199,6 +199,36 @@ class WorkflowTaskManager(QObject):
 
         return True, ""
 
+    def _validate_wgc_desktop_for_tasks(self, tasks: List[Any]) -> Tuple[bool, str]:
+        from utils.window_identity import (
+            WGC_DESKTOP_ENGINE_MESSAGE,
+            is_wgc_with_desktop_target,
+        )
+
+        windows = list(self.config.get("bound_windows") or [])
+        title = str(self.config.get("target_window_title") or "").strip()
+        if title:
+            windows.append({
+                "title": title,
+                "hwnd": self.config.get("target_hwnd"),
+            })
+        for task in tasks or []:
+            windows.append({
+                "title": getattr(task, "target_window_title", None),
+                "hwnd": getattr(task, "target_hwnd", None),
+            })
+            workflow_data = getattr(task, "workflow_data", None) or {}
+            if isinstance(workflow_data, dict):
+                windows.append({
+                    "title": workflow_data.get("target_window_title"),
+                    "hwnd": workflow_data.get("target_hwnd"),
+                })
+
+        engine = str(self.config.get("screenshot_engine") or "").strip().lower()
+        if is_wgc_with_desktop_target(engine, windows):
+            return False, WGC_DESKTOP_ENGINE_MESSAGE
+        return True, ""
+
     def add_task(self, name: str, filepath: str, workflow_data: dict) -> int:
         """
         添加新任务
@@ -372,6 +402,12 @@ class WorkflowTaskManager(QObject):
         if not valid_runtime:
             self._set_last_execute_error(error_message)
             logger.warning("任务启动前校验失败: %s", error_message)
+            return False
+
+        valid_wgc_desktop, wgc_desktop_error = self._validate_wgc_desktop_for_tasks([task])
+        if not valid_wgc_desktop:
+            self._set_last_execute_error(wgc_desktop_error)
+            logger.warning("任务启动前校验失败: %s", wgc_desktop_error)
             return False
 
         logger.info("执行任务: '%s'", task.name)

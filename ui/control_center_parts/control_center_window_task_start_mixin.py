@@ -4,6 +4,8 @@ from typing import Dict, List, Optional
 
 from PySide6.QtWidgets import QMessageBox
 
+from app_core.control_plane import JobState
+
 from ..main_window_parts.main_window_support import normalize_execution_mode_setting
 from ..control_center_parts.control_center_runtime import WindowTaskRunner
 
@@ -12,21 +14,46 @@ logger = logging.getLogger(__name__)
 
 class ControlCenterWindowTaskStartMixin:
     def start_window_task(self, row):
+        self._refresh_bound_window_handles()
         window_info = self.sorted_windows[row]
-        window_id = str(window_info.get("hwnd", row))
+        window_id = self._window_runtime_id(window_info, row)
         workflows = self._prepare_window_workflows_for_start(window_info, window_id)
         if workflows is None:
             return False
 
-        configured_execution_mode = self._get_configured_execution_mode()
-        runners = self._build_window_task_runners(
-            window_info,
-            window_id,
-            workflows,
-            configured_execution_mode,
-        )
-        self._register_window_task_runners(window_id, runners)
-        self._schedule_window_task_runners(window_id, runners)
+        scheduler = getattr(self, "scheduler", None)
+        start_accepted = False
+        if scheduler is not None:
+            command = scheduler.request_start(window_id)
+            if not command.ok:
+                logger.info("调度器拒绝启动作业 %s: %s", window_id, command.reason)
+                return False
+            start_accepted = True
+
+        try:
+            configured_execution_mode = self._get_configured_execution_mode()
+            runners = self._build_window_task_runners(
+                window_info,
+                window_id,
+                workflows,
+                configured_execution_mode,
+            )
+            self._register_window_task_runners(window_id, runners)
+            if self._is_start_aborted(window_id):
+                self._abort_registered_window_start(window_id, window_info)
+                return False
+            self._schedule_window_task_runners(window_id, runners)
+            if self._is_start_aborted(window_id):
+                self._abort_registered_window_start(window_id, window_info)
+                return False
+        except Exception as e:
+            logger.error("创建窗口运行器失败：window_id=%s, error=%s", window_id, e)
+            if start_accepted and scheduler is not None and not self._get_window_runner_list(window_id):
+                scheduler.revert_unstarted(window_id)
+                self._paint_job_snapshot(window_id)
+            self.log_message(f"启动窗口失败：{window_info.get('title') or window_id} -> {e}")
+            return False
+
         self.on_selection_changed()
 
         workflow_count = len(workflows)
@@ -35,6 +62,22 @@ class ControlCenterWindowTaskStartMixin:
             f"\u542f\u52a8\u7a97\u53e3\u5de5\u4f5c\u6d41: {window_title} - {workflow_count}\u4e2a\u5de5\u4f5c\u6d41\u5df2\u52a0\u5165\u8c03\u5ea6"
         )
         return True
+
+    def _is_start_aborted(self, window_id: str) -> bool:
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is None:
+            return False
+        job = scheduler.get_job(window_id)
+        return bool(job and job.state in {JobState.STOPPED, JobState.STOPPING})
+
+    def _abort_registered_window_start(self, window_id: str, window_info: Dict) -> None:
+        self._direct_stop_window_task(window_id)
+        if not self._get_window_runner_list(window_id):
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                scheduler.finalize_orphaned_stop(window_id)
+        self._sync_job_from_runners(window_id)
+        self.log_message(f"启动窗口已取消：{window_info.get('title') or window_id}")
 
     def _prepare_window_workflows_for_start(self, window_info: Dict, window_id: str) -> Optional[List[Dict]]:
         if self._is_parent_window_busy():
@@ -206,11 +249,12 @@ class ControlCenterWindowTaskStartMixin:
 
         dispatched_count = self._dispatch_pending_runner_starts()
         queued_count = sum(1 for runner in runners if getattr(runner, "_queued_for_start", False))
-        self._update_single_window_table_status(
-            window_id,
-            "\u7b49\u5f85\u5f00\u59cb" if queued_count > 0 and dispatched_count <= 0 else "\u6b63\u5728\u542f\u52a8",
-            "\u5de5\u4f5c\u6d41\u5df2\u52a0\u5165\u8c03\u5ea6\u961f\u5217" if queued_count > 0 else "\u5de5\u4f5c\u6d41\u542f\u52a8\u4e2d",
-        )
+        if not self._is_start_aborted(window_id):
+            self._update_single_window_table_status(
+                window_id,
+                "\u7b49\u5f85\u5f00\u59cb" if queued_count > 0 and dispatched_count <= 0 else "\u6b63\u5728\u542f\u52a8",
+                "\u5de5\u4f5c\u6d41\u5df2\u52a0\u5165\u8c03\u5ea6\u961f\u5217" if queued_count > 0 else "\u5de5\u4f5c\u6d41\u542f\u52a8\u4e2d",
+            )
         logger.info(
             "\u7a97\u53e3%s\u5de5\u4f5c\u6d41\u5df2\u52a0\u5165\u8c03\u5ea6: total=%d, dispatched=%d, queued=%d",
             window_id,

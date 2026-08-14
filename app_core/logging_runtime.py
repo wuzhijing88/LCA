@@ -10,7 +10,10 @@ from typing import Callable, Optional
 from utils.app_paths import get_logs_dir
 from utils.log_runtime_control import configure_noisy_logger_levels, install_runtime_log_filters
 
-LOG_DIR = get_logs_dir("LCA")
+def _log_dir() -> str:
+    return get_logs_dir("LCA")
+
+
 LOG_FILENAME_FORMAT = "app_%Y-%m-%d.log"
 MAX_LOG_FILE_SIZE_MB = 15
 MAX_LOG_BACKUP_COUNT = 0
@@ -55,7 +58,7 @@ def cleanup_log_files_and_temp(
     cleanup_temp_files_cb: Optional[Callable[[], None]] = None,
     verbose: bool = False,
 ):
-    log_pattern = os.path.join(LOG_DIR, "app_*.log*")
+    log_pattern = os.path.join(_log_dir(), "app_*.log*")
     current_time = time.time()
     deleted_count = 0
     deleted_size = 0
@@ -187,7 +190,7 @@ def setup_logging_and_cleanup(cleanup_temp_files_cb: Optional[Callable[[], None]
     )
 
     current_log_filename = datetime.date.today().strftime(LOG_FILENAME_FORMAT)
-    current_log_filepath = os.path.join(LOG_DIR, current_log_filename)
+    current_log_filepath = os.path.join(_log_dir(), current_log_filename)
 
     logger_instance = logging.getLogger()
     if logger_instance.hasHandlers():

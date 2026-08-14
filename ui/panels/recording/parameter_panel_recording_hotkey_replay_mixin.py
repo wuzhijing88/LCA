@@ -78,6 +78,16 @@ class ParameterPanelRecordingHotkeyReplayMixin:
             if QThread.currentThread() != self.thread():
                 QTimer.singleShot(0, self, self._on_replay_hotkey)
                 return
+            try:
+                from utils.instance_runtime import should_handle_hotkey
+
+                parent = getattr(self, "parent_window", None)
+                if not should_handle_hotkey(getattr(parent, "bound_windows", None) if parent else None):
+                    if parent is not None and hasattr(parent, "_notify_hotkey_routed_away"):
+                        parent._notify_hotkey_routed_away()
+                    return
+            except Exception:
+                pass
             if not self._is_recording_panel_active:
                 return
 

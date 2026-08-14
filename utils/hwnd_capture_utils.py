@@ -23,6 +23,8 @@ import cv2
 import numpy as np
 import win32gui
 
+from utils.hwnd_utils import as_hwnd
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +54,7 @@ class CaptureTargetInfo:
 
 def resolve_capture_target(hwnd: int) -> CaptureTargetInfo:
     """解析截图目标句柄。子窗口统一映射到顶层父窗口。"""
-    target_hwnd = int(hwnd or 0)
+    target_hwnd = as_hwnd(hwnd)
     capture_hwnd = target_hwnd
     is_child_window = False
 
@@ -60,7 +62,7 @@ def resolve_capture_target(hwnd: int) -> CaptureTargetInfo:
         return CaptureTargetInfo(target_hwnd=target_hwnd, capture_hwnd=capture_hwnd, is_child_window=False)
 
     try:
-        root_hwnd = int(win32gui.GetAncestor(target_hwnd, 2) or 0)
+        root_hwnd = as_hwnd(win32gui.GetAncestor(target_hwnd, 2))
         if root_hwnd and root_hwnd != target_hwnd:
             capture_hwnd = root_hwnd
             is_child_window = True
@@ -76,6 +78,7 @@ def resolve_capture_target(hwnd: int) -> CaptureTargetInfo:
 
 def get_window_rect_with_dwm(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
     """使用 DWM 获取窗口实际可见边界。"""
+    hwnd = as_hwnd(hwnd)
     if not hwnd:
         return None
 
@@ -83,7 +86,7 @@ def get_window_rect_with_dwm(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
         dwmapi = ctypes.windll.dwmapi
         rect = wintypes.RECT()
         result = dwmapi.DwmGetWindowAttribute(
-            wintypes.HWND(int(hwnd)),
+            wintypes.HWND(as_hwnd(hwnd)),
             wintypes.DWORD(9),
             ctypes.byref(rect),
             ctypes.sizeof(rect),
@@ -98,6 +101,7 @@ def get_window_rect_with_dwm(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
 
 def get_screen_rect(hwnd: int, client_area_only: bool) -> Optional[Tuple[int, int, int, int]]:
     """获取目标句柄在屏幕坐标系中的逻辑矩形。"""
+    hwnd = as_hwnd(hwnd)
     if not hwnd:
         return None
 

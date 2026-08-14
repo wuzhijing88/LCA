@@ -22,6 +22,21 @@ class MainWindowExecutionPersistenceMixin:
         except Exception:
             logger.exception("刷新变量池失败: task_id=%s", normalized_task_id)
 
+    def _import_runtime_variables_into_workflow_context(self, task, runtime_variables, task_key: str) -> None:
+        """把子进程导出的运行变量写回父进程工作流上下文，供变量池立即显示。"""
+        from task_workflow.workflow_context import get_workflow_context, import_global_vars
+        from task_workflow.workflow_vars import workflow_context_key
+
+        workflow_id = workflow_context_key(getattr(task, "task_id", None))
+        if not workflow_id:
+            return
+
+        import_global_vars(runtime_variables, workflow_id=workflow_id)
+        get_workflow_context(workflow_id).bind_runtime_storage(
+            task_key=task_key,
+            dirty=False,
+        )
+
     def _persist_task_runtime_variables(self, task, runtime_variables):
         """将运行变量直接持久化到工作流路径对应的 SQLite 空间。"""
         if task is None or not isinstance(runtime_variables, dict):
@@ -33,11 +48,16 @@ class MainWindowExecutionPersistenceMixin:
             save_runtime_snapshot(task_key, runtime_variables)
             if isinstance(task.workflow_data, dict):
                 task.workflow_data.pop("variables", None)
-            self._refresh_open_variable_pool_dialogs(task.task_id)
-            return True
         except Exception:
             logger.exception("运行变量写入 SQLite 失败: task_id=%s", getattr(task, "task_id", None))
             return False
+
+        try:
+            self._import_runtime_variables_into_workflow_context(task, runtime_variables, task_key)
+        except Exception:
+            logger.exception("运行变量回写工作流上下文失败: task_id=%s", getattr(task, "task_id", None))
+        self._refresh_open_variable_pool_dialogs(task.task_id)
+        return True
 
     def _persist_execution_runtime_variables(self, executor_obj=None, task_id=None):
         """将单工作流执行器的变量快照写入对应 SQLite 空间。"""

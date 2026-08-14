@@ -1776,6 +1776,21 @@ class VariablePoolDialog(QDialog):
             raw_vars = {}
             source_map = {}
             runtime_task_key = ""
+        if runtime_task_key:
+            try:
+                from task_workflow.runtime_var_store import list_runtime_var_sources
+
+                db_sources = list_runtime_var_sources(runtime_task_key) or {}
+                for raw_name, source in db_sources.items():
+                    name = str(raw_name or "").strip()
+                    if not name:
+                        continue
+                    if name not in raw_vars:
+                        raw_vars[name] = object()
+                    if name not in source_map and source is not None:
+                        source_map[name] = source
+            except Exception as exc:
+                logger.debug("合并 SQLite 变量索引失败: %s", exc)
         group_map: dict = {}
 
         display_names = [name for name in raw_vars.keys() if not self._is_system_var(name)]

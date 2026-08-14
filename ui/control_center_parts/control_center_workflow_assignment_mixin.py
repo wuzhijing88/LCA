@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
+from app_core.control_plane import unwrap_assignment_record, wrap_assignment_record
 from utils.app_paths import get_workflows_dir
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class ControlCenterWorkflowAssignmentMixin:
             window_info = self._get_row_window_info(row)
             if not window_info:
                 continue
-            window_id = str(window_info.get('hwnd', row))
+            window_id = self._window_runtime_id(window_info, row)
             window_title = str(window_info.get('title', '\u672a\u77e5\u7a97\u53e3'))
             try:
                 workflows = self._ensure_window_workflow_list(window_id)
@@ -92,6 +93,8 @@ class ControlCenterWorkflowAssignmentMixin:
             return False
 
         success_count, failed_rows = self._apply_workflow_entries_to_rows(rows, workflow_entries)
+        if success_count > 0:
+            self._save_workflow_config()
         self.on_selection_changed()
 
         detail_parts = [f"成功={success_count}"]
@@ -138,36 +141,90 @@ class ControlCenterWorkflowAssignmentMixin:
 
 
 
+    def _match_saved_window_id(self, saved_key: str) -> str:
+        key = str(saved_key or "").strip()
+        if not key:
+            return ""
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is not None:
+            resolved = scheduler.match_saved_key(key)
+            if resolved:
+                return resolved
+        for row, window_info in enumerate(self.sorted_windows):
+            bind_id = str(window_info.get("bind_id") or "").strip()
+            runtime_id = self._window_runtime_id(window_info, row)
+            if key in {bind_id, runtime_id}:
+                return runtime_id or key
+        return ""
+
+    def _persist_bound_window_identities(self):
+        parent = getattr(self, "parent_window", None)
+        if parent is None:
+            return
+        store = getattr(parent, "_store_runtime_bound_windows_to_config", None)
+        if callable(store):
+            try:
+                store()
+            except Exception as e:
+                logger.warning("回写绑定窗口身份失败: %s", e)
+        config = getattr(parent, "config", None)
+        save_config_func = getattr(parent, "save_config_func", None)
+        if callable(save_config_func) and isinstance(config, dict):
+            try:
+                save_config_func(config)
+                return
+            except Exception as e:
+                logger.warning("保存绑定窗口身份失败: %s", e)
+        silent_save = getattr(parent, "_save_config_silent", None)
+        if callable(silent_save):
+            try:
+                silent_save()
+            except Exception as e:
+                logger.warning("静默保存绑定窗口身份失败: %s", e)
+
     def _save_workflow_config(self):
         """保存工作流配置到临时文件"""
         try:
-            # 准备保存的数据
             config_data = {}
-            for window_id, workflows in self.window_workflows.items():
-                if isinstance(workflows, list):
-                    # 只保存文件路径，不保存完整的工作流数据（减少文件大小）
-                    config_data[window_id] = [
-                        {
-                            'file_path': wf.get('file_path', ''),
-                            'name': wf.get('name', '')
-                        }
-                        for wf in workflows
-                    ]
-                else:
-                    # 向后兼容旧格式
-                    config_data[window_id] = {
-                        'file_path': workflows.get('file_path', ''),
-                        'name': workflows.get('name', '')
-                    }
+            for row, window_info in enumerate(self.sorted_windows):
+                runtime_id = self._window_runtime_id(window_info, row)
+                workflows = self.window_workflows.get(runtime_id)
+                if not workflows:
+                    continue
+                persist_key = self._ensure_window_bind_id(window_info) or runtime_id
+                config_data[persist_key] = wrap_assignment_record(window_info, workflows)
 
-            # 保存到临时文件
-            with open(self.temp_workflow_config_file, 'w', encoding='utf-8') as f:
+            with open(self.temp_workflow_config_file, "w", encoding="utf-8") as f:
                 json.dump(config_data, f, ensure_ascii=False, indent=2)
 
+            self._persist_bound_window_identities()
             logger.info(f"工作流配置已保存到: {self.temp_workflow_config_file}")
 
         except Exception as e:
             logger.error(f"保存工作流配置失败: {e}")
+
+    def _load_workflow_entries_from_saved(self, workflows_info):
+        loaded = []
+        if not isinstance(workflows_info, list):
+            return loaded
+        for wf_info in workflows_info:
+            if not isinstance(wf_info, dict):
+                continue
+            file_path = wf_info.get("file_path", "")
+            if not file_path or not os.path.exists(file_path):
+                if file_path:
+                    logger.warning(f"工作流文件不存在: {file_path}")
+                continue
+            with open(file_path, "r", encoding="utf-8") as wf:
+                workflow_data = json.load(wf)
+            if isinstance(workflow_data, dict):
+                workflow_data.pop("variables", None)
+            loaded.append({
+                "file_path": file_path,
+                "data": copy.deepcopy(workflow_data),
+                "name": wf_info.get("name", os.path.basename(file_path)),
+            })
+        return loaded
 
     def _load_workflow_config(self):
         """从临时文件加载工作流配置"""
@@ -176,48 +233,27 @@ class ControlCenterWorkflowAssignmentMixin:
                 logger.info("未找到之前保存的工作流配置")
                 return
 
-            with open(self.temp_workflow_config_file, 'r', encoding='utf-8') as f:
+            with open(self.temp_workflow_config_file, "r", encoding="utf-8") as f:
                 config_data = json.load(f)
+            if not isinstance(config_data, dict):
+                return
 
-            # 加载工作流数据
             loaded_count = 0
-            for window_id, workflows_info in config_data.items():
+            for saved_key, workflows_info in config_data.items():
                 try:
-                    # 处理列表格式
-                    if isinstance(workflows_info, list):
-                        self.window_workflows[window_id] = []
-                        for wf_info in workflows_info:
-                            file_path = wf_info.get('file_path', '')
-                            if file_path and os.path.exists(file_path):
-                                # 重新读取工作流文件
-                                with open(file_path, 'r', encoding='utf-8') as wf:
-                                    workflow_data = json.load(wf)
-
-                                self.window_workflows[window_id].append({
-                                    'file_path': file_path,
-                                    'data': copy.deepcopy(workflow_data),
-                                    'name': wf_info.get('name', os.path.basename(file_path))
-                                })
-                                loaded_count += 1
-                            else:
-                                logger.warning(f"工作流文件不存在: {file_path}")
-
-                    # 处理旧的字典格式
-                    elif isinstance(workflows_info, dict):
-                        file_path = workflows_info.get('file_path', '')
-                        if file_path and os.path.exists(file_path):
-                            with open(file_path, 'r', encoding='utf-8') as wf:
-                                workflow_data = json.load(wf)
-
-                            self.window_workflows[window_id] = [{
-                                'file_path': file_path,
-                                'data': copy.deepcopy(workflow_data),
-                                'name': workflows_info.get('name', os.path.basename(file_path))
-                            }]
-                            loaded_count += 1
-
+                    saved = unwrap_assignment_record(workflows_info)
+                    if not saved.get("workflows"):
+                        continue
+                    window_id = self._match_saved_window_id(saved_key)
+                    if not window_id:
+                        continue
+                    entries = self._load_workflow_entries_from_saved(saved.get("workflows"))
+                    if not entries:
+                        continue
+                    self.window_workflows[window_id] = entries
+                    loaded_count += len(entries)
                 except Exception as e:
-                    logger.error(f"加载窗口{window_id}的工作流失败: {e}")
+                    logger.error(f"加载窗口{saved_key}的工作流失败: {e}")
 
             if loaded_count > 0:
                 logger.info(f"成功加载 {loaded_count} 个工作流配置")
@@ -279,8 +315,8 @@ class ControlCenterWorkflowAssignmentMixin:
         blocked: Dict[str, Dict[str, Any]] = {}
 
         for row, window_info in enumerate(self.sorted_windows):
-            window_id = str(window_info.get("hwnd", row))
-            if target_filter is not None and window_id not in target_filter:
+            window_id = self._window_runtime_id(window_info, row)
+            if target_filter is not None and not self._job_id_in_filter(window_id, target_filter, window_info):
                 continue
 
             workflows = self.window_workflows.get(window_id)

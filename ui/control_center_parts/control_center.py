@@ -4,6 +4,7 @@ from collections import deque
 from typing import Dict, Any, List, Optional
 from PySide6.QtWidgets import QMainWindow
 
+from app_core.control_plane import JobScheduler
 from utils.app_paths import get_user_data_dir
 from ..control_center_parts.control_center_runner_mixin import ControlCenterRunnerMixin
 from ..control_center_parts.control_center_timer_mixin import ControlCenterTimerMixin
@@ -11,7 +12,10 @@ from ..control_center_parts.control_center_pause_timer_mixin import ControlCente
 from ..control_center_parts.control_center_timer_dialog_mixin import ControlCenterTimerDialogMixin
 from ..control_center_parts.control_center_ui_layout_mixin import ControlCenterUiLayoutMixin
 from ..control_center_parts.control_center_window_lifecycle_mixin import ControlCenterWindowLifecycleMixin
-from ..control_center_parts.control_center_window_table_mixin import ControlCenterWindowTableMixin
+from ..control_center_parts.control_center_window_table_mixin import (
+    ControlCenterWindowTableMixin,
+    format_bound_window_display_title,
+)
 from ..control_center_parts.control_center_workflow_runtime_mixin import ControlCenterWorkflowRuntimeMixin
 from ..control_center_parts.control_center_workflow_assignment_mixin import ControlCenterWorkflowAssignmentMixin
 from ..control_center_parts.control_center_window_task_mixin import ControlCenterWindowTaskMixin
@@ -24,10 +28,13 @@ class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, Con
 
     def __init__(self, bound_windows: List[Dict], task_modules: Dict[str, Any], parent=None):
         super().__init__(parent)
+        self.setObjectName("ControlCenterWindow")
         self.bound_windows = bound_windows
         self.task_modules = task_modules
-        self.window_runners = {}  # 存储每个窗口的任务运行器列表: window_id -> [runner1, runner2, ...]
-        self.window_workflows = {}  # 存储每个窗口分配的工作流列表
+        self.scheduler = JobScheduler()
+        self.window_runners = {}  # job_id -> [runner1, runner2, ...]
+        self.window_workflows = self.scheduler.assignments_view()
+        self.scheduler.sync_targets(bound_windows)
         self.sorted_windows = []  # 存储排序后的窗口列表
         self.parent_window = parent  # 保存主窗口引用
 
@@ -54,12 +61,14 @@ class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, Con
         self._runner_dispatch_in_progress = False
 
         # 临时工作流配置文件路径
-        runtime_dir = os.path.join(get_user_data_dir("LCA"), "runtime")
+        try:
+            from utils.app_paths import get_runtime_state_dir
+
+            runtime_dir = get_runtime_state_dir("LCA")
+        except Exception:
+            runtime_dir = os.path.join(get_user_data_dir("LCA"), "runtime")
         os.makedirs(runtime_dir, exist_ok=True)
         self.temp_workflow_config_file = os.path.join(runtime_dir, ".control_center_workflows.json")
-
-        # 启动时清空之前的工作流配置（防止重复导入）
-        self._clear_workflow_config()
 
         self.setWindowTitle("中控软件 - 多窗口工作流管理")
         available_geometry = get_available_geometry_for_widget(self.parentWidget() or self)
@@ -76,6 +85,9 @@ class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, Con
         # 窗口样式现在由 themes/dark.qss 和 themes/light.qss 统一管理
 
         self.init_ui()
+        self._load_workflow_config()
+        self._refresh_all_window_workflow_cells()
+        self._persist_bound_window_identities()
         self.setup_timer()
         self._setup_shortcuts()
 
@@ -88,6 +100,9 @@ class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, Con
         return sorted(windows, key=get_sort_key)
 
     def format_window_title(self, original_title, row_index):
-        """格式化窗口标题显示"""
-        # 窗口保持原标题，如果有多个相同的，加上编号
-        return f"{original_title}-{row_index + 1}"
+        """格式化窗口标题显示。同名窗口才加编号。"""
+        return format_bound_window_display_title(
+            original_title,
+            row_index,
+            getattr(self, "sorted_windows", None),
+        )

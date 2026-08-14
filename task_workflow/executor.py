@@ -6,7 +6,7 @@ import re
 import time
 import copy
 import threading
-from typing import Callable, Dict, List, Any, Optional, Set
+from typing import Callable, Dict, List, Any, Optional, Set, Tuple
 from PySide6.QtCore import QObject, Signal, QThread
 from task_workflow.card_display import find_card_by_id, format_step_detail
 from task_workflow.workflow_identity import (
@@ -371,18 +371,29 @@ class WorkflowExecutor(QObject):
                     return 0
 
                 removed = 0
-                card_var_names = []
                 try:
-                    card_var_names = list(
-                        (getattr(context, "card_vars", {}) or {}).get(int(card_id), set()) or []
+                    owner_id = int(card_id)
+                except (TypeError, ValueError):
+                    return 0
+
+                candidate_names = []
+                try:
+                    candidate_names = list(
+                        (getattr(context, "card_vars", {}) or {}).get(owner_id, set()) or []
                     )
                 except Exception:
-                    card_var_names = []
+                    candidate_names = []
 
-                if card_var_names:
-                    candidate_names = card_var_names
-                else:
-                    candidate_names = list((getattr(context, "global_vars", {}) or {}).keys())
+                if not candidate_names:
+                    try:
+                        source_map = getattr(context, "var_sources", {}) or {}
+                        candidate_names = [
+                            str(name).strip()
+                            for name, source in source_map.items()
+                            if str(name or "").strip() and source == owner_id
+                        ]
+                    except Exception:
+                        candidate_names = []
 
                 for name in candidate_names:
                     name = str(name or "").strip()
@@ -390,7 +401,7 @@ class WorkflowExecutor(QObject):
                         continue
                     if name == prefix or name.startswith(f"{prefix}."):
                         try:
-                            context.remove_global_var(name)
+                            context.remove_global_var(name, persist=False)
                             removed += 1
                         except Exception:
                             pass
@@ -803,13 +814,23 @@ class WorkflowExecutor(QObject):
             task_type=task_type,
         )
 
+    def _reset_current_card_issue_state(self) -> None:
+        self._current_card_error_detail = ""
+        self._current_card_error_detail_level = logging.NOTSET
+        self._current_card_issue_logs = []
+
+    def _begin_card_issue_capture(self) -> None:
+        self._reset_current_card_issue_state()
+        self._capture_card_issue_logs = True
+
+    def _end_card_issue_capture(self) -> None:
+        self._capture_card_issue_logs = False
+
     def _reset_failure_context(self) -> None:
         self._last_failure_card_id = None
         self._last_failure_task_type = ""
         self._last_failure_detail = ""
-        self._current_card_error_detail = ""
-        self._current_card_error_detail_level = logging.NOTSET
-        self._current_card_issue_logs = []
+        self._reset_current_card_issue_state()
 
     def _remember_failure(self, card_id: Any, task_type: Any, detail: str = "") -> None:
         normalized_card_id = self._normalize_card_id_value(card_id)
@@ -874,8 +895,37 @@ class WorkflowExecutor(QObject):
                 return True
         return False
 
-    @staticmethod
-    def _is_capturable_issue_log(message: str, levelno: int) -> bool:
+    _MATCH_SCORE_PATTERNS = (
+        re.compile(r"分数:\s*([0-9.]+)\s*,\s*阈值:\s*([0-9.]+)"),
+        re.compile(r"模板匹配分数\s*([0-9.]+)\s*[，,]\s*要求至少\s*([0-9.]+)"),
+        re.compile(r"置信度\s*([0-9.]+)\s*[<＜>=≤≥]?\s*阈值\s*([0-9.]+)"),
+    )
+
+    @classmethod
+    def _parse_match_score_pair(cls, message: str) -> Optional[Tuple[float, float]]:
+        text = str(message or "").strip()
+        if not text:
+            return None
+        for pattern in cls._MATCH_SCORE_PATTERNS:
+            matched = pattern.search(text)
+            if not matched:
+                continue
+            try:
+                return float(matched.group(1)), float(matched.group(2))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @classmethod
+    def _is_passing_match_diagnostic(cls, message: str) -> bool:
+        pair = cls._parse_match_score_pair(message)
+        if pair is None:
+            return False
+        score, threshold = pair
+        return score >= threshold
+
+    @classmethod
+    def _is_capturable_issue_log(cls, message: str, levelno: int) -> bool:
         text = str(message or "").strip()
         if not text:
             return False
@@ -886,6 +936,9 @@ class WorkflowExecutor(QObject):
             "输入 size override ignored: static model 输入 shape",
         )
         if any(fragment in text for fragment in ignored_fragments):
+            return False
+
+        if cls._is_passing_match_diagnostic(text) and int(levelno) < logging.WARNING:
             return False
 
         if int(levelno) >= logging.WARNING:
@@ -974,10 +1027,12 @@ class WorkflowExecutor(QObject):
         )
         return any(keyword in text for keyword in diagnostic_keywords)
 
-    @staticmethod
-    def _normalize_issue_message_for_display(message: str) -> str:
+    @classmethod
+    def _normalize_issue_message_for_display(cls, message: str) -> str:
         text = str(message or "").strip()
         if not text:
+            return ""
+        if cls._is_passing_match_diagnostic(text):
             return ""
         if text.startswith("Target not detected"):
             return "未检测到目标"
@@ -1037,7 +1092,19 @@ class WorkflowExecutor(QObject):
         diagnostic_entries = [
             entry for entry in issue_logs
             if self._is_diagnostic_issue_message(entry.get("message"))
+            and not self._is_passing_match_diagnostic(entry.get("message"))
         ]
+
+        latest_match_entry = None
+        other_diagnostic_entries = []
+        for entry in diagnostic_entries:
+            if self._parse_match_score_pair(entry.get("message")) is not None:
+                latest_match_entry = entry
+            else:
+                other_diagnostic_entries.append(entry)
+        diagnostic_entries = other_diagnostic_entries
+        if latest_match_entry is not None:
+            diagnostic_entries.append(latest_match_entry)
 
         if any(not self._looks_generic_issue_message(entry.get("message")) for entry in failure_entries):
             failure_entries = [
@@ -1056,15 +1123,23 @@ class WorkflowExecutor(QObject):
             selected_messages.append(message)
 
         ranked_failures = sorted(
-            failure_entries,
-            key=lambda entry: self._issue_message_score(entry.get("message"), int(entry.get("levelno", logging.INFO))),
+            enumerate(failure_entries),
+            key=lambda item: (
+                self._issue_message_score(item[1].get("message"), int(item[1].get("levelno", logging.INFO))),
+                item[0],
+            ),
             reverse=True,
         )
         ranked_diagnostics = sorted(
-            diagnostic_entries,
-            key=lambda entry: self._issue_message_score(entry.get("message"), int(entry.get("levelno", logging.INFO))),
+            enumerate(diagnostic_entries),
+            key=lambda item: (
+                self._issue_message_score(item[1].get("message"), int(item[1].get("levelno", logging.INFO))),
+                item[0],
+            ),
             reverse=True,
         )
+        ranked_failures = [entry for _, entry in ranked_failures]
+        ranked_diagnostics = [entry for _, entry in ranked_diagnostics]
 
         _append_entry(ranked_failures[0] if ranked_failures else None)
         _append_entry(ranked_diagnostics[0] if ranked_diagnostics else None)
@@ -1080,8 +1155,12 @@ class WorkflowExecutor(QObject):
                 break
 
         if not selected_messages:
+            fallback_candidates = [
+                entry for entry in issue_logs
+                if not self._is_passing_match_diagnostic(entry.get("message"))
+            ] or list(issue_logs)
             fallback_entry = max(
-                issue_logs,
+                fallback_candidates,
                 key=lambda entry: self._issue_message_score(entry.get("message"), int(entry.get("levelno", logging.INFO))),
             )
             _append_entry(fallback_entry)
@@ -1653,6 +1732,12 @@ class WorkflowExecutor(QObject):
         # 环境变量应该由调用方（单窗口执行器或多窗口执行器）负责设置
         logger.info(f"WorkflowExecutor启动: 窗口='{self.target_window_title}', 模式={self.execution_mode}, HWND={self.target_hwnd}")
 
+        if WIN32GUI_AVAILABLE and self.target_hwnd and not win32gui.IsWindow(self.target_hwnd):
+            recovered_hwnd = self._try_recover_window_handle()
+            if recovered_hwnd:
+                logger.info(f"启动时重连目标窗口: {self.target_hwnd} => {recovered_hwnd}")
+                self.target_hwnd = recovered_hwnd
+
         logger.info("开始执行工作流")
         # 在前台模式下激活目标窗口
         # [闪退修复] 标准化执行模式以支持新的模式
@@ -1668,9 +1753,8 @@ class WorkflowExecutor(QObject):
             self._activate_target_window()
 
         # 【新增】后台模式下，如果是"二重螺旋"窗口，发送一次点击激活
-        if normalized_mode == 'background' and self.target_hwnd:
+        if normalized_mode == 'background' and self.target_hwnd and WIN32GUI_AVAILABLE:
             try:
-                import win32gui
                 window_title = win32gui.GetWindowText(self.target_hwnd)
                 if "二重螺旋" in window_title:
                     logger.info("[后台激活] 检测到二重螺旋窗口，发送一次点击激活")
@@ -2026,19 +2110,21 @@ class WorkflowExecutor(QObject):
             return 0
 
         window_title = self.target_window_title
-        if not window_title:
+        if not window_title and not self.target_hwnd:
             return 0
 
         try:
-            # 只接受唯一精确匹配，避免同名窗口串绑
-            new_hwnd = WindowFinder.find_unique_window_exact(window_title)
+            from utils.window_identity import resolve_bound_window_hwnd
+
+            new_hwnd = resolve_bound_window_hwnd({
+                'title': window_title,
+                'hwnd': self.target_hwnd,
+            })
             if new_hwnd and win32gui.IsWindow(new_hwnd):
-                logger.info(f"[Executor] 通过标题精确匹配恢复窗口: {window_title} -> {new_hwnd}")
+                logger.info(f"[Executor] 通过窗口特征恢复窗口: {window_title} -> {new_hwnd}")
                 return new_hwnd
 
-            logger.warning(f"[Executor] 未找到可唯一确认的目标窗口，拒绝模糊恢复: {window_title}")
-
-
+            logger.warning(f"[Executor] 未找到可确认的目标窗口，拒绝模糊恢复: {window_title}")
         except Exception as e:
             logger.error(f"[Executor] 恢复窗口句柄异常: {e}")
 
@@ -2321,7 +2407,7 @@ class WorkflowExecutor(QObject):
 
 
                 # 执行卡片逻辑
-                self._current_card_error_detail = ""
+                self._reset_current_card_issue_state()
                 success, next_card_id, task_detail = self._execute_card(current_card_id, task_type, card_params)
 
                 # 更新最后一个卡片的执行状态
@@ -2713,18 +2799,17 @@ class WorkflowExecutor(QObject):
                                 # 获取标题失败但窗口存在，继续执行
                                 logger.debug(f"成功 使用预设窗口句柄: {target_hwnd} (无法获取标题)")
                         else:
-                            # 窗口句柄失效，检查是否应该自动停止
-                            logger.warning(f"目标窗口已关闭 (HWND: {target_hwnd})")
-
-                            # 不再尝试恢复，直接停止工作流避免卡死
-                            detail = "目标窗口不存在或已关闭"
-                            logger.error(f"工作流已自动停止：{detail}")
-
-                            # 标记停止请求，确保工作流能够优雅退出
-                            self._stop_requested = True
-
-                            # 返回失败，触发工作流停止
-                            return _finalize_failure(detail=detail)
+                            logger.warning(f"目标窗口已关闭 (HWND: {target_hwnd})，尝试按窗口特征重连")
+                            recovered_hwnd = self._try_recover_window_handle()
+                            if recovered_hwnd and win32gui.IsWindow(recovered_hwnd):
+                                self.target_hwnd = recovered_hwnd
+                                target_hwnd = recovered_hwnd
+                                logger.info(f"目标窗口句柄已重连: {recovered_hwnd}")
+                            else:
+                                detail = "目标窗口不存在或已关闭"
+                                logger.error(f"工作流已自动停止：{detail}")
+                                self._stop_requested = True
+                                return _finalize_failure(detail=detail)
                 except Exception as e:
                     logger.error(f"错误 验证预设窗口句柄时出错: {e}")
                     # 发生异常时也停止工作流，避免继续执行导致卡死
@@ -2803,18 +2888,18 @@ class WorkflowExecutor(QObject):
                                 logger.warning("[输入调度] 等待输入锁 %.1fms (告警阈值 %.1fms): %s", total_wait_ms, wait_warn_ms, lock_owner)
                             elif total_wait_ms > 20:
                                 logger.debug("[输入调度] 等待输入锁 %.1fms: %s", total_wait_ms, lock_owner)
-                            self._capture_card_issue_logs = True
+                            self._begin_card_issue_capture()
                             try:
                                 task_result = _invoke_task_module()
                             finally:
-                                self._capture_card_issue_logs = False
+                                self._end_card_issue_capture()
                             break
             else:
-                self._capture_card_issue_logs = True
+                self._begin_card_issue_capture()
                 try:
                     task_result = _invoke_task_module()
                 finally:
-                    self._capture_card_issue_logs = False
+                    self._end_card_issue_capture()
 
             if task_result is None:
                 return _finalize_failure(detail="任务执行没有返回结果")

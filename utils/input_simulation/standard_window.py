@@ -12,6 +12,7 @@ from ..enhanced_window_activator import get_window_activator
 from .mode_utils import get_foreground_driver_backends, get_ibinputsimulator_config
 from typing import Optional, List, Any, Tuple
 from .base import BaseInputSimulator, ElementNotFoundError
+from utils.hwnd_utils import as_hwnd
 from utils.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
@@ -1404,18 +1405,18 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
     def _is_foreground_target_window(self, foreground_hwnd: int) -> bool:
         try:
-            fg_hwnd = int(foreground_hwnd or 0)
-            target_hwnd = int(self.hwnd or 0)
+            fg_hwnd = as_hwnd(foreground_hwnd)
+            target_hwnd = as_hwnd(self.hwnd)
         except Exception:
             return False
-        if fg_hwnd <= 0 or target_hwnd <= 0:
+        if fg_hwnd == 0 or target_hwnd == 0:
             return False
         if fg_hwnd == target_hwnd:
             return True
         try:
-            fg_root = int(win32gui.GetAncestor(fg_hwnd, win32con.GA_ROOT) or 0)
-            target_root = int(win32gui.GetAncestor(target_hwnd, win32con.GA_ROOT) or 0)
-            if fg_root > 0 and target_root > 0 and fg_root == target_root:
+            fg_root = as_hwnd(win32gui.GetAncestor(fg_hwnd, win32con.GA_ROOT))
+            target_root = as_hwnd(win32gui.GetAncestor(target_hwnd, win32con.GA_ROOT))
+            if fg_root != 0 and target_root != 0 and fg_root == target_root:
                 return True
         except Exception:
             return False

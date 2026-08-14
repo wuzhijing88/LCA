@@ -1,17 +1,17 @@
+# -*- coding: utf-8 -*-
 import logging
 import time
-from datetime import datetime
 
 from PySide6.QtCore import QTimer
+
+from app_core.scheduling import duration_to_seconds
+from app_core.scheduling.text import UNIT_SECONDS, unit_label
 
 logger = logging.getLogger(__name__)
 
 
 class ControlCenterPauseTimerMixin:
     def _setup_control_pause_timers(self):
-        self._cc_timed_pause_timer = QTimer(self)
-        self._cc_timed_pause_timer.timeout.connect(self._check_control_timed_pause_time)
-
         self._cc_timed_pause_resume_timer = QTimer(self)
         self._cc_timed_pause_resume_timer.setSingleShot(True)
         self._cc_timed_pause_resume_timer.timeout.connect(self._on_control_timed_pause_resume_timeout)
@@ -28,57 +28,6 @@ class ControlCenterPauseTimerMixin:
         self._cc_random_pause_countdown_timer.timeout.connect(self._on_control_random_pause_countdown_tick)
         self._cc_random_pause_deadlines_by_window = {}
         self._cc_random_auto_paused_window_ids = set()
-
-    def _load_control_pause_timer_settings(self, config):
-        self._cc_timed_pause_enabled = self._coerce_bool(config.get("cc_timed_pause_enabled", False), False)
-        self._cc_timed_pause_hour = self._coerce_int(config.get("cc_timed_pause_hour", 12), 12, 0, 23)
-        self._cc_timed_pause_minute = self._coerce_int(config.get("cc_timed_pause_minute", 0), 0, 0, 59)
-        self._cc_timed_pause_repeat = self._normalize_repeat_mode(config.get("cc_timed_pause_repeat", "daily"))
-        self._cc_timed_pause_duration_value = self._coerce_int(
-            config.get("cc_timed_pause_duration_value", 10), 10, 1, 999999
-        )
-        self._cc_timed_pause_duration_unit = self._normalize_duration_unit(
-            config.get("cc_timed_pause_duration_unit", "分钟")
-        )
-        self._cc_timed_pause_executed = False
-        self._cc_timed_pause_last_exec_date = None
-        self._cc_timed_auto_paused_window_ids = set()
-
-        self._cc_random_pause_enabled = self._coerce_bool(config.get("cc_random_pause_enabled", False), False)
-        self._cc_pause_probability = self._coerce_int(config.get("cc_pause_probability", 20), 20, 0, 100)
-        self._cc_pause_check_interval = self._coerce_int(config.get("cc_pause_check_interval", 30), 30, 1, 86400)
-        self._cc_pause_check_interval_unit = self._normalize_interval_unit(
-            config.get("cc_pause_check_interval_unit", "秒")
-        )
-        self._cc_pause_min_value = self._coerce_int(config.get("cc_pause_min_value", 60), 60, 1, 86400)
-        self._cc_pause_min_unit = self._normalize_duration_unit(config.get("cc_pause_min_unit", "秒"), "秒")
-        self._cc_pause_max_value = self._coerce_int(config.get("cc_pause_max_value", 120), 120, 1, 86400)
-        self._cc_pause_max_unit = self._normalize_duration_unit(config.get("cc_pause_max_unit", "秒"), "秒")
-        self._cc_random_pause_deadlines_by_window = {}
-        self._cc_random_auto_paused_window_ids = set()
-
-        self._cc_timed_pause_window_ids = self._normalize_window_id_list(config.get("cc_timed_pause_window_ids"))
-        self._cc_random_pause_window_ids = self._normalize_window_id_list(config.get("cc_random_pause_window_ids"))
-
-    def _save_control_pause_timer_settings(self, config):
-        config["cc_timed_pause_enabled"] = self._cc_timed_pause_enabled
-        config["cc_timed_pause_hour"] = self._cc_timed_pause_hour
-        config["cc_timed_pause_minute"] = self._cc_timed_pause_minute
-        config["cc_timed_pause_repeat"] = self._cc_timed_pause_repeat
-        config["cc_timed_pause_duration_value"] = self._cc_timed_pause_duration_value
-        config["cc_timed_pause_duration_unit"] = self._cc_timed_pause_duration_unit
-
-        config["cc_random_pause_enabled"] = self._cc_random_pause_enabled
-        config["cc_pause_probability"] = self._cc_pause_probability
-        config["cc_pause_check_interval"] = self._cc_pause_check_interval
-        config["cc_pause_check_interval_unit"] = self._cc_pause_check_interval_unit
-        config["cc_pause_min_value"] = self._cc_pause_min_value
-        config["cc_pause_min_unit"] = self._cc_pause_min_unit
-        config["cc_pause_max_value"] = self._cc_pause_max_value
-        config["cc_pause_max_unit"] = self._cc_pause_max_unit
-
-        config["cc_timed_pause_window_ids"] = list(self._cc_timed_pause_window_ids)
-        config["cc_random_pause_window_ids"] = list(self._cc_random_pause_window_ids)
 
     def _apply_control_pause_timer_settings(
         self,
@@ -106,17 +55,19 @@ class ControlCenterPauseTimerMixin:
         self._cc_timed_pause_repeat = self._normalize_repeat_mode(timed_pause_repeat)
         self._cc_timed_pause_duration_value = self._coerce_int(timed_pause_duration_value, 10, 1, 999999)
         self._cc_timed_pause_duration_unit = self._normalize_duration_unit(timed_pause_duration_unit)
-        self._cc_timed_pause_window_ids = self._normalize_window_id_list(timed_pause_window_ids)
+        self._cc_timed_pause_window_ids = self._retain_timer_window_ids(timed_pause_window_ids)
 
         self._cc_random_pause_enabled = random_pause_enabled
         self._cc_pause_probability = self._coerce_int(pause_probability, 20, 0, 100)
         self._cc_pause_check_interval = self._coerce_int(pause_check_interval, 30, 1, 86400)
-        self._cc_pause_check_interval_unit = self._normalize_interval_unit(pause_check_interval_unit, "秒")
+        self._cc_pause_check_interval_unit = self._normalize_interval_unit(
+            pause_check_interval_unit, UNIT_SECONDS
+        )
         self._cc_pause_min_value = self._coerce_int(pause_min_value, 60, 1, 86400)
-        self._cc_pause_min_unit = self._normalize_duration_unit(pause_min_unit, "秒")
+        self._cc_pause_min_unit = self._normalize_duration_unit(pause_min_unit, UNIT_SECONDS)
         self._cc_pause_max_value = self._coerce_int(pause_max_value, 120, 1, 86400)
-        self._cc_pause_max_unit = self._normalize_duration_unit(pause_max_unit, "秒")
-        self._cc_random_pause_window_ids = self._normalize_window_id_list(random_pause_window_ids)
+        self._cc_pause_max_unit = self._normalize_duration_unit(pause_max_unit, UNIT_SECONDS)
+        self._cc_random_pause_window_ids = self._retain_timer_window_ids(random_pause_window_ids)
 
         if not self._cc_timed_pause_enabled:
             if self._cc_timed_pause_resume_timer.isActive():
@@ -136,19 +87,13 @@ class ControlCenterPauseTimerMixin:
         self._update_control_random_pause_config()
 
     def _update_control_timed_pause_config(self):
-        if self._cc_timed_pause_timer.isActive():
-            self._cc_timed_pause_timer.stop()
-
-        self._cc_timed_pause_executed = False
-        self._cc_timed_pause_last_exec_date = None
+        self._sync_control_schedule_engine()
         if self._cc_timed_pause_enabled:
-            self._cc_timed_pause_timer.start(1000)
             logger.info(
                 f"中控定时暂停已启用，将在 {self._cc_timed_pause_hour:02d}:{self._cc_timed_pause_minute:02d} 暂停，"
-                f"持续 {self._cc_timed_pause_duration_value}{self._cc_timed_pause_duration_unit}，"
+                f"持续 {self._cc_timed_pause_duration_value}{unit_label(self._cc_timed_pause_duration_unit)}，"
                 f"重复模式: {self._cc_timed_pause_repeat}"
             )
-        self._refresh_control_timer_status_label()
 
     def _update_control_random_pause_config(self):
         if self._cc_random_pause_timer.isActive():
@@ -162,7 +107,7 @@ class ControlCenterPauseTimerMixin:
             self._cc_random_pause_timer.start(interval_ms)
             logger.info(
                 f"中控随机暂停已启用: 间隔={interval_ms}ms "
-                f"({self._cc_pause_check_interval}{self._cc_pause_check_interval_unit}), "
+                f"({self._cc_pause_check_interval}{unit_label(self._cc_pause_check_interval_unit, default=UNIT_SECONDS)}), "
                 f"概率={self._cc_pause_probability}%"
             )
         else:
@@ -175,10 +120,12 @@ class ControlCenterPauseTimerMixin:
             runtime_map = {}
             self._cc_random_pause_deadlines_by_window = runtime_map
 
-        target_filter = set(self._normalize_window_id_list(target_window_ids)) if target_window_ids else None
-        tracked_window_ids = set(runtime_map.keys())
-        if target_filter is not None:
-            tracked_window_ids &= target_filter
+        target_filter = self._canonicalize_window_id_set(target_window_ids) if target_window_ids else None
+        tracked_window_ids = set()
+        for raw_id in list(runtime_map.keys()):
+            if target_filter is not None and not self._job_id_in_filter(raw_id, target_filter):
+                continue
+            tracked_window_ids.add(raw_id)
 
         resumed_window_ids = set()
         if resume and tracked_window_ids:
@@ -212,16 +159,10 @@ class ControlCenterPauseTimerMixin:
         self._sync_pause_all_button_text()
 
     def _convert_duration_to_seconds(self, value: int, unit: str) -> int:
-        if unit == "小时":
-            return int(value) * 3600
-        if unit == "分钟":
-            return int(value) * 60
-        return int(value)
+        return duration_to_seconds(value, unit)
 
     def _convert_interval_to_milliseconds(self, value: int, unit: str) -> int:
-        if unit == "分钟":
-            return max(1000, int(value) * 60 * 1000)
-        return max(1000, int(value) * 1000)
+        return max(1000, duration_to_seconds(value, unit) * 1000)
 
     def _trigger_control_timed_pause(self) -> bool:
         duration_sec = self._convert_duration_to_seconds(
@@ -230,9 +171,14 @@ class ControlCenterPauseTimerMixin:
         )
         duration_sec = max(1, int(duration_sec))
 
+        target_ids, ok = self._resolve_configured_window_filter(self._cc_timed_pause_window_ids)
+        if not ok:
+            logger.info("[中控定时暂停] 无有效窗口，跳过本次触发")
+            return False
+
         paused_window_ids = self._pause_all_running_runners(
             "中控定时暂停",
-            target_window_ids=self._cc_timed_pause_window_ids,
+            target_window_ids=target_ids,
         )
         if not paused_window_ids:
             return False
@@ -248,47 +194,20 @@ class ControlCenterPauseTimerMixin:
         logger.info(f"[中控定时暂停] 已暂停，将在 {duration_sec} 秒后自动恢复")
         return True
 
-    def _check_control_timed_pause_time(self):
-        if not self._cc_timed_pause_enabled or getattr(self, "_is_closing", False):
+    def _execute_control_timed_pause(self):
+        if getattr(self, "_is_closing", False):
             return
-
-        now = datetime.now()
-        current_hour = now.hour
-        current_minute = now.minute
-        today = now.date()
-
-        if self._cc_timed_pause_repeat == "daily" and self._cc_timed_pause_executed:
-            if self._cc_timed_pause_last_exec_date is not None and self._cc_timed_pause_last_exec_date != today:
-                self._cc_timed_pause_executed = False
-                logger.info("[中控定时暂停] 跨日重置执行标记")
-
-        if current_hour == self._cc_timed_pause_hour and current_minute == self._cc_timed_pause_minute:
-            if self._cc_timed_pause_executed:
-                return
-
-            if self._count_unpaused_running_runners(target_window_ids=self._cc_timed_pause_window_ids) <= 0:
-                logger.info("[中控定时暂停] 当前无可暂停的运行任务，跳过本次触发")
-                return
-
-            if not self._can_execute_control_timer_action("timed_pause", now):
-                return
-
-            try:
-                triggered = self._trigger_control_timed_pause()
-            except Exception as e:
-                logger.error(f"[中控定时暂停] 触发失败: {e}")
-                triggered = False
-
-            if not triggered:
-                return
-
-            self._cc_timed_pause_executed = True
-            self._cc_timed_pause_last_exec_date = today
-
-            if self._cc_timed_pause_repeat == "once":
-                self._cc_timed_pause_enabled = False
-                self._cc_timed_pause_timer.stop()
-                logger.info("[中控定时暂停] 仅一次模式执行完成，已自动停用")
+        target_ids, ok = self._resolve_configured_window_filter(self._cc_timed_pause_window_ids)
+        if not ok:
+            logger.info("[中控定时暂停] 无有效窗口，跳过本次触发")
+            return
+        if self._count_unpaused_running_runners(target_window_ids=target_ids) <= 0:
+            logger.info("[中控定时暂停] 当前无可暂停的运行任务，跳过本次触发")
+            return
+        try:
+            self._trigger_control_timed_pause()
+        except Exception as e:
+            logger.error(f"[中控定时暂停] 触发失败: {e}")
 
     def _on_control_timed_pause_resume_timeout(self):
         if self._cc_auto_pause_source != "timed":
@@ -301,13 +220,13 @@ class ControlCenterPauseTimerMixin:
         self._cc_auto_pause_source = None
 
     def _release_timed_pause_targets(self, target_window_ids=None):
-        tracked_window_ids = set(
-            self._normalize_window_id_list(getattr(self, "_cc_timed_auto_paused_window_ids", None))
+        tracked_window_ids = self._canonicalize_window_id_set(
+            getattr(self, "_cc_timed_auto_paused_window_ids", None)
         )
         if not tracked_window_ids:
             return set()
 
-        target_filter = set(self._normalize_window_id_list(target_window_ids)) if target_window_ids else None
+        target_filter = self._canonicalize_window_id_set(target_window_ids) if target_window_ids else None
         released_window_ids = set(tracked_window_ids) if target_filter is None else (tracked_window_ids & target_filter)
         if not released_window_ids:
             return set()
@@ -336,15 +255,17 @@ class ControlCenterPauseTimerMixin:
         pause_min_sec = max(1, int(pause_min_sec))
         pause_max_sec = max(1, int(pause_max_sec))
 
-        target_filter = None
-        if self._cc_random_pause_window_ids:
-            target_filter = set(self._normalize_window_id_list(self._cc_random_pause_window_ids))
+        target_ids, ok = self._resolve_configured_window_filter(self._cc_random_pause_window_ids)
+        if not ok:
+            logger.info("[中控随机暂停] 无有效窗口，跳过本次检查")
+            return
+        target_filter = set(target_ids) if target_ids else None
 
         import random as rand
 
         triggered_window_ids = []
         for window_id in list(self.window_runners.keys()):
-            if target_filter is not None and window_id not in target_filter:
+            if target_filter is not None and not self._job_id_in_filter(window_id, target_filter):
                 continue
             if window_id in self._cc_random_pause_deadlines_by_window:
                 continue

@@ -25,6 +25,23 @@ class MainWindowUiSetupMixin:
         if available_geometry and not available_geometry.isEmpty():
             initial_x = available_geometry.left() + max(0, (available_geometry.width() - initial_width) // 2)
             initial_y = available_geometry.top() + max(0, (available_geometry.height() - initial_height) // 2)
+            try:
+                from utils.instance_runtime import apply_instance_window_offset
+
+                initial_x, initial_y = apply_instance_window_offset(
+                    initial_x,
+                    initial_y,
+                    initial_width,
+                    initial_height,
+                    (
+                        int(available_geometry.left()),
+                        int(available_geometry.top()),
+                        int(available_geometry.right()),
+                        int(available_geometry.bottom()),
+                    ),
+                )
+            except Exception:
+                pass
         else:
             initial_x, initial_y = 100, 100
         self.setGeometry(initial_x, initial_y, initial_width, initial_height) # Slightly larger window
@@ -290,6 +307,13 @@ class MainWindowUiSetupMixin:
             if hasattr(self, '_floating_controller') and self._floating_controller:
                 self._floating_controller.on_main_window_state_changed(self.isMinimized())
         elif event.type() == QEvent.Type.ActivationChange:
+            if self.isActiveWindow():
+                try:
+                    from utils.instance_runtime import mark_ui_focused
+
+                    mark_ui_focused()
+                except Exception:
+                    pass
             # 智能激活同步：保护参数面板输入框焦点
             if hasattr(self, 'parameter_panel'):
                 self._smart_sync_parameter_panel_activation()
@@ -307,17 +331,7 @@ class MainWindowUiSetupMixin:
         super().showEvent(event)
         # 触发窗口显示信号（用于更新对话框等待逻辑）
         self.windowShown.emit()
-        # 启动定时启动功能检查定时器
-        if self._schedule_enabled:
-            self._start_schedule_timer()
-        # 启动定时停止功能检查定时器
-        if self._global_timer_enabled:
-            if not self._stop_timer.isActive():
-                self._stop_timer.start(1000)  # 每1秒检查，确保准时触发
-                logger.info(f"定时停止功能已启用，将在 {self._stop_hour:02d}:{self._stop_minute:02d} 停止")
-        # 启动定时暂停功能检查定时器
-        if getattr(self, '_timed_pause_enabled', False):
-            self._start_timed_pause_timer()
+        self._arm_main_schedule_clock()
         # 自动加载最近打开的工作流
         if not hasattr(self, '_workflows_auto_loaded'):
             self._workflows_auto_loaded = True

@@ -1710,9 +1710,16 @@ class TaskCard(QGraphicsObject):
             return False
         suffixes = self._get_result_variable_suffixes()
         names = [f"{prefix}.{suffix}" for suffix in suffixes]
-        from task_workflow.workflow_context import get_workflow_context
+        context = None
+        if self.view is not None:
+            resolve_context = getattr(self.view, "get_variable_context", None)
+            if callable(resolve_context):
+                context = resolve_context()
+        if context is None:
+            from task_workflow.workflow_context import get_workflow_context
 
-        get_workflow_context().register_card_result_placeholders(self.card_id, names)
+            context = get_workflow_context()
+        context.register_card_result_placeholders(self.card_id, names)
         return True
 
     def copy_card(self):

@@ -41,7 +41,7 @@ class WindowTaskRunnerExecutionMixin:
                 if self._should_stop:
                     self._set_state(TaskState.STOPPED, "等待执行槽位时已取消")
                 else:
-                    self._set_state(TaskState.FAILED, "获取执行槽位失败")
+                    self._set_state(TaskState.FAILED, "获取执行槽位失败", force=True)
                 self._emit_task_completed_once(False)
                 return
 
@@ -141,13 +141,7 @@ class WindowTaskRunnerExecutionMixin:
                 start_card_id_for_executor,
             )
 
-            # 【重要】不设置全局环境变量，因为多线程并发时会互相覆盖
-            # 窗口句柄通过 WorkflowExecutor 构造函数的 target_hwnd 参数传递
-            # 多窗口模式标记使用 MULTI_WINDOW_MODE=true（所有线程共享，表示当前是多窗口模式）
-            import os
-            os.environ['MULTI_WINDOW_MODE'] = 'true'
-            # 不再设置 TARGET_WINDOW_HWND 和 TARGET_WINDOW_TITLE，避免多线程竞争
-
+            # 窗口句柄只通过 WorkflowExecutor 的 target_hwnd 传入，不写进程级 HWND。
             execution_mode = self._get_effective_execution_mode()
 
             workflow_id = self._build_workflow_id()
@@ -221,7 +215,7 @@ class WindowTaskRunnerExecutionMixin:
             logger.error(f"窗口工作流执行失败: {e}", exc_info=True)
             self._last_execution_message = f"错误: {str(e)}"
             self._last_execution_success = False
-            self._set_state(TaskState.FAILED, f"错误: {str(e)}")
+            self._set_state(TaskState.FAILED, f"错误: {str(e)}", force=True)
             self._emit_task_completed_once(False)
         finally:
             self._release_execution_slot()
@@ -236,24 +230,24 @@ class WindowTaskRunnerExecutionMixin:
 
     def _on_step_details(self, details):
         """步骤详情更新回调"""
-        self.step_updated.emit(self.window_id, details)
+        self._emit_step(details)
 
     def _on_card_executing(self, card_id):
         """卡片开始执行回调"""
         step_info = self._card_step_labels.get(str(card_id))
         if step_info:
-            self.step_updated.emit(self.window_id, step_info)
+            self._emit_step(step_info)
             return
 
         # 如果没有工作流数据或找不到卡片，至少显示卡片ID
-        self.step_updated.emit(self.window_id, f"执行卡片{card_id}")
+        self._emit_step(f"执行卡片{card_id}")
 
     def _on_card_finished(self, card_id, success):
         """卡片执行完成回调"""
         if success:
-            self.step_updated.emit(self.window_id, "步骤执行成功")
+            self._emit_step("步骤执行成功")
         else:
-            self.step_updated.emit(self.window_id, "步骤执行失败")
+            self._emit_step("步骤执行失败")
 
     def _on_execution_finished(self, success: bool, message: str):
         """工作流执行完成回调"""
@@ -264,15 +258,12 @@ class WindowTaskRunnerExecutionMixin:
                 self._capture_runtime_variables_from_executor(getattr(self, "executor", None))
             # 区分不同的完成状态
             if "被用户停止" in message or "用户停止" in message:
-                # 用户主动停止
-                self._set_state(TaskState.STOPPED, "工作流被中断")
+                self._set_state(TaskState.STOPPED, "工作流被中断", force=True)
                 success = False
             elif success:
-                # 正常完成
-                self._set_state(TaskState.COMPLETED, "工作流已完成")
+                self._set_state(TaskState.COMPLETED, "工作流已完成", force=True)
             else:
-                # 执行失败
-                self._set_state(TaskState.FAILED, "工作流执行失败")
+                self._set_state(TaskState.FAILED, "工作流执行失败", force=True)
 
             logger.info(f"窗口{self.window_id}工作流执行完成: {self._current_state.value} - success={success}, {message}")
 
@@ -289,6 +280,6 @@ class WindowTaskRunnerExecutionMixin:
             logger.error(f"执行完成回调处理失败: {e}")
             self._last_execution_message = f"错误: {str(e)}"
             self._last_execution_success = False
-            self._set_state(TaskState.FAILED, f"错误: {str(e)}")
+            self._set_state(TaskState.FAILED, f"错误: {str(e)}", force=True)
             self._emit_task_completed_once(False)
 

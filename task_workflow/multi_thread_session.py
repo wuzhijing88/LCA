@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
 
+from utils.hwnd_utils import as_hwnd
+
 from task_workflow.card_display import find_card_by_id, format_step_detail
 from task_workflow.executor import WorkflowExecutor
 from task_workflow.workflow_identity import (
@@ -222,11 +224,12 @@ class WorkflowMultiThreadSession(QObject):
                 raise TypeError(f"线程窗口配置必须是字典: start_card_id={raw_start_id}")
 
             config = dict(raw_config)
-            target_hwnd = config.get("target_hwnd")
-            if isinstance(target_hwnd, bool) or not isinstance(target_hwnd, int) or target_hwnd <= 0:
+            target_hwnd = as_hwnd(config.get("target_hwnd"))
+            if target_hwnd == 0:
                 raise ValueError(
-                    f"线程窗口配置句柄无效: start_card_id={raw_start_id}, hwnd={target_hwnd!r}"
+                    f"线程窗口配置句柄无效: start_card_id={raw_start_id}, hwnd={config.get('target_hwnd')!r}"
                 )
+            config["target_hwnd"] = target_hwnd
             normalized[raw_start_id] = config
         return normalized
 

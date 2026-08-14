@@ -15,6 +15,8 @@ from ui.system_parts.message_box_translator import place_dialog_on_screen
 logger = logging.getLogger(__name__)
 
 # 导入窗口隐藏管理器
+from utils.hwnd_utils import as_hwnd
+from utils.window_identity import is_desktop_window
 from utils.window_hider import WindowHider
 from utils.window_overlay_utils import (
     get_overlay_debug_snapshot,
@@ -36,7 +38,7 @@ except ImportError:
 class WindowPickerOverlay(QWidget):
     """窗口选择器覆盖层 - 跟踪鼠标位置并高亮显示窗口"""
 
-    window_selected = Signal(int, str)  # hwnd, title
+    window_selected = Signal(object, str)  # hwnd, title；object 避免 Qt int32 把 HWND 收成负数
 
     def __init__(
         self,
@@ -115,6 +117,8 @@ class WindowPickerOverlay(QWidget):
             return ""
 
     def _resolve_display_title(self, hwnd: int, fallback_title: str = "", parent_hwnd: Optional[int] = None) -> str:
+        if is_desktop_window(hwnd):
+            return self._desktop_display_title(hwnd)
         title = self._get_window_text_safe(hwnd)
         if title:
             return title
@@ -136,9 +140,10 @@ class WindowPickerOverlay(QWidget):
         return ""
 
     def _resolve_native_target_hwnd(self, hwnd: int, cursor_pos: Tuple[int, int]) -> int:
-        original_hwnd = hwnd
+        original_hwnd = as_hwnd(hwnd)
+        hwnd = original_hwnd
         while True:
-            parent = win32gui.GetParent(hwnd)
+            parent = as_hwnd(win32gui.GetParent(hwnd))
             if parent == 0:
                 break
             hwnd = parent
@@ -154,7 +159,42 @@ class WindowPickerOverlay(QWidget):
             except Exception:
                 hwnd = original_hwnd
 
-        return hwnd
+        return as_hwnd(hwnd)
+
+    def _get_desktop_bind_hwnd(self) -> int:
+        """取可绑定的桌面句柄：优先外壳窗口，其次桌面窗口。"""
+        if not PYWIN32_AVAILABLE:
+            return 0
+        try:
+            if hasattr(win32gui, "GetShellWindow"):
+                shell_hwnd = as_hwnd(win32gui.GetShellWindow())
+                if shell_hwnd and win32gui.IsWindow(shell_hwnd):
+                    return shell_hwnd
+        except Exception:
+            pass
+        try:
+            desktop_hwnd = as_hwnd(win32gui.GetDesktopWindow())
+            if desktop_hwnd and win32gui.IsWindow(desktop_hwnd):
+                return desktop_hwnd
+        except Exception:
+            pass
+        return 0
+
+    def _desktop_display_title(self, hwnd: int) -> str:
+        title = self._get_window_text_safe(hwnd)
+        if title:
+            return title
+        return "桌面"
+
+    def _set_current_desktop_target(self, hwnd: int) -> None:
+        hwnd = as_hwnd(hwnd)
+        title = self._desktop_display_title(hwnd)
+        if hwnd == self.current_window_hwnd and self.current_window_title == title:
+            return
+        self.current_window_hwnd = hwnd
+        self.current_window_title = title
+        self.current_window_rect = self._resolve_window_client_native_rect(hwnd)
+        self.update()
 
     def _quick_validate_window(self, hwnd: int, title: str) -> bool:
         """
@@ -171,6 +211,9 @@ class WindowPickerOverlay(QWidget):
             return True  # 如果没有win32，无法检查，默认允许
 
         try:
+            if is_desktop_window(hwnd):
+                return True
+
             # 快速检查1：窗口是否仍然存在
             if not win32gui.IsWindow(hwnd):
                 self._show_binding_error("窗口已关闭", f"窗口 '{title}' 已经不存在，无法选择。")
@@ -253,6 +296,9 @@ class WindowPickerOverlay(QWidget):
             return True  # 如果没有win32，无法检查，默认允许
 
         try:
+            if is_desktop_window(hwnd):
+                return True
+
             # 检查1：窗口是否仍然存在
             if not win32gui.IsWindow(hwnd):
                 self._show_binding_error("窗口已关闭", f"窗口 '{title}' 已经不存在，无法绑定。")
@@ -497,8 +543,6 @@ class WindowPickerOverlay(QWidget):
 
                         # 排除的窗口类列表
                         excluded_classes = [
-                            'Progman',           # Program Manager (桌面)
-                            'WorkerW',           # Desktop Worker Window
                             'Shell_TrayWnd',     # 任务栏
                             'DV2ControlHost',    # Windows Defender 控制
                             'Windows.UI.Core.CoreWindow',  # Windows 10/11 系统UI
@@ -531,7 +575,7 @@ class WindowPickerOverlay(QWidget):
 
                         # 添加到候选列表
                         param.append({
-                            'hwnd': enum_hwnd,
+                            'hwnd': as_hwnd(enum_hwnd),
                             'rect': rect,
                             'title': title,
                             'area': area
@@ -543,6 +587,14 @@ class WindowPickerOverlay(QWidget):
             win32gui.EnumWindows(enum_windows_callback, candidate_windows)
 
             if not candidate_windows:
+                desktop_hwnd = self._get_desktop_bind_hwnd()
+                if desktop_hwnd:
+                    self._set_current_desktop_target(desktop_hwnd)
+                elif self.current_window_hwnd:
+                    self.current_window_hwnd = None
+                    self.current_window_rect = None
+                    self.current_window_title = ""
+                    self.update()
                 return
 
             # 选择最合适的窗口
@@ -582,7 +634,7 @@ class WindowPickerOverlay(QWidget):
             if not selected:
                 selected = valid_candidates[0]
 
-            hwnd = selected['hwnd']
+            hwnd = as_hwnd(selected['hwnd'])
 
             # 增加窗口切换的稳定性：如果当前窗口仍然有效且在候选列表中，优先保持不变
             # 这可以避免在重叠窗口之间频繁切换导致的闪烁
@@ -723,6 +775,10 @@ class WindowPickerOverlay(QWidget):
             logger.info(f"[鼠标事件] 左键点击，当前锁定状态: {self.is_locked}")
             if not self.is_locked:
                 # 第一次点击：锁定窗口前进行基础验证（快速检查，不包括耗时的遮挡检测）
+                if not self.current_window_hwnd:
+                    desktop_hwnd = self._get_desktop_bind_hwnd()
+                    if desktop_hwnd:
+                        self._set_current_desktop_target(desktop_hwnd)
                 if self.current_window_hwnd:
                     # 快速验证窗口的基本状态
                     if not self._quick_validate_window(self.current_window_hwnd, self.current_window_title):
@@ -764,7 +820,7 @@ class WindowPickerOverlay(QWidget):
 
                 # 发送窗口选择信号
                 logger.info(f"窗口验证通过，确认绑定: {final_title} (句柄: {final_hwnd})")
-                self.window_selected.emit(final_hwnd, final_title)
+                self.window_selected.emit(as_hwnd(final_hwnd), final_title)
                 self.close()
         elif event.button() == Qt.MouseButton.RightButton:
             logger.info(f"[鼠标事件] 右键点击，当前锁定状态: {self.is_locked}")

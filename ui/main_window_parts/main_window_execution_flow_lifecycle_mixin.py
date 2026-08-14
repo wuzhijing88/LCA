@@ -14,23 +14,26 @@ from ..main_window_parts.main_window_stop_orchestrator import (
 
 class MainWindowExecutionFlowLifecycleMixin:
 
-    def safe_start_tasks(self, reset_jump_cancel=True):
+    def safe_start_tasks(self, reset_jump_cancel=True, interactive=True):
 
         """安全启动任务，带状态检查和防重复调用保护 - 启动所有便签页的工作流
 
         Args:
 
             reset_jump_cancel: 是否重置跳转取消标志（True表示用户手动启动，False表示自动跳转启动）
+            interactive: 是否允许弹窗。定时启动必须为 False。
 
         """
 
-        return main_window_safe_start_tasks(self, reset_jump_cancel=reset_jump_cancel)
+        return main_window_safe_start_tasks(
+            self, reset_jump_cancel=reset_jump_cancel, interactive=interactive
+        )
 
-    def _resume_workflow(self):
+    def _resume_workflow(self, source="manual"):
 
         """恢复暂停的工作流"""
 
-        return main_window_resume_workflow(self)
+        return main_window_resume_workflow(self, source=source)
 
     def toggle_pause_workflow(self):
 
@@ -38,11 +41,11 @@ class MainWindowExecutionFlowLifecycleMixin:
 
         return main_window_toggle_pause_workflow(self)
 
-    def _pause_workflow(self):
+    def _pause_workflow(self, source="manual"):
 
-        """暂停工作流（快捷键调用）"""
+        """暂停工作流"""
 
-        return main_window_pause_workflow(self)
+        return main_window_pause_workflow(self, source=source)
 
     def safe_stop_tasks(self):
 

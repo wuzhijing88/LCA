@@ -14,6 +14,12 @@ class MainWindowDialogMixin:
         try:
             # 工具 关键修复：打开中控前验证窗口句柄是否仍然有效
             logger.info("准备打开中控，开始验证窗口句柄...")
+            try:
+                from utils.window_identity import refresh_bound_windows
+
+                refresh_bound_windows(self.bound_windows)
+            except Exception as refresh_error:
+                logger.warning(f"打开中控前刷新绑定句柄失败: {refresh_error}")
             valid_windows = []
             invalid_windows = []
             import win32gui

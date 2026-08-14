@@ -49,23 +49,29 @@ class WindowTaskRunnerControlMixin:
             # 2. OLA实例会在下次启动前被清理（在start_window_task中）
             # 3. 程序退出时会统一释放所有OLA实例
 
-            # 【关键修复】清理OCR服务资源
+            hwnd_int = 0
             try:
-                from services.multiprocess_ocr_pool import get_multiprocess_ocr_pool
-                ocr_pool = get_multiprocess_ocr_pool()
-                ocr_pool.unregister_window(int(self.window_id))
-                logger.info(f"[资源清理] 已注销窗口{self.window_id}的OCR服务")
-            except Exception as e:
-                logger.debug(f"清理OCR服务失败: {e}")
+                from utils.hwnd_utils import as_hwnd
 
-            # 【关键修复】清理捕获器资源
-            try:
-                from utils.screenshot_helper import cleanup_screenshot_engine
-                hwnd_int = int(self.window_id)
-                cleanup_screenshot_engine(hwnd_int)
-                logger.info(f"[资源清理] 已清理窗口{self.window_id}的截图引擎资源")
-            except Exception as e:
-                logger.debug(f"清理WGC捕获器失败: {e}")
+                hwnd_int = as_hwnd(getattr(self, "hwnd", 0) or self.window_info.get("hwnd"))
+            except Exception:
+                hwnd_int = 0
+
+            if hwnd_int:
+                try:
+                    from services.multiprocess_ocr_pool import get_multiprocess_ocr_pool
+                    ocr_pool = get_multiprocess_ocr_pool()
+                    ocr_pool.unregister_window(hwnd_int)
+                    logger.info(f"[资源清理] 已注销窗口{self.window_id}的OCR服务 (HWND: {hwnd_int})")
+                except Exception as e:
+                    logger.debug(f"清理OCR服务失败: {e}")
+
+                try:
+                    from utils.screenshot_helper import cleanup_screenshot_engine
+                    cleanup_screenshot_engine(hwnd_int)
+                    logger.info(f"[资源清理] 已清理窗口{self.window_id}的截图引擎资源 (HWND: {hwnd_int})")
+                except Exception as e:
+                    logger.debug(f"清理WGC捕获器失败: {e}")
 
             # 清理执行器对象
             if hasattr(self, 'executor') and self.executor:
@@ -115,7 +121,7 @@ class WindowTaskRunnerControlMixin:
             if self._current_state == TaskState.IDLE:
                 logger.info(f"窗口{self.window_id}启动前收到停止请求，已标记取消")
                 self._queued_for_start = False
-                self._set_state(TaskState.STOPPED, "工作流已中断")
+                self._set_state(TaskState.STOPPED, "工作流已中断", force=True)
                 self._emit_task_completed_once(False)
             else:
                 logger.warning(f"窗口{self.window_id}当前状态{self._current_state.value}不允许停止")
@@ -139,30 +145,32 @@ class WindowTaskRunnerControlMixin:
 
     def pause(self) -> bool:
         """暂停当前工作流。"""
+        if not self._can_transition_to(TaskState.PAUSED):
+            return False
         executor = getattr(self, "executor", None)
         if executor is None or not hasattr(executor, "pause"):
             return False
-        if getattr(executor, "_paused", False):
+        if getattr(executor, "_paused", False) or self.current_state == TaskState.PAUSED:
             return False
         if not self.is_running:
             return False
 
         executor.pause()
-        self.status_updated.emit(self.window_id, "已暂停")
-        self.step_updated.emit(self.window_id, "工作流已暂停")
+        self._set_state(TaskState.PAUSED, "工作流已暂停")
         return True
 
     def resume(self) -> bool:
         """恢复当前工作流。"""
+        if self.current_state != TaskState.PAUSED:
+            return False
         executor = getattr(self, "executor", None)
         if executor is None or not hasattr(executor, "resume"):
             return False
-        if not getattr(executor, "_paused", False):
+        if not getattr(executor, "_paused", False) and self.current_state != TaskState.PAUSED:
             return False
 
         executor.resume()
-        self.status_updated.emit(self.window_id, "正在运行")
-        self.step_updated.emit(self.window_id, "工作流已恢复")
+        self._set_state(TaskState.RUNNING, "工作流已恢复")
         return True
 
     def _force_stop_completion(self):
@@ -176,7 +184,7 @@ class WindowTaskRunnerControlMixin:
             except Exception:
                 pass
             logger.warning(f"窗口{self.window_id}停止超时，强制设置为已停止状态")
-            self._set_state(TaskState.STOPPED, "工作流已强制停止")
+            self._set_state(TaskState.STOPPED, "工作流已强制停止", force=True)
             self._emit_task_completed_once(False)
             self._cleanup_thread()
 

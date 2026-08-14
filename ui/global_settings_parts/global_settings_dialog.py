@@ -5,6 +5,7 @@ from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QHBoxLayout, QTabWidget, QVBoxLayout
 
 from utils.window_coordinate_common import center_window_on_widget_screen
+from utils.hwnd_utils import normalize_bound_windows_hwnds
 from .global_settings_dialog_tabs_mixin import GlobalSettingsDialogTabsMixin
 from .global_settings_dialog_window_mixin import GlobalSettingsDialogWindowMixin
 from .global_settings_dialog_visibility_mixin import GlobalSettingsDialogVisibilityMixin
@@ -51,6 +52,9 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         self.current_config.setdefault('enable_floating_status_window', True)
         self.current_config.setdefault('enable_connection_line_animation', True)
         self.bound_windows = current_config.get('bound_windows', [])  # 绑定的窗口列表
+        if not isinstance(self.bound_windows, list):
+            self.bound_windows = []
+        normalize_bound_windows_hwnds(self.bound_windows)
         self.window_binding_mode = current_config.get('window_binding_mode', 'single')  # 'single' 或 'multiple'
         # 调试：记录初始化时的绑定窗口信息
         logger.info(f"GlobalSettingsDialog初始化: 加载了 {len(self.bound_windows)} 个绑定窗口")

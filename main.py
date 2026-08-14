@@ -251,6 +251,14 @@ if _IS_STANDALONE_SUBPROCESS or _mp.current_process().name != 'MainProcess':
     logging.info("[子进程隔离] 已创建 Qt 类占位符，避免加载 PySide6")
 else:
     _IS_SUBPROCESS = False
+
+if _IS_SUBPROCESS:
+    try:
+        from utils.instance_runtime import adopt_instance_slot_from_env
+
+        adopt_instance_slot_from_env()
+    except Exception:
+        pass
 # ============================================================
 
 logger = logging.getLogger(__name__)
@@ -482,93 +490,11 @@ def check_uac_enabled():
         return True  # 默认假设UAC启用
 # --- END is_admin definition ---
 
-_SINGLE_INSTANCE_MUTEX_NAME = "Local\\LCA_MainInstanceMutex"
-_single_instance_mutex_handle = None
-
-
-def _show_existing_instance_hint():
-    """提示用户已有实例在运行。"""
-    try:
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            "LCA 已在运行。\n请从系统托盘恢复窗口。",
-            "LCA",
-            0x00000040,  # MB_ICONINFORMATION
-        )
-    except Exception:
-        pass
-
-
-def _is_existing_instance_running() -> bool:
-    """仅探测是否存在已持有互斥锁的实例，不占用互斥锁。"""
-    if os.name != "nt":
-        return False
-
-    try:
-        kernel32 = ctypes.windll.kernel32
-        synchronize = 0x00100000  # SYNCHRONIZE
-        mutex_handle = kernel32.OpenMutexW(synchronize, False, _SINGLE_INSTANCE_MUTEX_NAME)
-        if mutex_handle:
-            kernel32.CloseHandle(mutex_handle)
-            return True
-    except Exception:
-        return False
-
-    return False
-
-
-def _acquire_single_instance_lock() -> bool:
-    """获取主实例互斥锁，返回是否成功。"""
-    global _single_instance_mutex_handle
-    if os.name != "nt":
-        return True
-
-    try:
-        kernel32 = ctypes.windll.kernel32
-        mutex_handle = kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX_NAME)
-        if not mutex_handle:
-            logging.error("主实例互斥锁创建失败，启动终止")
-            return False
-
-        last_error = kernel32.GetLastError()
-        already_exists = 183  # ERROR_ALREADY_EXISTS
-        if last_error == already_exists:
-            kernel32.CloseHandle(mutex_handle)
-            return False
-
-        _single_instance_mutex_handle = mutex_handle
-        return True
-    except Exception as e:
-        logging.error(f"主实例互斥锁初始化异常: {e}")
-        return False
-
-
-def _release_single_instance_lock():
-    """释放主实例互斥锁。"""
-    global _single_instance_mutex_handle
-    if os.name != "nt":
-        return
-
-    try:
-        if _single_instance_mutex_handle:
-            ctypes.windll.kernel32.CloseHandle(_single_instance_mutex_handle)
-            _single_instance_mutex_handle = None
-    except Exception:
-        _single_instance_mutex_handle = None
-
 # --- Admin elevation block --- #
 # 自动提权逻辑：确保程序以管理员权限运行
 # 兼容性：Windows 7/8/8.1/10/11 及 Server 版本
 # <<<< UNCOMMENTED START >>>>
-if os.name == "nt" and not _IS_SUBPROCESS and _is_existing_instance_running():
-    logging.warning("检测到已有实例在运行，当前启动请求已取消。")
-    _show_existing_instance_hint()
-    try:
-        sys.exit(0)
-    finally:
-        os._exit(0)
-
-if os.name == 'nt' and not is_admin():
+if os.name == 'nt' and not _IS_SUBPROCESS and not is_admin():
     reason_str = "程序需要管理员权限才能确保所有功能正常运行（全局快捷键、窗口操作等）"
     logging.warning("检测到程序未以管理员权限运行，正在尝试自动提权...")
     logging.info(f"  提权原因: {reason_str}")
@@ -586,54 +512,28 @@ if os.name == 'nt' and not is_admin():
     elevation_error = None
 
     try:
-        # 检测是否为打包环境
-        # Nuitka 打包后：
-        #   - sys.argv[0] 指向 main.exe（这是我们需要的）
-        #   - sys.executable 可能指向内部的 python.exe（错误的）
-        # PyInstaller 打包后：
-        #   - sys.executable 指向 exe 文件
-        #   - sys.frozen = True
-
-        # 优先使用 sys.argv[0] 获取主程序路径
-        main_exe_path = os.path.abspath(sys.argv[0])
-        sys_exe_path = os.path.abspath(sys.executable)
-        try:
-            sys_exe_path = os.path.realpath(sys_exe_path)
-        except Exception:
-            pass
-
-        is_nuitka = '__compiled__' in dir(sys.modules.get('__main__', None))
-        is_pyinstaller = getattr(sys, 'frozen', False)
-        is_exe_file = main_exe_path.lower().endswith('.exe')
-
-        if is_exe_file or is_nuitka or is_pyinstaller:
-            # 打包环境
-            # Nuitka: 使用 sys.argv[0] 获取 main.exe 路径
-            # PyInstaller: 使用 sys.executable
-            if is_nuitka and is_exe_file:
-                executable_to_run = main_exe_path
-                packager = "Nuitka"
-            elif is_pyinstaller:
-                executable_to_run = sys_exe_path
-                packager = "PyInstaller"
-            else:
-                # 兜底：如果 argv[0] 是 exe 就用它
-                executable_to_run = main_exe_path if is_exe_file else sys_exe_path
-                packager = "EXE"
-
+        # 打包后必须以当前 exe 提权：Nuitka standalone 的 sys.executable 就是 LCA.exe。
+        # 工作目录必须是 exe 所在目录，否则相对路径/依赖 DLL 会找不到。
+        if is_packaged_runtime():
+            executable_to_run = os.path.abspath(sys.executable or sys.argv[0])
+            if not executable_to_run.lower().endswith(".exe") or not os.path.isfile(executable_to_run):
+                candidate = os.path.abspath(sys.argv[0])
+                if candidate.lower().endswith(".exe") and os.path.isfile(candidate):
+                    executable_to_run = candidate
+            working_directory = os.path.dirname(executable_to_run)
             original_args = sys.argv[1:]
             params = subprocess.list2cmdline(original_args) if original_args else ""
-            logging.info(f"  检测到打包环境（{packager}），使用exe文件进行提权重启")
+            logging.info("  检测到打包环境，使用 exe 文件进行提权重启")
         else:
-            # 开发环境：使用python解释器
-            executable_to_run = sys_exe_path
-            # 开发环境使用当前脚本的绝对路径
+            executable_to_run = os.path.abspath(sys.executable)
+            working_directory = os.path.dirname(os.path.abspath(__file__))
             script_path = os.path.abspath(__file__)
             original_args = sys.argv[1:]
             params = subprocess.list2cmdline([script_path] + original_args)
             logging.info("  检测到开发环境（Python），使用python.exe进行提权重启")
 
         logging.info(f"  可执行文件: {executable_to_run}")
+        logging.info(f"  工作目录: {working_directory}")
         logging.info(f"  启动参数: {params if params else '(无)'}")
 
         # 尝试提权 - ShellExecuteW
@@ -645,7 +545,7 @@ if os.name == 'nt' and not is_admin():
             "runas",        # lpOperation - 以管理员身份运行
             executable_to_run,  # lpFile
             params,         # lpParameters
-            None,           # lpDirectory - 使用当前目录
+            working_directory,  # lpDirectory
             1               # nShowCmd - SW_SHOWNORMAL
         )
 
@@ -705,6 +605,15 @@ if os.name == 'nt' and not is_admin():
         if elevation_error:
             logging.warning(f"  失败原因: {elevation_error}")
         logging.warning("  程序将退出，请手动以管理员身份运行")
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "无法自动获取管理员权限。\n请右键 LCA.exe，选择「以管理员身份运行」。",
+                "LCA",
+                0x00000010,  # MB_ICONERROR
+            )
+        except Exception:
+            pass
     logging.info("=" * 80)
 
     try:
@@ -713,7 +622,7 @@ if os.name == 'nt' and not is_admin():
         # 确保在任何情况下都能彻底退出（强制退出）
         os._exit(0 if elevation_success else 1)
 
-elif os.name == 'nt':
+elif os.name == 'nt' and not _IS_SUBPROCESS:
     # 已经具有管理员权限
     if is_admin():
         logging.info("=" * 80)
@@ -728,7 +637,7 @@ elif os.name == 'nt':
         finally:
             os._exit(1)
 
-else:
+elif os.name != 'nt':
     # 非Windows系统
     logging.info("检测到非Windows系统，跳过管理员权限检查")
 # <<<< UNCOMMENTED END >>>>
@@ -942,6 +851,24 @@ def check_resolution_and_needs_admin(config_data):
         return True # Failed to get client rect, assume need admin
 
 # --- Configuration Loading ---
+if not _IS_SUBPROCESS:
+    try:
+        from utils.instance_runtime import claim_instance_slot, release_instance_slot
+
+        _instance_slot = claim_instance_slot()
+        atexit.register(release_instance_slot)
+        if _instance_slot > 1:
+            app_logging_runtime.setup_logging_and_cleanup(cleanup_temp_files_cb=_cleanup_temp_files)
+            from utils.app_paths import get_config_path as _get_instance_config_path
+
+            logging.info(
+                "多开实例已隔离: slot=%s config=%s",
+                _instance_slot,
+                _get_instance_config_path(),
+            )
+    except Exception as instance_claim_error:
+        logging.warning("领取多开实例槽位失败，将继续使用主实例路径: %s", instance_claim_error)
+
 from app_core.config_store import load_config, save_config
 
 def find_enhanced_window_handle(window_title):
@@ -1682,7 +1609,7 @@ class SystemTrayManager(QObject):
             self.tray_icon.setContextMenu(tray_menu)
 
             # 设置提示文本
-            self.tray_icon.setToolTip("工作流自动化工具\n右键查看菜单")
+            self.tray_icon.setToolTip(self._tray_tooltip())
 
             # 双击显示主窗口
             self.tray_icon.activated.connect(self._on_tray_activated)
@@ -1721,8 +1648,9 @@ class SystemTrayManager(QObject):
                 if hasattr(self.main_window, "save_config_func") and callable(self.main_window.save_config_func):
                     self.main_window.save_config_func(self.main_window.config)
             try:
-                from PySide6.QtCore import QSettings
-                settings = QSettings("LCA", "LCA")
+                from utils.instance_runtime import create_app_settings
+
+                settings = create_app_settings()
                 settings.setValue("close_behavior", "ask")
                 settings.setValue("close_behavior_remember", False)
             except Exception:
@@ -1732,10 +1660,23 @@ class SystemTrayManager(QObject):
         except Exception as exc:
             logging.error(f"清除关闭记住选择失败: {exc}")
 
+    def _tray_app_name(self):
+        try:
+            from utils.instance_runtime import get_instance_display_name
+
+            return get_instance_display_name("工作流自动化工具")
+        except Exception:
+            return "工作流自动化工具"
+
+    def _tray_tooltip(self, status=None):
+        if status:
+            return f"{self._tray_app_name()}\n状态: {status}\n右键查看菜单"
+        return f"{self._tray_app_name()}\n右键查看菜单"
+
     def update_tooltip(self, status):
         """更新托盘提示文本"""
         if self.tray_icon:
-            self.tray_icon.setToolTip(f"工作流自动化工具\n状态: {status}\n右键查看菜单")
+            self.tray_icon.setToolTip(self._tray_tooltip(status))
 
     def show_message(self, title, message, icon=QSystemTrayIcon.MessageIcon.Information):
         """显示托盘通知"""
@@ -1910,15 +1851,6 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
     # --- ADDED: Set the global exception hook at the very beginning ---
     sys.excepthook = global_exception_handler
     # -----------------------------------------------------------------
-
-    if not _acquire_single_instance_lock():
-        logging.warning("主实例锁获取失败或已有主实例运行，当前进程退出。")
-        _show_existing_instance_hint()
-        try:
-            sys.exit(0)
-        finally:
-            os._exit(0)
-    atexit.register(_release_single_instance_lock)
 
     logging.info("准备启动主程序...")
 
@@ -2329,14 +2261,12 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
             exit_cleanup_join_timeout_sec=_EXIT_CLEANUP_JOIN_TIMEOUT_SEC,
         )
         logging.info(f"应用程序正常退出，退出代码: {exit_code}")
-        _release_single_instance_lock()
         sys.exit(exit_code)
     except Exception as event_loop_error:
         logging.critical(
             f"启动 Qt 事件循环前发生错误: {event_loop_error}",
             exc_info=True,
         )
-        _release_single_instance_lock()
         sys.exit(1)
 
 

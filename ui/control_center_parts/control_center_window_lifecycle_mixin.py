@@ -156,9 +156,6 @@ class ControlCenterWindowLifecycleMixin:
         QTimer.singleShot(2000, delayed_cleanup)
         logger.info("已启动清理定时器（2秒后执行）")
 
-        # 清除临时工作流配置文件
-        self._clear_workflow_config()
-
         # 恢复主窗口的快捷键
         if self.parent_window and hasattr(self.parent_window, '_on_control_center_closed'):
             self.parent_window._on_control_center_closed()

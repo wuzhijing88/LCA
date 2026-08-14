@@ -145,7 +145,7 @@ class RapidOCROCRService:
                     "Det.ocr_version": OCRVersion.PPOCRV4,
                     "Det.model_type": ModelType.MOBILE,
                     "Det.lang_type": LangDet.CH,
-                    "Det.model_path": str(self._model_paths["det"]),
+                    "Det.model_path": str(self._model_paths["det"]),  # 指定本地 v4，避免 RapidOCR 回落到自带 v6
                     "Det.limit_type": "max",
                     "Det.limit_side_len": 960,
                     "Det.thresh": 0.2,

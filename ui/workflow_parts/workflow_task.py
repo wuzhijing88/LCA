@@ -17,7 +17,13 @@ from task_workflow.process_proxy import (
     create_process_workflow_runtime,
 )
 from utils.thread_start_utils import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from utils.hwnd_utils import as_hwnd
 from utils.window_binding_utils import get_bound_windows_for_mode
+from utils.window_identity import (
+    is_window_alive,
+    match_bound_window,
+    refresh_bound_windows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,10 +146,10 @@ class WorkflowTask(QObject):
             return
 
         try:
-            hwnd = int(payload.get("hwnd") or 0)
+            hwnd = as_hwnd(payload.get("hwnd"))
         except Exception:
             return
-        if hwnd <= 0:
+        if hwnd == 0:
             return
 
         detections = payload.get("detections")
@@ -630,25 +636,23 @@ class WorkflowTask(QObject):
         effective_bound_windows = get_bound_windows_for_mode(self.config)
         if not isinstance(effective_bound_windows, list):
             raise TypeError("bound_windows 必须是列表")
+        refresh_bound_windows(effective_bound_windows)
 
-        # 验证标签页绑定的窗口是否仍在全局设置中
-        if target_hwnd:
-            bound_windows = effective_bound_windows
-            hwnd_still_bound = any(
-                isinstance(window, dict)
-                and window.get('hwnd') == target_hwnd
-                and window.get('enabled', True) is True
-                for window in bound_windows
+        matched_window = None
+        if target_hwnd or target_window_title or self.bound_window_id:
+            matched_window = match_bound_window(
+                effective_bound_windows,
+                hwnd=target_hwnd,
+                title=target_window_title,
+                bind_id=self.bound_window_id,
             )
-
-            if not hwnd_still_bound:
+            if target_hwnd and matched_window is None:
                 raise ValueError(
                     f"任务 '{self.name}' 绑定的窗口不在当前全局窗口配置中: "
                     f"'{target_window_title}' (HWND: {target_hwnd})"
                 )
 
-        if not target_hwnd:
-            # 标签页没有绑定窗口，或绑定的窗口不在全局设置中
+        if matched_window is None:
             bound_windows = effective_bound_windows
             if bound_windows:
                 first_enabled_window = None
@@ -663,17 +667,11 @@ class WorkflowTask(QObject):
                         break
 
                 if first_enabled_window:
-                    target_hwnd = first_enabled_window.get('hwnd')
-                    target_window_title = first_enabled_window.get('title', '')
-
-                    import win32gui
-                    if not win32gui.IsWindow(target_hwnd):
-                        raise ValueError(f"任务 '{self.name}' 执行失败：全局窗口已失效（标题: '{target_window_title}'，HWND: {target_hwnd}）")
-
+                    matched_window = first_enabled_window
                     logger.info("=" * 80)
                     logger.info(f"[使用全局窗口] 任务 '{self.name}' 使用全局配置的第一个启用窗口")
-                    logger.info(f"  - 窗口标题: {target_window_title}")
-                    logger.info(f"  - 窗口句柄: {target_hwnd}")
+                    logger.info(f"  - 窗口标题: {first_enabled_window.get('title', '')}")
+                    logger.info(f"  - 窗口句柄: {first_enabled_window.get('hwnd')}")
                     logger.info("=" * 80)
                 else:
                     logger.warning("[跳过执行] 全局设置中没有启用的窗口")
@@ -682,15 +680,25 @@ class WorkflowTask(QObject):
                 logger.warning("[跳过执行] 没有绑定任何窗口")
                 raise ValueError(f"任务 '{self.name}' 执行失败：没有绑定任何窗口，请先在窗口管理中绑定窗口")
         else:
-            import win32gui
-            if not win32gui.IsWindow(target_hwnd):
-                raise ValueError(f"任务 '{self.name}' 执行失败：标签页绑定窗口已失效（标题: '{target_window_title}'，HWND: {target_hwnd}）")
-
             logger.info("=" * 80)
             logger.info(f"[使用标签页绑定] 任务 '{self.name}' 使用标签页绑定的窗口")
-            logger.info(f"  - 窗口标题: {target_window_title}")
-            logger.info(f"  - 窗口句柄: {target_hwnd}")
+            logger.info(f"  - 窗口标题: {matched_window.get('title', '')}")
+            logger.info(f"  - 窗口句柄: {matched_window.get('hwnd')}")
             logger.info("=" * 80)
+
+        target_hwnd = as_hwnd(matched_window.get('hwnd'))
+        target_window_title = matched_window.get('title', '') or target_window_title
+        self.target_hwnd = target_hwnd or None
+        if target_window_title:
+            self.target_window_title = target_window_title
+        if matched_window.get('bind_id') and not self.bound_window_id:
+            self.bound_window_id = matched_window.get('bind_id')
+
+        if not is_window_alive(target_hwnd):
+            raise ValueError(
+                f"任务 '{self.name}' 执行失败：目标窗口已失效（标题: '{target_window_title}'，HWND: {target_hwnd}）。"
+                f"请先打开目标窗口，程序会按标题/类名/进程名自动重连。"
+            )
 
         # 创建执行器
         from task_workflow.workflow_vars import workflow_context_key
@@ -1100,7 +1108,7 @@ class WorkflowTask(QObject):
             self.target_hwnd = hwnd
 
             # 保存窗口信息
-            self.bound_window_id = window_info.get('window_id', hwnd)  # 使用window_id或hwnd作为标识
+            self.bound_window_id = window_info.get('bind_id') or window_info.get('window_id', hwnd)
             self.target_window_title = window_info.get('title', '')
 
             # 标记为已修改

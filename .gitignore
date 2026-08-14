@@ -19,6 +19,7 @@ runtime_data/
 
 # Local runtime/user data
 config.json
+config.instance-*.json
 workflow_favorites.json
 images/
 workflows/

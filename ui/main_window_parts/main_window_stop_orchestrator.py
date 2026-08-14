@@ -130,12 +130,6 @@ def main_window_safe_stop_tasks(ctx):
 
             logger.info("[随机暂停] 定时器被 safe_stop_tasks 停止")
 
-        if hasattr(self, '_timed_pause_timer') and self._timed_pause_timer.isActive():
-
-            self._timed_pause_timer.stop()
-
-            logger.info("[定时暂停] 检查定时器被 safe_stop_tasks 停止")
-
         if hasattr(self, '_timed_pause_resume_timer') and self._timed_pause_resume_timer.isActive():
 
             self._timed_pause_resume_timer.stop()
@@ -149,12 +143,6 @@ def main_window_safe_stop_tasks(ctx):
         self._auto_pause_source = None
         self._runtime_stop_owner = None
         self._runtime_pause_owner = None
-
-        if hasattr(self, '_global_timer') and self._global_timer.isActive():
-
-            self._global_timer.stop()
-
-            self._global_timer_enabled = False
 
         # 第五步：重置按钮
 

@@ -19,11 +19,14 @@ class ControlCenterWindowTaskMixin(
 
     def stop_window_task(self, row):
         window_info = self.sorted_windows[row]
-        window_id = str(window_info.get("hwnd", row))
+        window_id = self._window_runtime_id(window_info, row)
         window_title = str(window_info.get("title", "未知窗口"))
 
         try:
             logger.info(f"停止窗口工作流：{window_id}")
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                scheduler.request_stop(window_id)
             stop_requested = self._direct_stop_window_task(window_id)
         except Exception as e:
             logger.error(f"停止窗口失败：window_id={window_id}, error={e}")
@@ -31,11 +34,15 @@ class ControlCenterWindowTaskMixin(
             return False
 
         if not stop_requested:
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None and not self._get_window_runner_list(window_id):
+                scheduler.finalize_orphaned_stop(window_id)
+                self._paint_job_snapshot(window_id)
             self.log_message(f"窗口未在运行或停止请求未发送：{window_title}")
             return False
 
         self.on_selection_changed()
-        self._update_single_window_table_status(window_id, "正在停止", "正在停止工作流")
+        self._sync_job_from_runners(window_id)
         self.log_message(f"已请求停止窗口：{window_title}")
         return True
 
@@ -65,12 +72,24 @@ class ControlCenterWindowTaskMixin(
         return stop_requested
 
     def on_window_status_updated(self, window_id, status):
+        snapshot = self._sync_job_from_runners(window_id)
+        if snapshot is not None:
+            return
         row = self.find_window_row(window_id)
         if row >= 0:
             self._set_status_cell(row, status)
             self._refresh_overview_metrics()
 
     def on_window_step_updated(self, window_id, step_info):
+        from app_core.control_plane import JobState
+
+        scheduler = getattr(self, "scheduler", None)
+        job = scheduler.get_job(window_id) if scheduler is not None else None
+        if job is not None and job.state not in {JobState.STARTING, JobState.RUNNING, JobState.PAUSED}:
+            return
+        snapshot = self._sync_job_from_runners(window_id)
+        if snapshot is not None:
+            return
         row = self.find_window_row(window_id)
         if row >= 0:
             self._set_step_cell(row, step_info)

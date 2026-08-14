@@ -18,6 +18,7 @@ def prepare_main_window_start(
     resolve_current_canvas_task_id,
     task_state_manager,
     start_state,
+    interactive=True,
 ):
     self = ctx
 
@@ -66,10 +67,11 @@ def prepare_main_window_start(
     executable_count = len(self.task_manager.get_executable_tasks())
     if executable_count == 0:
         logger.warning('no executable task found before start')
-        QMessageBox.warning(self, MSG_NO_EXEC_TITLE, MSG_NO_EXEC_TEXT)
+        if interactive:
+            QMessageBox.warning(self, MSG_NO_EXEC_TITLE, MSG_NO_EXEC_TEXT)
         return {'should_return': True}
 
-    if not self._check_window_binding():
+    if not self._check_window_binding(interactive=interactive):
         return {'should_return': True}
 
     logger.info('=' * 80)

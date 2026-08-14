@@ -1,7 +1,9 @@
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
@@ -264,9 +266,15 @@ class GlobalSettingsDialogExecutionTabMixin:
 
         # 初始化时更新截图引擎可见性
 
+        self._screenshot_engine_combo_ready = False
+
         self._update_screenshot_engine_visibility()
 
         self._update_foreground_driver_visibility()
+
+        self.screenshot_engine_combo.currentIndexChanged.connect(self._on_screenshot_engine_changed)
+
+        self._screenshot_engine_combo_ready = True
 
         exec_layout.addStretch(1)
 
@@ -284,6 +292,14 @@ class GlobalSettingsDialogExecutionTabMixin:
 
         """
 
+        previous_ready = getattr(self, "_screenshot_engine_combo_ready", False)
+        self._screenshot_engine_combo_ready = False
+        try:
+            self._rebuild_screenshot_engine_options()
+        finally:
+            self._screenshot_engine_combo_ready = previous_ready
+
+    def _rebuild_screenshot_engine_options(self):
         internal_mode = self.mode_combo.currentData()
 
         if not internal_mode:
@@ -335,4 +351,56 @@ class GlobalSettingsDialogExecutionTabMixin:
         if item_count > 0:
 
             self.screenshot_engine_combo.setMaxVisibleItems(item_count)
+
+    def _get_selected_screenshot_engine(self) -> str:
+        if not hasattr(self, "screenshot_engine_combo"):
+            return str((getattr(self, "current_config", {}) or {}).get("screenshot_engine") or "").strip().lower()
+        display_name = self.screenshot_engine_combo.currentText()
+        engine = self.screenshot_engine_map.get(display_name)
+        return str(engine or "").strip().lower()
+
+    def _is_wgc_desktop_combination(self) -> bool:
+        from utils.window_identity import is_wgc_with_desktop_target
+
+        return is_wgc_with_desktop_target(
+            self._get_selected_screenshot_engine(),
+            getattr(self, "bound_windows", None),
+        )
+
+    def _warn_wgc_desktop_engine(self) -> None:
+        from utils.window_identity import WGC_DESKTOP_ENGINE_MESSAGE
+
+        QMessageBox.warning(self, "请修改截图引擎", WGC_DESKTOP_ENGINE_MESSAGE)
+
+    def _schedule_wgc_desktop_engine_warning(self) -> None:
+        """绑定流程里不能立刻弹窗，否则会挡住窗口选择遮罩的关闭。"""
+        if not self._is_wgc_desktop_combination():
+            return
+        if getattr(self, "_wgc_desktop_warning_scheduled", False):
+            return
+        self._wgc_desktop_warning_scheduled = True
+        QTimer.singleShot(0, self._flush_wgc_desktop_engine_warning)
+
+    def _flush_wgc_desktop_engine_warning(self) -> None:
+        overlay = getattr(self, "window_picker_overlay", None)
+        try:
+            overlay_blocking = overlay is not None and overlay.isVisible()
+        except RuntimeError:
+            overlay_blocking = False
+        retries = int(getattr(self, "_wgc_desktop_warning_retries", 0) or 0)
+        if overlay_blocking or not self.isVisible():
+            if retries < 20:
+                self._wgc_desktop_warning_retries = retries + 1
+                QTimer.singleShot(50, self._flush_wgc_desktop_engine_warning)
+                return
+        self._wgc_desktop_warning_retries = 0
+        self._wgc_desktop_warning_scheduled = False
+        if self._is_wgc_desktop_combination():
+            self._warn_wgc_desktop_engine()
+
+    def _on_screenshot_engine_changed(self, _index: int = 0) -> None:
+        if not getattr(self, "_screenshot_engine_combo_ready", False):
+            return
+        if self._is_wgc_desktop_combination():
+            self._warn_wgc_desktop_engine()
 

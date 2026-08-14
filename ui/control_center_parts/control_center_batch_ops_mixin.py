@@ -5,8 +5,11 @@ from ..control_center_parts.control_center_stop_all_orchestrator import control_
 
 class ControlCenterBatchOpsMixin:
     def _resolve_batch_window_ids(self, window_ids=None):
+        scheduler = getattr(self, "scheduler", None)
         if window_ids is not None:
             normalized_ids = self._normalize_window_id_list(window_ids)
+            if scheduler is not None:
+                normalized_ids = scheduler.canonicalize_ids(normalized_ids)
             if normalized_ids:
                 return normalized_ids, f"指定窗口 {len(normalized_ids)} 个"
             if isinstance(window_ids, (list, tuple, set)) and len(window_ids) == 0:
@@ -15,10 +18,12 @@ class ControlCenterBatchOpsMixin:
 
         selected_ids = self._get_selected_window_ids()
         if selected_ids:
+            if scheduler is not None:
+                selected_ids = scheduler.canonicalize_ids(selected_ids)
             return selected_ids, f"已选窗口 {len(selected_ids)} 个"
         return [], "全部窗口"
 
-    def start_all_tasks(self, window_ids=None):
+    def start_all_tasks(self, window_ids=None, interactive=True):
         """Start workflows for all or selected windows."""
         resolved_ids, scope_desc = self._resolve_batch_window_ids(window_ids)
         if resolved_ids is None:
@@ -29,7 +34,7 @@ class ControlCenterBatchOpsMixin:
         self._cc_active_start_window_filter = active_filter
         self.log_message(f"批量启动：{scope_desc}")
         try:
-            result = control_center_start_all_tasks(self)
+            result = control_center_start_all_tasks(self, interactive=interactive)
         finally:
             self._cc_active_start_window_filter = None
         return result

@@ -64,6 +64,7 @@ def connect_main_window_runtime_bindings(
     if system_tray is None:
         logging.info("未创建系统托盘，跳过托盘接线")
     elif system_tray.setup_tray(main_window):
+        main_window.system_tray_manager = system_tray
         system_tray.start_requested.connect(main_window.safe_start_tasks, queued_connection)
         system_tray.stop_requested.connect(main_window.safe_stop_tasks, queued_connection)
         system_tray.show_window_requested.connect(main_window.restore_main_window, queued_connection)
