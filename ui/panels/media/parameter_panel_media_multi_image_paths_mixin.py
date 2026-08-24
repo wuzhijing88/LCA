@@ -1,0 +1,11 @@
+from .parameter_panel_media_multi_image_paths_display_mixin import ParameterPanelMediaMultiImagePathsDisplayMixin
+from .parameter_panel_media_multi_image_paths_format_mixin import ParameterPanelMediaMultiImagePathsFormatMixin
+from .parameter_panel_media_multi_image_paths_parse_mixin import ParameterPanelMediaMultiImagePathsParseMixin
+
+
+class ParameterPanelMediaMultiImagePathsMixin(
+    ParameterPanelMediaMultiImagePathsFormatMixin,
+    ParameterPanelMediaMultiImagePathsParseMixin,
+    ParameterPanelMediaMultiImagePathsDisplayMixin,
+):
+    pass

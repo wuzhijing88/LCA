@@ -1,0 +1,13 @@
+from .parameter_panel_selector_coordinate_basic_mixin import ParameterPanelSelectorCoordinateBasicMixin
+from .parameter_panel_selector_coordinate_display_mixin import ParameterPanelSelectorCoordinateDisplayMixin
+from .parameter_panel_selector_coordinate_multi_mixin import ParameterPanelSelectorCoordinateMultiMixin
+from .parameter_panel_selector_coordinate_offset_mixin import ParameterPanelSelectorCoordinateOffsetMixin
+
+
+class ParameterPanelSelectorCoordinateMixin(
+    ParameterPanelSelectorCoordinateMultiMixin,
+    ParameterPanelSelectorCoordinateOffsetMixin,
+    ParameterPanelSelectorCoordinateDisplayMixin,
+    ParameterPanelSelectorCoordinateBasicMixin,
+):
+    pass

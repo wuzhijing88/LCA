@@ -1,0 +1,9 @@
+from .parameter_panel_parameter_cleanup_storage_mixin import ParameterPanelParameterCleanupStorageMixin
+from .parameter_panel_parameter_cleanup_visual_mixin import ParameterPanelParameterCleanupVisualMixin
+
+
+class ParameterPanelParameterCleanupMixin(
+    ParameterPanelParameterCleanupVisualMixin,
+    ParameterPanelParameterCleanupStorageMixin,
+):
+    pass

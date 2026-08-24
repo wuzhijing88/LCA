@@ -1,0 +1,11 @@
+from .parameter_panel_favorites_view_entry_mixin import ParameterPanelFavoritesViewEntryMixin
+from .parameter_panel_favorites_view_layout_mixin import ParameterPanelFavoritesViewLayoutMixin
+from .parameter_panel_favorites_view_page_mixin import ParameterPanelFavoritesViewPageMixin
+
+
+class ParameterPanelFavoritesViewMixin(
+    ParameterPanelFavoritesViewEntryMixin,
+    ParameterPanelFavoritesViewLayoutMixin,
+    ParameterPanelFavoritesViewPageMixin,
+):
+    pass

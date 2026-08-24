@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+输入链路统一时序常量。
+"""
+
+from __future__ import annotations
+
+# 成熟方案默认值：按键按住 75ms，点击按住 50ms，双击间隔 50ms。
+DEFAULT_KEY_HOLD_SECONDS = 0.075
+DEFAULT_CLICK_HOLD_SECONDS = 0.050
+DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS = 0.050
+
+# 随机持续时间（仅在显式选择“随机持续时间”时使用）。
+DEFAULT_RANDOM_KEY_HOLD_MIN_SECONDS = 0.050
+DEFAULT_RANDOM_KEY_HOLD_MAX_SECONDS = 0.100
+DEFAULT_RANDOM_CLICK_HOLD_MIN_SECONDS = 0.030
+DEFAULT_RANDOM_CLICK_HOLD_MAX_SECONDS = 0.080

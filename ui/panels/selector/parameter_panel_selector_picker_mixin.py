@@ -1,0 +1,11 @@
+from .parameter_panel_selector_picker_color_mixin import ParameterPanelSelectorPickerColorMixin
+from .parameter_panel_selector_picker_lifecycle_mixin import ParameterPanelSelectorPickerLifecycleMixin
+from .parameter_panel_selector_picker_package_mixin import ParameterPanelSelectorPickerPackageMixin
+
+
+class ParameterPanelSelectorPickerMixin(
+    ParameterPanelSelectorPickerLifecycleMixin,
+    ParameterPanelSelectorPickerColorMixin,
+    ParameterPanelSelectorPickerPackageMixin,
+):
+    pass

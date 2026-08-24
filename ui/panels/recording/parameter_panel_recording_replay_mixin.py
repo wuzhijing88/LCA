@@ -1,0 +1,11 @@
+from .parameter_panel_recording_replay_payload_mixin import ParameterPanelRecordingReplayPayloadMixin
+from .parameter_panel_recording_replay_runtime_mixin import ParameterPanelRecordingReplayRuntimeMixin
+from .parameter_panel_recording_replay_start_mixin import ParameterPanelRecordingReplayStartMixin
+
+
+class ParameterPanelRecordingReplayMixin(
+    ParameterPanelRecordingReplayPayloadMixin,
+    ParameterPanelRecordingReplayRuntimeMixin,
+    ParameterPanelRecordingReplayStartMixin,
+):
+    pass

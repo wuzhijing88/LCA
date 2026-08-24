@@ -1,0 +1,9 @@
+# LCA 离线版打包
+
+# 1. 直接编译，无需维护或修改数字版本号
+build_assets\packaging\build_release.bat
+
+# 2. 固定输出
+build_assets\packaging\release_output\LCA_离线版_Setup.exe
+
+# 离线版不生成在线更新版本清单，不上传更新服务器。
