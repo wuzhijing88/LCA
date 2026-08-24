@@ -1,4 +1,0 @@
--r requirements-runtime.txt
-
-Nuitka==2.8.10
-ordered-set==4.1.0

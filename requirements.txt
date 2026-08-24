@@ -1,3 +1,0 @@
-# Backward-compatible build environment entry point.
-# Runtime-only installations should use requirements-runtime.txt.
--r requirements-build.txt
