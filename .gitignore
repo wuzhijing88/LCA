@@ -67,5 +67,6 @@ jw3-auth-server-ubuntu-deploy/logs/
 
 nuitka-crash-report.xml
 *.rar
+*.docx
 pytest-of-LS/
 universal_system_config.json
