@@ -31,6 +31,7 @@ LCA 是一套运行于 Windows 的本地桌面工作流自动化程序，发布�
 | `themes/` | 界面主题 |
 | `resources/` | 程序图标与声明文本 |
 | `requirements.txt` | 依赖列表 |
+| `build_assets/packaging/` | 离线版打包脚本 |
 | `LICENSE` | 许可证全文 |
 
 以下内容不纳入本仓库，仅存在于开发或运行环境：
@@ -46,6 +47,10 @@ LCA 是一套运行于 Windows 的本地桌面工作流自动化程序，发布�
 ## 依赖
 
 Python 依赖统一记录在 `requirements.txt`，按运行时、打包、开发与测试分组，并锁定版本。环境为 Windows 与 Python 3.10。
+
+## 打包
+
+打包脚本位于 `build_assets/packaging/`，入口为 `build_release.bat`。该目录只包含脚本，不包含安装包、模型和第三方运行文件。完整说明见该目录下的 `README.md`。
 
 ## 开源地址
 

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly
+  xmlns="urn:schemas-microsoft-com:asm.v1"
+  xmlns:asmv3="urn:schemas-microsoft-com:asm.v3"
+  xmlns:compat="urn:schemas-microsoft-com:compatibility.v1"
+  xmlns:ws2005="http://schemas.microsoft.com/SMI/2005/WindowsSettings"
+  xmlns:ws2016="http://schemas.microsoft.com/SMI/2016/WindowsSettings"
+  manifestVersion="1.0"
+>
+  <assemblyIdentity type="win32" name="LCA" version="1.0.0.0"/>
+
+  <compat:compatibility>
+    <compat:application>
+      <compat:supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/>
+      <compat:supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+      <compat:supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <compat:supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <compat:supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </compat:application>
+  </compat:compatibility>
+
+  <asmv3:application>
+    <asmv3:windowsSettings>
+      <ws2005:dpiAware>true/pm</ws2005:dpiAware>
+      <ws2016:dpiAwareness>PerMonitorV2, PerMonitor</ws2016:dpiAwareness>
+      <ws2016:longPathAware>true</ws2016:longPathAware>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+
+  <asmv3:trustInfo>
+    <asmv3:security>
+      <asmv3:requestedPrivileges>
+        <asmv3:requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </asmv3:requestedPrivileges>
+    </asmv3:security>
+  </asmv3:trustInfo>
+</assembly>
