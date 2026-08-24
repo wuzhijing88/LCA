@@ -1,6 +1,0 @@
-build/
-IbInputSimulator.dll
-
-.vs/
-out/
-CMakeSettings.json

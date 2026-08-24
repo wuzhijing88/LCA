@@ -47,7 +47,6 @@ def verify() -> dict[str, object]:
         PROJECT_ROOT / "docs" / "testing.md",
         PROJECT_ROOT / "docs" / "architecture.md",
         PROJECT_ROOT / "docs" / "task_authoring.md",
-        PROJECT_ROOT / "CHANGELOG.md",
         PROJECT_ROOT / "build_assets" / "third_party" / "manifest.json",
         PROJECT_ROOT / ".github" / "workflows" / "quality.yml",
     )

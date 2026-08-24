@@ -48,7 +48,7 @@ OLA/*.chm
 OLA/*.db
 
 backups/
-benchmarks/output/
+benchmarks/
 __tmp_*/
 备份/
 build_assets/packaging/build_output/
@@ -68,5 +68,15 @@ jw3-auth-server-ubuntu-deploy/logs/
 nuitka-crash-report.xml
 *.rar
 *.docx
+CHANGELOG.md
+CONTRIBUTING.md
+docs/BUG_SKILL.md
+docs/打包发布.txt
+tools/cfg.ini
+tools/dm_soft.txt
+tools/git_version_manager.py
+tools/generate_build_auth_secret.py
+tools/uninstall_interception.bat
+tools/ibinputsimulator/IbInputSimulator-master/
 pytest-of-LS/
 universal_system_config.json
