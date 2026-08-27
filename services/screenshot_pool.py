@@ -15,9 +15,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from utils.smart_image_matcher import normalize_match_image
-from utils.resolution_aware_matcher import smart_match_template
-from utils.screenshot_helper import (
+from utils.match.smart_image_matcher import normalize_match_image
+from utils.match.resolution_aware_matcher import smart_match_template
+from utils.capture.screenshot_helper import (
     _capture_with_engine,
     cleanup_screenshot_engine,
     clear_screenshot_cache as _clear_screenshot_cache_impl,

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Template matching worker subprocess.
 The worker keeps only a single cached screenshot to avoid repeatedly sending the same frame.
@@ -122,7 +122,7 @@ class TemplateMatchWorker:
         confidence_threshold: float,
     ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
         template_h, template_w = template.shape[:2]
-        from utils.resolution_aware_matcher import smart_match_template
+        from utils.match.resolution_aware_matcher import smart_match_template
 
         match_result = smart_match_template(
             haystack=screenshot,

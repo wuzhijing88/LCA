@@ -31,7 +31,7 @@ from services.ocr_socket_message_utils import (
     send_message as send_ocr_socket_message,
 )
 from utils.app_paths import get_app_root
-from utils.worker_entry import build_worker_launch_command, build_worker_process_env
+from app_core.runtime.worker_entry import build_worker_launch_command, build_worker_process_env
 
 logger = logging.getLogger(__name__)
 

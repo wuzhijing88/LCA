@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import cv2
 import numpy as np
 
-from app_core.ocr_runtime_contract import OCR_MODEL_FILES, OCR_MODEL_NAME
+from services.ocr_runtime_contract import OCR_MODEL_FILES, OCR_MODEL_NAME
 from utils.app_paths import get_app_root
 
 
