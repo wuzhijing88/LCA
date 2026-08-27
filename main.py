@@ -4,7 +4,7 @@ import atexit
 import ctypes
 import logging
 from utils.dpi_awareness import enable_process_dpi_awareness
-from utils.worker_entry import (
+from app_core.runtime.worker_entry import (
     StandaloneSubprocessSpec,
     ensure_project_main_runtime,
     get_cli_argument_value,
@@ -179,8 +179,6 @@ _standalone_exit_code = run_standalone_subprocess(sys.argv, _STANDALONE_SUBPROCE
 if _standalone_exit_code is not None:
     sys.exit(_standalone_exit_code)
 
-import json   # 用于JSON数据处理
-
 import multiprocessing as _mp
 _mp.freeze_support()  # 支持打包后的 exe
 
@@ -276,15 +274,9 @@ def setup_virtual_environment():
 # 设置虚拟环境
 setup_virtual_environment()
 
-import datetime # <-- Import datetime
-import glob     # <-- Import glob
-
-import time   # <-- Import time for sleep in listener
-import threading # <-- Import threading for async OCR initialization
-import subprocess  # <-- Used for safe Windows command-line quoting
-from traceback import format_exception # <-- ADDED: For global_exception_handler
-
-# --- REMOVED: Unused import publish dialog ---
+import time
+import subprocess
+from traceback import format_exception
 
 # 添加当前目录到 Python 路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -292,15 +284,6 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
     logger.info(f"已添加 {current_dir} 到 Python 路径")
 
-# --- ADDED: Import keyboard library ---
-try:
-    KEYBOARD_LIB_AVAILABLE = True
-    logging.info("keyboard 库已成功导入")
-except ImportError:
-    KEYBOARD_LIB_AVAILABLE = False
-    logging.warning("'keyboard' 库未安装，全局热键功能将不可用。请运行 'pip install keyboard'。")
-
-# --- ADDED: Check admin privileges ---
 def is_admin():
     """检查是否以管理员权限运行
 
@@ -320,105 +303,8 @@ def is_admin():
         logging.error(f"检查管理员权限时发生异常: {e}")
         return False
 
-def request_admin_privileges():
-    """请求管理员权限（已废弃，使用自动提权逻辑）
 
-    注意：此函数已被自动提权逻辑替代，保留仅为向后兼容
-    """
-    logging.warning("request_admin_privileges() 已废弃，请使用自动提权逻辑")
-    return is_admin()
-
-def show_admin_privilege_dialog():
-    """显示管理员权限提示对话框"""
-    from PySide6.QtWidgets import QMessageBox, QApplication
-
-    # 确保有QApplication实例
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-
-    msg = QMessageBox()
-    msg.setWindowTitle("需要管理员权限")
-    msg.setIcon(QMessageBox.Icon.Information)
-    msg.setText("检测到程序未以管理员权限运行")
-    msg.setInformativeText(
-        "为了使用全局热键功能（在主窗口未激活时也能使用F9/F10），\n"
-        "程序需要管理员权限。\n\n"
-        "您可以选择：\n"
-        "• 重新以管理员身份运行（推荐）\n"
-        "• 继续使用（仅在主窗口激活时热键有效）"
-    )
-
-    restart_btn = msg.addButton("重新以管理员身份运行", QMessageBox.ButtonRole.AcceptRole)
-    continue_btn = msg.addButton("继续使用", QMessageBox.ButtonRole.RejectRole)
-
-    msg.setDefaultButton(restart_btn)
-    place_dialog_on_screen(msg, reference_widget=app.activeWindow() if app is not None else None)
-    msg.exec()
-
-    if msg.clickedButton() == restart_btn:
-        return True
-    else:
-        return False
-# ------------------------------------
-
-# --- ADDED: For GetClientRect ---
-from ctypes import wintypes
-# ------------------------------
 from app_core import logging_runtime as app_logging_runtime
-
-
-def _trim_main_process_memory() -> float:
-    """尽量回收主进程工作集，返回估算释放量（MB）。"""
-    memory_before = None
-    memory_after = None
-    process = None
-
-    try:
-        import psutil
-        process = psutil.Process()
-        memory_before = process.memory_info().rss / 1024 / 1024
-    except Exception:
-        process = None
-
-    try:
-        import gc
-        gc.collect()
-    except Exception:
-        pass
-
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            try:
-                msvcrt = ctypes.CDLL("msvcrt")
-                if hasattr(msvcrt, "_heapmin"):
-                    msvcrt._heapmin()
-            except Exception:
-                pass
-
-            try:
-                kernel32 = ctypes.windll.kernel32
-                psapi = ctypes.windll.psapi
-                current_process = kernel32.GetCurrentProcess()
-                psapi.EmptyWorkingSet(current_process)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    if process is not None:
-        try:
-            memory_after = process.memory_info().rss / 1024 / 1024
-        except Exception:
-            memory_after = None
-
-    if memory_before is not None and memory_after is not None:
-        return memory_before - memory_after
-    return 0.0
-
-
 
 
 def _cleanup_temp_files():
@@ -466,32 +352,6 @@ def _cleanup_temp_files():
 
 # --- Call Setup Early in the script ---
 app_logging_runtime.setup_logging_and_cleanup(cleanup_temp_files_cb=_cleanup_temp_files)
-
-# is_admin 函数已在文件开头定义（第253行），无需重复定义
-
-def check_uac_enabled():
-    """检查UAC是否启用
-
-    Returns:
-        bool: True表示UAC已启用，False表示UAC已禁用
-    """
-    try:
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-            0,
-            winreg.KEY_READ
-        )
-        value, _ = winreg.QueryValueEx(key, "EnableLUA")
-        winreg.CloseKey(key)
-        is_enabled = (value == 1)
-        logging.debug(f"UAC状态检测: EnableLUA = {value}, UAC启用 = {is_enabled}")
-        return is_enabled
-    except Exception as e:
-        logging.warning(f"无法检测UAC状态: {e}，默认假设UAC已启用")
-        return True  # 默认假设UAC启用
-# --- END is_admin definition ---
 
 # --- Admin elevation block --- #
 # 自动提权逻辑：确保程序以管理员权限运行
@@ -648,16 +508,6 @@ elif os.name != 'nt':
 _EXIT_CLEANUP_JOIN_TIMEOUT_SEC = 2.0
 
 
-def _shutdown_existing_async_screenshot_pipeline() -> bool:
-    """Stop the async screenshot pipeline without importing it during cleanup."""
-    async_module = sys.modules.get("utils.async_screenshot")
-    shutdown_pipeline = getattr(async_module, "shutdown_global_pipeline", None)
-    if not callable(shutdown_pipeline):
-        return False
-    shutdown_pipeline()
-    return True
-
-
 def cleanup_yolo_runtime_resources(
     release_process: bool = True,
     compact_memory: bool = True,
@@ -702,7 +552,7 @@ def cleanup_all_resources():
 
         # 清理前台输入驱动（包含 IbInputSimulator AHK worker）
         try:
-            from utils.foreground_input_manager import get_foreground_input_manager
+            from utils.input.foreground_input_manager import get_foreground_input_manager
             fg_manager = get_foreground_input_manager()
             fg_manager.close()
             logging.info("前台输入驱动已清理")
@@ -736,7 +586,7 @@ def cleanup_all_resources():
 
         # 清理模板预加载缓存
         try:
-            from utils.template_preloader import clear_global_cache
+            from utils.match.template_preloader import clear_global_cache
             clear_global_cache()
             logging.info("模板预加载缓存已清理")
         except Exception as e:
@@ -744,7 +594,7 @@ def cleanup_all_resources():
 
         # 清理模板匹配缓存
         try:
-            from utils.template_matching import get_matcher
+            from utils.match.template_matching import get_matcher
             matcher = get_matcher()
             if hasattr(matcher, 'template_cache'):
                 matcher.template_cache.clear()
@@ -770,7 +620,7 @@ def cleanup_all_resources():
 
         # 清理截图缓存
         try:
-            from utils.screenshot_helper import clear_screenshot_cache
+            from utils.capture.screenshot_helper import clear_screenshot_cache
             clear_screenshot_cache()
             logging.info("截图缓存已清理")
         except Exception as e:
@@ -778,7 +628,7 @@ def cleanup_all_resources():
 
         # 清理截图引擎资源
         try:
-            from utils.screenshot_helper import cleanup_all_screenshot_engines
+            from utils.capture.screenshot_helper import cleanup_all_screenshot_engines
             cleanup_all_screenshot_engines()
             logging.info("截图引擎资源已清理")
         except Exception as e:
@@ -805,67 +655,6 @@ _runtime_lifecycle.register(
 )
 atexit.register(lambda: _runtime_lifecycle.teardown(final=True))
 
-#  安全检查调度器
-RESOLUTION_CHECK_TOLERANCE = 2 # Allow +/- 2 pixels difference
-
-def check_resolution_and_needs_admin(config_data):
-    """Checks target window client resolution and determines if admin rights might be needed."""
-    logging.info("检查窗口分辨率以确定是否需要提权...")
-
-    target_title = config_data.get('target_window_title')
-    target_width = config_data.get('custom_width')
-    target_height = config_data.get('custom_height')
-    if not target_title or not target_width or not target_height or target_width <= 0 or target_height <= 0:
-        logging.warning("配置中缺少目标窗口标题或有效的目标宽高，假定需要提权。")
-        return True # Need admin if config is incomplete
-
-    logging.info(f"目标窗口: '{target_title}', 目标客户区尺寸: {target_width}x{target_height}")
-
-    hwnd = find_enhanced_window_handle(target_title)
-
-    if not hwnd:
-        logging.warning(f"未找到标题为 '{target_title}' 的窗口，假定需要提权。")
-        return True # Need admin if window not found
-
-    # logging.info(f"找到窗口句柄: {hwnd}")
-
-    # GetClientRect requires wintypes.RECT
-    # --- ADDED: Get DPI for scaling ---
-    user32 = ctypes.windll.user32  # 工具 修复：重新定义user32
-    dpi = user32.GetDpiForWindow(hwnd) if hasattr(user32, 'GetDpiForWindow') else 96 # Fallback to 96 if API not available (older Windows)
-    scale_factor = dpi / 96.0
-    logging.info(f"窗口 DPI: {dpi} (缩放因子: {scale_factor:.2f})")
-    # -----------------------------------
-    rect = wintypes.RECT()
-    if user32.GetClientRect(hwnd, ctypes.byref(rect)):
-        client_width = rect.right - rect.left
-        client_height = rect.bottom - rect.top
-        logging.info(f"窗口 '{target_title}' 的客户区尺寸: {client_width}x{client_height}")
-
-        # 工具 Bug修复：DPI缩放计算错误！
-        # GetClientRect返回的是逻辑像素，不需要再乘以缩放因子
-        # 如果要获取物理像素，应该乘以缩放因子，但这里应该使用逻辑像素进行比较
-        # 因为配置中的尺寸通常是逻辑尺寸
-        scaled_width = client_width   # 直接使用逻辑像素
-        scaled_height = client_height # 直接使用逻辑像素
-        logging.info(f"应用 DPI 缩放后的客户区尺寸 (估算): {scaled_width}x{scaled_height}")
-
-        # --- MODIFIED: Check with tolerance ---
-        width_match = abs(scaled_width - target_width) <= RESOLUTION_CHECK_TOLERANCE
-        height_match = abs(scaled_height - target_height) <= RESOLUTION_CHECK_TOLERANCE
-        if width_match and height_match:
-            logging.info(f"窗口客户区尺寸在容差 ({RESOLUTION_CHECK_TOLERANCE}像素) 内匹配配置。跳过提权请求。")
-            return False # Resolution matches, DO NOT need admin for this reason
-        else:
-            logging.warning(f"窗口客户区尺寸 ({scaled_width}x{scaled_height}) 与配置 ({target_width}x{target_height}) 不匹配 (容差: {RESOLUTION_CHECK_TOLERANCE})。假定需要提权。")
-            return True # Resolution mismatch, need admin
-    else:
-        # Attempt to get error details
-        error_code = ctypes.get_last_error()
-        error_message = ctypes.FormatError(error_code) if error_code != 0 else "未知错误"
-        logging.error(f"调用 GetClientRect 失败，错误码: {error_code} ({error_message})。假定需要提权。")
-        return True # Failed to get client rect, assume need admin
-
 # --- Configuration Loading ---
 if not _IS_SUBPROCESS:
     try:
@@ -886,27 +675,6 @@ if not _IS_SUBPROCESS:
         logging.warning("领取多开实例槽位失败，将继续使用主实例路径: %s", instance_claim_error)
 
 from app_core.config_store import load_config, save_config
-
-def find_enhanced_window_handle(window_title):
-    """增强的窗口查找函数"""
-    if not window_title:
-        logging.error("窗口标题为空")
-        return None
-
-    logging.info(f"搜索 尝试查找窗口: '{window_title}'")
-
-    # 使用统一的窗口查找工具
-    try:
-        from utils.window_finder import WindowFinder
-        hwnd = WindowFinder.find_unique_window_exact(window_title)
-        if hwnd:
-            logging.info(f"成功 统一窗口查找工具找到窗口: {hwnd}")
-            return hwnd
-        logging.warning(f"未找到可唯一确认的目标窗口: '{window_title}'")
-    except Exception as e:
-        logging.warning(f"统一窗口查找工具失败: {e}")
-
-    return None
 
 # Load configuration EARLY
 config = load_config()
@@ -1416,6 +1184,16 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
                     if event.type() not in (QEvent.Type.Show, QEvent.Type.ShowToParent):
                         return False
 
+                    try:
+                        from PySide6.QtWidgets import QMenu
+                        from ui.system_parts.menu_style import polish_standard_edit_menu
+
+                        if isinstance(obj, QMenu):
+                            polish_standard_edit_menu(obj, frameless=False)
+                            return False
+                    except Exception:
+                        pass
+
                     popup = None
                     combo = None
 
@@ -1448,19 +1226,21 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
                             return
 
                         popup.setContentsMargins(0, 0, 0, 0)
-                        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-                        popup.setAutoFillBackground(True)
-                        popup.setStyleSheet("")
+                        try:
+                            from themes import get_theme_manager
 
-                        flags = popup.windowFlags()
-                        desired = (
-                            flags
-                            | Qt.WindowType.Popup
-                            | Qt.WindowType.FramelessWindowHint
-                            | Qt.WindowType.NoDropShadowWindowHint
-                        )
-                        if flags != desired:
-                            popup.setWindowFlags(desired)
+                            get_theme_manager().apply_combo_popup_theme(popup, combo.view())
+                        except Exception:
+                            from themes.rounded_popup import COMBO_RADIUS, apply_rounded_popup
+
+                            apply_rounded_popup(
+                                popup,
+                                radius=COMBO_RADIUS,
+                                border_key="combo_popup_border",
+                                frameless=True,
+                                force_window=True,
+                            )
+                        if not popup.isVisible():
                             popup.show()
 
                         combo_rect = combo.rect()
@@ -1474,9 +1254,9 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
                             view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
                             view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
                             view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-                            view.setAutoFillBackground(True)
+                            view.setAutoFillBackground(False)
                             if view.viewport():
-                                view.viewport().setAutoFillBackground(True)
+                                view.viewport().setAutoFillBackground(False)
                                 view.viewport().setContentsMargins(0, 0, 0, 0)
                             view.setContentsMargins(0, 0, 0, 0)
                             view.setFrameShape(QFrame.Shape.NoFrame)
@@ -1529,7 +1309,6 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
                                     popup.setFixedHeight(new_height)
                                     popup.move(combo_bottom_left)
 
-                        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
                     finally:
                         if popup:
                             popup.setProperty("_combo_popup_fixing", False)
@@ -1551,10 +1330,10 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
                     parse_foreground_backends,
                     requires_interception_driver,
                 )
-                from utils.interception_installation_prompt import (
+                from utils.input.interception_installation_prompt import (
                     request_interception_installation,
                 )
-                from utils.logitech_runtime import (
+                from utils.input.logitech_runtime import (
                     detect_logitech_runtime,
                     is_logitech_ibinputsimulator_configured,
                 )
@@ -1611,7 +1390,7 @@ if __name__ == "__main__" and not _IS_SUBPROCESS:
 
                 # 未安装时只询问，不得在初始化链路中自动安装。
                 try:
-                    from utils.interception_driver import get_driver
+                    from utils.input.interception_driver import get_driver
                     driver = get_driver()
 
                     if not driver.is_driver_registered():
