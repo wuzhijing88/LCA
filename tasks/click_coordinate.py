@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
 """
 点击绑定窗口的指定坐标任务模块
@@ -11,7 +11,7 @@ import ctypes
 import json
 import re
 from typing import Dict, Any, Optional, Tuple
-from utils.input_timing import (
+from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
 )
@@ -307,7 +307,7 @@ except ImportError:
 
 # 前台输入驱动管理器导入（自动处理 Interception/Win32 回退）
 try:
-    from utils.foreground_input_manager import get_foreground_input_manager
+    from utils.input.foreground_input_manager import get_foreground_input_manager
     foreground_input = get_foreground_input_manager()
     FOREGROUND_INPUT_AVAILABLE = True
 except ImportError:
@@ -614,7 +614,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         logger.info(f"最终点击坐标: ({final_x}, {final_y}), 模式: {effective_execution_mode}, 动作: {click_action}")
 
         # 执行点击 - 优先使用新的输入模拟模块
-        force_move_before_click = normalized_mode == 'foreground'
+        force_move_before_click = True
         success = _click_with_new_simulator(
             target_hwnd, final_x, final_y, button, clicks, interval,
             effective_execution_mode, click_action, hold_duration,
@@ -873,8 +873,7 @@ def _perform_simulator_click(simulator, x: int, y: int, button: str, click_actio
             break
         if attempt_index < (max_attempts - 1):
             logger.warning(
-                f"[{mode_label}模式] 前台点击失败，执行稳定性重试 "
-                f"{attempt_index + 2}/{max_attempts}"
+                f"[{mode_label}模式] 这次没点上，再试一次（{attempt_index + 2}/{max_attempts}）"
             )
             precise_sleep(0.12)
 

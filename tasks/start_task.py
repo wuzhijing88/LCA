@@ -1,7 +1,7 @@
 # tasks/start_task.py
 from typing import Any, Dict, Optional, Tuple
 
-from utils.thread_start_utils import THREAD_START_TASK_TYPE
+from task_workflow.thread_start import THREAD_START_TASK_TYPE
 
 TASK_TYPE = THREAD_START_TASK_TYPE
 

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import pyautogui
 import logging
 from typing import Dict, Any, Optional, Tuple
@@ -13,8 +13,8 @@ import cv2
 import numpy as np
 import os # For path checking if needed, though imdecode handles paths
 import traceback # For detailed error logging
-from app_core.mouse_runtime import mouse_move_fixer
-from utils.smart_image_matcher import normalize_match_image
+from utils.input.mouse_runtime import mouse_move_fixer
+from utils.match.smart_image_matcher import normalize_match_image
 from tasks.task_utils import (
     capture_window_smart as capture_window_wgc,
     capture_and_match_template_smart,
@@ -223,7 +223,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
         scroll_value_per_unit = -scroll_value_per_unit
 
     # 新增：根据执行模式设置前台输入管理器的强制模式（在标准化之前）
-    from utils.foreground_input_manager import get_foreground_input_manager
+    from utils.input.foreground_input_manager import get_foreground_input_manager
 
     foreground_input = get_foreground_input_manager()
     if foreground_input and execution_mode and execution_mode.startswith('foreground'):
@@ -426,7 +426,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
 
             try:
                 if target_x is not None and target_y is not None:
-                    from utils.enhanced_child_window_finder import EnhancedChildWindowFinder
+                    from utils.window.enhanced_child_window_finder import EnhancedChildWindowFinder
 
                     finder = EnhancedChildWindowFinder()
                     # 将客户区坐标转换为屏幕坐标（如果需要）

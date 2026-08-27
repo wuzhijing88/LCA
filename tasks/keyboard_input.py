@@ -15,7 +15,7 @@ import win32con
 import win32gui
 import win32process
 
-from utils.foreground_input_manager import get_foreground_input_manager
+from utils.input.foreground_input_manager import get_foreground_input_manager
 
 foreground_input = get_foreground_input_manager()
 
@@ -23,7 +23,7 @@ from .task_utils import precise_sleep, coerce_bool
 from .click_action_executor import execute_simulator_click_action
 from .click_param_resolver import normalize_click_action
 from .click_simulator_adapters import ForegroundDriverSimulatorAdapter
-from utils.input_timing import (
+from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_KEY_HOLD_SECONDS,
     DEFAULT_RANDOM_CLICK_HOLD_MAX_SECONDS,
@@ -3497,7 +3497,7 @@ def _activate_foreground_window(target_hwnd: Optional[int]):
 
         foreground_target = int(target_hwnd)
         try:
-            from utils.window_activation_utils import activate_window
+            from utils.window.window_activation_utils import activate_window
             activated_hwnd = activate_window(int(target_hwnd), log_prefix="键盘按键")
             if activated_hwnd:
                 foreground_target = int(activated_hwnd)
@@ -3981,7 +3981,10 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
 
                             return True, success_action, success_jump_target
                         else:
-                            logger.error("[后台模式] 文本输入失败")
+                            logger.error(
+                                "[后台模式] 文本输入失败：没有可用的输入框，或窗口没吃到文字。"
+                                "桌面和游戏请改前台，或先点进输入框再输入。"
+                            )
                             return False, failure_action, failure_jump_target
                     else:
                         logger.info("[后台模式] 文本为空，跳过")

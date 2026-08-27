@@ -26,9 +26,9 @@ from .task_utils import (
 )
 from .click_action_executor import execute_simulator_click_action
 from .click_param_resolver import resolve_click_params, normalize_button
-from utils.relative_mouse_move import perform_timed_relative_move as _shared_perform_timed_relative_move
-from utils.smart_image_matcher import normalize_match_image
-from utils.input_timing import (
+from utils.input.relative_mouse_move import perform_timed_relative_move as _shared_perform_timed_relative_move
+from utils.match.smart_image_matcher import normalize_match_image
+from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
     DEFAULT_RANDOM_CLICK_HOLD_MAX_SECONDS,
@@ -4071,7 +4071,6 @@ def _perform_move_click(params: Dict[str, Any], execution_mode: str, target_hwnd
         bool: 点击是否成功
     """
     try:
-        from utils.input_simulation import InputSimulatorFactory
         resolved_point = _resolve_move_click_screen_point(execution_mode, target_hwnd, click_x, click_y)
         if resolved_point is None:
             return False
@@ -4103,7 +4102,7 @@ def _perform_move_click(params: Dict[str, Any], execution_mode: str, target_hwnd
         )
 
         # 创建输入模拟器并执行点击
-        input_sim = InputSimulatorFactory.create_simulator(target_hwnd, execution_mode=execution_mode)
+        input_sim = _get_task_simulator(target_hwnd, execution_mode)
         if input_sim is None:
             logger.error("[鼠标移动点击] 无法创建输入模拟器")
             return False
@@ -4137,13 +4136,133 @@ def _perform_move_click(params: Dict[str, Any], execution_mode: str, target_hwnd
         logger.error(f"[鼠标移动点击] 执行点击时出错: {e}")
         return False
 
+def _is_background_execution_mode(execution_mode: str) -> bool:
+    return str(execution_mode or "").strip().lower().startswith("background")
+
+
+def _get_task_simulator(target_hwnd: Optional[int], execution_mode: str):
+    from utils.input_simulation import global_input_simulator_manager
+
+    return global_input_simulator_manager.get_simulator(target_hwnd, "auto", execution_mode)
+
+
+def _resolve_relative_move_start(execution_mode: str, target_hwnd: int) -> Tuple[int, int]:
+    if _is_background_execution_mode(execution_mode):
+        simulator = _get_task_simulator(target_hwnd, execution_mode)
+        getter = getattr(simulator, "get_virtual_cursor", None) if simulator else None
+        if callable(getter):
+            try:
+                cursor = getter()
+                if cursor and len(cursor) >= 2:
+                    return int(cursor[0]), int(cursor[1])
+            except Exception:
+                pass
+        try:
+            import win32gui
+
+            rect = win32gui.GetClientRect(target_hwnd)
+            return max(0, int(rect[2]) // 2), max(0, int(rect[3]) // 2)
+        except Exception:
+            return 0, 0
+
+    try:
+        import win32api
+        import win32gui
+
+        cursor_pos = win32api.GetCursorPos()
+        start_x, start_y = win32gui.ScreenToClient(target_hwnd, cursor_pos)
+        return int(start_x), int(start_y)
+    except Exception as e:
+        logger.warning(f"[鼠标移动] 获取鼠标位置失败: {e}，使用窗口中心点")
+        try:
+            import win32gui
+
+            rect = win32gui.GetClientRect(target_hwnd)
+            return int(rect[2]) // 2, int(rect[3]) // 2
+        except Exception:
+            return 500, 300
+
+
+def _perform_background_client_move(
+    simulator,
+    start_x: int,
+    start_y: int,
+    end_x: int,
+    end_y: int,
+    duration: float,
+    smoothness: int,
+    use_bezier: bool,
+    stop_checker=None,
+) -> bool:
+    if not simulator or not hasattr(simulator, "move_mouse"):
+        return False
+    if not bool(simulator.move_mouse(int(start_x), int(start_y))):
+        return False
+    offset_x = int(end_x) - int(start_x)
+    offset_y = int(end_y) - int(start_y)
+    if offset_x == 0 and offset_y == 0:
+        return True
+    if duration is None or float(duration) <= 0:
+        return bool(simulator.move_mouse(int(end_x), int(end_y)))
+
+    current = [int(start_x), int(start_y)]
+
+    def _step(delta_x: int, delta_y: int) -> bool:
+        current[0] += int(delta_x)
+        current[1] += int(delta_y)
+        return bool(simulator.move_mouse(current[0], current[1]))
+
+    if not _shared_perform_timed_relative_move(
+        offset_x,
+        offset_y,
+        duration,
+        _step,
+        smoothness=smoothness,
+        use_bezier=use_bezier,
+        stop_checker=stop_checker,
+    ):
+        return False
+    return bool(simulator.move_mouse(int(end_x), int(end_y)))
+
+
+def _execute_background_mouse_move(
+    target_hwnd: int,
+    execution_mode: str,
+    start_x: int,
+    start_y: int,
+    end_x: int,
+    end_y: int,
+    duration: float,
+    use_timed_move: bool,
+    smoothness: int,
+    use_bezier: bool,
+    stop_checker=None,
+) -> bool:
+    simulator = _get_task_simulator(target_hwnd, execution_mode)
+    if not simulator or not hasattr(simulator, "move_mouse"):
+        logger.error("[鼠标移动] 无法创建后台输入模拟器")
+        return False
+    logger.info(f"[鼠标移动] 使用后台消息移动: {execution_mode}")
+    return _perform_background_client_move(
+        simulator,
+        start_x,
+        start_y,
+        end_x,
+        end_y,
+        duration if use_timed_move else 0.0,
+        smoothness,
+        use_bezier,
+        stop_checker,
+    )
+
+
 def _perform_relative_mouse_move(offset_x: int, offset_y: int, execution_mode: str) -> bool:
     """执行相对移动（不受窗口边界限制）"""
     if offset_x == 0 and offset_y == 0:
         return True
 
     try:
-        from utils.foreground_input_manager import get_foreground_input_manager
+        from utils.input.foreground_input_manager import get_foreground_input_manager
         fg_input = get_foreground_input_manager()
         mode = (execution_mode or "").strip().lower()
         if mode.startswith("foreground"):
@@ -4328,23 +4447,7 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
                     logger.warning("[鼠标移动] 固定偏移参数无效,使用默认值0")
                     offset_x, offset_y = 0, 0
 
-            # 获取当前鼠标位置
-            import win32gui
-            import win32api
-
-            try:
-                # 获取屏幕坐标的鼠标位置
-                cursor_pos = win32api.GetCursorPos()
-                # 转换为窗口客户区坐标
-                start_x, start_y = win32gui.ScreenToClient(target_hwnd, cursor_pos)
-            except Exception as e:
-                logger.warning(f"[鼠标移动] 获取鼠标位置失败: {e}，使用窗口中心点")
-                try:
-                    rect = win32gui.GetClientRect(target_hwnd)
-                    start_x = rect[2] // 2
-                    start_y = rect[3] // 2
-                except Exception:
-                    start_x, start_y = 500, 300
+            start_x, start_y = _resolve_relative_move_start(execution_mode, target_hwnd)
 
             # 计算终点坐标（当前位置 + 偏移量）
             end_x = start_x + offset_x
@@ -4371,16 +4474,52 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
 
             logger.info(f"[鼠标移动] 相对移动({offset_mode}): 当前位置({start_x},{start_y}) 偏移({offset_x},{offset_y}) -> 目标({end_x},{end_y}), 距离{offset_distance:.0f}px, 持续{duration:.2f}s")
 
-        if not execution_mode.startswith('foreground'):
-            logger.error(f"[鼠标移动] 仅支持前台模式，当前模式: {execution_mode}")
+        use_timed_move = duration is not None and duration > 0
+        if _is_background_execution_mode(execution_mode):
+            success = _execute_background_mouse_move(
+                target_hwnd,
+                execution_mode,
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                duration,
+                use_timed_move,
+                smoothness,
+                use_bezier,
+                stop_checker,
+            )
+            if success:
+                logger.info("[鼠标移动] 移动成功")
+                move_enable_click = params.get('move_enable_click', False)
+                if move_enable_click:
+                    try:
+                        logger.info("[鼠标移动] 检测到启用移动后点击")
+                        click_result = _perform_move_click(
+                            params,
+                            execution_mode,
+                            target_hwnd,
+                            end_x,
+                            end_y,
+                            stop_checker,
+                        )
+                        if click_result:
+                            logger.info("[鼠标移动] 移动后点击成功")
+                        else:
+                            logger.warning("[鼠标移动] 移动后点击失败，但移动已成功")
+                    except Exception as click_error:
+                        logger.error(f"[鼠标移动] 执行移动后点击时出错: {click_error}")
+                return _handle_success(on_success_action, success_jump_id, card_id)
+            logger.error("[鼠标移动] 移动失败")
             return _handle_failure(on_failure_action, failure_jump_id, card_id)
+
         effective_mode = execution_mode
         logger.info(f"[鼠标移动] 使用前台模式执行: {effective_mode}")
 
         # 严格模式：记录本次实际使用驱动
         if (effective_mode or '').startswith('foreground'):
             try:
-                from utils.foreground_input_manager import get_foreground_input_manager
+                from utils.input.foreground_input_manager import get_foreground_input_manager
                 from utils.input_simulation.mode_utils import get_foreground_driver, get_ibinputsimulator_config
 
                 resolved_backend = get_foreground_driver(effective_mode)
@@ -5168,7 +5307,7 @@ def perform_mouse_drag_path_native(hwnd: int, path_points: list, duration: float
         window_coords = {}  # 存储每个窗口相对于自己客户区的坐标
         window_screen_offsets = {}  # 存储窗口左上角屏幕坐标，避免每步重复GetWindowRect
         try:
-            from utils.enhanced_child_window_finder import EnhancedChildWindowFinder
+            from utils.window.enhanced_child_window_finder import EnhancedChildWindowFinder
 
             finder = EnhancedChildWindowFinder()
             screen_x, screen_y = win32gui.ClientToScreen(hwnd, (start_x, start_y))
@@ -5396,8 +5535,11 @@ def _get_ocr_results_from_context(card_id: Optional[int]) -> Optional[list]:
     try:
         from task_workflow.workflow_context import get_workflow_context
         context = get_workflow_context()
-        ocr_results = context.get_latest_ocr_results()
-        return ocr_results
+        if card_id is not None:
+            results = context.get_ocr_results(card_id)
+            if results:
+                return results
+        return context.get_latest_ocr_results()
     except Exception as e:
         logger.debug(f"获取OCR结果失败: {e}")
         return None
@@ -5408,14 +5550,20 @@ def _get_ocr_target_text_from_context(card_id: Optional[int]) -> Tuple[Optional[
     try:
         from task_workflow.workflow_context import get_workflow_context
         context = get_workflow_context()
+        candidates = []
+        if card_id is not None:
+            candidates.append(card_id)
         latest_ocr_card_id = context.get_latest_ocr_card_id()
+        if latest_ocr_card_id is not None and latest_ocr_card_id not in candidates:
+            candidates.append(latest_ocr_card_id)
 
-        if latest_ocr_card_id is not None:
-            target_text = context.get_card_data(latest_ocr_card_id, 'ocr_target_text')
-            match_mode = context.get_card_data(latest_ocr_card_id, 'ocr_match_mode')
-        else:
-            target_text = None
-            match_mode = None
+        target_text = None
+        match_mode = None
+        for ocr_card_id in candidates:
+            target_text = context.get_card_data(ocr_card_id, 'ocr_target_text')
+            match_mode = context.get_card_data(ocr_card_id, 'ocr_match_mode')
+            if target_text:
+                break
 
         if not match_mode:
             match_mode = '包含'

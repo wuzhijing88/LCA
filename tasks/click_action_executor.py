@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 统一点击动作执行器
 """
@@ -12,14 +12,14 @@ import ctypes
 from typing import Any, Callable, Optional
 
 from .task_utils import interruptible_sleep, precise_sleep
-from utils.hwnd_utils import as_hwnd
-from utils.input_guard import (
+from utils.window.hwnd_utils import as_hwnd
+from utils.input.input_guard import (
     acquire_input_guard,
     get_current_input_guard_resource,
     get_input_lock_wait_warn_ms,
     resolve_input_lock_resource,
 )
-from utils.input_timing import (
+from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
 )
@@ -333,13 +333,21 @@ def _wait_cursor_reach_target(
 
 
 def _is_target_window_foreground(target_hwnd: Any) -> bool:
-    """校验目标窗口是否在前台（支持根窗口一致）。"""
+    """普通窗口须在前台才允许完整点击；桌面层不检查前台。"""
     try:
         hwnd = as_hwnd(target_hwnd)
     except Exception:
         return False
     if hwnd == 0:
         return False
+
+    try:
+        from utils.window.window_identity import is_desktop_window
+
+        if is_desktop_window(hwnd):
+            return True
+    except Exception:
+        pass
 
     try:
         import win32con
@@ -359,6 +367,22 @@ def _is_target_window_foreground(target_hwnd: Any) -> bool:
     except Exception:
         return False
 
+
+def _front_window_name() -> str:
+    try:
+        import win32gui
+
+        hwnd = as_hwnd(win32gui.GetForegroundWindow())
+        if hwnd <= 0:
+            return ""
+        title = (win32gui.GetWindowText(hwnd) or "").strip()
+        if title:
+            return title
+        return (win32gui.GetClassName(hwnd) or "").strip()
+    except Exception:
+        return ""
+
+
 def _ensure_foreground_cursor_ready(
     simulator: Any,
     x: int,
@@ -369,7 +393,7 @@ def _ensure_foreground_cursor_ready(
 ) -> bool:
     move_fn = getattr(simulator, "move_mouse", None)
     if not callable(move_fn):
-        _log(log_obj, "error", f"[{mode_label}] 前台模式缺少move_mouse接口")
+        _log(log_obj, "error", f"[{mode_label}] 没法移动鼠标，点不了")
         return False
 
     max_attempts = 3
@@ -382,7 +406,7 @@ def _ensure_foreground_cursor_ready(
         try:
             moved = bool(move_fn(target_x, target_y))
         except Exception as err:
-            _log(log_obj, "warning", f"[{mode_label}] 前台落位异常: {err}")
+            _log(log_obj, "warning", f"[{mode_label}] 鼠标移到点击位置时出错: {err}")
             moved = False
 
         if moved and _wait_cursor_reach_target(
@@ -402,7 +426,7 @@ def _ensure_foreground_cursor_ready(
         if attempt < (max_attempts - 1):
             _sleep_with_stop(0.01, stop_checker)
 
-    _log(log_obj, "error", f"[{mode_label}] 前台落位失败，坐标=({target_x}, {target_y})")
+    _log(log_obj, "error", f"[{mode_label}] 鼠标没移到要点的位置 ({target_x}, {target_y})")
     return False
 
 
@@ -622,10 +646,10 @@ def _foreground_single_click_with_retry(
     if callable(align_before_click):
         try:
             if not bool(align_before_click()):
-                _log(log_obj, "warning", f"[{mode_label}] 前台点击前落位失败")
+                _log(log_obj, "warning", f"[{mode_label}] 鼠标没移到要点的位置，已取消点击")
                 return False
         except Exception as err:
-            _log(log_obj, "warning", f"[{mode_label}] 前台点击前落位异常: {err}")
+            _log(log_obj, "warning", f"[{mode_label}] 鼠标移到点击位置时出错: {err}")
             return False
 
     first_ok = _foreground_single_click_via_down_up(
@@ -644,19 +668,19 @@ def _foreground_single_click_with_retry(
     retry_wait = min(0.1, float(interval or 0.0)) if interval > 0 else 0.03
     if retry_wait > 0:
         if not _sleep_with_stop(retry_wait, stop_checker):
-            _log(log_obj, "warning", f"[{mode_label}] 前台补发前收到停止请求")
+            _log(log_obj, "warning", f"[{mode_label}] 再点一次前收到停止")
             return False
 
     if callable(align_before_click):
         try:
             if not bool(align_before_click()):
-                _log(log_obj, "warning", f"[{mode_label}] 前台补发前落位失败")
+                _log(log_obj, "warning", f"[{mode_label}] 再点一次前鼠标没移到位，已取消点击")
                 return False
         except Exception as err:
-            _log(log_obj, "warning", f"[{mode_label}] 前台补发前落位异常: {err}")
+            _log(log_obj, "warning", f"[{mode_label}] 再点一次前移动鼠标出错: {err}")
             return False
 
-    _log(log_obj, "warning", f"[{mode_label}] 前台单击未成功，执行补发")
+    _log(log_obj, "warning", f"[{mode_label}] 这次没点上，再点一次")
     return _foreground_single_click_via_down_up(
         simulator=simulator,
         x=int(x),
@@ -730,8 +754,8 @@ def execute_simulator_click_action(
                 stop_checker=stop_checker,
             )
 
-        # 后台消息点击没有“先移动再点”的语义，移动前置只允许前台上下文使用。
-        effective_move_before_click = bool(move_before_click) and foreground_context
+        # 前台先把系统光标落到点击点；后台先把虚拟光标/消息坐标落到点击点。
+        effective_move_before_click = bool(move_before_click)
         if effective_move_before_click:
             move_fn = getattr(simulator, "move_mouse", None)
             if callable(move_fn):
@@ -773,14 +797,22 @@ def execute_simulator_click_action(
                     log_obj=logger_obj,
                     stop_checker=stop_checker,
                 ):
-                    _log(logger_obj, "warning", f"[{mode_label}] 点击前按键残留未恢复，已阻止点击")
+                    _log(logger_obj, "warning", f"[{mode_label}] 鼠标还按着没松开，没法点，已取消点击")
                     return False
             safe_target_hwnd = _safe_int(target_hwnd, default=0, minimum=0)
             if safe_target_hwnd > 0 and not _is_target_window_foreground(safe_target_hwnd):
-                _log(logger_obj, "warning", f"[{mode_label}] 完整点击前验证失败，目标窗口不在前台，已阻止点击")
+                front = _front_window_name()
+                if front:
+                    _log(
+                        logger_obj,
+                        "warning",
+                        f"[{mode_label}] 要点的窗口不在最前面（现在最前面是「{front}」），已取消点击",
+                    )
+                else:
+                    _log(logger_obj, "warning", f"[{mode_label}] 要点的窗口不在最前面，已取消点击")
                 return False
             if not _align_foreground_cursor():
-                _log(logger_obj, "warning", f"[{mode_label}] 完整点击前验证失败，已阻止点击")
+                _log(logger_obj, "warning", f"[{mode_label}] 鼠标没移到要点的位置，已取消点击")
                 return False
         click_attempted = False
         success = False
@@ -998,7 +1030,7 @@ def execute_simulator_click_action(
         if foreground_context and success:
             if click_action in {"完整点击", "双击", "仅松开"}:
                 if not _wait_mouse_button_release(button_type, stop_checker=stop_checker):
-                    _log(logger_obj, "warning", f"[{mode_label}] 前台点击完成后检测到鼠标按键仍未松开，尝试自动恢复")
+                    _log(logger_obj, "warning", f"[{mode_label}] 点完后鼠标还按着，正在松开")
                     recovered = _force_release_mouse_button(
                         simulator=simulator,
                         x=int(x),
@@ -1009,10 +1041,10 @@ def execute_simulator_click_action(
                         stop_checker=stop_checker,
                     )
                     if not recovered:
-                        _log(logger_obj, "warning", f"[{mode_label}] 前台点击后按键恢复失败")
+                        _log(logger_obj, "warning", f"[{mode_label}] 点完后鼠标松不开")
                         return False
                     if not _wait_mouse_button_release(button_type, stop_checker=stop_checker, timeout=0.12):
-                        _log(logger_obj, "warning", f"[{mode_label}] 前台点击恢复后按键仍未松开")
+                        _log(logger_obj, "warning", f"[{mode_label}] 点完后鼠标还是按着")
                         return False
             if not _sleep_with_stop(_FOREGROUND_POST_CLICK_SETTLE_SECONDS, stop_checker):
                 _log(logger_obj, "warning", f"[{mode_label}] 点击后稳定等待被中断")

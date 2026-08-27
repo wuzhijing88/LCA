@@ -9,7 +9,7 @@ import random
 from typing import Any, Dict, Optional, Tuple
 
 from .task_utils import coerce_bool
-from utils.input_timing import (
+from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
     DEFAULT_RANDOM_CLICK_HOLD_MAX_SECONDS,

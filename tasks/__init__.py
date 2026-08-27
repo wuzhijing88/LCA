@@ -10,7 +10,7 @@ import importlib
 import logging
 from typing import Dict
 
-from utils.thread_start_utils import THREAD_START_TASK_TYPE
+from task_workflow.thread_start import THREAD_START_TASK_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +63,12 @@ _PRIMARY_TASK_MODULE_PATHS = {
     "线程控制": "tasks.thread_control_task",
     "线程窗口限制": "tasks.thread_window_limit_task",
     "OCR文字识别": "tasks.ocr_region_recognition",
+    "点阵字库OCR": "tasks.dict_ocr_task",
     "YOLO目标检测": "tasks.yolo_detection",
     "录制回放": "tasks.record_replay_task",
     "附加条件": "tasks.watchdog_monitor",
     "子工作流": "tasks.sub_workflow_task",
+    "自定义脚本": "tasks.script_task",
 }
 
 TASK_CONTRACT_METADATA = {
@@ -83,6 +85,7 @@ TASK_MODULES_DICT = LazyTaskModuleDict(
     {
         **_PRIMARY_TASK_MODULE_PATHS,
         "图片点击": "tasks.image_match_click",
+        "字库识别": "tasks.dict_ocr_task",
     }
 )
 
@@ -94,12 +97,14 @@ _EXPORT_MODULES = {
     "conditional_control": "tasks.conditional_control",
     "start_task": "tasks.start_task",
     "ocr_region_recognition": "tasks.ocr_region_recognition",
+    "dict_ocr_task": "tasks.dict_ocr_task",
     "mouse_action_task": "tasks.mouse_action_task",
     "image_match_click": "tasks.image_match_click",
     "yolo_detection": "tasks.yolo_detection",
     "record_replay_task": "tasks.record_replay_task",
     "watchdog_monitor": "tasks.watchdog_monitor",
     "sub_workflow_task": "tasks.sub_workflow_task",
+    "script_task": "tasks.script_task",
     "random_jump": "tasks.random_jump",
     "thread_control_task": "tasks.thread_control_task",
     "thread_window_limit_task": "tasks.thread_window_limit_task",

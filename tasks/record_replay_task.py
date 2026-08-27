@@ -13,8 +13,8 @@ from typing import Dict, Any, Optional, Tuple
 from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Controller as KeyboardController
 from utils.app_paths import get_config_path
-from utils.relative_mouse_move import perform_timed_relative_move
-from utils.window_binding_utils import get_bound_windows_for_mode
+from utils.input.relative_mouse_move import perform_timed_relative_move
+from utils.window.window_binding_utils import get_bound_windows_for_mode
 
 try:
     import win32api
@@ -33,7 +33,7 @@ except ImportError:
 
 # 导入增强型输入控制器
 try:
-    from utils.enhanced_input import (
+    from utils.input.enhanced_input import (
         create_mouse_controller,
         create_keyboard_controller,
     )
@@ -711,7 +711,7 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                     key_str = action.get('key', '')
                     if key_str:
                         # 调用统一的回放引擎执行按键
-                        from utils.replay_engine import ReplayEngine
+                        from utils.input.replay_engine import ReplayEngine
                         if not hasattr(_execute_replay, '_replay_engine'):
                             _execute_replay._replay_engine = ReplayEngine()
                         _execute_replay._replay_engine.execute_action(action, recording_area, window_offset_x, window_offset_y, recording_mode)
@@ -723,7 +723,7 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
                     key_str = action.get('key', '')
                     if key_str:
                         # 调用统一的回放引擎执行按键释放
-                        from utils.replay_engine import ReplayEngine
+                        from utils.input.replay_engine import ReplayEngine
                         if not hasattr(_execute_replay, '_replay_engine'):
                             _execute_replay._replay_engine = ReplayEngine()
                         _execute_replay._replay_engine.execute_action(action, recording_area, window_offset_x, window_offset_y, recording_mode)

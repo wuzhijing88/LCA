@@ -20,8 +20,8 @@ from tasks.task_utils import (
     handle_failure_action,
     handle_success_action,
 )
-from utils.sub_workflow_path import resolve_sub_workflow_path
-from utils.thread_start_utils import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from task_workflow.sub_workflow_path import resolve_sub_workflow_path
+from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
 
 logger = logging.getLogger(__name__)
 

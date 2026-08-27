@@ -1,95 +1,14 @@
-# Revert to Class-based implementation for Delay task, inheriting object
-
 import time
 import random
 import logging
 from typing import Dict, Any, Optional, Tuple
 
-# Task Class Definition
-class DelayTask(object):
-    """
-    执行延迟操作的任务。
-    可以配置为固定延迟或在指定范围内的随机延迟。
-    """
-    NODE_TYPE = "Delay" # Unique identifier for this task type
+logger = logging.getLogger(__name__)
+TASK_NAME = '延迟'
 
-    def __init__(self, config=None):
-        """
-        初始化延迟任务。
-        Args:
-            config (dict, optional): 任务配置。
-        """
-        # No super().__init__() needed as we inherit from object
-        self.delay_mode = 'fixed'
-        self.fixed_delay = 1.0
-        self.min_delay = 0.5
-        self.max_delay = 2.0
-        self.set_config(config or {}) # Apply initial config
 
-    def run(self): # Changed from execute to run for potential consistency
-        """执行延迟操作。"""
-        delay_seconds = 0
-        try:
-            if self.delay_mode == 'fixed':
-                delay_seconds = self.fixed_delay
-                logging.info(f"执行固定延迟: {delay_seconds:.2f} 秒")
-            elif self.delay_mode == 'random':
-                if self.min_delay > self.max_delay:
-                    logging.warning("随机延迟配置错误：最小值大于最大值，使用最小值。")
-                    delay_seconds = self.min_delay
-                else:
-                    delay_seconds = random.uniform(self.min_delay, self.max_delay)
-                logging.info(f"执行随机延迟 (范围 {self.min_delay:.2f}-{self.max_delay:.2f}): {delay_seconds:.2f} 秒")
-            else:
-                logging.warning(f"未知的延迟模式: {self.delay_mode}，不执行延迟。")
-                return True # Treat unknown mode as non-fatal
-
-            time.sleep(delay_seconds)
-            logging.info("延迟执行完毕。")
-            return True # Indicate success
-
-        except Exception as e:
-            logging.error(f"延迟任务执行期间发生错误: {e}", exc_info=True)
-            return False # Indicate failure
-            
-    def get_config(self) -> dict:
-        """返回当前配置。"""
-        return {
-            'delay_mode': self.delay_mode,
-            'fixed_delay': self.fixed_delay,
-            'min_delay': self.min_delay,
-            'max_delay': self.max_delay,
-        }
-
-    def set_config(self, config: dict):
-        """根据提供的字典更新配置。"""
-        self.delay_mode = config.get('delay_mode', self.delay_mode)
-        self.fixed_delay = float(config.get('fixed_delay', self.fixed_delay))
-        self.min_delay = float(config.get('min_delay', self.min_delay))
-        self.max_delay = float(config.get('max_delay', self.max_delay))
-        logging.debug(f"DelayTask 配置已更新: {self.get_config()}")
-
-    # --- Static methods for UI display --- 
-    @staticmethod
-    def get_display_name() -> str:
-        return "等待 (延迟)"
-
-    @staticmethod
-    def get_category() -> str:
-        return "流程控制"
-
-    @staticmethod
-    def get_description() -> str:
-        return "暂停执行固定的秒数或一段随机时间。"
-
-    @staticmethod
-    def get_icon() -> str:
-        return "mdi.timer-sand"
-
-# --- Define get_params_definition at the MODULE level --- 
-# --- It MUST remain at module level for TaskCard compatibility --- 
 def get_params_definition() -> Dict[str, Any]:
-    """返回此任务的参数定义，供 ParameterDialog 使用 (仅含延迟相关参数)。"""
+    """返回此任务的参数定义（仅含延迟相关参数）。"""
     return {
         "delay_mode": {
             "label": "延迟模式",
@@ -145,13 +64,8 @@ def get_params_definition() -> Dict[str, Any]:
             "tooltip": "设置随机延迟的最大值",
             "condition": {"param": "delay_mode", "value": "随机延迟"}
         },
-        # REMOVED Separator and Post-Execution Jump Parameters
     }
 
-# Removed module-level execute function 
-
-logger = logging.getLogger(__name__)
-TASK_NAME = '延迟'
 
 def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mode='foreground', **kwargs) -> Tuple[bool, str, Optional[int]]:
     """Executes the delay task."""

@@ -18,13 +18,13 @@ from typing import Dict, Any, Optional, Tuple, List
 import cv2
 import numpy as np
 from tasks.click_param_resolver import resolve_click_params
-from utils.hwnd_utils import as_hwnd
-from utils.input_guard import (
+from utils.window.hwnd_utils import as_hwnd
+from utils.input.input_guard import (
     acquire_input_guard,
     get_input_lock_wait_warn_ms,
     resolve_input_lock_resource,
 )
-from utils.input_timing import (
+from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
 )
@@ -351,42 +351,41 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     failure_jump_id = params.get('failure_jump_target_id')
 
     normalized_mode = str(execution_mode or "").strip().lower()
-    supports_yolo_mode = normalized_mode.startswith("foreground")
+    supports_yolo_mode = normalized_mode.startswith("foreground") or normalized_mode.startswith("background")
 
     if not supports_yolo_mode:
-        logger.error("YOLO原生模式仅支持前台执行模式: %s", execution_mode)
+        logger.error("YOLO 不支持当前执行模式: %s", execution_mode)
         current_engine = "unknown"
         try:
-            from utils.screenshot_helper import get_screenshot_engine
+            from utils.capture.screenshot_helper import get_screenshot_engine
             current_engine = str(get_screenshot_engine() or "").strip().lower() or "unknown"
         except Exception:
             pass
         warning_message = (
-            "YOLO限制：原生模式仅支持前台模式。\n"
+            "YOLO限制：只支持前台或后台模式。\n"
             "当前执行模式: {mode}\n"
             "当前截图引擎: {engine}\n\n"
-            "请在全局设置切换为前台模式，并使用 DXGI 或 GDI。"
+            "请在全局设置切换为前台或后台，截图可用 DXGI / GDI / WGC / PrintWindow。"
         ).format(mode=execution_mode, engine=current_engine)
         return _stop_with_warning(warning_message)
 
     try:
-        from utils.screenshot_helper import (
+        from utils.capture.screenshot_helper import (
             get_screenshot_engine,
             get_screenshot_info,
             probe_dxgi_runtime_available,
         )
 
         current_engine = get_screenshot_engine()
-        allowed_engines = {"dxgi", "gdi"}
+        allowed_engines = {"dxgi", "gdi", "wgc", "printwindow"}
         if current_engine not in allowed_engines:
             logger.error(
-                "YOLO 禁止使用后台截图引擎，当前引擎=%s",
+                "YOLO 截图引擎不受支持，当前引擎=%s",
                 current_engine,
             )
             warning_message = (
-                "\u0059\u004f\u004c\u004f\u9650\u5236\uff1a\u7981\u7528\u540e\u53f0\u622a\u56fe\u5f15\u64ce\uff0c"
-                "\u4ec5\u652f\u6301\u0044\u0058\u0047\u0049/\u0047\u0044\u0049\u524d\u53f0\u622a\u56fe\uff0c"
-                "\u5f53\u524d\u5f15\u64ce: {engine}\u3002"
+                "YOLO限制：截图引擎仅支持 DXGI / GDI / WGC / PrintWindow，"
+                "当前引擎: {engine}。"
             ).format(engine=current_engine)
             return _stop_with_warning(warning_message)
 
@@ -461,7 +460,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
 
     detect_classes = list(target_classes) if target_classes else None
     try:
-        from utils.yolo_engine import get_yolo_engine
+        from utils.match.yolo_engine import get_yolo_engine
 
         raw_input_size = params.get('input_size', 416)
         try:
@@ -520,6 +519,18 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                     executor=executor,
                 )
                 draw_detections_on_window(target_hwnd, [], frame_shape, executor=executor)
+            if card_id is not None:
+                try:
+                    from task_workflow.runtime_store import publish_perception
+
+                    publish_perception(
+                        card_id,
+                        kind="yolo",
+                        ok=False,
+                        threshold=params.get("confidence_threshold"),
+                    )
+                except Exception:
+                    pass
             return _handle_result(False, on_failure, failure_jump_id, card_id)
 
 
@@ -879,10 +890,14 @@ def _mouse_move(hwnd: int, tx: int, ty: int, mode: str, shape: Optional[Tuple]) 
         elif mode.startswith('background'):
             normalized_mode = 'background'
 
-        # 后台模式不支持鼠标移动
         if normalized_mode == 'background':
-            logger.warning("后台模式不支持鼠标移动，请使用前台模式")
-            return False
+            from utils.input_simulation import global_input_simulator_manager
+
+            sim = global_input_simulator_manager.get_simulator(hwnd, "auto", mode)
+            if not sim or not hasattr(sim, "move_mouse"):
+                logger.warning("后台模式无法创建输入模拟器，鼠标移动失败")
+                return False
+            return bool(sim.move_mouse(int(tx), int(ty)))
 
         # 前台模式 - 使用相对移动（FPS场景）
         import win32gui
@@ -930,7 +945,7 @@ def _mouse_move(hwnd: int, tx: int, ty: int, mode: str, shape: Optional[Tuple]) 
             delta_y = -max_step
 
         try:
-            from utils.foreground_input_manager import get_foreground_input_manager
+            from utils.input.foreground_input_manager import get_foreground_input_manager
             fg_input = get_foreground_input_manager()
             fg_input.set_execution_mode(mode)
             if fg_input.move_mouse(delta_x, delta_y, absolute=False):
@@ -2531,7 +2546,7 @@ def _draw_detections_with_qt(hwnd: int, detections: List, frame_shape: Tuple) ->
 
         def _position_overlay(self):
             try:
-                from ui.widgets.window_overlay_utils import (
+                from utils.window.window_overlay_utils import (
                     get_window_client_overlay_metrics,
                     sync_overlay_geometry,
                 )
@@ -2573,7 +2588,7 @@ def _draw_detections_with_qt(hwnd: int, detections: List, frame_shape: Tuple) ->
                 painter.end()
                 return
 
-            from ui.widgets.window_overlay_utils import map_native_rect_to_local
+            from utils.window.window_overlay_utils import map_native_rect_to_local
 
             client_left, client_top, client_right, client_bottom = self._client_native_rect
             client_w = max(1, int(client_right - client_left))
@@ -3431,7 +3446,7 @@ def _update_tracking_state(hwnd: int, detections: List, frame_shape: Tuple,
 
 def _capture_tracking_frame(hwnd: int, engine: Optional[str]) -> Optional[np.ndarray]:
     try:
-        from utils.screenshot_helper import _capture_with_engine, get_screenshot_engine
+        from utils.capture.screenshot_helper import _capture_with_engine, get_screenshot_engine
 
         try:
             hwnd_value = int(hwnd)
@@ -3444,7 +3459,7 @@ def _capture_tracking_frame(hwnd: int, engine: Optional[str]) -> Optional[np.nda
             engine = get_screenshot_engine()
 
         engine_name = str(engine or "").strip().lower()
-        if engine_name not in {"dxgi", "gdi"}:
+        if engine_name not in {"dxgi", "gdi", "wgc", "printwindow"}:
             return None
 
         return _capture_with_engine(

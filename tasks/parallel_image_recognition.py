@@ -1,4 +1,4 @@
-﻿"""
+"""
 并行图片识别模块 - 多图识别性能优化
 支持多线程并行处理，显著提升多图识别速度
 
@@ -16,7 +16,7 @@ import concurrent.futures
 from typing import Dict, Any, Optional, Tuple, List
 import cv2
 import numpy as np
-from utils.smart_image_matcher import normalize_match_image
+from utils.match.smart_image_matcher import normalize_match_image
 import logging
 from tasks.task_utils import coerce_bool, capture_and_match_template_smart
 from dataclasses import dataclass
@@ -119,7 +119,7 @@ class ParallelImageRecognizer:
             logger.info(f"[并行识别] 开始处理{len(image_paths)}张图片，模式={mode.value}")
 
             try:
-                from utils.screenshot_helper import clear_screenshot_cache
+                from utils.capture.screenshot_helper import clear_screenshot_cache
                 clear_screenshot_cache(target_hwnd)
             except Exception as e:
                 logger.debug(f"[并行识别] 清除截图缓存失败: {e}")
@@ -250,7 +250,7 @@ class ParallelImageRecognizer:
                             return None
 
                         # 后台/模拟器模式：使用统一截图接口
-                        from utils.screenshot_helper import take_window_screenshot
+                        from utils.capture.screenshot_helper import take_window_screenshot
                         pil_img = take_window_screenshot(target_hwnd, client_area_only=True)
                         if pil_img is not None:
                             screenshot = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -269,7 +269,7 @@ class ParallelImageRecognizer:
                                 logger.error(f"[并行识别-前台] 验证窗口句柄时出错: {e}")
                                 return None
 
-                            from utils.screenshot_helper import take_window_screenshot
+                            from utils.capture.screenshot_helper import take_window_screenshot
                             pil_img = take_window_screenshot(target_hwnd, client_area_only=True)
                             if pil_img is not None:
                                 screenshot = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -502,7 +502,7 @@ class ParallelImageRecognizer:
             # 【性能优化】优先从模板缓存加载
             template = None
             try:
-                from utils.template_preloader import get_global_preloader
+                from utils.match.template_preloader import get_global_preloader
                 preloader = get_global_preloader()
                 template = preloader.get_template(image_path)
                 if template is not None:

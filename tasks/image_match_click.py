@@ -9,12 +9,12 @@ import traceback # Import traceback for printing exception details
 from tasks.task_utils import coerce_bool, coerce_float, coerce_int, capture_and_match_template_smart
 from tasks.click_action_executor import execute_simulator_click_action
 from tasks.click_param_resolver import resolve_click_params
-from utils.hwnd_utils import as_hwnd
-from utils.input_timing import (
+from utils.window.hwnd_utils import as_hwnd
+from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
 )
-from utils.smart_image_matcher import normalize_match_image
+from utils.match.smart_image_matcher import normalize_match_image
 
 import cv2
 import numpy as np
@@ -34,6 +34,43 @@ else:
     logger.warning("[图片识别] 截图引擎不可用")
 
 TASK_NAME = "图片点击"
+
+
+def _publish_image_perception(
+    card_id: Any,
+    *,
+    ok: bool,
+    score: Any = None,
+    threshold: Any = None,
+    x: Any = None,
+    y: Any = None,
+    x1: Any = None,
+    y1: Any = None,
+    x2: Any = None,
+    y2: Any = None,
+    path: Any = None,
+) -> None:
+    if card_id is None:
+        return
+    try:
+        from task_workflow.runtime_store import publish_perception
+
+        publish_perception(
+            card_id,
+            kind="image",
+            ok=ok,
+            score=score,
+            threshold=threshold,
+            x=x,
+            y=y,
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+            path=path,
+        )
+    except Exception:
+        return
 
 
 def _normalize_image_position_mode(value: Any) -> str:
@@ -588,7 +625,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     # 【优化】在找图开始前清除WGC缓存，确保获取新帧
     # 只清除缓存，不销毁捕获器，避免频繁重建开销
     try:
-        from utils.screenshot_helper import clear_screenshot_cache
+        from utils.capture.screenshot_helper import clear_screenshot_cache
         clear_screenshot_cache(target_hwnd)
         logger.debug(f"[找图] 已清除窗口 {target_hwnd} 的帧缓存")
     except Exception as e:
@@ -632,7 +669,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 # 【性能优化】优先从模板缓存加载
                 needle_image_raw = None
                 try:
-                    from utils.template_preloader import get_global_preloader
+                    from utils.match.template_preloader import get_global_preloader
                     preloader = get_global_preloader()
                     needle_image_raw = preloader.get_template(absolute_image_path)
                     if needle_image_raw is not None:
@@ -881,7 +918,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         if not found and attempt < max_attempts:
             # 【修复】清理WGC捕获器，确保下次重试使用新帧
             try:
-                from utils.screenshot_helper import clear_screenshot_cache
+                from utils.capture.screenshot_helper import clear_screenshot_cache
                 clear_screenshot_cache(target_hwnd)
                 logger.debug(f"[找图重试] 已清除窗口 {target_hwnd} 的帧缓存")
             except Exception as e:
@@ -1001,6 +1038,19 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 context.set_card_data(card_id, "image_target_y2", bbox_y2)
                 if absolute_image_path:
                     context.set_card_data(card_id, "used_image_path", absolute_image_path)
+                _publish_image_perception(
+                    card_id,
+                    ok=True,
+                    score=match_score,
+                    threshold=confidence,
+                    x=int(click_x),
+                    y=int(click_y),
+                    x1=bbox_x1,
+                    y1=bbox_y1,
+                    x2=bbox_x2,
+                    y2=bbox_y2,
+                    path=absolute_image_path,
+                )
             except Exception as exc:
                 logger.debug("[找图点击] 保存坐标失败: %s", exc)
 
@@ -1194,6 +1244,14 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             else:
                 failure_reason = "执行失败"
             logger.info(f"任务 '{TASK_NAME}' (图片: '{image_name}') 执行失败 ({failure_reason})。")
+            if not found:
+                _publish_image_perception(
+                    card_id,
+                    ok=False,
+                    score=locals().get("match_score"),
+                    threshold=locals().get("confidence"),
+                    path=absolute_image_path,
+                )
             # 使用统一的失败处理
             from .task_utils import handle_failure_action
             return handle_failure_action(params, card_id)

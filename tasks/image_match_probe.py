@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 统一图片识别测试模块
 
@@ -14,8 +14,8 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from tasks.task_utils import coerce_bool, capture_and_match_template_smart
 import cv2
-from utils.hwnd_utils import as_hwnd
-from utils.smart_image_matcher import normalize_match_image
+from utils.window.hwnd_utils import as_hwnd
+from utils.match.smart_image_matcher import normalize_match_image
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +239,7 @@ def _test_with_opencv(image_paths: List[str], target_hwnd: int, confidence: floa
                 continue
 
             try:
-                from utils.screenshot_helper import get_screenshot_engine
+                from utils.capture.screenshot_helper import get_screenshot_engine
                 match_engine = str(get_screenshot_engine() or "wgc").strip().lower()
             except Exception:
                 match_engine = "wgc"
@@ -336,7 +336,7 @@ def _draw_overlay(
         from PySide6.QtWidgets import QWidget, QApplication
         from PySide6.QtCore import Qt, QTimer
         from PySide6.QtGui import QPainter, QPen, QColor, QFont
-        from ui.widgets.window_overlay_utils import (
+        from utils.window.window_overlay_utils import (
             draw_dynamic_center_crosshair,
             get_window_client_overlay_metrics,
             map_native_rect_to_local,

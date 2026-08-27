@@ -295,8 +295,31 @@ def clear_all_motion_cache():
         logger.debug("[内存清理] 清理移动状态失败: %s", exc)
 # -----------------------------------------------------------
 
+_REMOVED_EXPRESSION_PARAM_KEYS = (
+    "expr_left",
+    "expr_operator",
+    "expr_right",
+    "expr_advanced",
+)
+
+
+def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(params or {})
+    if normalized.get("condition_type") == "表达式判断":
+        logger.warning("条件类型“表达式判断”已移除，已回退为计数器判断")
+        normalized["condition_type"] = "计数器判断"
+    for key in _REMOVED_EXPRESSION_PARAM_KEYS:
+        normalized.pop(key, None)
+    return normalized
+
+
+def normalize_panel_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
+    return normalize_parameters(params)
+
+
 def _execute_condition_control(params: Dict[str, Any], counters: Dict[str, int], execution_mode: str, target_hwnd: Optional[int], card_id: Optional[int], get_image_data=None, stop_checker=None) -> tuple[bool, str, Optional[int]]:
     """评估条件（计数器判断、时间判断、移动检测），并返回对应动作。"""
+    params = normalize_parameters(params)
     condition_type = params.get('condition_type', '计数器判断')
     # Get current card ID passed by executor
     current_card_id = card_id # Use the passed ID

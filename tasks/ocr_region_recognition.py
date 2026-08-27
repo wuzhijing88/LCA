@@ -42,6 +42,29 @@ except ImportError as e:
     logger.warning(f"[OCR截图] 截图引擎不可用: {e}")
 
 
+def _should_save_ocr_context(card_id: Optional[int], params: Optional[Dict[str, Any]] = None) -> bool:
+    """脚本内识字必须写入上下文；画布卡片仍按出线决定。"""
+    if isinstance(params, dict):
+        flag = params.get("force_save_ocr_context")
+        if flag in {True, 1, "1", "true", "True", "真", "是"}:
+            return True
+    try:
+        from task_workflow.workflow_context import get_workflow_context
+
+        context = get_workflow_context()
+        executor = getattr(context, "executor", None)
+        connections_map = getattr(executor, "_connections_map", None) if executor is not None else None
+        if connections_map is None:
+            return True
+        connections = connections_map.get(card_id, [])
+        for conn in connections:
+            if conn.get("type", "") in {"success", "sequential"}:
+                return True
+        return False
+    except Exception:
+        return True
+
+
 def _capture_window_for_ocr(hwnd: int, timeout: float = 4.0):
     """
     OCR截图统一走截图池入口：
@@ -792,22 +815,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                     except Exception:
                         pass
 
-                # 检查出向连线类型
-                should_save_context = False
-                try:
-                    from task_workflow.workflow_context import get_workflow_context
-                    context = get_workflow_context()
-                    if hasattr(context, 'executor') and hasattr(context.executor, '_connections_map'):
-                        connections = context.executor._connections_map.get(card_id, [])
-                        for conn in connections:
-                            conn_type = conn.get('type', '')
-                            if conn_type in ['success', 'sequential']:
-                                should_save_context = True
-                                break
-                    else:
-                        should_save_context = True
-                except Exception:
-                    should_save_context = True
+                should_save_context = _should_save_ocr_context(card_id, params)
 
                 if should_save_context:
                     try:
@@ -1240,24 +1248,7 @@ def _handle_multi_text_recognition(ocr_results, text_groups, match_mode, card_id
             if stop_checker and stop_checker():
                 return False, '停止工作流', None
 
-            # 【修复 2025-01-18】只有通过success或sequential连线连接到下一个卡片时才保存上下文
-            should_save_context = False
-            try:
-                from task_workflow.workflow_context import get_workflow_context
-                context_check = get_workflow_context()
-                # 尝试获取工作流的连接映射
-                if hasattr(context_check, 'executor') and hasattr(context_check.executor, '_connections_map'):
-                    connections = context_check.executor._connections_map.get(card_id, [])
-                    # 检查是否有success或sequential类型的出向连线
-                    for conn in connections:
-                        conn_type = conn.get('type', '')
-                        if conn_type in ['success', 'sequential']:
-                            should_save_context = True
-                            break
-                else:
-                    should_save_context = True
-            except Exception:
-                should_save_context = True
+            should_save_context = _should_save_ocr_context(card_id, params)
 
             if should_save_context:
                 set_ocr_results(card_id, filtered_results)
@@ -1790,7 +1781,7 @@ def test_ocr_output(params: Dict[str, Any], **kwargs) -> bool:
             pass
 
         try:
-            from utils.screenshot_helper import clear_screenshot_cache
+            from utils.capture.screenshot_helper import clear_screenshot_cache
             clear_screenshot_cache(target_hwnd if target_hwnd else None)
         except Exception:
             pass
