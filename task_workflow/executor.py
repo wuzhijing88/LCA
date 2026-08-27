@@ -1,4 +1,4 @@
-﻿"""
+"""
 工作流执行器模块
 """
 import logging
@@ -17,7 +17,7 @@ from task_workflow.workflow_identity import (
     normalize_workflow_id,
 )
 from task_workflow.task_result import normalize_task_result
-from utils.input_guard import (
+from utils.input.input_guard import (
     acquire_input_guard,
     get_input_lock_timeout_seconds,
     get_input_lock_wait_warn_ms,
@@ -25,8 +25,7 @@ from utils.input_guard import (
     task_requires_input_lock,
 )
 from utils.runtime_control import install_global_sleep_patch, thread_control_context
-from utils.window_finder import WindowFinder
-from utils.thread_start_utils import is_thread_start_task_type
+from task_workflow.thread_start import is_thread_start_task_type
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +65,7 @@ except ImportError:
 class WorkflowExecutor(QObject):
     """工作流执行器类"""
 
-    _OCR_TASK_TYPES = {"OCR文字识别", "字库识别"}
+    _OCR_TASK_TYPES = {"OCR文字识别"}
 
     # 信号定义 - 与 main_window.py 中期望的信号保持一致
     execution_started = Signal()
@@ -281,6 +280,18 @@ class WorkflowExecutor(QObject):
         except Exception:
             pass
         return context
+
+    def _resolve_runtime_params(self, card_id: int, card_params: Dict[str, Any]) -> Dict[str, Any]:
+        context = self._get_workflow_context()
+        store = getattr(context, "get_runtime_store", None)
+        runtime_store = store() if callable(store) else getattr(context, "runtime_store", None)
+        if runtime_store is None:
+            return dict(card_params) if isinstance(card_params, dict) else {}
+        runtime_store.bind_counters(self._persistent_counters)
+        runtime_store.set_current_card_id(card_id)
+        from task_workflow.expr import resolve_params
+
+        return resolve_params(card_params, runtime_store)
 
     def _is_allowed_card_id(self, card_id: Any) -> bool:
         if self._allowed_card_ids is None or card_id is None:
@@ -684,6 +695,9 @@ class WorkflowExecutor(QObject):
             return ""
         if cls._is_passing_match_diagnostic(text):
             return ""
+        text = re.sub(r"^\[(?:前台一|前台二|前台|后台)[^\]]*\]\s*", "", text).strip()
+        if "target window is not" in text.lower() and ("foreground" in text.lower() or "前台" in text):
+            return "要点的窗口不在最前面，已取消点击"
         if text.startswith("Target not detected"):
             return "未检测到目标"
         if (
@@ -1284,7 +1298,7 @@ class WorkflowExecutor(QObject):
 
         # 【性能优化】预加载模板图片到内存
         try:
-            from utils.template_preloader import get_global_preloader
+            from utils.match.template_preloader import get_global_preloader
             preloader = get_global_preloader()
             workflow_data = {'cards': list(self.cards_data.values())}
             loaded_count = preloader.preload_workflow_templates(workflow_data)
@@ -1494,7 +1508,7 @@ class WorkflowExecutor(QObject):
 
         # WGC完整销毁重建期间，阻塞任务执行，直到重建完成
         try:
-            from utils.wgc_hwnd_capture import (
+            from utils.capture.wgc_hwnd_capture import (
                 is_wgc_rebuilding,
                 wait_wgc_rebuild_complete,
             )
@@ -1542,7 +1556,7 @@ class WorkflowExecutor(QObject):
             # 先统一释放前台输入驱动中记录的按键/鼠标按下状态
             if not defer_global_input_release:
                 try:
-                    from utils.foreground_input_manager import get_foreground_input_manager
+                    from utils.input.foreground_input_manager import get_foreground_input_manager
 
                     fg_manager = get_foreground_input_manager()
                     if fg_manager is not None:
@@ -1777,7 +1791,7 @@ class WorkflowExecutor(QObject):
 
             # 使用增强激活器发送点击激活
             try:
-                from utils.enhanced_window_activator import get_window_activator
+                from utils.window.enhanced_window_activator import get_window_activator
                 activator = get_window_activator(enable_logging=False)
 
                 # 发送一次点击激活序列
@@ -2378,9 +2392,15 @@ class WorkflowExecutor(QObject):
                 if hasattr(task_module, 'execute_task'):
                     # 统一使用标准方法执行任务
                     logger.debug(f"执行任务 '{task_type}': 窗口='{self.target_window_title}' (HWND: {target_hwnd}), 模式={execution_mode}")
+                    try:
+                        resolved_params = self._resolve_runtime_params(card_id, card_params)
+                    except Exception as resolve_error:
+                        detail = str(resolve_error or "参数引用无法解析")
+                        logger.error("卡片 %s 参数插值失败: %s", card_id, detail)
+                        return False, '执行下一步', None, detail
                     with thread_control_context(self._task_runtime_stop_checker):
                         result = task_module.execute_task(
-                            params=card_params,
+                            params=resolved_params,
                             counters=counters,
                             execution_mode=execution_mode,
                             target_hwnd=target_hwnd,

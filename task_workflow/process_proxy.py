@@ -22,7 +22,7 @@ from services.socket_message_utils import SocketMessageError
 from services.worker_process_cleanup import register_worker_process, unregister_worker_process
 from task_workflow.process_payload import build_process_workflow_payload
 from utils.app_paths import get_app_root
-from utils.worker_entry import build_worker_launch_command, build_worker_process_env
+from app_core.runtime.worker_entry import build_worker_launch_command, build_worker_process_env
 
 logger = logging.getLogger(__name__)
 

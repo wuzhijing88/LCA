@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
 
-from utils.hwnd_utils import as_hwnd
+from utils.window.hwnd_utils import as_hwnd
 
 from task_workflow.card_display import find_card_by_id, format_step_detail
 from task_workflow.executor import WorkflowExecutor
@@ -299,7 +299,7 @@ class WorkflowMultiThreadSession(QObject):
             snapshot["context_diag_error"] = str(exc)
 
         try:
-            from utils.template_preloader import get_global_preloader
+            from utils.match.template_preloader import get_global_preloader
 
             template_stats = get_global_preloader().get_stats()
             total_bytes = int(template_stats.get("total_size_bytes", 0) or 0)
@@ -372,7 +372,7 @@ class WorkflowMultiThreadSession(QObject):
                 self._is_running = False
                 self._release_initial_start_gate_locked()
             try:
-                from utils.foreground_input_manager import get_foreground_input_manager
+                from utils.input.foreground_input_manager import get_foreground_input_manager
 
                 fg_manager = get_foreground_input_manager()
                 if fg_manager is not None:

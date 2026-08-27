@@ -8,7 +8,7 @@ import os
 import time
 from typing import Callable, Optional
 
-from utils.app_paths import get_app_root, get_images_dir
+from utils.app_paths import get_app_root, get_images_dir, get_sounds_dir
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +24,22 @@ def resolve_media_path(raw_path: str) -> Optional[str]:
     if os.path.isabs(text):
         candidates.append(text)
     else:
+        normalized = text.replace("\\", "/")
+        basename = os.path.basename(normalized)
         candidates.append(os.path.abspath(text))
         candidates.append(os.path.join(get_app_root(), text))
-        basename = os.path.basename(text.replace("\\", "/"))
+        if normalized.lower().startswith("sounds/"):
+            suffix = normalized[7:].lstrip("/")
+            if suffix:
+                candidates.append(os.path.join(get_sounds_dir(), suffix))
+                candidates.append(os.path.join(get_app_root(), "sounds", suffix))
+        if normalized.lower().startswith("images/"):
+            suffix = normalized[7:].lstrip("/")
+            if suffix:
+                candidates.append(os.path.join(get_images_dir(), suffix))
         if basename:
             candidates.append(os.path.join(get_images_dir(), basename))
+            candidates.append(os.path.join(get_sounds_dir(), basename))
             candidates.append(os.path.join(get_app_root(), "sounds", basename))
 
     seen = set()
@@ -51,20 +62,30 @@ def play_audio(
     resolved = resolve_media_path(path) or str(path or "").strip()
     if not resolved or not os.path.exists(resolved):
         raise FileNotFoundError(f"音频文件不存在: {path}")
+    stop_audio()
     ext = os.path.splitext(resolved)[1].lower()
-    if ext == ".wav":
+    if ext == ".wav" and not (wait and stop_checker):
         _play_wav(resolved, wait=wait)
         return resolved
     _play_mci(resolved, wait=wait, stop_checker=stop_checker)
     return resolved
 
 
-def open_media(path: str) -> str:
-    resolved = resolve_media_path(path) or str(path or "").strip()
-    if not resolved or not os.path.exists(resolved):
-        raise FileNotFoundError(f"文件不存在: {path}")
-    os.startfile(resolved)
-    return resolved
+def stop_audio() -> None:
+    try:
+        _mci_send(f"stop {_MCI_ALIAS}")
+    except Exception:
+        pass
+    try:
+        _mci_send(f"close {_MCI_ALIAS}")
+    except Exception:
+        pass
+    try:
+        import winsound
+
+        winsound.PlaySound(None, winsound.SND_PURGE)
+    except Exception:
+        pass
 
 
 def _play_wav(path: str, *, wait: bool) -> None:

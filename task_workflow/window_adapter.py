@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from utils.hwnd_utils import as_hwnd
-from utils.window_identity import is_window_alive, resolve_bound_window_hwnd
+from utils.window.hwnd_utils import as_hwnd
+from utils.window.window_identity import is_window_alive, resolve_bound_window_hwnd
 
 
 @dataclass(frozen=True)

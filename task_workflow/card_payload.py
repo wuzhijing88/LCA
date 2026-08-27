@@ -34,47 +34,6 @@ def publish_card_payload(context: Any, card_id: Any, **fields: Any) -> None:
             continue
 
 
-def normalize_yolo_item(item: Any) -> dict:
-    if not isinstance(item, dict):
-        return {}
-    payload = dict(item)
-    class_name = payload.get("文字")
-    if class_name is None:
-        class_name = payload.get("class_name")
-    x = payload.get("坐标X")
-    if x is None:
-        x = payload.get("x")
-    y = payload.get("坐标Y")
-    if y is None:
-        y = payload.get("y")
-    x1 = payload.get("范围X1")
-    if x1 is None:
-        x1 = payload.get("x1")
-    y1 = payload.get("范围Y1")
-    if y1 is None:
-        y1 = payload.get("y1")
-    x2 = payload.get("范围X2")
-    if x2 is None:
-        x2 = payload.get("x2")
-    y2 = payload.get("范围Y2")
-    if y2 is None:
-        y2 = payload.get("y2")
-    payload["文字"] = class_name
-    payload["坐标X"] = x
-    payload["坐标Y"] = y
-    payload["范围X1"] = x1
-    payload["范围Y1"] = y1
-    payload["范围X2"] = x2
-    payload["范围Y2"] = y2
-    if "class_name" not in payload:
-        payload["class_name"] = class_name
-    if "x" not in payload:
-        payload["x"] = x
-    if "y" not in payload:
-        payload["y"] = y
-    return payload
-
-
 def bounds_from_bbox(bbox: Any) -> Optional[Tuple[Any, Any, Any, Any]]:
     if not bbox:
         return None
@@ -91,6 +50,15 @@ def bounds_from_bbox(bbox: Any) -> Optional[Tuple[Any, Any, Any, Any]]:
         return min(xs), min(ys), max(xs), max(ys)
     except (TypeError, IndexError, ValueError):
         return None
+
+
+def publish_perception(card_id: Any, **fields: Any) -> None:
+    try:
+        from task_workflow.runtime_store import publish_perception as publish_runtime_perception
+
+        publish_runtime_perception(card_id, **fields)
+    except Exception:
+        return
 
 
 def publish_click_target(
@@ -114,14 +82,15 @@ def publish_click_target(
         "click_target_text": text,
     }
     publish_card_payload(context, card_id, **{key: value for key, value in fields.items() if value is not None})
-
-
-def first_card_data(context: Any, card_id: Any, keys: Tuple[str, ...]) -> Optional[Any]:
-    getter = getattr(context, "get_card_data", None)
-    if not callable(getter):
-        return None
-    for key in keys:
-        value = getter(card_id, key)
-        if value is not None:
-            return value
-    return None
+    publish_perception(
+        card_id,
+        kind="click",
+        ok=x is not None and y is not None,
+        x=x,
+        y=y,
+        x1=x1,
+        y1=y1,
+        x2=x2,
+        y2=y2,
+        text=text,
+    )

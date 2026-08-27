@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from utils.hwnd_utils import as_hwnd
-from utils.thread_start_utils import is_thread_start_task_type
+from utils.window.hwnd_utils import as_hwnd
+from task_workflow.thread_start import is_thread_start_task_type
 
 
 THREAD_WINDOW_LIMIT_TASK_TYPE = "线程窗口限制"

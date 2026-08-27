@@ -21,7 +21,7 @@ from app_core.diagnostics.context import bind_diagnostic_context
 from services.ocr_socket_message_utils import recv_message, send_message
 from utils.app_paths import get_app_root, get_logs_dir
 from utils.log_runtime_control import configure_noisy_logger_levels, install_runtime_log_filters
-from utils.worker_entry import bootstrap_current_process_virtual_environment
+from app_core.runtime.worker_entry import bootstrap_current_process_virtual_environment
 
 logger = logging.getLogger(__name__)
 _FAULT_HANDLER_STREAM = None
@@ -42,7 +42,7 @@ def _resolve_worker_screenshot_engine(payload: Dict[str, Any]) -> str:
 
 def _apply_worker_runtime_preferences(payload: Dict[str, Any]) -> None:
     requested_engine = _resolve_worker_screenshot_engine(payload)
-    from utils.screenshot_helper import get_screenshot_engine, set_screenshot_engine
+    from utils.capture.screenshot_helper import get_screenshot_engine, set_screenshot_engine
 
     set_screenshot_engine(requested_engine)
     actual_engine = str(get_screenshot_engine() or "").strip().lower()

@@ -5,7 +5,6 @@ from typing import Any, Optional, Union
 
 from task_workflow.workflow_context import (
     clear_workflow_context,
-    get_workflow_context,
 )
 
 
@@ -29,13 +28,6 @@ def workflow_context_key(task_id: Any) -> Optional[str]:
     if task_id is None:
         return None
     return f"workflow_{task_id}"
-
-
-def get_context_for_task(task_id: Any):
-    key = workflow_context_key(task_id)
-    if key is None:
-        return None
-    return get_workflow_context(key)
 
 
 def clear_context_for_task(task_id: Any) -> None:

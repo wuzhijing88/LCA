@@ -11,6 +11,7 @@ import time
 from typing import TYPE_CHECKING, Dict, List, Any, Optional, Set
 from dataclasses import dataclass, field
 
+from task_workflow.runtime_store import RuntimeStore
 from task_workflow.workflow_identity import normalize_workflow_id
 
 if TYPE_CHECKING:
@@ -49,6 +50,8 @@ class WorkflowContext:
     # Shared capture frames for parallel tasks
     shared_captures: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     shared_capture_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    runtime_store: RuntimeStore = field(default_factory=RuntimeStore, repr=False)
+    latest_ocr_card_id: Optional[int] = None
 
     @property
     def _monitor_configs(self) -> Dict[int, Dict[str, Any]]:
@@ -80,11 +83,13 @@ class WorkflowContext:
         """清空所有上下文数据"""
         self.ocr_results.clear()
         self.ocr_result_snapshots.clear()
+        self.latest_ocr_card_id = None
         self.image_results.clear()
         self.yolo_results.clear()
         self.card_data.clear()
         self.ai_conversations.clear()
         self.shared_captures.clear()
+        self.runtime_store.reset()
         if self.run_state is not None:
             self.run_state.monitor_configs.clear()
             self.run_state.should_stop_workflow = False
@@ -172,10 +177,18 @@ class WorkflowContext:
             # 删除最旧的一半
             for old_card_id in old_cards[:len(old_cards)//2]:
                 del self.ocr_results[old_card_id]
+                self._forget_ocr_card(old_card_id)
                 logger.debug(f"自动清理旧OCR结果: 卡片 {old_card_id}")
 
         self.ocr_results[card_id] = results
+        self.latest_ocr_card_id = card_id
         logger.debug(f"设置卡片 {card_id} 的OCR结果: {len(results)} 个文字 (最新)")
+        try:
+            from task_workflow.runtime_store import perception_from_ocr_results
+
+            self.runtime_store.publish(card_id, perception_from_ocr_results(results, ok=True))
+        except Exception:
+            pass
 
     def set_ocr_result_snapshot(
         self,
@@ -202,6 +215,29 @@ class WorkflowContext:
             "window_hwnd": window_hwnd,
             "updated_at": float(time.time()),
         }
+        self.latest_ocr_card_id = card_id
+        try:
+            from task_workflow.runtime_store import perception_from_ocr_results
+
+            target = str(target_text or "").strip()
+            matched = bool(normalized_results)
+            if target:
+                mode = str(match_mode or "包含").strip() or "包含"
+                matched = False
+                for item in normalized_results:
+                    text = str(item.get("text") or "")
+                    if mode == "等于" and text == target:
+                        matched = True
+                        break
+                    if mode != "等于" and target in text:
+                        matched = True
+                        break
+            self.runtime_store.publish(
+                card_id,
+                perception_from_ocr_results(normalized_results, ok=matched),
+            )
+        except Exception:
+            pass
 
     def get_ocr_result_snapshot(self, card_id: int) -> Optional[Dict[str, Any]]:
         snapshot = self.ocr_result_snapshots.get(card_id)
@@ -218,12 +254,10 @@ class WorkflowContext:
         """获取OCR识别结果"""
         if card_id is not None:
             return self.ocr_results.get(card_id, [])
-        
-        # 如果没有指定卡片ID，返回最近的OCR结果
-        if self.ocr_results:
-            latest_card_id = max(self.ocr_results.keys())
-            return self.ocr_results[latest_card_id]
-        
+
+        latest_card_id = self.get_latest_ocr_card_id()
+        if latest_card_id is not None:
+            return self.ocr_results.get(latest_card_id, [])
         return []
     
     def get_latest_ocr_results(self) -> List[Dict[str, Any]]:
@@ -236,10 +270,16 @@ class WorkflowContext:
         return []
 
     def get_latest_ocr_card_id(self) -> Optional[int]:
-        """获取最新OCR结果的卡片ID"""
-        if not self.ocr_results:
-            return None
-        return max(self.ocr_results.keys())
+        """获取最近写入的OCR结果卡片ID。"""
+        if self.latest_ocr_card_id is not None and self.latest_ocr_card_id in self.ocr_results:
+            return self.latest_ocr_card_id
+        if self.ocr_results:
+            return max(self.ocr_results.keys())
+        return None
+
+    def _forget_ocr_card(self, card_id: int) -> None:
+        if self.latest_ocr_card_id == card_id:
+            self.latest_ocr_card_id = None
 
     def set_yolo_result(self, card_id: int, result: Dict[str, Any]):
         """设置YOLO检测结果
@@ -264,6 +304,12 @@ class WorkflowContext:
         self.yolo_results.pop(card_id, None)
         self.yolo_results[card_id] = result
         logger.debug(f"设置卡片 {card_id} 的YOLO结果: 目标=({result.get('target_x')}, {result.get('target_y')})")
+        try:
+            from task_workflow.runtime_store import perception_from_yolo_result
+
+            self.runtime_store.publish(card_id, perception_from_yolo_result(result, ok=True))
+        except Exception:
+            pass
 
     def get_yolo_result(self, card_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """获取YOLO检测结果"""
@@ -434,6 +480,7 @@ class WorkflowContext:
         # 清除OCR识别结果（上下文）
         if card_id in self.ocr_results:
             del self.ocr_results[card_id]
+            self._forget_ocr_card(card_id)
             logger.debug(f"清除卡片 {card_id} 的OCR上下文结果")
 
         # 清除OCR上下文相关的卡片数据（不包括记忆数据）
@@ -450,6 +497,7 @@ class WorkflowContext:
         # 清除OCR识别结果
         if card_id in self.ocr_results:
             del self.ocr_results[card_id]
+            self._forget_ocr_card(card_id)
             logger.debug(f"清除卡片 {card_id} 的OCR识别结果")
         self.clear_ocr_result_snapshot(card_id)
 
@@ -481,6 +529,7 @@ class WorkflowContext:
         """清除所有OCR相关数据"""
         self.ocr_results.clear()
         self.ocr_result_snapshots.clear()
+        self.latest_ocr_card_id = None
 
         # 清除所有卡片的OCR相关数据
         for card_id in list(self.card_data.keys()):
@@ -489,13 +538,20 @@ class WorkflowContext:
         self._run_gc_collect()
         logger.debug("清除所有OCR相关数据")
 
+    def get_runtime_store(self) -> RuntimeStore:
+        if self.runtime_store is None:
+            self.runtime_store = RuntimeStore()
+        return self.runtime_store
+
     def clear_runtime_state_for_new_run(self):
         """清理上次执行遗留的 OCR/YOLO/卡片缓存。"""
         card_cache_count = len(self.card_data)
         self.ocr_results.clear()
         self.ocr_result_snapshots.clear()
+        self.latest_ocr_card_id = None
         self.yolo_results.clear()
         self.card_data.clear()
+        self.runtime_store.reset()
         self._run_gc_collect()
         logger.info(
             "执行前运行态清理完成: 清理卡片缓存 %d 个",
@@ -919,6 +975,11 @@ def get_workflow_context(workflow_id: str = "default") -> WorkflowContext:
 def get_current_workflow_context() -> WorkflowContext:
     """获取当前工作流上下文的便捷函数"""
     return _context_manager.get_current_context()
+
+
+def get_runtime_store(workflow_id: str = "default") -> RuntimeStore:
+    """获取当前或指定工作流的运行时数据。"""
+    return get_workflow_context(workflow_id).get_runtime_store()
 
 def set_current_workflow_context(context: WorkflowContext) -> None:
     """设置当前线程的工作流上下文。"""
