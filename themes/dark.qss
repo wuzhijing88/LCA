@@ -419,6 +419,30 @@ QComboBox QAbstractItemView::item:selected {
     color: #ffffff;
 }
 
+QComboBoxPrivateContainer {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    border: 1px solid #707070;
+    border-radius: 6px;
+    padding: 0px;
+}
+
+QComboBoxPrivateContainer QAbstractItemView,
+QComboBoxPrivateContainer QAbstractItemView::viewport {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    border: none;
+    outline: none;
+}
+
+QComboBoxPrivateContainer[roundedPopup="true"],
+QComboBoxPrivateContainer[roundedPopup="true"] QFrame,
+QComboBoxPrivateContainer[roundedPopup="true"] QAbstractItemView,
+QComboBoxPrivateContainer[roundedPopup="true"] QAbstractItemView::viewport {
+    background-color: transparent;
+    border: none;
+}
+
 /* Hide combo popup scroll buttons (up/down triangles) */
 QComboBox QAbstractItemView QToolButton#qt_scrollarea_up_button,
 QComboBox QAbstractItemView QToolButton#qt_scrollarea_down_button {
@@ -913,6 +937,11 @@ QMenu[unifiedMenu="true"] {
     border: 1px solid #3e3e3e;
     border-radius: 8px;
     padding: 6px;
+}
+
+QMenu[unifiedMenu="true"][roundedPopup="true"] {
+    background-color: transparent;
+    border: none;
 }
 
 QMenu::item,
@@ -1976,6 +2005,340 @@ QFrame#randomTargetCard:hover {
     font-size: 11px;
     padding: 4px;
     selection-background-color: #0078d4;
+}
+
+#scriptEditorDialog {
+    background-color: #1e1e1e;
+    color: #e0e0e0;
+}
+
+#scriptEditorDialog QPlainTextEdit#scriptEditor {
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+    font-size: 13px;
+    padding: 8px 8px 8px 4px;
+    selection-background-color: #264f78;
+    selection-color: #ffffff;
+}
+
+#scriptEditorDialog QLabel#scriptHelpTitle {
+    background: transparent;
+    color: #e0e0e0;
+    font-weight: bold;
+}
+
+#scriptEditorDialog QPushButton {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    padding: 6px 16px;
+    min-height: 24px;
+}
+
+#scriptEditorDialog QPushButton:hover {
+    background-color: #3a3a3a;
+    border-color: #4e4e4e;
+}
+
+#scriptEditorDialog QPushButton:pressed {
+    background-color: #252525;
+    border-color: #3e3e3e;
+}
+
+#scriptEditorDialog QPushButton:disabled {
+    background-color: #252525;
+    color: #666666;
+    border-color: #2e2e2e;
+}
+
+#scriptEditorDialog QPushButton[primary="true"] {
+    background-color: #0078d4;
+    color: #ffffff;
+    border-color: #0078d4;
+}
+
+#scriptEditorDialog QPushButton[primary="true"]:hover {
+    background-color: #1084d8;
+}
+
+#scriptEditorDialog QPushButton[primary="true"]:pressed {
+    background-color: #006cbe;
+}
+
+#scriptEditorDialog QPushButton#scriptActionButton {
+    min-width: 88px;
+    min-height: 32px;
+    max-height: 32px;
+    padding: 0 10px;
+}
+
+#scriptEditorDialog QPushButton#scriptCaptureButton {
+    min-width: 56px;
+    padding: 6px 10px;
+}
+
+#scriptEditorDialog QLineEdit,
+#scriptEditorDialog QComboBox {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    padding: 5px 8px;
+    min-height: 24px;
+}
+
+#scriptEditorDialog QLineEdit:focus,
+#scriptEditorDialog QComboBox:focus {
+    border-color: #0078d4;
+}
+
+#scriptEditorDialog QComboBox QLineEdit {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: none;
+    padding: 0;
+    min-height: 0;
+}
+
+#scriptEditorDialog QComboBox QAbstractItemView,
+#scriptEditorDialog QComboBox QAbstractItemView::viewport {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    border: 1px solid #707070;
+    outline: none;
+}
+
+#scriptEditorDialog QComboBox QAbstractItemView::item {
+    padding: 6px 12px;
+    color: #e0e0e0;
+}
+
+#scriptEditorDialog QComboBox QAbstractItemView::item:hover {
+    background-color: #3a3a3a;
+}
+
+#scriptEditorDialog QComboBox QAbstractItemView::item:selected {
+    background-color: #0078d4;
+    color: #ffffff;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree,
+#scriptEditorDialog QTreeWidget#scriptCommandTree::viewport {
+    background-color: #1e1e1e;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    color: #d4d4d4;
+    padding: 4px;
+    outline: none;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree::item {
+    color: #d4d4d4;
+    padding: 3px 4px;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree::item:hover {
+    background-color: #2d2d2d;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree::item:selected {
+    background-color: #0078d4;
+    color: #ffffff;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree::branch {
+    background-color: #1e1e1e;
+}
+
+#scriptEditorDialog QLabel#scriptCommandHint,
+#scriptEditorDialog QLabel#scriptCommandDetail,
+#scriptEditorDialog QLabel#scriptCaptureHint,
+#scriptEditorDialog QLabel#scriptResourceHint,
+#scriptEditorDialog QLabel#scriptResourceEmpty,
+#scriptEditorDialog QLabel#scriptResourceTitle,
+#scriptEditorDialog QWidget#scriptFindBar QLabel,
+#scriptEditorDialog QCheckBox#scriptFindCase {
+    background: transparent;
+    color: #b0b0b0;
+}
+
+#scriptEditorDialog QLabel#scriptCaptureHint {
+    padding-top: 1px;
+}
+
+#scriptEditorDialog QLabel#scriptResourceTitle {
+    font-weight: bold;
+}
+
+#scriptEditorDialog QListWidget#scriptResourceList,
+#scriptEditorDialog QListWidget#scriptResourceList::viewport {
+    background-color: #252525;
+    border: 1px solid #3c3c3c;
+    border-radius: 4px;
+}
+
+#scriptEditorDialog QListWidget#scriptResourceList::item {
+    padding: 4px 6px;
+}
+
+#scriptEditorDialog QListWidget#scriptResourceList::item:selected {
+    background-color: #264f78;
+    color: #e6e6e6;
+}
+
+#scriptEditorDialog QTextEdit#scriptHelpNotes,
+#scriptEditorDialog QTextEdit#scriptHelpNotes::viewport {
+    background-color: #252525;
+    color: #c8c8c8;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+}
+
+#scriptEditorDialog QTextEdit#scriptHelpNotes {
+    padding: 8px;
+    min-height: 160px;
+}
+
+#scriptEditorDialog QWidget#scriptCaptureBar,
+#scriptEditorDialog QWidget#scriptFindBar,
+#scriptEditorDialog QWidget#scriptHelpPanel,
+#scriptEditorDialog QWidget#scriptEditorColumn,
+#scriptEditorDialog QWidget#scriptResourcePanel {
+    background-color: #1e1e1e;
+}
+
+#scriptEditorDialog QWidget#scriptParamBar,
+#scriptEditorDialog QWidget#scriptParamInner,
+#scriptEditorDialog QScrollArea#scriptParamScroll,
+#scriptEditorDialog QScrollArea#scriptParamScroll::viewport {
+    background-color: #252525;
+}
+
+#scriptEditorDialog QWidget#scriptParamBar {
+    max-height: 42px;
+}
+
+#scriptEditorDialog QScrollArea#scriptParamScroll {
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    min-height: 36px;
+    max-height: 42px;
+}
+
+#scriptEditorDialog QLabel#scriptParamName {
+    background: transparent;
+    color: #0078d4;
+    font-weight: bold;
+    min-width: 48px;
+}
+
+#scriptEditorDialog QLabel#scriptParamLabel {
+    background: transparent;
+    color: #b0b0b0;
+}
+
+#scriptEditorDialog QLabel#scriptParamEmpty {
+    background: transparent;
+    color: #666666;
+}
+
+#scriptEditorDialog QLineEdit#scriptParamField,
+#scriptEditorDialog QWidget#scriptParamField {
+    min-height: 22px;
+    max-height: 26px;
+    min-width: 88px;
+    padding: 2px 6px;
+    border: 1px solid #3e3e3e;
+    border-radius: 3px;
+    background-color: #1e1e1e;
+    color: #e0e0e0;
+}
+
+#scriptEditorDialog QWidget#scriptParamField {
+    padding: 0;
+}
+
+#scriptEditorDialog #scriptParamBar QLineEdit#customDropdownEdit,
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow {
+    min-height: 22px;
+    max-height: 26px;
+    padding: 2px 6px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: #e0e0e0;
+}
+
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow,
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow:hover,
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow:pressed,
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow:focus {
+    min-width: 22px;
+    max-width: 22px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: #b0b0b0;
+}
+
+#scriptEditorDialog QLineEdit#scriptParamField[activeParam="true"],
+#scriptEditorDialog QWidget#scriptParamField[activeParam="true"] {
+    border-color: #0078d4;
+}
+
+#scriptEditorDialog QLabel#scriptEditorStatus {
+    background: transparent;
+    color: #b0b0b0;
+    padding: 2px 4px 2px 0;
+}
+
+#scriptEditorDialog QLabel#scriptEditorStatus[state="ok"] {
+    color: #3fb950;
+}
+
+#scriptEditorDialog QLabel#scriptEditorStatus[state="error"] {
+    color: #f1707b;
+}
+
+QLabel#scriptSignatureHint {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-family: Consolas, "Microsoft YaHei UI", monospace;
+    font-size: 12px;
+}
+
+QListView#scriptCompleterPopup {
+    background: transparent;
+    color: #e0e0e0;
+    border: none;
+    outline: none;
+    padding: 4px 2px;
+    font-family: Consolas, "Microsoft YaHei UI", monospace;
+    font-size: 12px;
+}
+
+QListView#scriptCompleterPopup::item {
+    padding: 6px 12px;
+    min-height: 20px;
+    border: none;
+    border-radius: 3px;
+    margin: 1px 2px;
+}
+
+QListView#scriptCompleterPopup::item:hover {
+    background-color: #3a3a3a;
+}
+
+QListView#scriptCompleterPopup::item:selected {
+    background-color: #0078d4;
+    color: #ffffff;
 }
 
 

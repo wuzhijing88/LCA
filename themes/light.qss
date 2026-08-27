@@ -366,6 +366,30 @@ QComboBox QAbstractItemView::item:selected {
     color: #ffffff;
 }
 
+QComboBoxPrivateContainer {
+    background-color: #ffffff;
+    color: #333333;
+    border: 1px solid #707070;
+    border-radius: 6px;
+    padding: 0px;
+}
+
+QComboBoxPrivateContainer QAbstractItemView,
+QComboBoxPrivateContainer QAbstractItemView::viewport {
+    background-color: #ffffff;
+    color: #333333;
+    border: none;
+    outline: none;
+}
+
+QComboBoxPrivateContainer[roundedPopup="true"],
+QComboBoxPrivateContainer[roundedPopup="true"] QFrame,
+QComboBoxPrivateContainer[roundedPopup="true"] QAbstractItemView,
+QComboBoxPrivateContainer[roundedPopup="true"] QAbstractItemView::viewport {
+    background-color: transparent;
+    border: none;
+}
+
 /* Hide combo popup scroll buttons (up/down triangles) */
 QComboBox QAbstractItemView QToolButton#qt_scrollarea_up_button,
 QComboBox QAbstractItemView QToolButton#qt_scrollarea_down_button {
@@ -555,7 +579,7 @@ QTreeView::branch:open:has-children:has-siblings {
 QTableView, QTableWidget {
     background-color: #ffffff;
     alternate-background-color: #ffffff;
-    color: #1f2328;
+    color: #333333;
     border: 1px solid #e0e0e0;
     border-radius: 8px;
     padding: 0;
@@ -569,12 +593,12 @@ QTableView::item, QTableWidget::item {
     padding: 0 8px;
     border: none;
     background-color: transparent;
-    color: #1f2328;
+    color: #333333;
 }
 
 QTableView::item:hover, QTableWidget::item:hover {
     background-color: transparent;
-    color: #1f2328;
+    color: #333333;
 }
 
 QTableView::item:selected, QTableWidget::item:selected {
@@ -861,6 +885,11 @@ QMenu[unifiedMenu="true"] {
     border: 1px solid #d0d0d0;
     border-radius: 8px;
     padding: 6px;
+}
+
+QMenu[unifiedMenu="true"][roundedPopup="true"] {
+    background-color: transparent;
+    border: none;
 }
 
 QMenu::item,
@@ -1878,6 +1907,340 @@ QGraphicsView#workflowView::corner {
 
 QTabWidget#workflowTabs::pane {
     border: none;
+}
+
+#scriptEditorDialog {
+    background-color: #ffffff;
+    color: #333333;
+}
+
+#scriptEditorDialog QPlainTextEdit#scriptEditor {
+    background-color: #ffffff;
+    color: #333333;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+    font-size: 13px;
+    padding: 8px 8px 8px 4px;
+    selection-background-color: #add6ff;
+    selection-color: #333333;
+}
+
+#scriptEditorDialog QLabel#scriptHelpTitle {
+    background: transparent;
+    color: #333333;
+    font-weight: bold;
+}
+
+#scriptEditorDialog QPushButton {
+    background-color: #f5f5f5;
+    color: #333333;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    padding: 6px 16px;
+    min-height: 22px;
+}
+
+#scriptEditorDialog QPushButton:hover {
+    background-color: #e8e8e8;
+    border-color: #d0d0d0;
+}
+
+#scriptEditorDialog QPushButton:pressed {
+    background-color: #d8d8d8;
+    border-color: #c0c0c0;
+}
+
+#scriptEditorDialog QPushButton:disabled {
+    background-color: #fafafa;
+    color: #999999;
+    border-color: #e8e8e8;
+}
+
+#scriptEditorDialog QPushButton[primary="true"] {
+    background-color: #0078d4;
+    color: #ffffff;
+    border-color: #0078d4;
+}
+
+#scriptEditorDialog QPushButton[primary="true"]:hover {
+    background-color: #1084d8;
+}
+
+#scriptEditorDialog QPushButton[primary="true"]:pressed {
+    background-color: #006cbe;
+}
+
+#scriptEditorDialog QPushButton#scriptActionButton {
+    min-width: 88px;
+    min-height: 32px;
+    max-height: 32px;
+    padding: 0 10px;
+}
+
+#scriptEditorDialog QPushButton#scriptCaptureButton {
+    min-width: 56px;
+    padding: 6px 10px;
+}
+
+#scriptEditorDialog QLineEdit,
+#scriptEditorDialog QComboBox {
+    background-color: #ffffff;
+    color: #333333;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    padding: 5px 8px;
+    min-height: 22px;
+}
+
+#scriptEditorDialog QLineEdit:focus,
+#scriptEditorDialog QComboBox:focus {
+    border-color: #0078d4;
+}
+
+#scriptEditorDialog QComboBox QLineEdit {
+    background-color: #ffffff;
+    color: #333333;
+    border: none;
+    padding: 0;
+    min-height: 0;
+}
+
+#scriptEditorDialog QComboBox QAbstractItemView,
+#scriptEditorDialog QComboBox QAbstractItemView::viewport {
+    background-color: #ffffff;
+    color: #333333;
+    border: 1px solid #707070;
+    outline: none;
+}
+
+#scriptEditorDialog QComboBox QAbstractItemView::item {
+    padding: 6px 12px;
+    color: #333333;
+}
+
+#scriptEditorDialog QComboBox QAbstractItemView::item:hover {
+    background-color: #e8e8e8;
+}
+
+#scriptEditorDialog QComboBox QAbstractItemView::item:selected {
+    background-color: #0078d4;
+    color: #ffffff;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree,
+#scriptEditorDialog QTreeWidget#scriptCommandTree::viewport {
+    background-color: #ffffff;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    color: #333333;
+    padding: 4px;
+    outline: none;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree::item {
+    color: #333333;
+    padding: 3px 4px;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree::item:hover {
+    background-color: #f5f5f5;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree::item:selected {
+    background-color: #0078d4;
+    color: #ffffff;
+}
+
+#scriptEditorDialog QTreeWidget#scriptCommandTree::branch {
+    background-color: #ffffff;
+}
+
+#scriptEditorDialog QLabel#scriptCommandHint,
+#scriptEditorDialog QLabel#scriptCommandDetail,
+#scriptEditorDialog QLabel#scriptCaptureHint,
+#scriptEditorDialog QLabel#scriptResourceHint,
+#scriptEditorDialog QLabel#scriptResourceEmpty,
+#scriptEditorDialog QLabel#scriptResourceTitle,
+#scriptEditorDialog QWidget#scriptFindBar QLabel,
+#scriptEditorDialog QCheckBox#scriptFindCase {
+    background: transparent;
+    color: #666666;
+}
+
+#scriptEditorDialog QLabel#scriptCaptureHint {
+    padding-top: 1px;
+}
+
+#scriptEditorDialog QLabel#scriptResourceTitle {
+    font-weight: bold;
+}
+
+#scriptEditorDialog QListWidget#scriptResourceList,
+#scriptEditorDialog QListWidget#scriptResourceList::viewport {
+    background-color: #f5f5f5;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+}
+
+#scriptEditorDialog QListWidget#scriptResourceList::item {
+    padding: 4px 6px;
+}
+
+#scriptEditorDialog QListWidget#scriptResourceList::item:selected {
+    background-color: #e8e8e8;
+    color: #333333;
+}
+
+#scriptEditorDialog QTextEdit#scriptHelpNotes,
+#scriptEditorDialog QTextEdit#scriptHelpNotes::viewport {
+    background-color: #f5f5f5;
+    color: #666666;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+}
+
+#scriptEditorDialog QTextEdit#scriptHelpNotes {
+    padding: 8px;
+    min-height: 160px;
+}
+
+#scriptEditorDialog QWidget#scriptCaptureBar,
+#scriptEditorDialog QWidget#scriptFindBar,
+#scriptEditorDialog QWidget#scriptHelpPanel,
+#scriptEditorDialog QWidget#scriptEditorColumn,
+#scriptEditorDialog QWidget#scriptResourcePanel {
+    background-color: #ffffff;
+}
+
+#scriptEditorDialog QWidget#scriptParamBar,
+#scriptEditorDialog QWidget#scriptParamInner,
+#scriptEditorDialog QScrollArea#scriptParamScroll,
+#scriptEditorDialog QScrollArea#scriptParamScroll::viewport {
+    background-color: #f5f5f5;
+}
+
+#scriptEditorDialog QWidget#scriptParamBar {
+    max-height: 42px;
+}
+
+#scriptEditorDialog QScrollArea#scriptParamScroll {
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    min-height: 36px;
+    max-height: 42px;
+}
+
+#scriptEditorDialog QLabel#scriptParamName {
+    background: transparent;
+    color: #0078d4;
+    font-weight: bold;
+    min-width: 48px;
+}
+
+#scriptEditorDialog QLabel#scriptParamLabel {
+    background: transparent;
+    color: #666666;
+}
+
+#scriptEditorDialog QLabel#scriptParamEmpty {
+    background: transparent;
+    color: #999999;
+}
+
+#scriptEditorDialog QLineEdit#scriptParamField,
+#scriptEditorDialog QWidget#scriptParamField {
+    min-height: 22px;
+    max-height: 26px;
+    min-width: 88px;
+    padding: 2px 6px;
+    border: 1px solid #e0e0e0;
+    border-radius: 3px;
+    background-color: #ffffff;
+    color: #333333;
+}
+
+#scriptEditorDialog QWidget#scriptParamField {
+    padding: 0;
+}
+
+#scriptEditorDialog #scriptParamBar QLineEdit#customDropdownEdit,
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow {
+    min-height: 22px;
+    max-height: 26px;
+    padding: 2px 6px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: #333333;
+}
+
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow,
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow:hover,
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow:pressed,
+#scriptEditorDialog #scriptParamBar QPushButton#customDropdownArrow:focus {
+    min-width: 22px;
+    max-width: 22px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: #666666;
+}
+
+#scriptEditorDialog QLineEdit#scriptParamField[activeParam="true"],
+#scriptEditorDialog QWidget#scriptParamField[activeParam="true"] {
+    border-color: #0078d4;
+}
+
+#scriptEditorDialog QLabel#scriptEditorStatus {
+    background: transparent;
+    color: #666666;
+    padding: 2px 4px 2px 0;
+}
+
+#scriptEditorDialog QLabel#scriptEditorStatus[state="ok"] {
+    color: #107c10;
+}
+
+#scriptEditorDialog QLabel#scriptEditorStatus[state="error"] {
+    color: #e81123;
+}
+
+QLabel#scriptSignatureHint {
+    background-color: #ffffff;
+    color: #333333;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-family: Consolas, "Microsoft YaHei UI", monospace;
+    font-size: 12px;
+}
+
+QListView#scriptCompleterPopup {
+    background: transparent;
+    color: #333333;
+    border: none;
+    outline: none;
+    padding: 4px 2px;
+    font-family: Consolas, "Microsoft YaHei UI", monospace;
+    font-size: 12px;
+}
+
+QListView#scriptCompleterPopup::item {
+    padding: 6px 12px;
+    min-height: 20px;
+    border: none;
+    border-radius: 3px;
+    margin: 1px 2px;
+}
+
+QListView#scriptCompleterPopup::item:hover {
+    background-color: #e8e8e8;
+}
+
+QListView#scriptCompleterPopup::item:selected {
+    background-color: #0078d4;
+    color: #ffffff;
 }
 
 

@@ -6,9 +6,9 @@
 
 from pathlib import Path
 from utils.app_paths import get_app_root
-from typing import Optional, Dict, Callable
-from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QColor
+from typing import Optional, Callable
+from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtCore import QObject, Signal, QTimer, Qt
 import json
 import logging
@@ -188,7 +188,7 @@ class ThemeManager:
             'picker_search_bg': '#ffff00',      # 搜索区域背景：黄色
             'picker_crosshair_outer': '#ffffff',  # 十字光标外边框：白色
             'picker_crosshair_inner': '#ff0000',  # 十字光标内部：红色
-            'picker_text': '#ffffff',           # UI文本：白色
+            'picker_text': '#00ff00',           # UI文本：绿色
             'picker_text_bg': '#000000',        # 文本背景：黑色
         },
         'dark': {
@@ -220,7 +220,7 @@ class ThemeManager:
             'picker_search_bg': '#ffff00',      # 搜索区域背景：黄色
             'picker_crosshair_outer': '#ffffff',  # 十字光标外边框：白色
             'picker_crosshair_inner': '#ff0000',  # 十字光标内部：红色
-            'picker_text': '#ffffff',           # UI文本：白色
+            'picker_text': '#00ff00',           # UI文本：绿色
             'picker_text_bg': '#000000',        # 文本背景：黑色
         }
     }
@@ -320,18 +320,9 @@ class ThemeManager:
         # 解析实际主题
         actual_theme = self._resolve_theme()
 
-        # 先强制使用 Fusion，避免原生样式导致QSS显示异常
-        try:
-            app.setStyle('Fusion')
-        except Exception:
-            pass
-
-        # 加载QSS样式表
         stylesheet = self.load_stylesheet(actual_theme)
-        if stylesheet:
-            app.setStyleSheet(stylesheet)
-
         self.current_theme = actual_theme
+        self._apply_to_app(app, stylesheet)
 
         # 保存偏好
         self._save_preference(theme_mode)
@@ -368,12 +359,7 @@ class ThemeManager:
             logger.info(f"系统主题已变化，自动切换到: {new_theme}")
             self.current_theme = new_theme
             stylesheet = self.load_stylesheet(new_theme)
-            if stylesheet:
-                try:
-                    self.app.setStyle('Fusion')
-                except Exception:
-                    pass
-                self.app.setStyleSheet(stylesheet)
+            self._apply_to_app(self.app, stylesheet)
 
             # 通知所有回调函数
             self._notify_theme_change_callbacks()
@@ -412,6 +398,129 @@ class ThemeManager:
     def is_dark_mode(self) -> bool:
         """判断当前是否为深色模式"""
         return self.current_theme == 'dark'
+
+    def _apply_to_app(self, app: QApplication, stylesheet: str) -> None:
+        """Fusion + 主题调色板 + QSS，让原生弹出层也跟主题走。"""
+        try:
+            app.setStyle('Fusion')
+        except Exception:
+            pass
+        app.setPalette(self.build_palette())
+        if stylesheet:
+            app.setStyleSheet(stylesheet)
+
+    def build_palette(self) -> QPalette:
+        """给原生下拉、菜单、提示框用的主题调色板。"""
+        palette = QPalette()
+        background = QColor(self.get_color('background'))
+        surface = QColor(self.get_color('surface'))
+        card = QColor(self.get_color('card'))
+        text = QColor(self.get_color('text'))
+        secondary = QColor(self.get_color('text_secondary'))
+        disabled = QColor(self.get_color('text_disabled'))
+        accent = QColor(self.get_color('accent'))
+        hover = QColor(self.get_color('hover'))
+        border = QColor(self.get_color('border'))
+        highlight_text = QColor('#ffffff')
+
+        palette.setColor(QPalette.ColorRole.Window, background)
+        palette.setColor(QPalette.ColorRole.WindowText, text)
+        palette.setColor(QPalette.ColorRole.Base, card)
+        palette.setColor(QPalette.ColorRole.AlternateBase, surface)
+        palette.setColor(QPalette.ColorRole.Text, text)
+        palette.setColor(QPalette.ColorRole.Button, surface)
+        palette.setColor(QPalette.ColorRole.ButtonText, text)
+        palette.setColor(QPalette.ColorRole.BrightText, highlight_text)
+        palette.setColor(QPalette.ColorRole.ToolTipBase, card)
+        palette.setColor(QPalette.ColorRole.ToolTipText, text)
+        palette.setColor(QPalette.ColorRole.PlaceholderText, secondary)
+        palette.setColor(QPalette.ColorRole.Highlight, accent)
+        palette.setColor(QPalette.ColorRole.HighlightedText, highlight_text)
+        palette.setColor(QPalette.ColorRole.Link, accent)
+        palette.setColor(QPalette.ColorRole.Light, hover)
+        palette.setColor(QPalette.ColorRole.Midlight, hover)
+        palette.setColor(QPalette.ColorRole.Mid, border)
+        palette.setColor(QPalette.ColorRole.Dark, border)
+        palette.setColor(QPalette.ColorRole.Shadow, border)
+
+        for group in (QPalette.ColorGroup.Disabled, QPalette.ColorGroup.Inactive):
+            palette.setColor(group, QPalette.ColorRole.WindowText, disabled)
+            palette.setColor(group, QPalette.ColorRole.Text, disabled)
+            palette.setColor(group, QPalette.ColorRole.ButtonText, disabled)
+        palette.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.WindowText, text)
+        palette.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.Text, text)
+        palette.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.ButtonText, text)
+        return palette
+
+    def combo_popup_stylesheet(self) -> str:
+        text = self.get_color('text')
+        hover = self.get_color('hover')
+        selected = self.get_color('selected')
+        return f"""
+            QComboBoxPrivateContainer, QFrame {{
+                background-color: transparent;
+                color: {text};
+                border: none;
+                border-radius: 6px;
+                padding: 0px;
+            }}
+            QAbstractItemView, QAbstractItemView::viewport, QListView, QListView::viewport {{
+                background-color: transparent;
+                color: {text};
+                border: none;
+                outline: none;
+            }}
+            QAbstractItemView::item, QListView::item {{
+                color: {text};
+                padding: 6px 12px;
+                min-height: 20px;
+                border: none;
+            }}
+            QAbstractItemView::item:hover, QListView::item:hover {{
+                background-color: {hover};
+                color: {text};
+            }}
+            QAbstractItemView::item:selected, QListView::item:selected {{
+                background-color: {selected};
+                color: #ffffff;
+            }}
+        """
+
+    def apply_combo_popup_theme(self, popup: Optional[QWidget], view: Optional[QWidget] = None) -> None:
+        if popup is None:
+            return
+        try:
+            from PySide6.QtWidgets import QComboBox
+
+            name = str(popup.objectName() or "")
+            if name in {"scriptCompleterPopup", "customDropdownPopup", "customDropdownList"}:
+                return
+            if isinstance(popup, QComboBox):
+                return
+            from themes.rounded_popup import COMBO_RADIUS, apply_rounded_popup, apply_transparent_popup_palette
+
+            apply_rounded_popup(
+                popup,
+                radius=COMBO_RADIUS,
+                border_key="combo_popup_border",
+                frameless=True,
+                force_window=True,
+            )
+            popup.setStyleSheet(self.combo_popup_stylesheet())
+            targets = [view] if view is not None else []
+            if view is None:
+                from PySide6.QtWidgets import QAbstractItemView
+
+                targets.extend(popup.findChildren(QAbstractItemView))
+            for item in targets:
+                if item is None:
+                    continue
+                apply_transparent_popup_palette(item)
+                viewport = item.viewport() if hasattr(item, "viewport") else None
+                if viewport is not None:
+                    apply_transparent_popup_palette(viewport)
+        except RuntimeError:
+            return
 
     def get_color(self, color_key: str) -> str:
         """获取当前主题的指定颜色"""
@@ -452,6 +561,28 @@ class ThemeManager:
 _theme_manager: Optional[ThemeManager] = None
 
 
+def theme_color(key: str, default: str = "#000000") -> str:
+    """当前主题色。主题未就绪时返回 default。"""
+    try:
+        return get_theme_manager().get_color(key)
+    except Exception:
+        return default
+
+
+def theme_rgba(key: str, alpha: int, default: str = "#000000") -> str:
+    """当前主题色的 rgba() 字符串，用于半透明选中态。"""
+    raw = str(theme_color(key, default) or default).strip().lstrip("#")
+    if len(raw) == 6:
+        try:
+            red = int(raw[0:2], 16)
+            green = int(raw[2:4], 16)
+            blue = int(raw[4:6], 16)
+            return f"rgba({red}, {green}, {blue}, {max(0, min(255, int(alpha)))})"
+        except ValueError:
+            pass
+    return f"rgba(0, 0, 0, {max(0, min(255, int(alpha)))})"
+
+
 def get_theme_manager(config_path: Optional[str] = None) -> ThemeManager:
     """获取主题管理器单例"""
     global _theme_manager
@@ -464,8 +595,4 @@ def reset_theme_manager():
     """重置主题管理器（用于测试）"""
     global _theme_manager
     _theme_manager = None
-
-
-# --- 统一的 ComboBox 项目高度 Delegate ---
-from PySide6.QtWidgets import QStyledItemDelegate
 
