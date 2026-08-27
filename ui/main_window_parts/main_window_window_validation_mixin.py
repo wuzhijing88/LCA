@@ -49,7 +49,7 @@ class MainWindowWindowValidationMixin:
                 )
             return False
 
-        from utils.window_identity import is_window_alive, refresh_bound_windows
+        from utils.window.window_identity import is_window_alive, refresh_bound_windows
 
         old_hwnds = [window_info.get('hwnd') for window_info in enabled_windows]
         recovered = refresh_bound_windows(self.bound_windows)
@@ -138,8 +138,8 @@ class MainWindowWindowValidationMixin:
 
         """
 
-        from utils.hwnd_utils import as_hwnd
-        from utils.window_identity import apply_window_identity, resolve_bound_window_hwnd
+        from utils.window.hwnd_utils import as_hwnd
+        from utils.window.window_identity import apply_window_identity, resolve_bound_window_hwnd
 
         window_title = window_info.get('title', '')
         if not window_title and not window_info.get('class_name') and not window_info.get('process_name'):
@@ -349,7 +349,7 @@ class MainWindowWindowValidationMixin:
 
             total_count = len(bound_windows)
 
-            from utils.universal_window_manager import get_universal_window_manager
+            from utils.window.universal_window_manager import get_universal_window_manager
 
             window_manager = get_universal_window_manager()
 

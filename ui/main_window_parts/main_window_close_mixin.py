@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from utils.window_coordinate_common import center_window_on_widget_screen
-from utils.window_activation_utils import show_and_activate_overlay
+from utils.window.window_coordinate_common import center_window_on_widget_screen
+from utils.window.window_activation_utils import show_and_activate_overlay
 
 logger = logging.getLogger(__name__)
 

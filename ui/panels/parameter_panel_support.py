@@ -28,7 +28,7 @@ from utils.app_paths import (
     get_images_dir,
     normalize_workflow_image_path,
 )
-from utils.thread_start_utils import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
 from tasks.random_jump import get_branch_weight, set_branch_weight
 from ..widgets.custom_widgets import CustomDropdown as QComboBox
 from ..system_parts.menu_style import apply_unified_menu_style

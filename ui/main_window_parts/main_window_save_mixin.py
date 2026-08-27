@@ -225,3 +225,9 @@ class MainWindowSaveMixin:
             logger.debug("_mark_unsaved_changes: Marking changes as unsaved.")
             self.unsaved_changes = True
             self._update_main_window_title()
+        tab_widget = getattr(self, "workflow_tab_widget", None)
+        if tab_widget is None or not hasattr(tab_widget, "get_current_task_id"):
+            return
+        task_id = tab_widget.get_current_task_id()
+        if task_id is not None:
+            tab_widget._mark_task_modified(task_id)

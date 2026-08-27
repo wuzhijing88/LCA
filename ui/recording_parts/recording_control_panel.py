@@ -9,8 +9,8 @@ from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QCursor, QFont
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
-from utils.window_activation_utils import show_and_activate_overlay
-from utils.window_coordinate_common import get_available_geometry_for_widget
+from utils.window.window_activation_utils import show_and_activate_overlay
+from utils.window.window_coordinate_common import get_available_geometry_for_widget
 
 logger = logging.getLogger(__name__)
 

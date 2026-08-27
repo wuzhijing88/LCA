@@ -11,29 +11,34 @@ from PySide6.QtWidgets import QWidget, QPushButton, QVBoxLayout, QMessageBox
 from PySide6.QtCore import Signal, QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor, QBrush
 
-from utils.window_finder import resolve_unique_window_hwnd
-from utils.window_coordinate_common import (
-    get_qt_virtual_desktop_rect,
+from utils.window.window_finder import resolve_unique_window_hwnd
+from utils.window.window_coordinate_common import (
     build_window_info,
     client_relative_to_qt_global,
     get_window_client_logical_size,
     get_window_client_physical_size,
     normalize_window_hwnd,
 )
-from utils.window_overlay_utils import (
+from utils.window.window_overlay_utils import (
+    apply_overlay_text_style,
+    capture_virtual_desktop_pixmap,
+    capture_window_client_pixmap,
+    configure_opaque_picker_overlay,
+    draw_picker_backdrop,
     draw_target_window_overlay,
-    fill_overlay_event_background,
     get_target_window_overlay_rect,
     overlay_point_to_client_qpoint,
     overlay_rect_contains_point,
+    prime_picker_backdrop,
     sync_overlay_geometry,
 )
-from utils.window_activation_utils import (
-    activate_overlay_widget,
+from utils.window.window_activation_utils import (
     activate_window,
     ensure_overlay_ready_for_input,
+    grab_overlay_input,
+    release_overlay_input,
     show_and_activate_overlay,
-    schedule_window_top_boost,
+    schedule_overlay_activation_boost,
 )
 from .multi_coordinate_text import (
     MULTI_COORDINATE_BUTTON_TEXT,
@@ -63,6 +68,8 @@ class CoordinateSelectorOverlay(QWidget):
         self.target_hwnd = None
         self.window_info = None
         self.target_window_title = ""  # 从句柄获取的窗口标题，仅用于显示
+        self.backdrop_pixmap = None
+        self.desktop_pixmap = None
 
         # 选择状态
         self.selecting = False
@@ -72,17 +79,7 @@ class CoordinateSelectorOverlay(QWidget):
         self._is_ready_for_input = False
         self._activation_attempts = 0
 
-        # 设置窗口属性（移除 BypassWindowManagerHint 以改善事件处理）
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
-        )
-
-        self.setWindowModality(Qt.WindowModality.NonModal)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        configure_opaque_picker_overlay(self)
         
         logger.info("创建坐标选择器覆盖层")
 
@@ -124,8 +121,30 @@ class CoordinateSelectorOverlay(QWidget):
 
         # 设置覆盖层几何
         self._setup_overlay_geometry()
+        self._refresh_backdrop()
         
         return True
+
+    def _refresh_backdrop(self) -> None:
+        hwnd = int(self.target_window_hwnd or 0)
+        self.backdrop_pixmap = capture_window_client_pixmap(hwnd) if hwnd else None
+        self.desktop_pixmap = capture_virtual_desktop_pixmap()
+        prime_picker_backdrop(
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            window_pixmap=self.backdrop_pixmap,
+            target_rect=self._get_target_window_rect() if self.window_info else QRect(),
+        )
+
+    def _paint_backdrop(self, painter) -> None:
+        target_rect = self._get_target_window_rect() if self.window_info else QRect()
+        draw_picker_backdrop(
+            painter,
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            window_pixmap=self.backdrop_pixmap,
+            target_rect=target_rect,
+        )
 
     def _get_window_info(self, hwnd: int):
         """获取窗口信息（包括DPI处理）"""
@@ -219,17 +238,17 @@ class CoordinateSelectorOverlay(QWidget):
     def paintEvent(self, event):
         """Paint overlay."""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
-        fill_overlay_event_background(painter, self)
+        self._paint_backdrop(painter)
 
         if self.window_info:
             target_rect = self._get_target_window_rect()
             draw_target_window_overlay(
                 painter,
                 target_rect,
-                title=f"Target window: {self.target_window_title}",
-                subtitle_lines=["Click to select coordinate"],
+                title=f"目标窗口: {self.target_window_title}",
+                subtitle_lines=["点击选择坐标"],
             )
 
         
@@ -271,19 +290,15 @@ class CoordinateSelectorOverlay(QWidget):
                 bg_rect.adjust(-5, -2, 5, 2)
 
                 painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
-                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                apply_overlay_text_style(painter)
                 painter.drawRect(bg_rect)
-
-                # 绘制文本
-                painter.setPen(QPen(QColor(255, 255, 255), 1))
                 painter.drawText(text_pos, coord_text)
 
     def showEvent(self, event):
-        """窗口显示事件 - 延迟激活以确保窗口系统准备就绪"""
+        """窗口显示事件 - 先抓输入，再补一次激活。"""
         super().showEvent(event)
-        # 延迟激活，确保窗口系统完成所有初始化
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(250, self._ensure_ready_for_input)
+        grab_overlay_input(self, log_prefix='坐标选择覆盖层')
+        QTimer.singleShot(50, self._ensure_ready_for_input)
 
     def _ensure_ready_for_input(self):
         """确保覆盖层准备好接收输入"""
@@ -296,13 +311,7 @@ class CoordinateSelectorOverlay(QWidget):
         )
 
     def mousePressEvent(self, event):
-        """鼠标按下事件（添加窗口激活检查）"""
-        # 检查窗口是否真的激活，如果未激活则先激活
-        if not self.isActiveWindow():
-            logger.warning("覆盖层未激活，尝试重新激活")
-            activate_overlay_widget(self, log_prefix='坐标选择覆盖层', focus=True)
-            self._is_ready_for_input = True  # 下次点击将正常工作
-
+        """鼠标按下事件。第一次点击直接选点，不拿来激活窗口。"""
         if event.button() == Qt.MouseButton.LeftButton:
             # 检查是否在目标窗口内
             if self._is_point_in_target_window(event.pos()):
@@ -334,9 +343,7 @@ class CoordinateSelectorOverlay(QWidget):
                 # 直接发射坐标信号（不使用通用坐标系统标准化）
                 self.coordinate_selected.emit(relative_pos.x(), relative_pos.y())
 
-                # 延迟关闭，让用户能看到十字光标
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(300, self.close)  # 300ms后关闭，减少等待时间
+                QTimer.singleShot(300, self._close_after_preview)
             else:
                 logger.warning("点击位置不在目标窗口内")
 
@@ -350,7 +357,17 @@ class CoordinateSelectorOverlay(QWidget):
             logger.info("ESC键退出")
             self.close()
 
+    def _close_after_preview(self):
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self.close()
+        except RuntimeError:
+            return
+
     def closeEvent(self, event):
+        self._closing = True
+        release_overlay_input(self)
         self.selection_closed.emit()
         super().closeEvent(event)
 
@@ -421,8 +438,12 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
 
     def mouseMoveEvent(self, event):
         if self.dragging:
+            old_end = QPoint(self.drag_end) if self.drag_end else event.pos()
             self.drag_end = event.pos()
-            self.update()
+            start = self.drag_start or old_end
+            dirty = QRect(start, old_end).normalized().united(QRect(start, self.drag_end).normalized())
+            dirty.adjust(-80, -40, 80, 40)
+            self.update(dirty.intersected(self.rect()))
 
     def mouseReleaseEvent(self, event):
         if self.dragging and event.button() == Qt.MouseButton.LeftButton:
@@ -440,25 +461,20 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
                 )
                 self.offset_selected.emit(dx, dy)
 
-            QTimer.singleShot(300, self.close)
-
-    def closeEvent(self, event):
-        self.selection_closed.emit()
-        super().closeEvent(event)
+            QTimer.singleShot(300, self._close_after_preview)
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
-        # 绘制近乎透明的全屏遮罩，用于捕获鼠标事件
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
+        self._paint_backdrop(painter)
 
         if self.window_info:
             target_rect = self._get_target_window_rect()
             if not target_rect.isEmpty():
                 painter.setPen(QPen(QColor(0, 255, 0), 4))
                 painter.drawRect(target_rect)
-                painter.setPen(QPen(QColor(255, 255, 255)))
+                apply_overlay_text_style(painter)
                 painter.drawText(target_rect.topLeft() + QPoint(10, 25), f"目标窗口: {self.target_window_title}")
                 painter.drawText(target_rect.topLeft() + QPoint(10, 50), "拖拽选择偏移")
 
@@ -491,12 +507,12 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
             dx = end_rel.x() - start_rel.x()
             dy = end_rel.y() - start_rel.y()
             text = f"偏移: ({dx:+d}, {dy:+d})"
+            apply_overlay_text_style(painter)
             text_rect = painter.fontMetrics().boundingRect(text)
             text_pos = self.drag_end + QPoint(12, -8)
             bg_rect = text_rect.translated(text_pos)
             bg_rect.adjust(-4, -2, 4, 2)
             painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
-            painter.setPen(QPen(QColor(255, 255, 255), 1))
             painter.drawRect(bg_rect)
             painter.drawText(text_pos, text)
 
@@ -562,9 +578,12 @@ class OffsetSelectorWidget(QWidget):
         if overlay.setup_target_window():
             if show_and_activate_overlay(overlay, log_prefix='偏移选择覆盖层启动'):
                 logger.info("已使用统一覆盖层激活链启动偏移选择覆盖层")
-            schedule_window_top_boost(
-                overlay.window_info['hwnd'],
-                log_prefix='偏移选择目标窗口',
+            grab_overlay_input(overlay, log_prefix='偏移选择覆盖层')
+            schedule_overlay_activation_boost(
+                overlay,
+                log_prefix='偏移选择覆盖层',
+                intervals_ms=(50, 150, 300),
+                focus=True,
             )
         else:
             self._cleanup_previous_overlay()
@@ -595,6 +614,7 @@ class OffsetSelectorWidget(QWidget):
                 self._current_overlay.selection_closed.disconnect()
             except Exception:
                 pass
+            self._current_overlay._closing = True
             self._current_overlay.hide()
             self._current_overlay.deleteLater()
             self._current_overlay = None
@@ -804,9 +824,12 @@ class CoordinateSelectorWidget(QWidget):
         if overlay.setup_target_window():
             if show_and_activate_overlay(overlay, log_prefix='坐标选择覆盖层启动'):
                 logger.info("已使用统一覆盖层激活链启动坐标选择覆盖层")
-            schedule_window_top_boost(
-                overlay.window_info['hwnd'],
-                log_prefix='坐标选择目标窗口',
+            grab_overlay_input(overlay, log_prefix='坐标选择覆盖层')
+            schedule_overlay_activation_boost(
+                overlay,
+                log_prefix='坐标选择覆盖层',
+                intervals_ms=(50, 150, 300),
+                focus=True,
             )
         else:
             self._cleanup_previous_overlay()
@@ -835,7 +858,7 @@ class CoordinateSelectorWidget(QWidget):
             except Exception:
                 pass
 
-            # 直接删除覆盖层
+            overlay._closing = True
             overlay.hide()
             overlay.deleteLater()
             logger.info("坐标选择覆盖层已隐藏并标记删除")
@@ -991,6 +1014,8 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         # 窗口激活状态标志
         self._is_ready_for_input = False
         self._activation_attempts = 0
+        self.backdrop_pixmap = None
+        self.desktop_pixmap = None
 
         self._setup_overlay()
         if not self._setup_target_window():
@@ -998,23 +1023,9 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
             return
 
     def _setup_overlay(self):
-        """设置覆盖层（移除 BypassWindowManagerHint 以改善事件处理）"""
-        # 设置为全屏覆盖层
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("background: transparent;")
-
-        # 设置全屏
-        screen = get_qt_virtual_desktop_rect() or QRect(0, 0, 0, 0)
-        self.setGeometry(screen)
-
-        # 设置鼠标追踪和焦点策略
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        """设置覆盖层为不透明顶层窗，避免 Windows 点穿。"""
+        configure_opaque_picker_overlay(self)
+        sync_overlay_geometry(self)
 
     def _setup_target_window(self):
         """设置目标窗口"""
@@ -1051,6 +1062,15 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
 
         # 设置覆盖层几何
         self._setup_overlay_geometry()
+        hwnd = int(self.target_window_hwnd or 0)
+        self.backdrop_pixmap = capture_window_client_pixmap(hwnd) if hwnd else None
+        self.desktop_pixmap = capture_virtual_desktop_pixmap()
+        prime_picker_backdrop(
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            window_pixmap=self.backdrop_pixmap,
+            target_rect=self._get_target_window_rect() if self.window_info else QRect(),
+        )
 
         return True
 
@@ -1192,17 +1212,23 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
     def paintEvent(self, event):
         """Paint overlay."""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
-        fill_overlay_event_background(painter, self)
+        target_rect = self._get_target_window_rect() if self.window_info else QRect()
+        draw_picker_backdrop(
+            painter,
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            window_pixmap=self.backdrop_pixmap,
+            target_rect=target_rect,
+        )
 
         if self.window_info:
-            target_rect = self._get_target_window_rect()
             draw_target_window_overlay(
                 painter,
                 target_rect,
-                title=f"Target window: {self.target_window_title}",
-                subtitle_lines=["Left click to add route points"],
+                title=f"目标窗口: {self.target_window_title}",
+                subtitle_lines=["左键添加路线点"],
             )
 
         if len(self.click_positions) > 1:
@@ -1214,12 +1240,12 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         if self.click_positions:
             if len(self.click_positions) == 1:
                 painter.setBrush(QColor(255, 80, 80, 180))
-                painter.setPen(QColor(255, 255, 255))
+                apply_overlay_text_style(painter)
                 painter.drawEllipse(self.click_positions[0], 8, 8)
                 painter.drawText(self.click_positions[0] + QPoint(15, 5), "目标")
             else:
                 painter.setBrush(QColor(0, 255, 0, 180))
-                painter.setPen(QColor(255, 255, 255))
+                apply_overlay_text_style(painter)
                 painter.drawEllipse(self.click_positions[0], 8, 8)
                 painter.drawText(self.click_positions[0] + QPoint(15, 5), "起点")
 
@@ -1232,8 +1258,7 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawEllipse(self.click_positions[i], 4, 4)
 
-        # 绘制提示信息
-        painter.setPen(QColor(255, 255, 255))
+        apply_overlay_text_style(painter)
         if len(self.coordinate_points) > 0:
             painter.drawText(20, 30, format_multi_coordinate_selected_text(len(self.coordinate_points)))
             painter.drawText(20, 50, MULTI_COORDINATE_SELECTED_HINT_LINES[0])
@@ -1244,11 +1269,10 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
             painter.drawText(20, 70, MULTI_COORDINATE_EMPTY_HINT_LINES[2])
 
     def showEvent(self, event):
-        """窗口显示事件 - 延迟激活以确保窗口系统准备就绪"""
+        """窗口显示事件 - 先抓输入，再补一次激活。"""
         super().showEvent(event)
-        # 延迟激活，确保窗口系统完成所有初始化
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(250, self._ensure_ready_for_input)
+        grab_overlay_input(self, log_prefix='多点坐标覆盖层')
+        QTimer.singleShot(50, self._ensure_ready_for_input)
 
     def _ensure_ready_for_input(self):
         """确保覆盖层准备好接收输入"""
@@ -1262,11 +1286,6 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
 
     def mousePressEvent(self, event):
         """鼠标按下事件。"""
-        if not self.isActiveWindow():
-            logger.warning("多点坐标覆盖层未激活，尝试重新激活")
-            activate_overlay_widget(self, log_prefix='多点坐标覆盖层', focus=True)
-            self._is_ready_for_input = True
-
         if event.button() == Qt.MouseButton.LeftButton:
             self._append_route_point(event.pos())
         elif event.button() == Qt.MouseButton.RightButton:
@@ -1310,6 +1329,8 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         self.close()
 
     def closeEvent(self, event):
+        self._closing = True
+        release_overlay_input(self)
         self.selection_closed.emit()
         super().closeEvent(event)
 
@@ -1336,22 +1357,24 @@ class MultiPointCoordinateSelectorWidget(QWidget):
 
         # 选择按钮
         self.select_button = QPushButton(MULTI_COORDINATE_BUTTON_TEXT)
-        self.select_button.setStyleSheet("""
-            QPushButton {
-                background-color: #007ACC;
+        from themes import theme_color
+
+        self.select_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {theme_color("accent", "#0078d4")};
                 color: white;
                 border: none;
                 border-radius: 4px;
                 padding: 8px 16px;
                 font-weight: bold;
                 font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #005A9E;
-            }
-            QPushButton:pressed {
-                background-color: #004578;
-            }
+            }}
+            QPushButton:hover {{
+                background-color: {theme_color("accent_hover", "#1084d8")};
+            }}
+            QPushButton:pressed {{
+                background-color: {theme_color("accent_pressed", "#006cbe")};
+            }}
         """)
         self.select_button.clicked.connect(self.start_selection)
 
@@ -1413,9 +1436,12 @@ class MultiPointCoordinateSelectorWidget(QWidget):
             # 显示覆盖层
             if show_and_activate_overlay(self.overlay, log_prefix='多点坐标覆盖层启动'):
                 logger.info("已使用统一覆盖层激活链启动多点坐标选择覆盖层")
-            schedule_window_top_boost(
-                self.overlay.window_info['hwnd'],
-                log_prefix='多点坐标选择目标窗口',
+            grab_overlay_input(self.overlay, log_prefix='多点坐标覆盖层')
+            schedule_overlay_activation_boost(
+                self.overlay,
+                log_prefix='多点坐标覆盖层',
+                intervals_ms=(50, 150, 300),
+                focus=True,
             )
 
         except Exception as e:
@@ -1486,6 +1512,7 @@ class MultiPointCoordinateSelectorWidget(QWidget):
             overlay.selection_closed.disconnect()
         except Exception:
             pass
+        overlay._closing = True
         try:
             overlay.hide()
         except Exception:

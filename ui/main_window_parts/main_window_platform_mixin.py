@@ -152,7 +152,7 @@ class MainWindowPlatformMixin:
 
             try:
 
-                from utils.universal_window_manager import get_universal_window_manager
+                from utils.window.universal_window_manager import get_universal_window_manager
 
                 if target_hwnd:
 

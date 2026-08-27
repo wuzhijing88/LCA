@@ -51,7 +51,7 @@ class WindowTaskRunnerControlMixin:
 
             hwnd_int = 0
             try:
-                from utils.hwnd_utils import as_hwnd
+                from utils.window.hwnd_utils import as_hwnd
 
                 hwnd_int = as_hwnd(getattr(self, "hwnd", 0) or self.window_info.get("hwnd"))
             except Exception:
@@ -67,7 +67,7 @@ class WindowTaskRunnerControlMixin:
                     logger.debug(f"清理OCR服务失败: {e}")
 
                 try:
-                    from utils.screenshot_helper import cleanup_screenshot_engine
+                    from utils.capture.screenshot_helper import cleanup_screenshot_engine
                     cleanup_screenshot_engine(hwnd_int)
                     logger.info(f"[资源清理] 已清理窗口{self.window_id}的截图引擎资源 (HWND: {hwnd_int})")
                 except Exception as e:

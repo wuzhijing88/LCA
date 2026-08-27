@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QPushButton, QMessageBox, QProgressBar)
 from PySide6.QtCore import QTimer, Signal, QThread
 from PySide6.QtGui import QFont
-from utils.window_activation_utils import show_and_raise_widget
+from utils.window.window_activation_utils import show_and_raise_widget
 
 logger = logging.getLogger(__name__)
 
@@ -105,47 +105,58 @@ class DPINotificationWidget(QWidget):
     def setup_ui(self):
         """设置UI"""
         self.setFixedHeight(120)  # 增加高度以容纳进度条
-        self.setStyleSheet("""
-            QWidget {
-                /* background-color removed - use theme */
-                border: 1px solid #ffeaa7;
+        from themes import theme_color
+
+        warning = theme_color("warning", "#ff8c00")
+        text = theme_color("text", "#333333")
+        surface = theme_color("surface", "#f5f5f5")
+        border = theme_color("border", "#e0e0e0")
+        success = theme_color("success", "#107c10")
+        disabled = theme_color("text_disabled", "#999999")
+        self.setStyleSheet(f"""
+            QWidget {{
+                border: 1px solid {warning};
                 border-radius: 4px;
-            }
-            QLabel {
-                color: #856404;
+            }}
+            QLabel {{
+                color: {text};
                 background: transparent;
                 border: none;
-            }
-            QPushButton {
-                background-color: #ffc107;
-                border: 1px solid #ffb300;
+            }}
+            QPushButton {{
+                background-color: {warning};
+                border: 1px solid {warning};
                 border-radius: 3px;
                 padding: 4px 8px;
-                color: #212529;
+                color: {text};
                 font-weight: bold;
                 min-width: 80px;
-            }
-            QPushButton:hover {
-                background-color: #e0a800;
-            }
-            QPushButton:pressed {
-                background-color: #d39e00;
-            }
-            QPushButton:disabled {
-                background-color: #f8f9fa;
-                color: #6c757d;
-                border-color: #dee2e6;
-            }
-            QProgressBar {
-                border: 1px solid #dee2e6;
+            }}
+            QPushButton:hover {{
+                background-color: {warning};
+                border-color: {warning};
+                color: {text};
+            }}
+            QPushButton:pressed {{
+                background-color: {warning};
+                border-color: {warning};
+                color: {text};
+            }}
+            QPushButton:disabled {{
+                background-color: {surface};
+                color: {disabled};
+                border-color: {border};
+            }}
+            QProgressBar {{
+                border: 1px solid {border};
                 border-radius: 3px;
                 text-align: center;
-                background-color: #f8f9fa;
-            }
-            QProgressBar::chunk {
-                background-color: #28a745;
+                background-color: {surface};
+            }}
+            QProgressBar::chunk {{
+                background-color: {success};
                 border-radius: 2px;
-            }
+            }}
         """)
         
         layout = QHBoxLayout(self)

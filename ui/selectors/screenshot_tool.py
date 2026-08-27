@@ -10,29 +10,35 @@ import logging
 import os
 from datetime import datetime
 from typing import Optional, Tuple
-from PySide6.QtWidgets import QWidget, QMessageBox, QPushButton
-from PySide6.QtCore import Signal, QPoint, QRect, Qt
+from PySide6.QtWidgets import QApplication, QWidget, QMessageBox, QPushButton
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter, QPen, QColor, QPixmap, QFontMetrics
 from PIL import Image
 import numpy as np
 import cv2
 
 logger = logging.getLogger(__name__)
-from utils.window_coordinate_common import (
+from utils.window.window_coordinate_common import (
     get_qt_virtual_desktop_rect,
     build_window_info,
 )
 from ui.system_parts.message_box_translator import show_critical_box
-from utils.window_overlay_utils import (
+from utils.window.window_overlay_utils import (
+    OVERLAY_TEXT_COLOR,
+    apply_overlay_text_style,
+    capture_virtual_desktop_pixmap,
+    configure_opaque_picker_overlay,
     draw_dynamic_center_crosshair,
     draw_overlay_frame,
-    fill_overlay_event_background,
+    draw_picker_backdrop,
     get_overlay_debug_snapshot,
     get_window_client_overlay_metrics,
     map_native_rect_to_local,
+    overlay_hint_font,
+    prime_picker_backdrop,
     sync_overlay_geometry,
 )
-from utils.window_activation_utils import (
+from utils.window.window_activation_utils import (
     activate_window,
     schedule_overlay_activation_boost,
     show_and_activate_overlay,
@@ -96,6 +102,7 @@ class ScreenshotOverlay(QWidget):
         screenshot_format: str = "bmp",
         card_id: Optional[int] = None,
         workflow_id: Optional[object] = None,
+        unique_filename: bool = False,
     ):
         super().__init__(None)  # 独立窗口
 
@@ -104,6 +111,7 @@ class ScreenshotOverlay(QWidget):
         self.parent_widget = parent
         self.card_id = card_id
         self._workflow_token = self._normalize_workflow_token(workflow_id)
+        self.unique_filename = bool(unique_filename)
         self._completion_emitted = False
 
         # 截图格式设置
@@ -129,6 +137,7 @@ class ScreenshotOverlay(QWidget):
         # 截图数据
         self.screenshot_pixmap = None
         self.screenshot_image = None
+        self.desktop_pixmap = None
 
         # DPI和窗口信息
         self.device_pixel_ratio = 1.0
@@ -136,22 +145,23 @@ class ScreenshotOverlay(QWidget):
         self.client_physical_pos = None  # 窗口客户区在屏幕物理坐标中的位置（原始值，避免舍入误差）
 
         # 性能优化：缓存字体和颜色
-        from PySide6.QtGui import QFont
-        self.hint_font = QFont("Microsoft YaHei", 12)
-        self.size_font = QFont("Microsoft YaHei", 11)
-        self.selection_color = QColor(0, 120, 215)
-        self.hint_color = QColor(0, 255, 0)
+        self.hint_font = overlay_hint_font()
+        self.size_font = overlay_hint_font()
+        self.selection_color = QColor(0, 255, 0)
+        self.hint_color = OVERLAY_TEXT_COLOR
         self.mask_color = QColor(0, 0, 0, 100)
 
-        # 窗口设置
+        # 抓图前保持轻量 Tool 窗，和仓库旧实现一致。
+        # 这里如果先建成不透明原生顶层窗，会和 DXGI Desktop Duplication 抢 D3D，dxcam 直接失败。
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
+        self._closing = False
 
         # 提示文字
         self.hint_text = "拖动鼠标选择截图区域 | 右键或ESC取消"
@@ -208,6 +218,21 @@ class ScreenshotOverlay(QWidget):
             token = token.replace("__", "_")
         return token[:64]
 
+    def _allocate_unique_filepath(self, ext: str) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if isinstance(self.card_id, int) and self.card_id >= 0:
+            prefix = self._build_card_filename_base()
+        else:
+            prefix = "screenshot"
+        filename = f"{prefix}_{timestamp}{ext}"
+        filepath = os.path.join(self.save_dir, filename)
+        index = 1
+        while os.path.exists(filepath):
+            filename = f"{prefix}_{timestamp}_{index}{ext}"
+            filepath = os.path.join(self.save_dir, filename)
+            index += 1
+        return filepath
+
     def _build_card_filename_base(self) -> str:
         """构建卡片截图文件名基础部分（不含扩展名）。"""
         if self._workflow_token:
@@ -233,14 +258,14 @@ class ScreenshotOverlay(QWidget):
 
             # 仅在使用 WGC 引擎时清理 WGC 缓存，避免与其他引擎日志混淆
             try:
-                from utils.screenshot_helper import get_screenshot_engine
+                from utils.capture.screenshot_helper import get_screenshot_engine
                 engine = get_screenshot_engine()
             except Exception:
                 engine = "unknown"
 
             if engine == "wgc":
                 try:
-                    from utils.screenshot_helper import clear_screenshot_cache
+                    from utils.capture.screenshot_helper import clear_screenshot_cache
                     clear_screenshot_cache()
                     logger.debug("WGC缓存已清理")
                 except Exception as e:
@@ -248,31 +273,29 @@ class ScreenshotOverlay(QWidget):
 
             logger.info(f"开始捕获截图，窗口句柄: {self.target_hwnd}")
 
-            # 激活目标窗口（对于模拟器，激活主窗口）
+            # 激活目标窗口（桌面不能置顶，跳过）
             if self.target_hwnd and PYWIN32_AVAILABLE:
-                # 检测是否为模拟器，如果是则激活主窗口
-                window_to_activate = self.target_hwnd
-                try:
-                    pass
-                except Exception as e:
-                    logger.debug(f"模拟器检测失败，使用默认激活逻辑: {e}")
+                from utils.window.window_identity import is_desktop_window
 
-                logger.info(f"激活窗口: {window_to_activate}")
-                self._activate_target_window(window_to_activate)
-                import time
-                time.sleep(0.5)
+                if is_desktop_window(self.target_hwnd):
+                    logger.info("目标是桌面，跳过窗口激活")
+                else:
+                    window_to_activate = self.target_hwnd
+                    logger.info(f"激活窗口: {window_to_activate}")
+                    self._activate_target_window(window_to_activate)
+                    import time
+                    time.sleep(0.5)
 
-                # 验证窗口是否激活成功
-                try:
-                    foreground_hwnd = win32gui.GetForegroundWindow()
-                    if foreground_hwnd == window_to_activate or foreground_hwnd == self.target_hwnd:
-                        logger.info(f"窗口激活成功 (前台: {foreground_hwnd})")
-                    else:
-                        logger.warning(f"窗口可能未激活，当前前台窗口: {foreground_hwnd}, 目标: {window_to_activate}")
-                        self._activate_target_window(window_to_activate)
-                        time.sleep(0.3)
-                except Exception as e:
-                    logger.warning(f"验证窗口激活状态失败: {e}")
+                    try:
+                        foreground_hwnd = win32gui.GetForegroundWindow()
+                        if foreground_hwnd == window_to_activate or foreground_hwnd == self.target_hwnd:
+                            logger.info(f"窗口激活成功 (前台: {foreground_hwnd})")
+                        else:
+                            logger.warning(f"窗口可能未激活，当前前台窗口: {foreground_hwnd}, 目标: {window_to_activate}")
+                            self._activate_target_window(window_to_activate)
+                            time.sleep(0.3)
+                    except Exception as e:
+                        logger.warning(f"验证窗口激活状态失败: {e}")
 
             # 统一使用窗口客户区截图
             if not self.target_hwnd:
@@ -290,7 +313,7 @@ class ScreenshotOverlay(QWidget):
                 return False
 
             try:
-                from utils.screenshot_helper import get_screenshot_engine
+                from utils.capture.screenshot_helper import get_screenshot_engine
                 current_engine = get_screenshot_engine()
             except Exception:
                 current_engine = "unknown"
@@ -323,15 +346,15 @@ class ScreenshotOverlay(QWidget):
                 return False
 
             logger.info(f"截图QPixmap创建: 尺寸={self.screenshot_pixmap.width()}x{self.screenshot_pixmap.height()}")
+            self.desktop_pixmap = capture_virtual_desktop_pixmap()
 
-            # 设置为全屏
+            # 抓完再改成不透明顶层窗，避免半透明 Tool 被点穿。
+            configure_opaque_picker_overlay(self)
+            self._apply_action_buttons_theme()
+
+            # 先铺好覆盖层几何并算好客户区，再显示，避免第一帧把窗口截图拉满全屏。
             sync_overlay_geometry(self)
-            if show_and_activate_overlay(self, log_prefix='截图覆盖层', focus=True):
-                logger.info("已使用统一覆盖层激活链启动截图覆盖层")
-
-            # 保存DPI信息用于绘制
             self.device_pixel_ratio = 1.0
-
             native_client_rect = (
                 int(self._snapshot_client_pos[0]),
                 int(self._snapshot_client_pos[1]),
@@ -339,11 +362,28 @@ class ScreenshotOverlay(QWidget):
                 int(self._snapshot_client_pos[1] + self._snapshot_client_h),
             )
             self.client_qt_rect = self._native_rect_to_overlay_rect(native_client_rect)
-            if not self.client_qt_rect or self.client_qt_rect.isEmpty():
-                logger.error("客户区坐标转换失败")
-                self.hide()
-                self.close()
-                return False
+            if self._should_use_full_overlay_selection():
+                self.client_qt_rect = QRect(self.rect())
+                logger.info("截图覆盖层改用全屏框选区域: %sx%s", self.client_qt_rect.width(), self.client_qt_rect.height())
+            elif not self._client_rect_is_usable():
+                logger.warning("显示前客户区尚未对齐，先只画桌面，避免把窗口截图拉满全屏")
+
+            if show_and_activate_overlay(self, log_prefix='截图覆盖层', focus=True):
+                logger.info("已使用统一覆盖层激活链启动截图覆盖层")
+            QApplication.processEvents()
+            sync_overlay_geometry(self)
+            mapped_rect = self._native_rect_to_overlay_rect(native_client_rect)
+            if self._should_use_full_overlay_selection():
+                self.client_qt_rect = QRect(self.rect())
+            elif mapped_rect and not mapped_rect.isEmpty():
+                self.client_qt_rect = mapped_rect
+
+            prime_picker_backdrop(
+                self,
+                desktop_pixmap=self.desktop_pixmap,
+                window_pixmap=self.screenshot_pixmap if self._client_rect_is_usable() else None,
+                target_rect=self.client_qt_rect,
+            )
 
             try:
                 snapshot = get_overlay_debug_snapshot(self, native_client_rect)
@@ -372,6 +412,8 @@ class ScreenshotOverlay(QWidget):
                 intervals_ms=(50, 150, 300),
                 focus=True,
             )
+            for delay in (0, 50, 160, 320):
+                QTimer.singleShot(delay, self._grab_overlay_input)
 
             logger.info("截图覆盖层已显示，等待用户选择区域")
 
@@ -422,6 +464,46 @@ class ScreenshotOverlay(QWidget):
     def _native_rect_to_overlay_rect(self, native_rect: Tuple[int, int, int, int]) -> QRect:
         """Convert a Win32 native rect to an overlay-local Qt rect."""
         return map_native_rect_to_local(self, native_rect)
+
+    def _should_use_full_overlay_selection(self) -> bool:
+        try:
+            from utils.window.window_identity import is_desktop_window
+
+            return is_desktop_window(self.target_hwnd)
+        except Exception:
+            return False
+
+    def _client_rect_is_usable(self) -> bool:
+        rect = self.client_qt_rect
+        if rect is None or rect.isEmpty():
+            return False
+        overlap = rect.intersected(self.rect())
+        return overlap.width() >= 32 and overlap.height() >= 32
+
+    def _grab_overlay_input(self) -> None:
+        try:
+            if getattr(self, "_closing", False) or not self.isVisible() or self.selection_ready:
+                return
+            self.raise_()
+            self.activateWindow()
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.grabMouse()
+            self.grabKeyboard()
+            logger.info("截图覆盖层已抓取鼠标和键盘")
+        except RuntimeError:
+            return
+        except Exception as exc:
+            logger.warning("截图覆盖层抓取输入失败: %s", exc)
+
+    def _release_overlay_input(self) -> None:
+        try:
+            self.releaseMouse()
+        except Exception:
+            pass
+        try:
+            self.releaseKeyboard()
+        except Exception:
+            pass
 
     def _get_window_info(self, hwnd: int):
         """获取窗口信息（包括DPI处理）"""
@@ -487,7 +569,7 @@ class ScreenshotOverlay(QWidget):
             # 与 image_match_click 执行路径统一：始终走 capture_window_smart。
             from tasks.task_utils import capture_window_smart
             try:
-                from utils.screenshot_helper import get_screenshot_engine
+                from utils.capture.screenshot_helper import get_screenshot_engine
                 engine = get_screenshot_engine()
             except Exception:
                 engine = "unknown"
@@ -535,6 +617,7 @@ class ScreenshotOverlay(QWidget):
         self.selection_ready = bool(ready)
         if self.selection_ready:
             self.hint_text = "可拖动微调 | 方向键微调(Shift=5px, Ctrl+方向键缩放) | 点“确定”保存"
+            self._release_overlay_input()
             self.confirm_button.show()
             self.reselect_button.show()
             self._update_action_buttons_position()
@@ -544,6 +627,8 @@ class ScreenshotOverlay(QWidget):
             self.confirm_button.hide()
             self.reselect_button.hide()
             self.setCursor(Qt.CursorShape.CrossCursor)
+            if self.isVisible():
+                self._grab_overlay_input()
 
     def _cursor_for_resize_mode(self, mode: Optional[str]):
         if mode in ('left', 'right'):
@@ -641,9 +726,10 @@ class ScreenshotOverlay(QWidget):
             return
         moved = QRect(self.selection_rect)
         moved.translate(dx, dy)
+        old_rect = QRect(self.selection_rect)
         self.selection_rect = self._clamp_rect_to_client(moved)
         self._update_action_buttons_position()
-        self.update()
+        self._invalidate_selection_region(old_rect, self.selection_rect)
 
     def _resize_selection_by(self, dw: int, dh: int):
         if self.selection_rect.isEmpty():
@@ -656,9 +742,10 @@ class ScreenshotOverlay(QWidget):
         resized = self._clamp_rect_to_client(resized)
 
         if resized.width() >= min_size and resized.height() >= min_size:
+            old_rect = QRect(self.selection_rect)
             self.selection_rect = resized
             self._update_action_buttons_position()
-            self.update()
+            self._invalidate_selection_region(old_rect, self.selection_rect)
 
     def _resize_selection_with_mouse(self, dx: int, dy: int):
         if self.selection_rect.isEmpty() or not self.resize_mode:
@@ -694,9 +781,17 @@ class ScreenshotOverlay(QWidget):
 
         resized = QRect(QPoint(left, top), QPoint(right, bottom)).normalized()
         if resized.width() >= min_size and resized.height() >= min_size:
+            old_rect = QRect(self.selection_rect)
             self.selection_rect = self._clamp_rect_to_client(resized)
             self._update_action_buttons_position()
-            self.update()
+            self._invalidate_selection_region(old_rect, self.selection_rect)
+
+    def _invalidate_selection_region(self, old_rect: QRect, new_rect: QRect) -> None:
+        dirty = QRect(old_rect).united(new_rect)
+        if dirty.isEmpty():
+            return
+        dirty.adjust(-16, -40, 16, 16)
+        self.update(dirty.intersected(self.rect()))
 
     def _confirm_selection(self):
         if self.selection_rect.isEmpty() or not self.selection_ready:
@@ -721,10 +816,9 @@ class ScreenshotOverlay(QWidget):
         """鼠标按下事件"""
         if event.button() == Qt.MouseButton.LeftButton:
             click_pos = event.pos()
-            self.current_pos = click_pos
-
             if self.client_qt_rect and not self.client_qt_rect.contains(click_pos):
-                return
+                click_pos = self._clamp_point_to_client(click_pos)
+            self.current_pos = click_pos
 
             if self.selection_ready and not self.selection_rect.isEmpty():
                 hit_mode = self._hit_test_resize_mode(click_pos)
@@ -770,14 +864,7 @@ class ScreenshotOverlay(QWidget):
 
             # 性能优化：只重绘变化的区域
             if old_rect != self.selection_rect:
-                # 计算需要更新的区域（旧矩形 + 新矩形的并集）
-                update_region = old_rect.united(self.selection_rect)
-                # 扩展一点边界以确保边框完全刷新
-                update_region.adjust(-5, -5, 5, 5)
-                self.update(update_region)
-            else:
-                # 如果没有变化，不重绘
-                pass
+                self._invalidate_selection_region(old_rect, self.selection_rect)
             event.accept()
             return
 
@@ -809,8 +896,6 @@ class ScreenshotOverlay(QWidget):
             self.setCursor(Qt.CursorShape.CrossCursor)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
-
-        self.update()
 
     def mouseReleaseEvent(self, event):
         """鼠标释放事件"""
@@ -903,34 +988,39 @@ class ScreenshotOverlay(QWidget):
     def paintEvent(self, event):
         """Paint overlay."""
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        dirty = event.rect() if event is not None else self.rect()
 
-        fill_overlay_event_background(painter, self)
-
-        if self.screenshot_pixmap and self.client_qt_rect:
-            painter.drawPixmap(self.client_qt_rect, self.screenshot_pixmap)
+        window_pixmap = self.screenshot_pixmap if self._client_rect_is_usable() else None
+        draw_picker_backdrop(
+            painter,
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            window_pixmap=window_pixmap,
+            target_rect=self.client_qt_rect,
+        )
 
         if self.client_qt_rect:
             draw_overlay_frame(painter, self.client_qt_rect, border_color=QColor(0, 255, 0), border_width=3)
 
-        # 绘制半透明遮罩（未选择区域）
         if self.selecting or not self.selection_rect.isEmpty():
-            # 创建遮罩
-            painter.fillRect(self.rect(), self.mask_color)
-
-            # 清除选择区域的遮罩（显示原图）
+            painter.fillRect(dirty, self.mask_color)
             if not self.selection_rect.isEmpty():
                 painter.save()
-                painter.setClipRect(self.selection_rect)
-                if self.client_qt_rect and self.screenshot_pixmap:
-                    painter.drawPixmap(self.client_qt_rect, self.screenshot_pixmap)
+                painter.setClipRect(self.selection_rect.intersected(dirty))
+                draw_picker_backdrop(
+                    painter,
+                    self,
+                    desktop_pixmap=self.desktop_pixmap,
+                    window_pixmap=self.screenshot_pixmap,
+                    target_rect=self.client_qt_rect,
+                )
                 painter.restore()
 
-                # 绘制选择框边界
                 pen = QPen(self.selection_color, 2, Qt.PenStyle.SolidLine)
                 painter.setPen(pen)
                 painter.drawRect(self.selection_rect)
 
-                # 绘制中心准心（随框选尺寸缩放，并限制在框选区域内）
                 draw_dynamic_center_crosshair(
                     painter,
                     self.selection_rect,
@@ -938,16 +1028,10 @@ class ScreenshotOverlay(QWidget):
                     inset=1,
                 )
 
-                # 绘制尺寸信息
                 size_text = f"{self.selection_rect.width()} x {self.selection_rect.height()}"
                 self._draw_selection_size_label(painter, self.selection_rect, size_text)
 
-                if self.selection_ready:
-                    self._update_action_buttons_position()
-
-        # 绘制提示文字
-        painter.setPen(self.hint_color)
-        painter.setFont(self.hint_font)
+        apply_overlay_text_style(painter)
         painter.drawText(20, 30, self.hint_text)
 
     def _draw_selection_size_label(self, painter: QPainter, selection_rect: QRect, text: str) -> None:
@@ -982,7 +1066,7 @@ class ScreenshotOverlay(QWidget):
         painter.setBrush(QColor(0, 0, 0, 160))
         painter.drawRoundedRect(label_rect, 6, 6)
 
-        painter.setPen(QColor(255, 255, 255))
+        painter.setPen(OVERLAY_TEXT_COLOR)
         painter.drawText(label_rect.adjusted(pad_x, pad_y, -pad_x, -pad_y), Qt.AlignmentFlag.AlignCenter, text)
         painter.restore()
 
@@ -1108,17 +1192,15 @@ class ScreenshotOverlay(QWidget):
             format_info = self.SUPPORTED_FORMATS.get(self.screenshot_format, self.SUPPORTED_FORMATS['bmp'])
             ext = format_info['ext']
 
-            # 生成文件名（优先按卡片ID命名，便于重复截图覆盖）
-            if isinstance(self.card_id, int) and self.card_id >= 0:
-                base_name = self._build_card_filename_base()
-                filename = f"{base_name}{ext}"
+            # 脚本采集每次单独存一张；卡片截图仍按卡片名覆盖。
+            if self.unique_filename or not (isinstance(self.card_id, int) and self.card_id >= 0):
+                filepath = self._allocate_unique_filepath(ext)
             else:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"screenshot_{timestamp}{ext}"
-            filepath = os.path.join(self.save_dir, filename)
+                base_name = self._build_card_filename_base()
+                filepath = os.path.join(self.save_dir, f"{base_name}{ext}")
 
             # 卡片命名模式：先清理同名不同后缀，避免残留旧格式文件
-            if isinstance(self.card_id, int) and self.card_id >= 0:
+            if (not self.unique_filename) and isinstance(self.card_id, int) and self.card_id >= 0:
                 base_name = self._build_card_filename_base()
                 for fmt_name, fmt_info in self.SUPPORTED_FORMATS.items():
                     stale_path = os.path.join(self.save_dir, f"{base_name}{fmt_info['ext']}")
@@ -1132,6 +1214,9 @@ class ScreenshotOverlay(QWidget):
             # 【关键】坐标转换：基于截图时锁定的客户区映射，避免打包环境 DPI 偏移
             if not self.client_qt_rect:
                 logger.error("缺少窗口客户区信息")
+                QMessageBox.critical(self, "错误", "缺少窗口客户区信息，无法保存截图")
+                self._emit_screenshot_cancelled_once()
+                self.close()
                 return
 
             # 用户框选的Qt逻辑坐标
@@ -1193,7 +1278,7 @@ class ScreenshotOverlay(QWidget):
                 # 边界检查
                 img_h, img_w = self.screenshot_image.shape[:2]
                 try:
-                    from utils.screenshot_helper import get_screenshot_engine
+                    from utils.capture.screenshot_helper import get_screenshot_engine
                     engine = get_screenshot_engine()
                 except Exception:
                     engine = "unknown"
@@ -1246,6 +1331,8 @@ class ScreenshotOverlay(QWidget):
             self.close()
 
     def closeEvent(self, event):
+        self._closing = True
+        self._release_overlay_input()
         self._emit_screenshot_cancelled_once()
         super().closeEvent(event)
 
@@ -1272,7 +1359,7 @@ class ScreenshotOverlay(QWidget):
         """截图保存后主动失效模板缓存，避免立即识别命中旧图。"""
         try:
             from pathlib import Path
-            from utils.template_preloader import get_global_preloader
+            from utils.match.template_preloader import get_global_preloader
 
             preloader = get_global_preloader()
             if preloader is None:
@@ -1282,6 +1369,12 @@ class ScreenshotOverlay(QWidget):
             preloader.invalidate_template(normalized)
             preloader.invalidate_template(filepath)
             preloader.invalidate_template(filepath.replace("\\", "/"))
+        except Exception:
+            pass
+        try:
+            from utils.image_paths import get_image_path_resolver
+
+            get_image_path_resolver().invalidate(filepath)
         except Exception:
             pass
 
@@ -1319,22 +1412,23 @@ class QuickScreenshotButton:
         button.setToolTip("点击后拖动鼠标选择区域截图\n截图将自动保存到 images 目录")
         button.clicked.connect(self.start_screenshot)
 
-        # 设置样式
-        button.setStyleSheet("""
-            QPushButton {
-                background-color: #0078D4;
+        from themes import theme_color
+
+        button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {theme_color("accent", "#0078d4")};
                 color: white;
                 border: none;
                 padding: 5px 10px;
                 border-radius: 3px;
                 font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #1084D8;
-            }
-            QPushButton:pressed {
-                background-color: #006CC1;
-            }
+            }}
+            QPushButton:hover {{
+                background-color: {theme_color("accent_hover", "#1084d8")};
+            }}
+            QPushButton:pressed {{
+                background-color: {theme_color("accent_pressed", "#006cbe")};
+            }}
         """)
 
         return button

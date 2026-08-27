@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QThread, QTimer
 
+from app_core.config_sections import DEFAULT_HOTKEYS
 from task_workflow.executor import WorkflowExecutor
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ class MainWindowInitStateMixin:
         ) # Load from config
         logger.info(f"从配置加载执行模式: {self.current_execution_mode}")
         try:
-            from utils.foreground_input_manager import get_foreground_input_manager
+            from utils.input.foreground_input_manager import get_foreground_input_manager
             from utils.input_simulation.mode_utils import parse_foreground_backends
             foreground_input = get_foreground_input_manager()
             mouse_backend, keyboard_backend = parse_foreground_backends(self.config)
@@ -88,11 +89,11 @@ class MainWindowInitStateMixin:
         # 操作模式配置 - 默认使用自动检测
         self.operation_mode = 'auto'
         # 快捷键配置
-        self.start_task_hotkey = self.config.get('start_task_hotkey', 'XButton1')
-        self.stop_task_hotkey = self.config.get('stop_task_hotkey', 'XButton2')
-        self.pause_workflow_hotkey = self.config.get('pause_workflow_hotkey', 'F11')
-        self.record_hotkey = self.config.get('record_hotkey', 'F12')
-        self.replay_hotkey = self.config.get('replay_hotkey', 'F10')
+        self.start_task_hotkey = self.config.get('start_task_hotkey', DEFAULT_HOTKEYS['start_task_hotkey'])
+        self.stop_task_hotkey = self.config.get('stop_task_hotkey', DEFAULT_HOTKEYS['stop_task_hotkey'])
+        self.pause_workflow_hotkey = self.config.get('pause_workflow_hotkey', DEFAULT_HOTKEYS['pause_workflow_hotkey'])
+        self.record_hotkey = self.config.get('record_hotkey', DEFAULT_HOTKEYS['record_hotkey'])
+        self.replay_hotkey = self.config.get('replay_hotkey', DEFAULT_HOTKEYS['replay_hotkey'])
         # 应用截图引擎配置（异步初始化，避免主线程首屏阻塞）
         screenshot_engine = self.config.get('screenshot_engine', 'wgc')
         self._startup_engine_init_target = str(screenshot_engine or "").strip().lower()

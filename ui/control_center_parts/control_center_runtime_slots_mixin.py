@@ -5,7 +5,7 @@ import threading
 from typing import Any, Dict, Optional
 
 from task_workflow.card_display import format_step_detail
-from utils.thread_start_utils import is_thread_start_task_type
+from task_workflow.thread_start import is_thread_start_task_type
 
 logger = logging.getLogger(__name__)
 

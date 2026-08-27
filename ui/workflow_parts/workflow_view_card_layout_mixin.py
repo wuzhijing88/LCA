@@ -6,6 +6,20 @@ operation_logger = logging.getLogger("workflow.operations")
 debug_print = lambda *args, **kwargs: None
 class WorkflowViewCardLayoutMixin:
 
+    def _notify_cards_moved(self, cards) -> None:
+        """用户拖动卡片后标记工作流未保存。"""
+        if getattr(self, "_loading_workflow", False) or getattr(self, "_undoing_operation", False):
+            return
+        notified = False
+        for card in cards or ():
+            card_id = getattr(card, "card_id", None)
+            if card_id is None:
+                continue
+            self.card_moved.emit(card_id, card.pos())
+            notified = True
+        if notified and hasattr(self, "_mark_workflow_dirty"):
+            self._mark_workflow_dirty()
+
     def _resolve_card_id(self, requested_card_id: Optional[int]) -> int:
         """返回明确指定的 ID，或根据当前卡片集合生成下一个 ID。"""
         if not isinstance(self.cards, dict):

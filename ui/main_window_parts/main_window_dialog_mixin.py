@@ -2,8 +2,8 @@ import logging
 
 from PySide6.QtWidgets import QMessageBox
 
-from utils.window_coordinate_common import center_window_on_widget_screen
-from utils.window_activation_utils import show_and_activate_overlay
+from utils.window.window_coordinate_common import center_window_on_widget_screen
+from utils.window.window_activation_utils import show_and_activate_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,7 @@ class MainWindowDialogMixin:
             # 工具 关键修复：打开中控前验证窗口句柄是否仍然有效
             logger.info("准备打开中控，开始验证窗口句柄...")
             try:
-                from utils.window_identity import refresh_bound_windows
+                from utils.window.window_identity import refresh_bound_windows
 
                 refresh_bound_windows(self.bound_windows)
             except Exception as refresh_error:

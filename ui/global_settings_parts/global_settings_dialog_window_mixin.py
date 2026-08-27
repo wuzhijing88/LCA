@@ -9,10 +9,10 @@ except ImportError:
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QMessageBox
-from utils.hwnd_utils import as_hwnd
-from utils.window_binding_utils import sync_runtime_window_binding_state
-from utils.window_identity import is_window_alive, refresh_bound_windows
-from utils.window_activation_utils import (
+from utils.window.hwnd_utils import as_hwnd
+from utils.window.window_binding_utils import sync_runtime_window_binding_state
+from utils.window.window_identity import is_window_alive, refresh_bound_windows
+from utils.window.window_activation_utils import (
     schedule_overlay_activation_boost,
     show_and_activate_overlay,
     show_and_raise_widget,
@@ -481,7 +481,7 @@ class GlobalSettingsDialogWindowMixin:
                 return True
             win32gui.EnumWindows(enum_windows_callback, None)
             try:
-                from utils.window_identity import is_desktop_window
+                from utils.window.window_identity import is_desktop_window
                 desktop_hwnd = 0
                 if hasattr(win32gui, "GetShellWindow"):
                     desktop_hwnd = as_hwnd(win32gui.GetShellWindow())
@@ -533,7 +533,7 @@ class GlobalSettingsDialogWindowMixin:
                         should_update = False
                 updated = False
                 if should_update and existing_hwnd != hwnd:
-                    from utils.window_identity import apply_window_identity
+                    from utils.window.window_identity import apply_window_identity
                     apply_window_identity(target, hwnd)
                     updated = True
                 if updated:

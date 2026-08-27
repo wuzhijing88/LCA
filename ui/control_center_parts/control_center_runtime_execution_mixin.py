@@ -6,7 +6,7 @@ from app_core.runtime.execution_coordinator import (
     ExecutionSource,
     create_coordinated_workflow_runtime,
 )
-from utils.thread_start_utils import THREAD_START_TASK_TYPE
+from task_workflow.thread_start import THREAD_START_TASK_TYPE
 
 from .control_center_runtime_types import TaskState
 

@@ -7,16 +7,8 @@ logger = logging.getLogger(__name__)
 
 
 _OCR_TASK_TYPES = {
-
     "OCR文字识别",
-
-    "字库识别",
-
     "ocr_region_recognition",
-
-    "dict_ocr_task",
-
-
 }
 
 
@@ -243,7 +235,7 @@ def _release_input_drivers() -> None:
 
     try:
 
-        from utils.foreground_input_manager import get_foreground_input_manager
+        from utils.input.foreground_input_manager import get_foreground_input_manager
 
         manager = get_foreground_input_manager()
 

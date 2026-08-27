@@ -10,14 +10,13 @@ from typing import Any, Dict, Optional, Tuple
 from PySide6.QtWidgets import (
     QWidget, QPushButton, QVBoxLayout, QMessageBox, QApplication
 )
-from PySide6.QtCore import Qt, Signal, QRect, QPoint
+from PySide6.QtCore import Qt, Signal, QRect, QPoint, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor
 
-from utils.window_finder import resolve_unique_window_hwnd
+from utils.window.window_finder import resolve_unique_window_hwnd
 
 from utils.app_paths import get_config_path
-from utils.window_coordinate_common import (
-    get_qt_virtual_desktop_rect,
+from utils.window.window_coordinate_common import (
     build_window_info,
     get_window_client_logical_size,
     get_window_client_physical_size,
@@ -25,20 +24,25 @@ from utils.window_coordinate_common import (
     normalize_region_binding_hwnd,
     normalize_window_hwnd,
 )
-from utils.window_overlay_utils import (
+from utils.window.window_overlay_utils import (
+    apply_overlay_text_style,
+    capture_virtual_desktop_pixmap,
+    capture_window_client_pixmap,
+    configure_opaque_picker_overlay,
+    draw_picker_backdrop,
     draw_selection_overlay,
     draw_target_window_overlay,
-    fill_overlay_event_background,
     map_native_rect_to_local,
+    prime_picker_backdrop,
     overlay_point_to_client_qpoint,
     overlay_rect_contains_point,
     refresh_target_window_overlay_rect,
     sync_overlay_geometry,
 )
-from utils.window_activation_utils import (
-    activate_overlay_widget,
+from utils.window.window_activation_utils import (
     activate_window,
     ensure_overlay_ready_for_input,
+    grab_overlay_input,
     schedule_overlay_activation_boost,
     show_and_activate_overlay,
 )
@@ -74,27 +78,14 @@ class OCRRegionSelectorOverlay(QWidget):
         self.selection_rect = QRect()
         self.selection_info_text = ""
         self.target_window_rect = QRect()
+        self.screenshot = None
+        self.window_pixmap = None
 
         # 窗口激活状态标志
         self._is_ready_for_input = False
         self._activation_attempts = 0
 
-        # 设置窗口属性（移除有问题的标志以改善事件处理）
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
-        )
-
-        # 强制设置为非模态，完全独立运行
-        self.setWindowModality(Qt.WindowModality.NonModal)
-
-        # 设置窗口透明但确保能接收鼠标事件
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-
-        # 设置鼠标追踪和焦点
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        configure_opaque_picker_overlay(self)
 
         logger.info("创建OCR区域选择覆盖层")
 
@@ -143,26 +134,29 @@ class OCRRegionSelectorOverlay(QWidget):
             QMessageBox.warning(self, "警告", "无法获取窗口信息")
             return False
 
-        # 【强制获取新帧】在截图前先强制捕获目标窗口最新帧，确保显示最新内容
         logger.info("[OCR框选] 捕获目标窗口最新帧...")
-        try:
-            from tasks.task_utils import capture_window_smart
-            # 强制获取最新帧
-            temp_frame = capture_window_smart(self.target_hwnd, client_area_only=True)
-            if temp_frame is not None:
-                logger.info(f"[OCR框选] 捕获成功，尺寸: {temp_frame.shape}")
-            else:
-                logger.warning("[OCR框选] 捕获失败，继续使用全屏截图")
-        except Exception as e:
-            logger.warning(f"[OCR框选] 捕获异常: {e}，继续使用全屏截图")
+        self.window_pixmap = capture_window_client_pixmap(self.target_hwnd)
+        if self.window_pixmap is not None:
+            logger.info(
+                "[OCR框选] 窗口截图成功，尺寸: %sx%s",
+                self.window_pixmap.width(),
+                self.window_pixmap.height(),
+            )
+        else:
+            logger.warning("[OCR框选] 窗口截图失败，继续使用全屏截图")
 
-        # 进行全屏截图
-        if not self._take_screenshot():
+        if not self._take_screenshot() and self.window_pixmap is None:
             QMessageBox.warning(self, "警告", "无法进行截图")
             return False
 
         # 设置全屏覆盖
         self._setup_fullscreen_overlay()
+        prime_picker_backdrop(
+            self,
+            desktop_pixmap=self.screenshot,
+            window_pixmap=self.window_pixmap,
+            target_rect=self.target_window_rect,
+        )
 
         # 验证窗口位置是否正确（通过检查绿色边框是否在正确位置）
         self._verify_window_position()
@@ -287,44 +281,13 @@ class OCRRegionSelectorOverlay(QWidget):
             
     def _take_screenshot(self) -> bool:
         """进行全屏截图"""
-        try:
-            from PySide6.QtWidgets import QApplication
-            from PySide6.QtGui import QPainter, QPixmap
-
-            screens = QApplication.screens()
-            primary = QApplication.primaryScreen()
-            if not screens or not primary:
-                logger.error("无法获取屏幕信息")
-                return False
-
-            virtual_geometry = get_qt_virtual_desktop_rect()
-            if virtual_geometry.isEmpty():
-                logger.error("虚拟桌面范围为空")
-                return False
-
-            screenshot = QPixmap(virtual_geometry.size())
-            screenshot.fill(Qt.GlobalColor.transparent)
-
-            painter = QPainter(screenshot)
-            for screen in screens:
-                shot = screen.grabWindow(0)
-                if shot.isNull():
-                    continue
-                offset = screen.geometry().topLeft() - virtual_geometry.topLeft()
-                painter.drawPixmap(offset, shot)
-            painter.end()
-
-            self.screenshot = screenshot
-            if self.screenshot.isNull():
-                logger.error("截图失败")
-                return False
-
-            logger.info(f"截图成功 (Qt备用): {self.screenshot.width()}x{self.screenshot.height()}")
-            return True
-
-        except Exception as e:
-            logger.error(f"截图失败: {e}")
+        self.screenshot = capture_virtual_desktop_pixmap()
+        if self.screenshot is None or self.screenshot.isNull():
+            logger.error("截图失败")
+            self.screenshot = None
             return False
+        logger.info(f"截图成功 (Qt备用): {self.screenshot.width()}x{self.screenshot.height()}")
+        return True
 
     def _setup_fullscreen_overlay(self):
         """Set fullscreen overlay geometry."""
@@ -403,8 +366,8 @@ class OCRRegionSelectorOverlay(QWidget):
             return QRect(), ""
 
         if self.window_info:
-            relative_start = self._get_relative_coordinates(self.start_pos)
-            relative_end = self._get_relative_coordinates(current_end_pos)
+            relative_start = self._overlay_to_client_point_fast(self.start_pos)
+            relative_end = self._overlay_to_client_point_fast(current_end_pos)
             relative_rect = QRect(relative_start, relative_end).normalized()
             info_text = (
                 f"({relative_rect.x()}, {relative_rect.y()}) "
@@ -479,6 +442,14 @@ class OCRRegionSelectorOverlay(QWidget):
 
         except Exception as e:
             logger.error(f"窗口位置校验失败: {e}")
+
+    def _overlay_to_client_point_fast(self, overlay_pos: QPoint) -> QPoint:
+        if not self.window_info:
+            return QPoint(overlay_pos)
+        target_rect = self._get_target_window_rect(refresh=False)
+        if target_rect.isEmpty():
+            return QPoint(overlay_pos)
+        return overlay_point_to_client_qpoint(self.window_info, target_rect, overlay_pos)
 
     def _get_relative_coordinates(self, overlay_pos: QPoint) -> QPoint:
         """Convert overlay coordinates to client-relative coordinates."""
@@ -567,45 +538,37 @@ class OCRRegionSelectorOverlay(QWidget):
         return overlay_rect_contains_point(target_rect, qt_screen_pos)
 
     def paintEvent(self, event):
-        """Paint overlay with transparent background and selection."""
+        """Paint frozen window image and selection."""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
-        fill_overlay_event_background(painter, self)
+        target_rect = self._get_target_window_rect(refresh=False) if self.window_info else QRect()
+        draw_picker_backdrop(
+            painter,
+            self,
+            desktop_pixmap=self.screenshot,
+            window_pixmap=self.window_pixmap,
+            target_rect=target_rect,
+        )
 
         if self.window_info:
-            target_rect = self._get_target_window_rect(refresh=False)
             draw_target_window_overlay(painter, target_rect)
 
         if self.selecting and not self.selection_rect.isEmpty():
             draw_selection_overlay(painter, self.selection_rect, info_text=self.selection_info_text)
 
-        painter.setPen(QPen(QColor(255, 255, 255)))
-        painter.drawText(50, 50, "Drag to select | Right click or ESC to cancel")
+        apply_overlay_text_style(painter)
+        painter.drawText(50, 50, "拖动框选 | 右键或 ESC 取消")
 
     def mousePressEvent(self, event):
-        """Handle mouse press and ensure the overlay stays active."""
-        if not self.isActiveWindow():
-            logger.warning("OCR overlay is not active, trying to reactivate")
-            activate_overlay_widget(self, log_prefix='OCR覆盖层', focus=True)
-            event.accept()
-            return
-
+        """按下后立刻开始框选，中途不再抢前台，避免把拖拽掐断。"""
         if event.button() == Qt.MouseButton.LeftButton:
-            if not self._is_ready_for_input:
-                logger.info("OCR overlay not ready yet; use this click only to activate")
-                activate_overlay_widget(self, log_prefix='OCR覆盖层', focus=True)
-                event.accept()
-                return
-
-            if self.window_info and not self._is_point_in_target_window(event.pos()):
-                logger.debug("Left click outside target window; ignore selection start")
-                self.setCursor(Qt.CursorShape.ArrowCursor)
-                event.accept()
-                return
-
             self._refresh_target_window_rect(force=True)
-            self.start_pos = self._clamp_point_to_target_window(event.pos())
+            target_rect = self._get_target_window_rect(refresh=False)
+            if target_rect.isEmpty():
+                self.start_pos = QPoint(event.pos())
+            else:
+                self.start_pos = self._clamp_point_to_target_window(event.pos())
             self.end_pos = self.start_pos
             self.selecting = False
             self.selection_pending = True
@@ -736,12 +699,13 @@ class OCRRegionSelectorOverlay(QWidget):
 
     def showEvent(self, event):
         """显示事件 - 延迟激活以确保窗口系统准备就绪"""
+        if getattr(self, "_closing", False):
+            event.ignore()
+            return
         logger.info("OCR区域选择器显示事件触发")
         super().showEvent(event)
-
-        # 延迟激活，确保窗口系统完成所有初始化
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(250, self._ensure_ready_for_input)
+        grab_overlay_input(self, log_prefix='OCR覆盖层')
+        QTimer.singleShot(50, self._ensure_ready_for_input)
 
     def _ensure_ready_for_input(self):
         """确保覆盖层准备好接收输入"""
@@ -1000,6 +964,7 @@ class OCRRegionSelectorWidget(QWidget):
                 self.current_region_binding = self._build_region_binding_info(getattr(overlay, 'target_hwnd', None))
                 if show_and_activate_overlay(overlay, log_prefix='OCR覆盖层启动', focus=True):
                     logger.info("已使用统一覆盖层激活链启动OCR覆盖层")
+                grab_overlay_input(overlay, log_prefix='OCR覆盖层')
                 schedule_overlay_activation_boost(
                     overlay,
                     log_prefix='OCR覆盖层置顶',

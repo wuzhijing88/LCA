@@ -2,16 +2,17 @@ import logging
 
 from PySide6.QtWidgets import QDialog
 
-from utils.window_coordinate_common import center_window_on_widget_screen
-from utils.window_activation_utils import show_and_activate_overlay
-from utils.window_binding_utils import sync_runtime_window_binding_state
+from app_core.config_sections import DEFAULT_HOTKEYS
+from utils.window.window_coordinate_common import center_window_on_widget_screen
+from utils.window.window_activation_utils import show_and_activate_overlay
+from utils.window.window_binding_utils import sync_runtime_window_binding_state
 
 logger = logging.getLogger(__name__)
 
 
 def _sync_foreground_input_runtime(config: dict) -> None:
     """应用前台驱动配置，并让输入模拟器在下次使用时按新配置创建。"""
-    from utils.foreground_input_manager import get_foreground_input_manager
+    from utils.input.foreground_input_manager import get_foreground_input_manager
     from utils.input_simulation import global_input_simulator_manager
     from utils.input_simulation.mode_utils import parse_foreground_backends
     foreground_input = get_foreground_input_manager()
@@ -69,11 +70,11 @@ class MainWindowGlobalSettingsMixin:
         self.multi_window_delay = settings.get('multi_window_delay', 500)
         logger.info(f"更新后 MainWindow.bound_windows: {len(self.bound_windows)} 个")
         # 快捷键设置
-        self.start_task_hotkey = settings.get('start_task_hotkey', 'XButton1')
-        self.stop_task_hotkey = settings.get('stop_task_hotkey', 'XButton2')
-        self.pause_workflow_hotkey = settings.get('pause_workflow_hotkey', 'F11')
-        self.record_hotkey = settings.get('record_hotkey', 'F12')
-        self.replay_hotkey = settings.get('replay_hotkey', 'F10')
+        self.start_task_hotkey = settings.get('start_task_hotkey', DEFAULT_HOTKEYS['start_task_hotkey'])
+        self.stop_task_hotkey = settings.get('stop_task_hotkey', DEFAULT_HOTKEYS['stop_task_hotkey'])
+        self.pause_workflow_hotkey = settings.get('pause_workflow_hotkey', DEFAULT_HOTKEYS['pause_workflow_hotkey'])
+        self.record_hotkey = settings.get('record_hotkey', DEFAULT_HOTKEYS['record_hotkey'])
+        self.replay_hotkey = settings.get('replay_hotkey', DEFAULT_HOTKEYS['replay_hotkey'])
         # 更新配置字典
         self.config.update(settings)
         self.config['bound_windows'] = self.native_bound_windows
@@ -165,7 +166,7 @@ class MainWindowGlobalSettingsMixin:
                 logger.error(f"显示错误消息框失败: {msg_error}")
         # 用户在前台模式中选择 Interception 后，必须再次明确同意才能安装。
         try:
-            from utils.interception_installation_prompt import request_interception_installation
+            from utils.input.interception_installation_prompt import request_interception_installation
             request_interception_installation(self, self.config)
         except Exception as install_prompt_error:
             logger.error(f"处理 Interception 安装确认时出错: {install_prompt_error}", exc_info=True)

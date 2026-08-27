@@ -2,7 +2,7 @@ import logging
 import os
 from typing import List
 
-from utils.workflow_workspace_utils import (
+from task_workflow.workspace import (
     get_effective_workflow_images_dir,
     load_workspace_favorites_snapshot,
     save_workspace_favorites_snapshot,
@@ -128,7 +128,9 @@ class MainWindowFavoritesMixin:
             if self._is_any_workflow_running():
                 if hasattr(self, 'step_detail_label'):
                     self.step_detail_label.setText("存在正在运行的工作流，不能打开新的收藏工作流")
-                    self._set_step_detail_style(text_color="#FF0000")
+                    from themes import theme_color
+
+                    self._set_step_detail_style(text_color=theme_color("error", "#e81123"))
                     QTimer.singleShot(3000, lambda: self.step_detail_label.setText("准备就绪..."))
                 logger.warning("存在正在运行的工作流，跳过打开收藏工作流")
                 return

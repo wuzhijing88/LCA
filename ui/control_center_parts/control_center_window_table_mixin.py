@@ -126,8 +126,8 @@ class ControlCenterWindowTableMixin:
                 store[new_key] = store.pop(old_key)
 
     def _refresh_bound_window_handles(self) -> bool:
-        from utils.hwnd_utils import as_hwnd
-        from utils.window_identity import refresh_bound_windows
+        from utils.window.hwnd_utils import as_hwnd
+        from utils.window.window_identity import refresh_bound_windows
 
         old_ids = {
             id(window_info): self._window_runtime_id(window_info, row)
@@ -175,22 +175,24 @@ class ControlCenterWindowTableMixin:
     def _apply_status_style(self, item: Optional[QTableWidgetItem], status_text: str):
         if item is None:
             return
+        from themes import theme_color
+
         status_colors = {
-            "未分配": QColor("#999999"),
-            "就绪": QColor("#4f86f7"),
-            "等待开始": QColor("#4f86f7"),
-            "正在启动": QColor("#4f86f7"),
-            "正在运行": QColor("#1a7f37"),
-            "暂停中": QColor("#b26a00"),
-            "已暂停": QColor("#b26a00"),
-            "正在停止": QColor("#b26a00"),
-            "已中断": QColor("#666666"),
-            "已完成": QColor("#1a7f37"),
-            "完成": QColor("#1a7f37"),
-            "失败": QColor("#c62828"),
-            "执行失败": QColor("#c62828"),
+            "未分配": QColor(theme_color("text_disabled", "#999999")),
+            "就绪": QColor(theme_color("info", "#0078d4")),
+            "等待开始": QColor(theme_color("info", "#0078d4")),
+            "正在启动": QColor(theme_color("info", "#0078d4")),
+            "正在运行": QColor(theme_color("success", "#107c10")),
+            "暂停中": QColor(theme_color("warning", "#ff8c00")),
+            "已暂停": QColor(theme_color("warning", "#ff8c00")),
+            "正在停止": QColor(theme_color("warning", "#ff8c00")),
+            "已中断": QColor(theme_color("text_disabled", "#666666")),
+            "已完成": QColor(theme_color("success", "#107c10")),
+            "完成": QColor(theme_color("success", "#107c10")),
+            "失败": QColor(theme_color("error", "#e81123")),
+            "执行失败": QColor(theme_color("error", "#e81123")),
         }
-        item.setForeground(status_colors.get(status_text, QColor("#333333")))
+        item.setForeground(status_colors.get(status_text, QColor(theme_color("text", "#333333"))))
 
     def _set_status_cell(self, row: int, status_text: str):
         item = self.window_table.item(row, COL_STATUS)
@@ -212,7 +214,7 @@ class ControlCenterWindowTableMixin:
         item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
     def _window_row_tooltip(self, window_info: Optional[Dict[str, Any]], window_id: str = "") -> str:
-        from utils.hwnd_utils import as_hwnd
+        from utils.window.hwnd_utils import as_hwnd
 
         title = str((window_info or {}).get("title") or "未知窗口")
         hwnd = as_hwnd((window_info or {}).get("hwnd"))
@@ -429,7 +431,7 @@ class ControlCenterWindowTableMixin:
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        from utils.hwnd_utils import as_hwnd
+        from utils.window.hwnd_utils import as_hwnd
 
         hwnd = as_hwnd(window_info.get("hwnd"))
         header_label = QLabel(

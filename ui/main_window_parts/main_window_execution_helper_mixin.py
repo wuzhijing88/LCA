@@ -3,8 +3,8 @@ import os
 
 from PySide6.QtWidgets import QMessageBox
 
-from utils.hwnd_utils import as_hwnd
-from utils.thread_start_utils import is_thread_start_task_type
+from utils.window.hwnd_utils import as_hwnd
+from task_workflow.thread_start import is_thread_start_task_type
 
 logger = logging.getLogger(__name__)
 
@@ -388,7 +388,7 @@ class MainWindowExecutionHelperMixin:
 
         logger.info(f"启动时验证绑定窗口，配置中有 {len(self.bound_windows)} 个窗口")
 
-        from utils.window_identity import is_window_alive, refresh_bound_windows
+        from utils.window.window_identity import is_window_alive, refresh_bound_windows
 
         original_hwnds = [window_info.get('hwnd') for window_info in self.bound_windows]
         changed = refresh_bound_windows(self.bound_windows)

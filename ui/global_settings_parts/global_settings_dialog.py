@@ -4,8 +4,8 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QHBoxLayout, QTabWidget, QVBoxLayout
 
-from utils.window_coordinate_common import center_window_on_widget_screen
-from utils.hwnd_utils import normalize_bound_windows_hwnds
+from utils.window.window_coordinate_common import center_window_on_widget_screen
+from utils.window.hwnd_utils import normalize_bound_windows_hwnds
 from .global_settings_dialog_tabs_mixin import GlobalSettingsDialogTabsMixin
 from .global_settings_dialog_window_mixin import GlobalSettingsDialogWindowMixin
 from .global_settings_dialog_visibility_mixin import GlobalSettingsDialogVisibilityMixin

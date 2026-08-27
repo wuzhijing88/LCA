@@ -16,13 +16,13 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QThread, QTimer
 from PySide6.QtGui import QColor
-from themes import get_theme_manager
+from themes import get_theme_manager, theme_color
 from ui.panels.recording.parameter_panel_recording_replay_thread import ParameterPanelReplayThread
-from utils.window_activation_utils import (
+from utils.window.window_activation_utils import (
     resolve_replay_window_offsets_from_config,
 )
 from ..widgets.custom_widgets import CustomDropdown as QComboBox
-from utils.window_coordinate_common import get_available_geometry_for_widget, clamp_preferred_window_size
+from utils.window.window_coordinate_common import get_available_geometry_for_widget, clamp_preferred_window_size
 
 logger = logging.getLogger(__name__)
 
@@ -328,27 +328,33 @@ class ActionEditorDialog(QDialog):
         """补充步骤编辑器局部样式，使详情区与全局主题一致。"""
         try:
             theme_manager = get_theme_manager()
-            is_dark = bool(theme_manager.is_dark_mode())
             text_secondary = theme_manager.get_color("text_secondary")
             text_color = theme_manager.get_color("text")
             border = theme_manager.get_color("border")
             border_light = theme_manager.get_color("border_light")
+            detail_background = theme_manager.get_color("card")
+            button_background = theme_manager.get_color("surface")
+            button_hover_background = theme_manager.get_color("hover")
+            button_pressed_background = theme_manager.get_color("pressed")
+            button_border = theme_manager.get_color("border")
+            button_hover_border = theme_manager.get_color("border_light")
+            button_disabled_background = theme_manager.get_color("canvas")
+            button_disabled_text = theme_manager.get_color("text_disabled")
+            button_disabled_border = theme_manager.get_color("border")
         except Exception:
-            is_dark = False
             text_secondary = "#666666"
-            text_color = "#1f2328"
-            border = "#d0d0d0"
-            border_light = "#b8b8b8"
-
-        detail_background = "#2d2d2d" if is_dark else "#ffffff"
-        button_background = "#2d2d2d" if is_dark else "#f5f5f5"
-        button_hover_background = "#3a3a3a" if is_dark else "#e8e8e8"
-        button_pressed_background = "#252525" if is_dark else "#d8d8d8"
-        button_border = "#3e3e3e" if is_dark else "#e0e0e0"
-        button_hover_border = "#4e4e4e" if is_dark else "#d0d0d0"
-        button_disabled_background = "#252525" if is_dark else "#fafafa"
-        button_disabled_text = "#666666" if is_dark else "#999999"
-        button_disabled_border = "#2e2e2e" if is_dark else "#e8e8e8"
+            text_color = "#333333"
+            border = "#e0e0e0"
+            border_light = "#eeeeee"
+            detail_background = "#ffffff"
+            button_background = "#f5f5f5"
+            button_hover_background = "#e8e8e8"
+            button_pressed_background = "#d8d8d8"
+            button_border = "#e0e0e0"
+            button_hover_border = "#eeeeee"
+            button_disabled_background = "#fafafa"
+            button_disabled_text = "#999999"
+            button_disabled_border = "#e0e0e0"
 
         self.setStyleSheet(
             f"""
@@ -421,11 +427,11 @@ class ActionEditorDialog(QDialog):
     def _get_detail_theme_colors(self) -> Dict[str, str]:
         """获取详情区渲染所需的主题颜色。"""
         defaults = {
-            "text": "#1f2328",
-            "text_secondary": "#667085",
-            "surface": "#f7f7f7",
+            "text": "#333333",
+            "text_secondary": "#666666",
+            "surface": "#f5f5f5",
             "card": "#ffffff",
-            "border": "#d0d7de",
+            "border": "#e0e0e0",
         }
 
         try:
@@ -541,17 +547,17 @@ class ActionEditorDialog(QDialog):
         type_display = self.get_type_display_name(action_type)
         type_item = QTableWidgetItem(type_display)
 
-        # 根据类型设置颜色
+        # 类型色走主题令牌，暗色下也能看清
         if action_type == 'mouse_move':
-            type_item.setForeground(QColor("#0066cc"))
+            type_item.setForeground(QColor(theme_color("info", "#0078d4")))
         elif action_type == 'mouse_move_relative':
-            type_item.setForeground(QColor("#0099ff"))
+            type_item.setForeground(QColor(theme_color("accent_hover", "#1084d8")))
         elif action_type == 'mouse_click':
-            type_item.setForeground(QColor("#009900"))
+            type_item.setForeground(QColor(theme_color("success", "#107c10")))
         elif action_type in ['key_press', 'key_release']:
-            type_item.setForeground(QColor("#cc6600"))
+            type_item.setForeground(QColor(theme_color("warning", "#ff8c00")))
         elif action_type == 'mouse_scroll':
-            type_item.setForeground(QColor("#9900cc"))
+            type_item.setForeground(QColor(theme_color("accent", "#0078d4")))
 
         self.table.setItem(row, 3, type_item)
 
@@ -1336,19 +1342,23 @@ class ActionEditorDialog(QDialog):
     def highlight_step(self, index: int):
         """高亮显示当前执行的步骤"""
         def do_highlight():
+            from PySide6.QtGui import QBrush
+
+            highlight = QColor(theme_color("warning", "#ff8c00"))
+            highlight.setAlpha(72)
             # 清除之前的高亮
             for i in range(self.table.rowCount()):
                 for j in range(1, 6):  # 跳过复选框列
                     item = self.table.item(i, j)
                     if item:
-                        item.setBackground(QColor(255, 255, 255))  # 白色背景
+                        item.setBackground(QBrush())
 
             # 高亮当前步骤
             if 0 <= index < self.table.rowCount():
                 for j in range(1, 6):  # 跳过复选框列
                     item = self.table.item(index, j)
                     if item:
-                        item.setBackground(QColor(255, 255, 0))  # 黄色高亮
+                        item.setBackground(highlight)
 
                 # 滚动到当前步骤
                 self.table.scrollToItem(self.table.item(index, 1))
@@ -1358,11 +1368,13 @@ class ActionEditorDialog(QDialog):
     def clear_all_highlights(self):
         """清除所有高亮"""
         def do_clear():
+            from PySide6.QtGui import QBrush
+
             for i in range(self.table.rowCount()):
                 for j in range(1, 6):
                     item = self.table.item(i, j)
                     if item:
-                        item.setBackground(QColor(255, 255, 255))
+                        item.setBackground(QBrush())
 
         self._run_on_ui_thread(do_clear, "清除高亮失败")
 

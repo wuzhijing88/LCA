@@ -10,8 +10,8 @@ from functools import partial
 from typing import Dict, List, Optional, Any, Tuple
 from PySide6.QtCore import QObject, Signal
 
-from ..workflow_parts.workflow_task import WorkflowTask
-from utils.workflow_workspace_utils import get_effective_workflow_images_dir
+from task_workflow.workflow_task import WorkflowTask
+from task_workflow.workspace import get_effective_workflow_images_dir
 
 logger = logging.getLogger(__name__)
 
@@ -172,35 +172,19 @@ class WorkflowTaskManager(QObject):
         if len(yolo_tasks) > 3:
             task_names = f"{task_names} 等{len(yolo_tasks)}个任务"
 
-        requires_native_screenshot_engine = False
-        for task in yolo_tasks:
-            execution_mode = str(
-                getattr(task, "execution_mode", "") or self.config.get("execution_mode", "")
-            ).strip().lower()
-            if execution_mode.startswith("foreground"):
-                requires_native_screenshot_engine = True
-                continue
-            return False, (
-                f"任务“{task_names}”包含YOLO，当前执行模式为"
-                f"{self._format_execution_mode_label(execution_mode)}。"
-                "YOLO原生模式仅支持前台模式，且截图引擎必须为DXGI或GDI。"
-            )
-
-        if not requires_native_screenshot_engine:
-            return True, ""
-
         screenshot_engine = str(self.config.get("screenshot_engine", "") or "").strip().lower()
-        if screenshot_engine not in {"dxgi", "gdi"}:
+        allowed_engines = {"dxgi", "gdi", "wgc", "printwindow"}
+        if screenshot_engine and screenshot_engine not in allowed_engines:
             return False, (
                 f"任务“{task_names}”包含YOLO，当前截图引擎为"
                 f"{self._format_screenshot_engine_label(screenshot_engine)}。"
-                "YOLO仅支持DXGI/GDI前台截图，请到全局设置切换后重试。"
+                "YOLO可用 DXGI、GDI、WGC、PrintWindow，请到全局设置切换后重试。"
             )
 
         return True, ""
 
     def _validate_wgc_desktop_for_tasks(self, tasks: List[Any]) -> Tuple[bool, str]:
-        from utils.window_identity import (
+        from utils.window.window_identity import (
             WGC_DESKTOP_ENGINE_MESSAGE,
             is_wgc_with_desktop_target,
         )

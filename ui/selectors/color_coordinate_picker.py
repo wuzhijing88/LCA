@@ -15,25 +15,34 @@ from PySide6.QtWidgets import (QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
 from PySide6.QtCore import Signal, QPoint, QRect, Qt, QTimer, QThread
 from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QImage, QPixmap
 
-from utils.window_coordinate_common import (
+from utils.window.window_coordinate_common import (
     get_qt_virtual_desktop_rect,
     build_window_info,
     client_relative_to_qt_global,
     get_window_client_physical_size,
+    get_window_client_qt_global_rect,
     normalize_window_hwnd,
 )
-from utils.window_overlay_utils import (
+from utils.window.window_overlay_utils import (
+    apply_overlay_text_style,
+    capture_virtual_desktop_pixmap,
+    configure_opaque_picker_overlay,
     draw_overlay_frame,
-    fill_overlay_event_background,
+    draw_picker_backdrop,
     get_target_window_overlay_rect,
+    numpy_screenshot_to_qpixmap,
     overlay_point_to_client_qpoint,
     overlay_rect_contains_point,
+    prime_picker_backdrop,
     sync_overlay_geometry,
 )
-from utils.window_activation_utils import (
+from utils.window.window_activation_utils import (
     activate_overlay_widget,
     activate_window,
     ensure_overlay_ready_for_input,
+    grab_overlay_input,
+    release_overlay_input,
+    schedule_overlay_activation_boost,
     show_and_activate_overlay,
 )
 
@@ -68,7 +77,7 @@ except Exception:
     _CCP_USER32 = None
 
 # 导入窗口隐藏管理器
-from utils.window_hider import WindowHider
+from utils.window.window_hider import WindowHider
 
 # 导入主题管理器
 try:
@@ -285,6 +294,8 @@ class ColorCoordinatePickerOverlay(QWidget):
     """颜色坐标选择器覆盖层 - 点击获取坐标和颜色"""
 
     color_coordinate_selected = Signal(int, int, int, int, int)  # x, y, r, g, b
+    color_picking_finished = Signal(str)
+    picking_closed = Signal()
 
     def __init__(self, target_window_hwnd: int, parent=None, search_region=None, initial_points: Optional[List[Tuple[int, int, int, int, int]]] = None):
         super().__init__(None)  # 独立窗口
@@ -318,6 +329,7 @@ class ColorCoordinatePickerOverlay(QWidget):
         # 静态截图（在显示覆盖层时拍摄）
         self.static_screenshot = None
         self._static_screenshot_pixmap: Optional[QPixmap] = None
+        self.desktop_pixmap = None
         self.original_mouse_pos = None  # 保存原始鼠标位置
 
         # 放大镜刷新节流与缓存（避免全屏重绘导致卡顿）
@@ -350,17 +362,8 @@ class ColorCoordinatePickerOverlay(QWidget):
         self.input_monitor.esc_pressed.connect(self._on_global_esc)
         self.input_monitor.right_click.connect(self._on_global_right_click)
 
-        # 设置窗口属性
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Dialog  # 使用Dialog确保能接收键盘和鼠标事件
-        )
-
-        self.setWindowModality(Qt.WindowModality.NonModal)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        configure_opaque_picker_overlay(self)
+        self._closing = False
 
         self._init_action_buttons()
 
@@ -371,8 +374,76 @@ class ColorCoordinatePickerOverlay(QWidget):
 
     def capture_screenshot_before_show(self):
         """在显示覆盖层前拍摄静态截图（由外部调用）"""
+        try:
+            self.hide()
+        except Exception:
+            pass
         self._capture_static_screenshot()
-        return self.static_screenshot is not None
+        if self.desktop_pixmap is None:
+            self.desktop_pixmap = capture_virtual_desktop_pixmap()
+        if self._screenshot_is_unusable(self.static_screenshot):
+            cropped = self._crop_desktop_to_client_bgr()
+            if cropped is not None:
+                logger.warning("窗口截图过暗或失败，改用桌面裁剪作为取色画面")
+                self.static_screenshot = cropped
+                self._static_screenshot_pixmap = None
+                self.cached_screenshot = cropped
+        self._setup_overlay_geometry()
+        prime_picker_backdrop(
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            window_pixmap=self._get_static_screenshot_pixmap(),
+            target_rect=self._get_target_window_rect() if self.window_info else QRect(),
+        )
+        return self.static_screenshot is not None or (
+            self.desktop_pixmap is not None and not self.desktop_pixmap.isNull()
+        )
+
+    @staticmethod
+    def _screenshot_is_unusable(screenshot) -> bool:
+        if screenshot is None:
+            return True
+        try:
+            import numpy as np
+
+            sample = np.asarray(screenshot)
+            if sample.size == 0:
+                return True
+            channels = sample.reshape(-1, sample.shape[-1])[:, :3]
+            return float(np.mean(channels.max(axis=1))) < 4.0
+        except Exception:
+            return True
+
+    def _crop_desktop_to_client_bgr(self):
+        if self.desktop_pixmap is None or self.desktop_pixmap.isNull() or not self.window_info:
+            return None
+        try:
+            import numpy as np
+
+            virtual = get_qt_virtual_desktop_rect()
+            client = get_window_client_qt_global_rect(self.window_info)
+            if virtual is None or virtual.isEmpty() or client is None or client.isEmpty():
+                return None
+            crop = QRect(
+                int(client.x() - virtual.x()),
+                int(client.y() - virtual.y()),
+                int(client.width()),
+                int(client.height()),
+            ).intersected(QRect(0, 0, self.desktop_pixmap.width(), self.desktop_pixmap.height()))
+            if crop.isEmpty():
+                return None
+            image = self.desktop_pixmap.copy(crop).toImage().convertToFormat(QImage.Format.Format_RGB888)
+            width = int(image.width())
+            height = int(image.height())
+            if width <= 0 or height <= 0:
+                return None
+            ptr = image.constBits()
+            arr = np.frombuffer(ptr, dtype=np.uint8).reshape(height, image.bytesPerLine())
+            rgb = arr[:, : width * 3].reshape(height, width, 3)
+            return np.ascontiguousarray(rgb[:, :, ::-1])
+        except Exception as error:
+            logger.warning("桌面裁剪取色画面失败: %s", error)
+            return None
 
     def setup_target_window(self):
         """设置目标窗口"""
@@ -404,12 +475,8 @@ class ColorCoordinatePickerOverlay(QWidget):
             logger.error("无法获取窗口信息")
             return False
 
-        # 激活目标窗口
+        # 激活目标窗口。全屏几何必须等截图完成后再设，否则不透明覆盖层会把画面盖成黑的。
         self._activate_target_window(target_hwnd)
-
-        # 设置覆盖层几何
-        self._setup_overlay_geometry()
-
         return True
 
     def _get_window_info(self, hwnd: int):
@@ -665,40 +732,52 @@ class ColorCoordinatePickerOverlay(QWidget):
         self.finish_button.show()
         self.cancel_button.show()
 
+    def _is_fullscreen_like_target(self, target_rect: QRect) -> bool:
+        overlay_rect = self.rect()
+        if overlay_rect.isEmpty() or target_rect.isEmpty():
+            return False
+        try:
+            from utils.window.window_identity import is_desktop_window
+
+            if is_desktop_window(self.target_window_hwnd):
+                return True
+        except Exception:
+            pass
+        overlay_area = max(1, overlay_rect.width() * overlay_rect.height())
+        target_area = max(0, target_rect.width() * target_rect.height())
+        return (target_area / overlay_area) >= 0.85
+
     def _position_action_buttons(self):
-        """根据目标窗口位置摆放覆盖层按钮（优先目标区域右下方）。"""
+        """普通窗口放在客户区下方；桌面/全屏改到顶部，避免挡住取色。"""
         if not hasattr(self, "finish_button") or not hasattr(self, "cancel_button"):
             return
 
         gap = 8
         margin = 12
-        anchor_rect = self._get_target_window_rect()
-        if anchor_rect.isEmpty():
-            anchor_rect = self.rect()
+        overlay_rect = self.rect()
+        target_rect = self._get_target_window_rect()
+        if target_rect.isEmpty():
+            target_rect = overlay_rect
 
         total_w = self.finish_button.width() + self.cancel_button.width() + gap
         btn_h = self.finish_button.height()
 
-        # 主定位：目标区域右下方（不挡右上角取色）
-        x = anchor_rect.right() - total_w
-        y = anchor_rect.bottom() + gap
+        if self._is_fullscreen_like_target(target_rect):
+            x = overlay_rect.center().x() - total_w // 2
+            y = overlay_rect.top() + margin
+        else:
+            x = target_rect.right() - total_w
+            y = target_rect.bottom() + gap
+            if y + btn_h > overlay_rect.bottom() - margin:
+                x = overlay_rect.center().x() - total_w // 2
+                y = overlay_rect.top() + margin
 
-        # 横向边界保护
-        if x < margin:
-            x = margin
-        if x + total_w > self.width() - margin:
-            x = self.width() - total_w - margin
-
-        # 纵向边界保护：优先贴近底部，不上移到顶部
-        if y + btn_h > self.height() - margin:
-            y = self.height() - btn_h - margin
-        if y < margin:
-            y = margin
-
-        x = int(x)
-        y = int(y)
+        x = max(margin, min(int(x), overlay_rect.width() - total_w - margin))
+        y = max(margin, min(int(y), overlay_rect.height() - btn_h - margin))
         self.finish_button.move(x, y)
         self.cancel_button.move(x + self.finish_button.width() + gap, y)
+        self.finish_button.raise_()
+        self.cancel_button.raise_()
 
     def _apply_action_buttons_theme(self) -> None:
         """应用与截图工具一致的按钮风格。"""
@@ -810,14 +889,35 @@ class ColorCoordinatePickerOverlay(QWidget):
         self.finish_button.setStyleSheet(action_style)
         self.cancel_button.setStyleSheet(action_style)
 
+    def _build_color_string_from_points(self) -> str:
+        points = list(getattr(self, "selected_points", []) or [])
+        if not points:
+            return ""
+        if len(points) == 1:
+            _x, _y, r, g, b = points[0]
+            return f"{int(r)},{int(g)},{int(b)}"
+        x0, y0, r0, g0, b0 = points[0]
+        parts = [f"{int(r0)},{int(g0)},{int(b0)}"]
+        for x, y, r, g, b in points[1:]:
+            parts.append(f"{int(x) - int(x0)},{int(y) - int(y0)},{int(r)},{int(g)},{int(b)}")
+        return "|".join(parts)
+
     def _on_finish_clicked(self):
         """完成取色并关闭覆盖层。"""
-        logger.info("取色覆盖层点击完成，关闭覆盖层")
-        self.close()
+        color_text = self._build_color_string_from_points()
+        logger.info("取色覆盖层点击完成，点数=%s", len(getattr(self, "selected_points", []) or []))
+        if color_text:
+            self.color_picking_finished.emit(color_text)
+        self._request_close()
 
     def _on_cancel_clicked(self):
         """取消取色并关闭覆盖层。"""
         logger.info("取色覆盖层点击取消，关闭覆盖层")
+        self._request_close()
+
+    def _request_close(self):
+        if getattr(self, "_closing", False):
+            return
         self.close()
 
     def _get_static_screenshot_pixmap(self) -> Optional[QPixmap]:
@@ -830,10 +930,11 @@ class ColorCoordinatePickerOverlay(QWidget):
             return None
 
         try:
-            rgb = screenshot[:, :, ::-1]
-            h, w = rgb.shape[:2]
-            image = QImage(rgb.data, w, h, int(rgb.strides[0]), QImage.Format.Format_RGB888)
-            self._static_screenshot_pixmap = QPixmap.fromImage(image.copy())
+            self._static_screenshot_pixmap = numpy_screenshot_to_qpixmap(screenshot)
+            if self._static_screenshot_pixmap is None or self._static_screenshot_pixmap.isNull():
+                logger.warning("静态截图转QPixmap失败")
+                self._static_screenshot_pixmap = None
+                return None
             return self._static_screenshot_pixmap
         except Exception as e:
             logger.debug(f"静态截图转QPixmap失败: {e}")
@@ -921,7 +1022,7 @@ class ColorCoordinatePickerOverlay(QWidget):
             'picker_search_bg': QColor(255, 255, 0),
             'picker_crosshair_outer': QColor(255, 255, 255),
             'picker_crosshair_inner': QColor(255, 0, 0),
-            'picker_text': QColor(255, 255, 255),
+            'picker_text': QColor(0, 255, 0),
             'picker_text_bg': QColor(0, 0, 0),
         }
         return default_colors.get(color_key, QColor(255, 255, 255))
@@ -929,20 +1030,19 @@ class ColorCoordinatePickerOverlay(QWidget):
     def paintEvent(self, event):
         """绘制事件"""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        apply_overlay_text_style(painter)
 
-        fill_overlay_event_background(painter, self)
+        target_rect = self._get_target_window_rect() if self.window_info else QRect()
+        draw_picker_backdrop(
+            painter,
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            window_pixmap=self._get_static_screenshot_pixmap(),
+            target_rect=target_rect,
+        )
 
         if self.window_info:
-            target_rect = self._get_target_window_rect()
-            if target_rect.isEmpty():
-                target_rect = QRect()
-
-            if not target_rect.isEmpty():
-                static_pixmap = self._get_static_screenshot_pixmap()
-                if static_pixmap is not None and not static_pixmap.isNull():
-                    painter.drawPixmap(target_rect, static_pixmap)
-
             if not target_rect.isEmpty():
                 border_color = self._get_picker_color('picker_target_border')
                 draw_overlay_frame(painter, target_rect, border_color=border_color, border_width=4)
@@ -1007,10 +1107,10 @@ class ColorCoordinatePickerOverlay(QWidget):
             pixel_size = int(self._magnifier_pixel_size)
             half_grid = grid_size // 2
 
-            # 背景与边框
+            # 背景与边框。不要用 picker_text 的绿边，那是旧取色器配色。
             painter.fillRect(mag_rect, QColor(40, 40, 40, 220))
-            text_color = self._get_picker_color('picker_text')
-            painter.setPen(QPen(text_color, 2))
+            frame_color = self._get_picker_color('picker_crosshair_outer')
+            painter.setPen(QPen(frame_color, 2))
             painter.drawRect(mag_rect)
 
             # 复用同一中心点缓存，避免重复构建放大图
@@ -1050,7 +1150,7 @@ class ColorCoordinatePickerOverlay(QWidget):
                 r, g, b = center_color
                 info_text = f"({center_x},{center_y}) RGB({r},{g},{b})"
 
-                painter.setPen(QPen(text_color))
+                painter.setPen(QPen(frame_color))
                 text_rect = painter.fontMetrics().boundingRect(info_text)
                 info_bg_rect = QRect(
                     info_rect.x(),
@@ -1074,12 +1174,14 @@ class ColorCoordinatePickerOverlay(QWidget):
 
     def showEvent(self, event):
         """窗口显示事件"""
+        if getattr(self, "_closing", False):
+            event.ignore()
+            return
         super().showEvent(event)
 
-        # 如果还没有拍摄静态截图，现在拍摄（兜底逻辑）
-        if self.static_screenshot is None:
-            logger.warning("showEvent中检测到静态截图为空，执行兜底截图")
-            self._capture_static_screenshot()
+        # 覆盖层已经盖住屏幕，这里不能再截窗口，否则会把黑屏盖层拍进去。
+        self._setup_overlay_geometry()
+        self.update()
 
         # 启动放大镜定时器
         if self.magnifier_enabled:
@@ -1090,7 +1192,7 @@ class ColorCoordinatePickerOverlay(QWidget):
 
         # 不自动关闭覆盖层：由用户点击“完成取色”后再销毁
 
-        # 使用窗口隐藏管理器隐藏所有应用窗口，避免颜色干扰找色
+        self.window_hider.add_visible_app_windows(exclude=(self,))
         hidden_count = self.window_hider.hide_all()
         logger.info(f"已隐藏 {hidden_count} 个窗口以避免颜色干扰找色")
 
@@ -1105,11 +1207,12 @@ class ColorCoordinatePickerOverlay(QWidget):
         else:
             logger.error("全局输入监听器线程启动失败")
 
-        # 延迟激活，确保窗口系统完成所有初始化
-        QTimer.singleShot(250, self._ensure_ready_for_input)
+        QTimer.singleShot(50, self._ensure_ready_for_input)
 
     def _on_timeout(self):
         """超时自动关闭"""
+        if getattr(self, "_closing", False):
+            return
         logger.warning("取色器超时（30秒未操作），自动关闭以释放资源")
         self.close()
 
@@ -1118,14 +1221,14 @@ class ColorCoordinatePickerOverlay(QWidget):
         try:
             # 仅在使用 WGC 引擎时清理 WGC 缓存，避免与其他引擎日志混淆
             try:
-                from utils.screenshot_helper import get_screenshot_engine
+                from utils.capture.screenshot_helper import get_screenshot_engine
                 engine = get_screenshot_engine()
             except Exception:
                 engine = "unknown"
 
             if engine == "wgc":
                 try:
-                    from utils.screenshot_helper import clear_screenshot_cache
+                    from utils.capture.screenshot_helper import clear_screenshot_cache
                     clear_screenshot_cache()
                     logger.debug("WGC缓存已清理")
                 except Exception as e:
@@ -1188,7 +1291,6 @@ class ColorCoordinatePickerOverlay(QWidget):
             ready_message='颜色坐标选择器已就绪，可以接收输入',
             retry_message='颜色坐标选择器未能激活（尝试 {attempt}/{max_attempts}），用户首次点击可能需要激活窗口',
             exhausted_message='已达到最大激活尝试次数，继续执行（用户首次操作将用于激活窗口）',
-            auto_show=True,
         )
 
     def mouseMoveEvent(self, event):
@@ -1208,6 +1310,8 @@ class ColorCoordinatePickerOverlay(QWidget):
 
     def _update_magnifier(self):
         """定时更新放大镜（仅在鼠标位置变化时局部刷新）"""
+        if getattr(self, "_closing", False):
+            return
         if not self.magnifier_enabled or self.mouse_pos.isNull():
             return
 
@@ -1220,15 +1324,17 @@ class ColorCoordinatePickerOverlay(QWidget):
 
     def _on_global_esc(self):
         """全局ESC键处理（通过钩子触发，不依赖窗口激活）"""
+        if getattr(self, "_closing", False):
+            return
         logger.info("[全局钩子] ESC键退出")
-        # 使用QTimer.singleShot确保在主线程中执行close
-        QTimer.singleShot(0, self.close)
+        QTimer.singleShot(0, self._request_close)
 
     def _on_global_right_click(self):
         """全局右键处理（通过钩子触发，不依赖窗口激活）"""
+        if getattr(self, "_closing", False):
+            return
         logger.info("[全局钩子] 右键取消选择")
-        # 使用QTimer.singleShot确保在主线程中执行close
-        QTimer.singleShot(0, self.close)
+        QTimer.singleShot(0, self._request_close)
 
     def mousePressEvent(self, event):
         """鼠标按下事件"""
@@ -1242,12 +1348,14 @@ class ColorCoordinatePickerOverlay(QWidget):
             self.timeout_timer.stop()
             logger.debug("用户开始操作，超时定时器已停止")
 
-        if not self.isActiveWindow():
-            logger.warning("覆盖层未激活，尝试重新激活")
-            activate_overlay_widget(self, log_prefix='颜色取点覆盖层', focus=True)
-            self._is_ready_for_input = True
-
         if event.button() == Qt.MouseButton.LeftButton:
+            child = self.childAt(event.pos())
+            if child is getattr(self, "finish_button", None):
+                self._on_finish_clicked()
+                return
+            if child is getattr(self, "cancel_button", None):
+                self._on_cancel_clicked()
+                return
             logger.info("[鼠标事件] 左键点击")
             if self._is_point_in_target_window(event.pos()):
                 logger.info("[鼠标事件] 点击位置在目标窗口内")
@@ -1279,62 +1387,66 @@ class ColorCoordinatePickerOverlay(QWidget):
 
         elif event.button() == Qt.MouseButton.RightButton:
             logger.info("[鼠标事件] 右键点击，取消选择")
-            self.close()
+            self._request_close()
 
     def keyPressEvent(self, event):
         """键盘事件"""
         logger.info(f"[键盘事件] 接收到键盘事件: 键={event.key()}")
         if event.key() == Qt.Key.Key_Escape:
             logger.info("ESC键退出")
-            self.close()
+            self._request_close()
         event.accept()
 
     def closeEvent(self, event):
         """关闭事件 - 清理所有资源"""
+        if getattr(self, "_closing", False):
+            super().closeEvent(event)
+            return
+        self._closing = True
+        release_overlay_input(self)
         try:
-            # 停止全局输入监听器
-            if hasattr(self, 'input_monitor') and self.input_monitor.isRunning():
-                self.input_monitor.stop()
-                self.input_monitor.wait(1000)  # 等待线程结束
-                logger.info("全局输入监听器已停止")
+            # 先收起覆盖层再恢复宿主，避免模态顶层窗把主界面压住。
+            try:
+                self.hide()
+            except Exception:
+                pass
+            restored_count = self.window_hider.restore_all()
+            logger.info(f"已恢复 {restored_count} 个窗口显示")
+            self.picking_closed.emit()
 
-            # 停止所有定时器
+            monitor = getattr(self, "input_monitor", None)
+            if monitor is not None:
+                try:
+                    monitor.esc_pressed.disconnect()
+                except Exception:
+                    pass
+                try:
+                    monitor.right_click.disconnect()
+                except Exception:
+                    pass
+                if monitor.isRunning():
+                    monitor.stop()
+                    if not monitor.wait(2000):
+                        logger.warning("全局输入监听器未能及时退出")
+                    else:
+                        logger.info("全局输入监听器已停止")
+
             if hasattr(self, 'magnifier_timer') and self.magnifier_timer.isActive():
                 self.magnifier_timer.stop()
-                logger.info("放大镜定时器已停止")
 
             if hasattr(self, 'timeout_timer') and self.timeout_timer.isActive():
                 self.timeout_timer.stop()
-                logger.info("超时定时器已停止")
 
-            # 清理静态截图，释放内存
-            if hasattr(self, 'static_screenshot') and self.static_screenshot is not None:
-                self.static_screenshot = None
-                logger.debug("静态截图已清理")
-
-            if hasattr(self, 'cached_screenshot') and self.cached_screenshot is not None:
-                self.cached_screenshot = None
-                logger.debug("缓存截图已清理")
-
-            if hasattr(self, '_static_screenshot_pixmap') and self._static_screenshot_pixmap is not None:
-                self._static_screenshot_pixmap = None
-
+            self.static_screenshot = None
+            self.cached_screenshot = None
+            self._static_screenshot_pixmap = None
+            self.desktop_pixmap = None
             self._magnifier_cache_center = None
             self._magnifier_cache_pixmap = None
             self._last_magnifier_mouse_pos = QPoint()
-    
-            if hasattr(self, 'selected_points'):
-                self.selected_points = []
-
-            if hasattr(self, 'original_mouse_pos'):
-                self.original_mouse_pos = None
-
+            self.selected_points = []
+            self.original_mouse_pos = None
             logger.debug("取色器资源已全部释放")
-
-            # 使用窗口隐藏管理器恢复所有应用窗口
-            restored_count = self.window_hider.restore_all()
-            logger.info(f"已恢复 {restored_count} 个窗口显示")
-
         except Exception as e:
             logger.error(f"关闭取色器时出错: {e}")
             import traceback
@@ -1650,6 +1762,7 @@ class ColorCoordinatePickerWidget(QWidget):
             initial_points=self.color_points
         )
         self.overlay.color_coordinate_selected.connect(self._on_color_coordinate_selected)
+        self.overlay.picking_closed.connect(self._restore_host_after_picking)
         self.overlay.destroyed.connect(lambda *_: setattr(self, "overlay", None))
 
         if self.overlay.setup_target_window():
@@ -1658,6 +1771,13 @@ class ColorCoordinatePickerWidget(QWidget):
             if self.overlay.capture_screenshot_before_show():
                 logger.info("静态截图拍摄成功，显示覆盖层")
                 show_and_activate_overlay(self.overlay, log_prefix='颜色取点覆盖层启动', focus=True)
+                grab_overlay_input(self.overlay, log_prefix='颜色取点覆盖层')
+                schedule_overlay_activation_boost(
+                    self.overlay,
+                    log_prefix='颜色取点覆盖层',
+                    intervals_ms=(50, 150, 300),
+                    focus=True,
+                )
                 logger.info("颜色坐标选择器覆盖层已显示")
             else:
                 logger.error("静态截图拍摄失败")
@@ -1674,6 +1794,21 @@ class ColorCoordinatePickerWidget(QWidget):
                 pass
             self.overlay = None
             QMessageBox.critical(self, "错误", "无法设置目标窗口")
+
+    def _restore_host_after_picking(self):
+        host = self.window()
+        if host is None:
+            return
+        for widget in (host, host.window()):
+            if widget is None:
+                continue
+            try:
+                widget.show()
+                widget.raise_()
+                if widget.isWindow():
+                    widget.activateWindow()
+            except Exception:
+                logger.debug("恢复取色宿主窗口失败", exc_info=True)
 
     def _on_color_coordinate_selected(self, x: int, y: int, r: int, g: int, b: int):
         """处理颜色坐标选择"""

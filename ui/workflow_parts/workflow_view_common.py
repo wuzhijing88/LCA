@@ -1,4 +1,4 @@
-﻿from typing import Optional, Any, Dict, List # Import Dict for type hinting
+from typing import Optional, Any, Dict, List # Import Dict for type hinting
 
 from .workflow_debug_utils import debug_print
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QApplication, QPushButton, QVBoxLayout, QWidget, QGraphicsLineItem, QMenu, QInputDialog, QMessageBox, QDialog, QFileDialog, QGraphicsEllipseItem, QComboBox, QFrame, QGraphicsItem # Removed QResizeEvent, QShowEvent
@@ -20,7 +20,7 @@ from task_workflow.thread_window_binding import (
     is_thread_window_limit_task_type,
     is_valid_thread_window_limit_connection,
 )
-from utils.thread_start_utils import is_thread_start_task_type
+from task_workflow.thread_start import is_thread_start_task_type
 
 logger = logging.getLogger(__name__) # <<< ADDED: Define module-level logger
 

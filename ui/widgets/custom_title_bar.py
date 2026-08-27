@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 # Import QIcon explicitly if needed for size setting
 from PySide6.QtCore import Qt, QPoint 
 from PySide6.QtGui import QMouseEvent, QAction, QFontMetrics
-from utils.window_activation_utils import show_and_raise_widget
+from utils.window.window_activation_utils import show_and_raise_widget
 
 class MainWindow: pass
 

@@ -2,9 +2,9 @@ import logging
 
 from PySide6.QtWidgets import QMessageBox
 
-from utils.window_coordinate_common import center_window_on_widget_screen
+from utils.window.window_coordinate_common import center_window_on_widget_screen
 
-from utils.thread_start_utils import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ class MainWindowMultiWindowRuntimeMixin:
             logger.info("[多窗口执行前检查] 发现参数面板处于打开状态，自动应用并关闭")
             self.parameter_panel.apply_and_close()
         # =====================================
-        from utils.window_identity import refresh_bound_windows
+        from utils.window.window_identity import refresh_bound_windows
         refresh_bound_windows(self.bound_windows)
         # 检查是否有启用的窗口
         enabled_windows = [w for w in self.bound_windows if w.get('enabled', True)]
@@ -145,7 +145,7 @@ class MainWindowMultiWindowRuntimeMixin:
                 logger.warning(f"清理旧执行器时出错: {e}")
         # 创建统一多窗口执行器
         try:
-            from ..runtime_parts.unified_multi_window_executor import UnifiedMultiWindowExecutor
+            from task_workflow.multi_window_executor import UnifiedMultiWindowExecutor
             logger.info("创建新的多窗口执行器...")
             self.multi_executor = UnifiedMultiWindowExecutor(self)
             # 工具 关键修复：添加所有窗口（包括禁用的），正确传递enabled状态
@@ -254,7 +254,7 @@ class MainWindowMultiWindowRuntimeMixin:
             # 全局执行模式与多窗口并发策略解耦：
             # - execution_mode: 传给窗口执行器（foreground/background）
             # - sync_execution_mode: 传给多窗口调度器（parallel/sequential）
-            from ..runtime_parts.unified_multi_window_executor import ExecutionMode
+            from task_workflow.multi_window_executor import ExecutionMode
             runtime_execution_mode = (
                 self.current_execution_mode if hasattr(self, 'current_execution_mode') else 'background_sendmessage'
             )

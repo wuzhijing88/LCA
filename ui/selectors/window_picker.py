@@ -15,16 +15,25 @@ from ui.system_parts.message_box_translator import place_dialog_on_screen
 logger = logging.getLogger(__name__)
 
 # 导入窗口隐藏管理器
-from utils.hwnd_utils import as_hwnd
-from utils.window_identity import is_desktop_window
-from utils.window_hider import WindowHider
-from utils.window_overlay_utils import (
+from utils.window.hwnd_utils import as_hwnd
+from utils.window.window_identity import is_desktop_window
+from utils.window.window_hider import WindowHider
+from utils.window.window_overlay_utils import (
+    apply_overlay_text_style,
+    capture_virtual_desktop_pixmap,
+    configure_opaque_picker_overlay,
+    draw_picker_backdrop,
     get_overlay_debug_snapshot,
     get_window_client_overlay_metrics,
     map_native_rect_to_local,
+    prime_picker_backdrop,
     sync_overlay_geometry,
 )
-from utils.window_activation_utils import ensure_overlay_ready_for_input
+from utils.window.window_activation_utils import (
+    ensure_overlay_ready_for_input,
+    grab_overlay_input,
+    release_overlay_input,
+)
 
 try:
     import win32gui
@@ -74,28 +83,23 @@ class WindowPickerOverlay(QWidget):
         self._is_ready_for_input = False
         self._activation_attempts = 0
 
-        # 设置窗口属性 - 使用独立的顶层窗口
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Dialog  # 使用Dialog确保能接收键盘和鼠标事件
-        )
-
-        # 完全独立，不受父窗口模态性影响
-        self.setWindowModality(Qt.WindowModality.NonModal)
-        # 注意：不使用 WA_TranslucentBackground，改为绘制半透明背景
-        # self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-
-        # 设置窗口透明度（通过样式表）
-        self.setStyleSheet("background: transparent;")
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.desktop_pixmap = None
+        self._highlight_overlay_rect = QRect()
+        configure_opaque_picker_overlay(self)
 
         logger.info("创建窗口选择器覆盖层")
 
         # 设置全屏覆盖
         self._setup_fullscreen_overlay()
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
+        self.desktop_pixmap = capture_virtual_desktop_pixmap()
+        prime_picker_backdrop(
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            dim_color=QColor(0, 0, 0, 80) if self.desktop_pixmap is not None else None,
+            fill_color=QColor(18, 18, 18),
+        )
 
         # 启动鼠标跟踪定时器
         self.mouse_timer = QTimer(self)
@@ -390,30 +394,32 @@ class WindowPickerOverlay(QWidget):
                 Qt.WindowType.WindowStaysOnTopHint
             )
 
-            # 设置正常的样式表，确保背景和文字可见
-            msg_box.setStyleSheet("""
-                QMessageBox {
-                    /* background-color removed - use theme */
-                }
-                QMessageBox QLabel {
-                    color: black;
+            from themes import theme_color
+
+            text = theme_color("text", "#333333")
+            accent = theme_color("accent", "#0078d4")
+            accent_hover = theme_color("accent_hover", "#1084d8")
+            accent_pressed = theme_color("accent_pressed", "#006cbe")
+            msg_box.setStyleSheet(f"""
+                QMessageBox QLabel {{
+                    color: {text};
                     font-size: 10pt;
                     padding: 10px;
-                }
-                QPushButton {
-                    background-color: #0078d4;
+                }}
+                QPushButton {{
+                    background-color: {accent};
                     color: white;
                     border: none;
                     padding: 8px 20px;
                     font-size: 10pt;
                     min-width: 80px;
-                }
-                QPushButton:hover {
-                    background-color: #106ebe;
-                }
-                QPushButton:pressed {
-                    background-color: #005a9e;
-                }
+                }}
+                QPushButton:hover {{
+                    background-color: {accent_hover};
+                }}
+                QPushButton:pressed {{
+                    background-color: {accent_pressed};
+                }}
             """)
 
             # 显示消息框
@@ -456,6 +462,8 @@ class WindowPickerOverlay(QWidget):
 
     def _update_window_under_mouse(self):
         """更新鼠标下的窗口"""
+        if getattr(self, "_closing", False):
+            return
         if not PYWIN32_AVAILABLE:
             return
 
@@ -677,6 +685,7 @@ class WindowPickerOverlay(QWidget):
                 )
 
                 self.current_window_rect = self._resolve_window_client_native_rect(hwnd)
+                overlay_rect = QRect()
                 try:
                     overlay_rect = self._native_rect_to_overlay_rect(self.current_window_rect) if self.current_window_rect else QRect()
                     snapshot = get_overlay_debug_snapshot(self, self.current_window_rect)
@@ -693,8 +702,14 @@ class WindowPickerOverlay(QWidget):
                 except Exception as e:
                     logger.warning(f"记录窗口选择器映射诊断失败: {e}")
 
-                # 触发重绘
-                self.update()
+                old_rect = QRect(self._highlight_overlay_rect)
+                self._highlight_overlay_rect = QRect(overlay_rect) if overlay_rect else QRect()
+                dirty = old_rect.united(self._highlight_overlay_rect)
+                if dirty.isEmpty():
+                    self.update()
+                else:
+                    dirty.adjust(-12, -40, 12, 12)
+                    self.update(dirty.intersected(self.rect()))
 
         except Exception as e:
             logger.debug(f"更新鼠标下窗口失败: {e}")
@@ -702,61 +717,45 @@ class WindowPickerOverlay(QWidget):
     def paintEvent(self, event):
         """绘制事件 - 绘制绿色边框"""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
-        # 绘制一个几乎透明的背景，确保能接收鼠标事件
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
+        draw_picker_backdrop(
+            painter,
+            self,
+            desktop_pixmap=self.desktop_pixmap,
+            dim_color=QColor(0, 0, 0, 80) if self.desktop_pixmap is not None else None,
+            fill_color=QColor(18, 18, 18),
+        )
 
-        # 根据是否锁定显示不同的窗口
         display_rect = self.locked_window_rect if self.is_locked else self.current_window_rect
         display_title = self.locked_window_title if self.is_locked else self.current_window_title
 
-        # 如果有窗口，绘制边框
         if display_rect:
             overlay_rect = self._native_rect_to_overlay_rect(display_rect)
             if overlay_rect and not overlay_rect.isEmpty():
                 x = overlay_rect.x()
                 y = overlay_rect.y()
 
-                # 根据状态使用不同颜色的边框
                 if self.is_locked:
-                    # 锁定状态 - 使用黄色边框
                     painter.setPen(QPen(QColor(255, 255, 0), 6))
                 else:
-                    # 跟踪状态 - 使用绿色边框
                     painter.setPen(QPen(QColor(0, 255, 0), 4))
 
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(overlay_rect)
 
-                # 绘制窗口标题
                 if display_title:
-                    painter.setPen(QPen(QColor(255, 255, 255)))
-                    # 添加半透明背景让文字更清晰
-                    if self.is_locked:
-                        text = f"已锁定: {display_title}"
-                    else:
-                        text = f"窗口: {display_title}"
-
-                    # 计算文本区域
-                    from PySide6.QtGui import QFontMetrics
-                    metrics = QFontMetrics(painter.font())
+                    text = f"已锁定: {display_title}" if self.is_locked else f"窗口: {display_title}"
+                    apply_overlay_text_style(painter)
+                    metrics = painter.fontMetrics()
                     text_rect = metrics.boundingRect(text)
                     text_bg_rect = text_rect.adjusted(-5, -2, 5, 2)
                     text_bg_rect.moveTopLeft(QPoint(x + 10, y + 10))
-
-                    # 绘制半透明背景
                     painter.fillRect(text_bg_rect, QColor(0, 0, 0, 150))
-
-                    # 绘制文字
                     painter.drawText(x + 10, y + 25, text)
 
-        # 绘制提示信息
-        painter.setPen(QPen(QColor(255, 255, 255)))
-
-        # 提示信息背景
         painter.fillRect(10, 10, 600, 60, QColor(0, 0, 0, 150))
-
+        apply_overlay_text_style(painter)
         if self.is_locked:
             painter.drawText(20, 30, f"已锁定窗口: {self.locked_window_title}")
             painter.drawText(20, 50, "再次点击确认绑定 | 右键或ESC键取消")
@@ -847,14 +846,17 @@ class WindowPickerOverlay(QWidget):
 
     def showEvent(self, event):
         """窗口显示事件"""
+        if getattr(self, "_closing", False):
+            event.ignore()
+            return
         super().showEvent(event)
 
         # 临时隐藏父窗口和主窗口，避免焦点冲突和ESC键事件被父窗口捕获
         hidden_count = self.window_hider.hide_all()
         logger.info(f"已隐藏 {hidden_count} 个窗口以避免焦点冲突")
 
-        # 延迟激活，确保窗口系统完成所有初始化
-        QTimer.singleShot(250, self._ensure_ready_for_input)
+        grab_overlay_input(self, log_prefix='窗口选择覆盖层')
+        QTimer.singleShot(50, self._ensure_ready_for_input)
 
     def _ensure_ready_for_input(self):
         """确保覆盖层准备好接收输入"""
@@ -868,11 +870,11 @@ class WindowPickerOverlay(QWidget):
 
     def closeEvent(self, event):
         """关闭事件"""
-        # 停止定时器
+        self._closing = True
         if hasattr(self, 'mouse_timer'):
             self.mouse_timer.stop()
 
-        # 使用窗口隐藏管理器恢复所有应用窗口
+        release_overlay_input(self)
         restored_count = self.window_hider.restore_all()
         logger.info(f"已恢复 {restored_count} 个窗口显示")
 

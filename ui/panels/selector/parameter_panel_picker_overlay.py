@@ -1,6 +1,6 @@
 from ..parameter_panel_support import *
-from utils.window_activation_utils import activate_overlay_widget
-from utils.window_overlay_utils import (
+from utils.window.window_activation_utils import activate_overlay_widget
+from utils.window.window_overlay_utils import (
     draw_selection_overlay,
     map_native_rect_to_local,
     sync_overlay_geometry,
@@ -18,8 +18,10 @@ class ParameterPanelPickerOverlay(QWidget):
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
+        self._closing = False
         sync_overlay_geometry(self)
         self.setCursor(Qt.CrossCursor)
         self._apply_transparent_window_style()

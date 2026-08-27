@@ -170,7 +170,7 @@ def main_window_safe_stop_tasks(ctx):
 
         try:
 
-            from utils.screenshot_helper import cleanup_screenshot_engines_on_stop
+            from utils.capture.screenshot_helper import cleanup_screenshot_engines_on_stop
 
             cleanup_screenshot_engines_on_stop(keep_current_engine=True)
 

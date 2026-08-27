@@ -35,7 +35,7 @@ from ui.scheduling.timer_form import (
     new_form_container,
     new_tab,
 )
-from utils.window_coordinate_common import center_window_on_widget_screen
+from utils.window.window_coordinate_common import center_window_on_widget_screen
 
 logger = logging.getLogger(__name__)
 

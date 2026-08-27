@@ -9,7 +9,7 @@ import logging
 import os
 import json
 from utils.app_paths import get_config_path
-from utils.hwnd_utils import as_hwnd
+from utils.window.hwnd_utils import as_hwnd
 from typing import Dict, Optional, List, Any
 from PySide6.QtWidgets import (QTabWidget, QTabBar, QWidget, QPushButton,
                                QFileDialog, QMessageBox, QMenu)
@@ -534,7 +534,7 @@ class WorkflowTabWidget(QTabWidget):
                 window_binding['target_hwnd'] = normalized_hwnd
                 if not window_binding['target_window_title'].strip():
                     raise ValueError("已绑定窗口时 target_window_title 不能为空")
-                from utils.window_identity import resolve_workflow_window_binding
+                from utils.window.window_identity import resolve_workflow_window_binding
 
                 config = getattr(self.task_manager, 'config', {})
                 bound_windows = config.get('bound_windows', []) if isinstance(config, dict) else []

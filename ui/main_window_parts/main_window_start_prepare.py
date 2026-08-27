@@ -148,7 +148,7 @@ def prepare_main_window_runtime_environment(ctx):
         global_input_simulator_manager.clear_cache()
         logger.debug('cleared input simulator cache before start')
 
-        from utils.foreground_input_manager import get_foreground_input_manager
+        from utils.input.foreground_input_manager import get_foreground_input_manager
 
         foreground_input = get_foreground_input_manager()
         foreground_input._initialization_attempted = False

@@ -5,6 +5,7 @@
 import time
 import logging
 import re
+from app_core.config_sections import DEFAULT_HOTKEYS
 from utils.app_paths import get_config_path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -12,8 +13,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QSize
 from PySide6.QtGui import QColor, QPainter, QBrush, QIcon, QPixmap, QPen, QPalette
-from utils.window_activation_utils import show_and_activate_overlay, show_and_raise_widget
-from utils.window_coordinate_common import get_available_geometry_for_widget
+from utils.window.window_activation_utils import show_and_activate_overlay, show_and_raise_widget
+from utils.window.window_coordinate_common import get_available_geometry_for_widget
 
 logger = logging.getLogger(__name__)
 
@@ -281,8 +282,8 @@ class FloatingStatusWindow(QWidget):
         self._is_running = False
         self._is_paused = False
 
-        self._start_hotkey = "Num7"
-        self._pause_hotkey = "F11"
+        self._start_hotkey = DEFAULT_HOTKEYS["start_task_hotkey"]
+        self._pause_hotkey = DEFAULT_HOTKEYS["pause_workflow_hotkey"]
 
         self._init_ui()
         self._load_hotkey_config()
@@ -451,8 +452,8 @@ class FloatingStatusWindow(QWidget):
             if os.path.exists(config_path):
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                self._start_hotkey = config.get('start_task_hotkey', 'Num7')
-                self._pause_hotkey = config.get('pause_workflow_hotkey', 'F11')
+                self._start_hotkey = config.get('start_task_hotkey', DEFAULT_HOTKEYS['start_task_hotkey'])
+                self._pause_hotkey = config.get('pause_workflow_hotkey', DEFAULT_HOTKEYS['pause_workflow_hotkey'])
         except Exception as e:
             logger.warning(f"加载快捷键配置失败: {e}")
 

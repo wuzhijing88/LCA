@@ -74,7 +74,7 @@ class WindowTaskRunner(
 
         bind_id = str(self.window_info.get("bind_id") or "").strip()
         try:
-            from utils.hwnd_utils import as_hwnd
+            from utils.window.hwnd_utils import as_hwnd
 
             self.hwnd = as_hwnd(self.window_info.get("hwnd"))
         except Exception:

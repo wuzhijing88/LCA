@@ -1,5 +1,5 @@
 from ..parameter_panel_support import *
-from utils.window_activation_utils import show_and_raise_widget
+from utils.window.window_activation_utils import show_and_raise_widget
 
 
 class ParameterPanelPresentationMixin:
@@ -9,15 +9,23 @@ class ParameterPanelPresentationMixin:
                        images_dir: str = None, target_window_hwnd: int = None, task_module=None, main_window=None,
                        custom_name: str = None):
         logger.info(f"显示参数面板: 卡片={card_id}, 任务={task_type}")
+        if task_type == "自定义脚本":
+            logger.warning("自定义脚本使用独立编辑器，已忽略参数面板请求")
+            return
 
         if not self._prepare_parameter_panel_request(card_id, task_type, custom_name, task_module, main_window):
             return
 
-        self._load_parameter_panel_values(card_id, param_definitions, current_parameters)
-        self._store_parameter_panel_context(param_definitions, workflow_cards_info, images_dir, target_window_hwnd)
-        self._restore_dynamic_select_options()
-        self._log_parameter_panel_state()
-        self._show_parameter_panel_window(card_id, task_type, custom_name)
+        self._loading_parameter_panel = True
+        try:
+            self._load_parameter_panel_values(card_id, param_definitions, current_parameters)
+            self._store_parameter_panel_context(param_definitions, workflow_cards_info, images_dir, target_window_hwnd)
+            self._restore_dynamic_select_options()
+            self._log_parameter_panel_state()
+            self._show_parameter_panel_window(card_id, task_type, custom_name)
+            self._opened_parameters_snapshot = dict(self.current_parameters)
+        finally:
+            self._loading_parameter_panel = False
         self._check_and_register_record_hotkey()
 
     def _prepare_parameter_panel_request(self, card_id: int, task_type: str, custom_name: Optional[str], task_module, main_window) -> bool:

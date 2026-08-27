@@ -19,8 +19,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
 )
 from PySide6.QtCore import Qt, Signal, QSize, QMargins, QEvent, QRect, QPoint
-from PySide6.QtGui import QPainterPath, QPainter, QColor, QBrush, QPen, QFontMetrics
-from utils.window_activation_utils import show_and_raise_widget
+from PySide6.QtGui import QBrush, QColor, QFontMetrics, QIcon, QPainter, QPainterPath, QPen
+from utils.window.window_activation_utils import show_and_raise_widget
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,45 @@ class CenteredTextDelegate(QStyledItemDelegate):
         elided = QFontMetrics(opt.font).elidedText(opt.text, Qt.TextElideMode.ElideRight, text_rect.width())
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
         painter.restore()
+
+
+class DropdownArrowButton(QPushButton):
+    """可编辑下拉的箭头：自己画三角，不用 ▾，避免中文字体画成怪符号。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._arrow_only = False
+
+    def setArrowOnly(self, arrow_only: bool) -> None:
+        self._arrow_only = bool(arrow_only)
+        if self._arrow_only:
+            super().setText("")
+            self.setIcon(QIcon())
+        self.update()
+
+    def setText(self, text: str) -> None:
+        if self._arrow_only:
+            super().setText("")
+            return
+        super().setText(text)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._arrow_only:
+            return
+        color = QColor(_get_theme_color("text_secondary", "#666666"))
+        if not self.isEnabled():
+            color = QColor(_get_theme_color("text_disabled", "#999999"))
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        path = QPainterPath()
+        path.moveTo(cx - 3.5, cy - 1.5)
+        path.lineTo(cx + 3.5, cy - 1.5)
+        path.lineTo(cx, cy + 2.5)
+        path.closeSubpath()
+        painter.fillPath(path, QBrush(color))
 
 
 class RoundedPopupFrame(QFrame):
@@ -198,7 +237,7 @@ class CustomDropdown(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.display_button = QPushButton()
+        self.display_button = DropdownArrowButton()
         self.display_button.setObjectName("customDropdownButton")
         self.display_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.display_button.clicked.connect(self._toggle_popup)
@@ -669,7 +708,7 @@ class CustomDropdown(QWidget):
         layout = self.layout()
         layout.insertWidget(0, self._line_edit)
         self.display_button.setObjectName("customDropdownArrow")
-        self.display_button.setText("▾")
+        self.display_button.setArrowOnly(True)
         self.display_button.setFixedWidth(28)
         self.display_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.display_button.style().unpolish(self.display_button)
@@ -686,6 +725,7 @@ class CustomDropdown(QWidget):
         layout.removeWidget(self._line_edit)
         self._line_edit.deleteLater()
         self._line_edit = None
+        self.display_button.setArrowOnly(False)
         self.display_button.setObjectName("customDropdownButton")
         self.display_button.setMinimumWidth(0)
         self.display_button.setMaximumWidth(16777215)

@@ -333,7 +333,7 @@ class GlobalDialogScreenFixer(QObject):
             return
 
         try:
-            from utils.window_coordinate_common import center_window_on_widget_screen
+            from utils.window.window_coordinate_common import center_window_on_widget_screen
         except Exception:
             return
 
@@ -416,7 +416,7 @@ def place_dialog_on_screen(dialog, parent=None, reference_widget=None, global_po
             global_pos = None
 
     try:
-        from utils.window_coordinate_common import center_window_on_widget_screen
+        from utils.window.window_coordinate_common import center_window_on_widget_screen
     except Exception:
         return False
 

@@ -19,7 +19,7 @@ class MainWindowScreenshotEngineMixin:
             self._runtime_engine_switch_running = True
         def _worker():
             try:
-                from utils.screenshot_helper import set_screenshot_engine, get_screenshot_engine
+                from utils.capture.screenshot_helper import set_screenshot_engine, get_screenshot_engine
                 while True:
                     with self._runtime_engine_switch_lock:
                         target_engine = str(self._runtime_engine_switch_target or "").strip().lower()
@@ -75,7 +75,7 @@ class MainWindowScreenshotEngineMixin:
             return
         def _worker():
             try:
-                from utils.screenshot_helper import set_screenshot_engine, get_screenshot_engine
+                from utils.capture.screenshot_helper import set_screenshot_engine, get_screenshot_engine
                 switch_ok = bool(set_screenshot_engine(requested_engine))
                 actual_engine = str(get_screenshot_engine() or "").strip().lower()
                 if switch_ok and actual_engine == requested_engine:

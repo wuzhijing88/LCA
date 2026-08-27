@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from ..widgets.custom_title_bar import CustomTitleBar
 from ..panels.parameter_panel import ParameterPanel
 from utils.app_paths import get_resource_path
-from utils.window_coordinate_common import (
+from utils.window.window_coordinate_common import (
     clamp_preferred_window_size,
     get_available_geometry_for_widget,
 )

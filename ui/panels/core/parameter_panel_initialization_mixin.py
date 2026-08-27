@@ -24,6 +24,11 @@ class ParameterPanelInitializationMixin:
         self.main_window = None
         self._is_editing_locked: bool = False
         self._workflow_dependent_refreshers: Dict[str, list] = {}
+        self._loading_parameter_panel: bool = False
+        self._opened_parameters_snapshot: Dict[str, Any] = {}
+        self._current_screenshot_target = None
+        self._current_screenshot_param_name: Optional[str] = None
+        self._screenshot_overlay = None
 
     def _initialize_recording_panel_state(self) -> None:
         self._is_recording_panel_active = False

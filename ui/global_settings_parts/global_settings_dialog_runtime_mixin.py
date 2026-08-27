@@ -35,7 +35,7 @@ class GlobalSettingsDialogRuntimeMixin:
                 return
             # 分辨率不符合，进行调整
             logger.info(f"窗口 {title} 分辨率不符合 ({current_width}x{current_height} -> {target_width}x{target_height})，开始调整")
-            from utils.universal_window_manager import get_universal_window_manager
+            from utils.window.universal_window_manager import get_universal_window_manager
             window_manager = get_universal_window_manager()
             result = window_manager.adjust_single_window(hwnd, target_width, target_height, async_mode=True)
             if result.success:
@@ -69,7 +69,7 @@ class GlobalSettingsDialogRuntimeMixin:
             logger.info(f"[批量调整] 共需调整 {len(windows_to_resize)} 个窗口")
             # 使用通用窗口管理器批量调整
             try:
-                from utils.universal_window_manager import get_universal_window_manager
+                from utils.window.universal_window_manager import get_universal_window_manager
                 window_manager = get_universal_window_manager()
                 success_count = 0
                 fail_count = 0
@@ -137,7 +137,7 @@ class GlobalSettingsDialogRuntimeMixin:
     def _register_windows_to_handle_manager(self):
         """将绑定的窗口注册到句柄管理器"""
         try:
-            from utils.window_handle_manager import get_window_handle_manager
+            from utils.window.window_handle_manager import get_window_handle_manager
             handle_manager = get_window_handle_manager()
             # 启用自动监控，检测窗口句柄变化
             handle_manager.start_monitoring(interval=10.0)
@@ -176,7 +176,7 @@ class GlobalSettingsDialogRuntimeMixin:
                         # 更新句柄
                         window_info['hwnd'] = new_hwnd
                         try:
-                            from utils.window_identity import apply_window_identity
+                            from utils.window.window_identity import apply_window_identity
                             apply_window_identity(window_info, new_hwnd)
                         except Exception as e:
                             logger.debug(f"更新窗口特征失败: {e}")
@@ -245,7 +245,7 @@ class GlobalSettingsDialogRuntimeMixin:
     def _check_and_update_window_handles(self):
         """手动检查并更新窗口句柄 - 在任务执行前调用"""
         try:
-            from utils.window_handle_manager import get_window_handle_manager
+            from utils.window.window_handle_manager import get_window_handle_manager
             handle_manager = get_window_handle_manager()
             # 手动检查所有注册的窗口
             for i, window_info in enumerate(self.bound_windows):

@@ -167,11 +167,11 @@ def _get_toolbar_icon_color() -> QColor:
 
     """获取标题栏动作图标颜色（跟随主题文本色）。"""
 
-    icon_color = QColor(get_theme_color('text', '#1f2328'))
+    icon_color = QColor(get_theme_color('text', '#333333'))
 
     if not icon_color.isValid():
 
-        icon_color = QColor('#1f2328')
+        icon_color = QColor('#333333')
 
     icon_color.setAlpha(245)
 

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # 导入Raw Input录制器
 try:
-    from utils.raw_input_recorder import RawInputRecorder
+    from utils.input.raw_input_recorder import RawInputRecorder
     RAW_INPUT_AVAILABLE = True
 except ImportError:
     RAW_INPUT_AVAILABLE = False

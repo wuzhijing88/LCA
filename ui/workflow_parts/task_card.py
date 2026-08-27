@@ -895,18 +895,10 @@ class TaskCard(QGraphicsObject):
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent):
         """Handle mouse release and finalize dragging state."""
         start_pos = getattr(self, '_drag_start_card_pos', None)
-        was_actually_dragged = start_pos is not None and self.pos() != start_pos
-
+        partner_starts = dict(getattr(self, '_other_selected_cards_start_positions', {}) or {})
         was_multi_dragging = getattr(self, '_dragging_multi_selection', False)
-        moved_cards = None
-        partner_cards = []
-        other_cards = getattr(self, '_other_selected_cards_start_positions', None)
-        if was_multi_dragging and other_cards:
-            partner_cards = list(other_cards.keys())
-        if was_actually_dragged:
-            moved_cards = [self]
-            if partner_cards:
-                moved_cards.extend(partner_cards)
+        partner_cards = list(partner_starts.keys())
+
         self._dragging_multi_selection = False
         self._other_selected_cards_start_positions = {}
         self._drag_start_pos = None
@@ -921,11 +913,22 @@ class TaskCard(QGraphicsObject):
 
         super().mouseReleaseEvent(event)
 
-        if was_actually_dragged and not was_multi_dragging:
+        if start_pos is not None and not was_multi_dragging:
             self._apply_grid_snap()
             self._apply_snap_alignment()
 
         self._drag_start_card_pos_for_snap = None
+
+        moved_cards = []
+        if start_pos is not None and self.pos() != start_pos:
+            moved_cards.append(self)
+        for card, partner_start in partner_starts.items():
+            if card.pos() != partner_start:
+                moved_cards.append(card)
+        if moved_cards:
+            notify = getattr(self.view, "_notify_cards_moved", None)
+            if callable(notify):
+                notify(moved_cards)
 
 
     def _cancel_drag_state(self):
@@ -1362,11 +1365,12 @@ class TaskCard(QGraphicsObject):
         if self.task_type in base_restricted_types:
             return True
 
-        if self.task_type == "条件控制":
+        if self.task_type in {"条件控制", "自定义脚本"}:
             return False
 
         always_branch_types = [
             "OCR文字识别",
+            "点阵字库OCR",
             "字库识别",
             "OCR区域识别",
             "图片点击",

@@ -8,7 +8,7 @@ from app_core.runtime.execution_coordinator import (
     ExecutionSource,
     create_coordinated_workflow_runtime,
 )
-from utils.thread_start_utils import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
 
 logger = logging.getLogger(__name__)
 

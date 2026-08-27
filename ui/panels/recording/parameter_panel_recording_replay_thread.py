@@ -1,5 +1,5 @@
 from ..parameter_panel_support import *
-from utils.replay_engine import ReplayEngine
+from utils.input.replay_engine import ReplayEngine
 
 
 class ParameterPanelReplayThread(QThread):

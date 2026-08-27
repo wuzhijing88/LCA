@@ -1,39 +1,80 @@
 # -*- coding: utf-8 -*-
-from PySide6.QtCore import QObject, QEvent, QPoint, Qt
-from PySide6.QtGui import QCursor, QGuiApplication
-from PySide6.QtWidgets import QApplication, QLabel, QWidget, QAbstractItemView, QGraphicsView
-from utils.window_activation_utils import show_and_raise_widget
+from PySide6.QtCore import QEvent, QObject, QPoint, QRectF, Qt
+from PySide6.QtGui import QBrush, QColor, QCursor, QGuiApplication, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QGraphicsView, QLabel, QWidget
+
+from utils.window.window_activation_utils import show_and_raise_widget
 
 _tooltip_manager = None
+_TOOLTIP_RADIUS = 6.0
+
+
+def _theme_color(key: str, default: str) -> QColor:
+    try:
+        from themes import get_theme_manager
+
+        return get_theme_manager().get_qcolor(key)
+    except Exception:
+        return QColor(default)
+
+
+class RoundedTooltip(QLabel):
+    """无边框提示：自己画圆角，避免 Windows 垫一层直角底。"""
+
+    def __init__(self) -> None:
+        flags = Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
+        if hasattr(Qt.WindowType, "NoDropShadowWindowHint"):
+            flags |= Qt.WindowType.NoDropShadowWindowHint
+        super().__init__(None, flags)
+        self.setObjectName("customRoundedTooltip")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setWordWrap(True)
+        self.setMaximumWidth(520)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self._bg = QColor("#f5f5f5")
+        self._fg = QColor("#333333")
+        self._border = QColor("#e0e0e0")
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        self._bg = _theme_color("surface", "#f5f5f5")
+        self._fg = _theme_color("text", "#333333")
+        self._border = _theme_color("border", "#e0e0e0")
+        self.setStyleSheet(
+            "QLabel#customRoundedTooltip {"
+            "background: transparent;"
+            f"color: {self._fg.name()};"
+            "border: none;"
+            "padding: 6px 8px;"
+            "}"
+        )
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, _TOOLTIP_RADIUS, _TOOLTIP_RADIUS)
+        painter.fillPath(path, QBrush(self._bg))
+        painter.setPen(QPen(self._border, 1))
+        painter.drawPath(path)
+        painter.end()
+        super().paintEvent(event)
 
 
 class CustomTooltipManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._tooltip = QLabel("", None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
-        self._tooltip.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self._tooltip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._tooltip.setWordWrap(True)
-        self._tooltip.setMaximumWidth(520)
-        self._tooltip.setTextFormat(Qt.TextFormat.PlainText)
-        self.set_theme("light")
+        self._tooltip = RoundedTooltip()
 
     def install(self, app: QApplication) -> None:
         app.installEventFilter(self)
 
-    def set_theme(self, theme_name: str) -> None:
-        if theme_name == "dark":
-            background = "#2d2d2d"
-            text = "#e0e0e0"
-            border = "#3e3e3e"
-        else:
-            background = "#f5f5f5"
-            text = "#333333"
-            border = "#d0d0d0"
-        self._tooltip.setStyleSheet(
-            "background-color: %s; color: %s; border: 1px solid %s; "
-            "border-radius: 4px; padding: 4px;" % (background, text, border)
-        )
+    def set_theme(self, theme_name: str = "") -> None:
+        self._tooltip.apply_theme()
         app = QApplication.instance()
         if app:
             self._tooltip.setFont(app.font())
@@ -61,13 +102,14 @@ class CustomTooltipManager(QObject):
         if not text:
             self.hide()
             return
+        self._tooltip.apply_theme()
         self._tooltip.setText(text)
         self._tooltip.adjustSize()
         pos = global_pos or QCursor.pos()
         pos += QPoint(8, 8)
         pos = self._clamp_to_screen(pos)
         self._tooltip.move(pos)
-        show_and_raise_widget(self._tooltip, log_prefix='自定义提示')
+        show_and_raise_widget(self._tooltip, log_prefix="自定义提示")
 
     def hide(self) -> None:
         self._tooltip.hide()

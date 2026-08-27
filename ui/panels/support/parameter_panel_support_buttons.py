@@ -8,64 +8,56 @@ logger = logging.getLogger(__name__)
 
 
 class CloseButton(QPushButton):
-    STYLE_NORMAL = """
-        QPushButton {
-            background-color: transparent;
-            border: none;
-            border-radius: 4px;
-            color: #666666;
-            font-family: "Segoe UI Symbol", "Segoe UI Emoji", "Arial";
-            font-size: 12px;
-        }
-    """
-    STYLE_HOVER = """
-        QPushButton {
-            background-color: #f44336;
-            border: none;
-            border-radius: 4px;
-            color: #ffffff;
-            font-family: "Segoe UI Symbol", "Segoe UI Emoji", "Arial";
-            font-size: 12px;
-        }
-    """
-    STYLE_PRESSED = """
-        QPushButton {
-            background-color: #d32f2f;
-            border: none;
-            border-radius: 4px;
-            color: #ffffff;
-            font-family: "Segoe UI Symbol", "Segoe UI Emoji", "Arial";
-            font-size: 12px;
-        }
-    """
-
     def __init__(self, parent=None):
         super().__init__("✕", parent)
         self.setObjectName("windowButton")
         self.setToolTip("关闭")
         self.setFixedSize(36, 28)
-        self.setStyleSheet(self.STYLE_NORMAL)
+        self.setStyleSheet(self._style("normal"))
+
+    def _style(self, kind: str) -> str:
+        from themes import theme_color
+
+        if kind == "hover":
+            background = theme_color("error", "#e81123")
+            color = "#ffffff"
+        elif kind == "pressed":
+            background = theme_color("error", "#e81123")
+            color = "#ffffff"
+        else:
+            background = "transparent"
+            color = theme_color("text_secondary", "#666666")
+        return f"""
+        QPushButton {{
+            background-color: {background};
+            border: none;
+            border-radius: 4px;
+            color: {color};
+            font-family: "Segoe UI Symbol", "Segoe UI Emoji", "Arial";
+            font-size: 12px;
+        }}
+        """
 
     def enterEvent(self, event):
-        self.setStyleSheet(self.STYLE_HOVER)
+        self.setStyleSheet(self._style("hover"))
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.setStyleSheet(self.STYLE_NORMAL)
+        self.setStyleSheet(self._style("normal"))
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.setStyleSheet(self.STYLE_PRESSED)
+            self.setStyleSheet(self._style("pressed"))
             self.clicked.emit()
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self.setStyleSheet(self.STYLE_NORMAL)
+        self.setStyleSheet(self._style("normal"))
         super().mouseReleaseEvent(event)
 
     def resetStyle(self):
-        self.setStyleSheet(self.STYLE_NORMAL)
+        self.setStyleSheet(self._style("normal"))
 
 
 class ResponsiveButton(QPushButton):
