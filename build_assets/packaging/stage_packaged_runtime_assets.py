@@ -13,7 +13,7 @@ PROJECT_ROOT_FOR_IMPORTS = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT_FOR_IMPORTS))
 
-from app_core.ocr_runtime_contract import OCR_REQUIRED_RUNTIME_DLLS
+from services.ocr_runtime_contract import OCR_REQUIRED_RUNTIME_DLLS
 
 
 def _resolve_existing_path(project_root: Path, candidates: list[str], *, label: str, expect_dir: bool = False) -> Path:
@@ -90,13 +90,11 @@ def _stage_interception_files(project_root: Path, dist_root: Path) -> None:
     )
 
 
-def _stage_extra_tools(project_root: Path, dist_root: Path) -> None:
-    print("[5.6/6] Copy extra tool...")
-    _copy_required_file(
-        project_root / "tools" / "大漠综合工具.exe",
-        dist_root / "tools" / "大漠综合工具.exe",
-        label="大漠综合工具.exe",
-    )
+def _remove_unused_bundled_tools(dist_root: Path) -> None:
+    leftover = dist_root / "tools" / "大漠综合工具.exe"
+    if leftover.is_file():
+        leftover.unlink()
+        print("[5.6/6] Removed leftover 大漠综合工具.exe")
 
 
 def main() -> int:
@@ -114,7 +112,7 @@ def main() -> int:
     _stage_qt_platform_plugin(project_root, dist_root)
     _stage_ocr_runtime(project_root, dist_root)
     _stage_interception_files(project_root, dist_root)
-    _stage_extra_tools(project_root, dist_root)
+    _remove_unused_bundled_tools(dist_root)
     return 0
 
 

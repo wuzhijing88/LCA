@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app_core.ocr_runtime_contract import (
+from services.ocr_runtime_contract import (
     OCR_MODEL_DIRECTORY,
     OCR_MODEL_FILES,
     OCR_REQUIRED_RUNTIME_DLLS,

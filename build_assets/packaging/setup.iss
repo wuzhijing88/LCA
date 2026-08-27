@@ -102,7 +102,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Name: "startmenuicon"; Description: "创建开始菜单快捷方式"; GroupDescription: "附加选项:"; Flags: unchecked
 
 [Files]
-Source: "{#MySourceDist}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "export_runtime\*;runtime_templates\*;workflow_lite_runner_template*.exe;_tufup_data\*;qtmonaco\*;QtWebEngineProcess.exe;*Qt6WebEngine*;*qtwebengine*;*PP-OCRv6*.onnx;*PP-OCRv5*.onnx;config\credentials.json;config\build_auth_secret.b64x2"
+Source: "{#MySourceDist}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "export_runtime\*;runtime_templates\*;workflow_lite_runner_template*.exe;_tufup_data\*;qtmonaco\*;QtWebEngineProcess.exe;*Qt6WebEngine*;*qtwebengine*;*PP-OCRv6*.onnx;*PP-OCRv5*.onnx;config\credentials.json;config\build_auth_secret.b64x2;tools\大漠综合工具.exe"
 
 [InstallDelete]
 ; 安装前清理旧版残留：源码缓存、已废弃更新/精简运行时、变量编辑器，以及 RapidOCR 误带的 v5/v6 模型
@@ -126,6 +126,7 @@ Type: files; Name: "{app}\models\rapidocr\*PP-OCRv6*"
 Type: files; Name: "{app}\models\rapidocr\*PP-OCRv5*"
 Type: files; Name: "{app}\rapidocr\*.onnx"
 Type: files; Name: "{app}\rapidocr\*\*.onnx"
+Type: files; Name: "{app}\tools\大漠综合工具.exe"
 
 [Icons]
 ; 桌面图标

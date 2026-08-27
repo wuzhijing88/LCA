@@ -19,7 +19,7 @@ PROJECT_ROOT_FOR_IMPORTS = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT_FOR_IMPORTS))
 
-from app_core.ocr_runtime_contract import (
+from services.ocr_runtime_contract import (
     OCR_MODEL_DIRECTORY,
     OCR_MODEL_FILES,
     OCR_REQUIRED_REQUIREMENTS,
@@ -28,6 +28,7 @@ from app_core.ocr_runtime_contract import (
 
 INCLUDE_PACKAGES = (
     "tasks",
+    "task_workflow",
     "uiautomation",
     "winrt",
     "dxcam",
@@ -43,7 +44,9 @@ INCLUDE_MODULES = (
     "services.multiprocess_ocr_pool",
     "services.multiprocess_ocr_worker",
     "services.rapidocr_ocr_service",
+    "services.dict_ocr_service",
     "services.screenshot_pool",
+    "ui.dialogs.dict_maker_dialog",
     "utils.dxgi_capture",
     "services.multiprocess_match_worker",
     "task_workflow.process_worker",
@@ -374,6 +377,23 @@ def _is_unused_qt_editor_path(relative_path: Path) -> bool:
     return "qtwebengine" in name or "qt6webengine" in name
 
 
+def _remove_unused_bundled_tools(dist_dir: Path) -> list[tuple[Path, int]]:
+    leftover_names = {
+        "大漠综合工具.exe",
+    }
+    removed: list[tuple[Path, int]] = []
+    tools_dir = dist_dir / "tools"
+    if not tools_dir.is_dir():
+        return removed
+    for leftover_name in leftover_names:
+        leftover_path = tools_dir / leftover_name
+        if leftover_path.is_file():
+            file_size = int(leftover_path.stat().st_size)
+            leftover_path.unlink()
+            removed.append((leftover_path.relative_to(dist_dir), file_size))
+    return removed
+
+
 def _remove_unused_qt_editor_runtime(dist_dir: Path) -> list[tuple[Path, int]]:
     if not dist_dir.is_dir():
         return []
@@ -640,6 +660,16 @@ def main() -> int:
             f"{len(removed_excluded_dlls)} files, {removed_size / 1024 / 1024:.2f} MB"
         )
         for relative_path, _file_size in removed_excluded_dlls:
+            print(f"  - {relative_path.as_posix()}")
+
+    removed_unused_tools = _remove_unused_bundled_tools(result_exe.parent)
+    if removed_unused_tools:
+        removed_size = sum(file_size for _relative_path, file_size in removed_unused_tools)
+        print(
+            "removed_unused_bundled_tools="
+            f"{len(removed_unused_tools)} files, {removed_size / 1024 / 1024:.2f} MB"
+        )
+        for relative_path, _file_size in removed_unused_tools:
             print(f"  - {relative_path.as_posix()}")
 
     removed_unused_qt_runtime = _remove_unused_qt_editor_runtime(result_exe.parent)
