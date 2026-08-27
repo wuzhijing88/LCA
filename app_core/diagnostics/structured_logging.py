@@ -36,12 +36,4 @@ class JsonLineFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def create_jsonl_handler(path: str, level: int = logging.INFO) -> logging.Handler:
-    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
-    handler.setLevel(level)
-    handler.addFilter(DiagnosticContextFilter())
-    handler.setFormatter(JsonLineFormatter())
-    return handler
-
-
-__all__ = ["DiagnosticContextFilter", "JsonLineFormatter", "create_jsonl_handler"]
+__all__ = ["DiagnosticContextFilter", "JsonLineFormatter"]

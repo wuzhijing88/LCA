@@ -2,7 +2,7 @@ import uuid
 from collections.abc import MutableMapping
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from utils.hwnd_utils import as_hwnd
+from utils.window.hwnd_utils import as_hwnd
 
 from .job_models import CommandResult, Job, JobSnapshot
 from .job_state import (

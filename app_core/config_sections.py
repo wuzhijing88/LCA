@@ -6,7 +6,16 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
+
+# 出厂快捷键必须互不重复。缺任一键时，热键注册会各自 fallback，容易再次撞车。
+DEFAULT_HOTKEYS = {
+    "start_task_hotkey": "F9",
+    "stop_task_hotkey": "F10",
+    "pause_workflow_hotkey": "F11",
+    "record_hotkey": "F12",
+    "replay_hotkey": "F8",
+}
 
 SECTION_FIELDS = {
     "ui": (
@@ -40,18 +49,25 @@ SECTION_FIELDS = {
         "custom_height",
         "bound_windows",
     ),
-    "hotkeys": ("start_task_hotkey", "stop_task_hotkey"),
+    "hotkeys": tuple(DEFAULT_HOTKEYS),
 }
 
 
-def apply_sections(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a flat-compatible config with canonical section mirrors."""
+def apply_sections(config: Mapping[str, Any], *, prefer: str = "section") -> dict[str, Any]:
+    """Return a flat-compatible config with canonical section mirrors.
+
+    prefer="section": nested section overwrites flat keys (load / migrate).
+    prefer="flat": flat keys overwrite section mirrors (save after UI edits).
+    """
+    use_flat = str(prefer or "section").strip().lower() == "flat"
     result = dict(config)
     for section_name, field_names in SECTION_FIELDS.items():
         existing = result.get(section_name)
         section = dict(existing) if isinstance(existing, Mapping) else {}
         for field_name in field_names:
-            if field_name in section:
+            if use_flat and field_name in result:
+                section[field_name] = result[field_name]
+            elif field_name in section:
                 result[field_name] = section[field_name]
             elif field_name in result:
                 section[field_name] = result[field_name]
@@ -84,6 +100,7 @@ def execution_settings(config: Mapping[str, Any]) -> ExecutionSettings:
 
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
+    "DEFAULT_HOTKEYS",
     "ExecutionSettings",
     "SECTION_FIELDS",
     "apply_sections",

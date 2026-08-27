@@ -49,10 +49,6 @@ def is_daily_due(now: datetime, hour: int, minute: int, executed: bool, last_exe
     return now.hour == hour and now.minute == minute
 
 
-def is_interval_due(now: datetime, next_fire_at: Optional[datetime]) -> bool:
-    return is_armed_due(now, next_fire_at)
-
-
 def is_armed_due(now: datetime, next_fire_at: Optional[datetime]) -> bool:
     return next_fire_at is not None and now >= next_fire_at
 

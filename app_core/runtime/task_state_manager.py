@@ -557,7 +557,7 @@ class TaskStateManager(QObject):
 
                 # 2. 释放截图引擎资源（包含WGC捕获器/线程/帧池）
                 try:
-                    from utils.screenshot_helper import cleanup_all_screenshot_engines
+                    from utils.capture.screenshot_helper import cleanup_all_screenshot_engines
                     cleanup_all_screenshot_engines()
                 except Exception as e:
                     logging.warning(f"[后台清理] 截图引擎资源释放失败: {e}")

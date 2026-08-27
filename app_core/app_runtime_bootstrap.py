@@ -14,10 +14,12 @@ def create_application(argv):
 
 
 def install_global_ui_helpers(app):
+    from ui.system_parts.menu_style import install_edit_menu_fixer
     from ui.widgets.custom_tooltip import get_tooltip_manager
 
     tooltip_manager = get_tooltip_manager()
     tooltip_manager.install(app)
+    install_edit_menu_fixer(app)
     return tooltip_manager
 
 
@@ -112,7 +114,7 @@ def run_qt_event_loop(
                 logging.error(f"[后台清理] 系统托盘清理失败: {error}")
 
         try:
-            from utils.window_handle_manager import get_window_handle_manager
+            from utils.window.window_handle_manager import get_window_handle_manager
 
             get_window_handle_manager().stop_monitoring()
             logging.info("[后台清理] 窗口句柄监控已停止")

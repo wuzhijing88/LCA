@@ -5,11 +5,11 @@ import time
 from collections.abc import Mapping
 from copy import deepcopy
 
-from app_core.config_sections import CONFIG_SCHEMA_VERSION, apply_sections
+from app_core.config_sections import CONFIG_SCHEMA_VERSION, DEFAULT_HOTKEYS, apply_sections
 from app_core.scheduling.store import OLD_SCHEDULE_KEYS, apply_schedule_schema, default_control_schedule_dict, default_main_schedule_dict
 from app_core.user_data_migration import migrate_default_user_data
 from utils.app_paths import get_config_path
-from utils.hwnd_utils import normalize_bound_windows_hwnds
+from utils.window.hwnd_utils import normalize_bound_windows_hwnds
 
 
 def _config_file() -> str:
@@ -39,8 +39,7 @@ _DEFAULT_CONFIG = {
     "enable_connection_line_animation": True,
     "close_behavior": "ask",
     "close_behavior_remember": False,
-    "start_task_hotkey": "F9",
-    "stop_task_hotkey": "F10",
+    **DEFAULT_HOTKEYS,
     "main_schedule": default_main_schedule_dict(),
     "control_schedule": default_control_schedule_dict(),
     "multi_window_delay": 500,
@@ -59,7 +58,23 @@ def _build_default_config() -> dict:
     return deepcopy(_DEFAULT_CONFIG)
 
 
-def _normalize_config(config: Mapping) -> dict:
+def _repair_factory_hotkey_collision(config: dict) -> None:
+    """Fix the known factory clash: pause and record both defaulted to F11."""
+    pause = str(config.get("pause_workflow_hotkey") or "").strip().upper()
+    record = str(config.get("record_hotkey") or "").strip().upper()
+    if pause != "F11" or record != "F11":
+        return
+    replacement = DEFAULT_HOTKEYS["record_hotkey"]
+    taken = {
+        str(config.get(key) or "").strip().upper()
+        for key in DEFAULT_HOTKEYS
+        if key != "record_hotkey"
+    }
+    if replacement.upper() not in taken:
+        config["record_hotkey"] = replacement
+
+
+def _normalize_config(config: Mapping, *, prefer: str = "section") -> dict:
     """Fill current-schema defaults and drop removed keys. Does not mutate *config*."""
     if not isinstance(config, Mapping):
         raise ValueError("配置文件根节点必须是 JSON 对象")
@@ -69,10 +84,11 @@ def _normalize_config(config: Mapping) -> dict:
         normalized.pop(key, None)
     for key, value in _build_default_config().items():
         normalized.setdefault(key, value)
+    _repair_factory_hotkey_collision(normalized)
     apply_schedule_schema(normalized)
     normalize_bound_windows_hwnds(normalized.get("bound_windows"))
     normalize_bound_windows_hwnds(normalized.get("active_bound_windows"))
-    return apply_sections(normalized)
+    return apply_sections(normalized, prefer=prefer)
 
 
 def load_config() -> dict:
@@ -118,7 +134,7 @@ def load_config() -> dict:
 
 def save_config(config_to_save: Mapping):
     """Persist a config atomically, leaving the caller's mapping untouched."""
-    config_to_save = _normalize_config(config_to_save)
+    config_to_save = _normalize_config(config_to_save, prefer="flat")
     config_file = _config_file()
 
     config_dir = os.path.dirname(config_file)
