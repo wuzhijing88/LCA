@@ -150,6 +150,14 @@ def get_images_dir(app_name: str = "LCA") -> str:
     return _ensure_dir(os.path.join(get_user_data_dir(app_name), "images"))
 
 
+def get_dicts_dir(app_name: str = "LCA") -> str:
+    return _ensure_dir(os.path.join(get_images_dir(app_name), "dicts"))
+
+
+def get_sounds_dir(app_name: str = "LCA") -> str:
+    return _ensure_dir(os.path.join(get_user_data_dir(app_name), "sounds"))
+
+
 def normalize_workflow_image_path(raw_path: str, app_name: str = "LCA") -> str:
     value = str(raw_path or "").strip()
     if not value or value.startswith("memory://"):

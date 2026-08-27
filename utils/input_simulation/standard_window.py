@@ -12,14 +12,14 @@ from ..enhanced_window_activator import get_window_activator
 from .mode_utils import get_foreground_driver_backends, get_ibinputsimulator_config
 from typing import Optional, List, Any, Tuple
 from .base import BaseInputSimulator, ElementNotFoundError
-from utils.hwnd_utils import as_hwnd
-from utils.input_timing import (
+from utils.window.hwnd_utils import as_hwnd
+from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
     DEFAULT_KEY_HOLD_SECONDS,
 )
 from utils.precise_sleep import precise_sleep as _shared_precise_sleep
-from utils.uiautomation_runtime import import_uiautomation
+from utils.input.uiautomation_runtime import import_uiautomation
 
 
 def _precise_sleep(duration: float) -> None:
@@ -64,6 +64,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         self._ib_runtime_signature = None
         # 记录最近一次成功文本输入的控件句柄（用于后续回车等按键发送）
         self._last_input_control_hwnd = None
+        self._virtual_cursor = None
 
         # 增强功能开关
         self.enable_deep_child_search = enable_deep_child_search
@@ -89,7 +90,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         if not self.use_foreground:
             return False
         try:
-            from utils.foreground_input_manager import get_foreground_input_manager
+            from utils.input.foreground_input_manager import get_foreground_input_manager
 
             fg_manager = get_foreground_input_manager()
             if self.foreground_driver == "pyautogui":
@@ -156,6 +157,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             self.driver = None
             self._ib_runtime_signature = None
             self._last_input_control_hwnd = None
+            self._virtual_cursor = None
             if hasattr(self, "child_finder"):
                 self.child_finder = None
             if hasattr(self, "window_activator"):
@@ -182,7 +184,19 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         win32con.WM_CHAR,
     }
 
+    _QUEUE_INPUT_MESSAGES = {
+        win32con.WM_KEYDOWN,
+        win32con.WM_KEYUP,
+        win32con.WM_SYSKEYDOWN,
+        win32con.WM_SYSKEYUP,
+        win32con.WM_CHAR,
+    }
+
     def _send_message(self, hwnd: int, msg: int, wparam: int, lparam: int):
+        # 记事本等标准窗只处理消息队列里的按键：SendMessage(KEYDOWN) 不会走 TranslateMessage，也就没有字。
+        # 后台一鼠标仍同步发送；按键/字符一律进队列，再用 WM_NULL 等待处理。
+        if (not self.use_foreground) and msg in self._QUEUE_INPUT_MESSAGES:
+            return win32gui.PostMessage(hwnd, msg, wparam, lparam)
         if self.use_async_message and msg in self._ASYNC_SAFE_MESSAGES:
             return win32gui.PostMessage(hwnd, msg, wparam, lparam)
         return win32gui.SendMessage(hwnd, msg, wparam, lparam)
@@ -286,7 +300,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
         send_timeout = getattr(win32gui, "SendMessageTimeout", None)
         if not callable(send_timeout):
-            return not self.use_async_message
+            return True
 
         targets = self._collect_message_guard_targets(hwnds)
         if not targets:
@@ -307,9 +321,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             except Exception:
                 continue
 
-        if delivered:
-            return True
-        return not self.use_async_message
+        return bool(delivered)
 
     def _get_control_chain(self, control_hwnd: int):
         """获取控件及其父窗口链，用于将按键消息发送到合适的目标"""
@@ -674,6 +686,262 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
         return window_chain, window_coords
 
+    def _is_desktop_target(self) -> bool:
+        try:
+            from utils.window.window_identity import is_desktop_window
+
+            return bool(is_desktop_window(self.hwnd))
+        except Exception:
+            return False
+
+    def get_virtual_cursor(self) -> Tuple[int, int]:
+        if self._virtual_cursor:
+            return int(self._virtual_cursor[0]), int(self._virtual_cursor[1])
+        try:
+            _left, _top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            return max(0, int(right) // 2), max(0, int(bottom) // 2)
+        except Exception:
+            return 0, 0
+
+    def _remember_cursor(self, x: int, y: int) -> None:
+        self._virtual_cursor = (int(x), int(y))
+
+    def _remember_target_control(self, window_chain) -> None:
+        for hwnd in reversed(list(window_chain or ())):
+            try:
+                if hwnd and win32gui.IsWindow(int(hwnd)):
+                    self._last_input_control_hwnd = int(hwnd)
+                    return
+            except Exception:
+                continue
+
+    def _activate_background_point(self, client_x: int, client_y: int) -> None:
+        if self.use_foreground or not self.enable_activation_sequence:
+            return
+        if self._is_desktop_target():
+            return
+        activator = getattr(self, "window_activator", None)
+        if activator is None:
+            return
+        try:
+            chain, _coords = self._resolve_mouse_message_targets(int(client_x), int(client_y))
+            child = chain[-1] if chain else self.hwnd
+            activator.activate_for_click(
+                self.hwnd,
+                child,
+                int(client_x),
+                int(client_y),
+                use_post_message=self.use_async_message,
+            )
+        except Exception:
+            pass
+
+    def _background_key_targets(self):
+        # 只发给一个窗口。父子链各发一次时，模拟器会把同一个键吃成两次。
+        # 非输入框的子窗（模拟器渲染层）通常不处理按键，必须回到绑定窗口。
+        last = self._last_input_control_hwnd
+        if self._is_window_alive(last) and self._looks_like_edit(self._control_class_name(last)):
+            return [int(last)]
+        if self._is_window_alive(self.hwnd):
+            return [int(self.hwnd)]
+        return []
+
+    def _looks_like_edit(self, class_name: str) -> bool:
+        name = str(class_name or "").lower()
+        return any(token in name for token in ("edit", "richedit", "textinput", "cwdtextbox"))
+
+    def _send_sync_message(self, hwnd: int, msg: int, wparam=0, lparam=0):
+        return win32gui.SendMessage(int(hwnd), msg, wparam, lparam)
+
+    def _is_window_alive(self, hwnd) -> bool:
+        try:
+            hwnd = int(hwnd or 0)
+            return bool(hwnd) and bool(win32gui.IsWindow(hwnd))
+        except Exception:
+            return False
+
+    def _control_class_name(self, hwnd: int) -> str:
+        try:
+            return str(win32gui.GetClassName(int(hwnd)) or "")
+        except Exception:
+            return ""
+
+    def _child_under_cursor(self) -> int:
+        try:
+            client_x, client_y = self.get_virtual_cursor()
+            chain, _coords = self._resolve_mouse_message_targets(client_x, client_y)
+            for hwnd in reversed(list(chain or ())):
+                if self._is_window_alive(hwnd):
+                    return int(hwnd)
+        except Exception:
+            pass
+        return 0
+
+    def _activate_background_control(self, control_hwnd: int) -> None:
+        if self.use_foreground or not self.enable_activation_sequence:
+            return
+        if self._is_desktop_target():
+            return
+        activator = getattr(self, "window_activator", None)
+        if activator is None:
+            return
+        try:
+            cursor_x, cursor_y = self.get_virtual_cursor()
+            activator.activate_for_click(
+                self.hwnd,
+                int(control_hwnd or self.hwnd),
+                int(cursor_x),
+                int(cursor_y),
+                use_post_message=self.use_async_message,
+            )
+        except Exception:
+            pass
+
+    def _get_control_text(self, hwnd: int) -> str:
+        try:
+            import ctypes
+
+            length = int(win32gui.SendMessage(int(hwnd), win32con.WM_GETTEXTLENGTH, 0, 0) or 0)
+            if length <= 0:
+                return str(win32gui.GetWindowText(int(hwnd)) or "")
+            buf = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.SendMessageW(int(hwnd), win32con.WM_GETTEXT, length + 1, buf)
+            return str(buf.value or "")
+        except Exception:
+            try:
+                return str(win32gui.GetWindowText(int(hwnd)) or "")
+            except Exception:
+                return ""
+
+    def _control_contains_text(self, hwnd: int, text: str) -> bool:
+        if not text:
+            return True
+        return str(text) in self._get_control_text(hwnd)
+
+    def _collect_text_targets(self) -> list:
+        targets = []
+        seen = set()
+
+        def push(hwnd) -> None:
+            try:
+                hwnd = int(hwnd or 0)
+            except Exception:
+                return
+            if not hwnd or hwnd in seen or not self._is_window_alive(hwnd):
+                return
+            seen.add(hwnd)
+            targets.append(hwnd)
+
+        push(self._last_input_control_hwnd)
+        push(self._find_focused_child_control())
+        try:
+            for control_hwnd, class_name, _text in self._find_all_input_controls():
+                if self._looks_like_edit(class_name):
+                    push(control_hwnd)
+        except Exception:
+            pass
+        push(self._child_under_cursor())
+        push(self.hwnd)
+        return targets
+
+    def _clipboard_set_text(self, text: str):
+        import win32clipboard
+
+        win32clipboard.OpenClipboard()
+        try:
+            try:
+                original = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+            except Exception:
+                original = None
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(str(text), win32con.CF_UNICODETEXT)
+            return original
+        finally:
+            win32clipboard.CloseClipboard()
+
+    def _try_edit_replace_text(self, control_hwnd: int, text: str) -> bool:
+        try:
+            self._send_sync_message(control_hwnd, win32con.EM_SETSEL, 0, -1)
+            self._send_sync_message(control_hwnd, win32con.EM_REPLACESEL, 1, str(text))
+            if self._control_contains_text(control_hwnd, text):
+                return True
+            self._send_sync_message(control_hwnd, win32con.WM_SETTEXT, 0, str(text))
+            return self._control_contains_text(control_hwnd, text)
+        except Exception:
+            return False
+
+    def _try_clipboard_paste(self, control_hwnd: int, text: str) -> bool:
+        original = None
+        try:
+            original = self._clipboard_set_text(text)
+        except Exception:
+            return False
+        try:
+            self._send_sync_message(control_hwnd, win32con.WM_PASTE, 0, 0)
+            if self._looks_like_edit(self._control_class_name(control_hwnd)):
+                return self._control_contains_text(control_hwnd, text)
+            return True
+        except Exception:
+            return False
+        finally:
+            if original is not None:
+                try:
+                    self._clipboard_set_text(original)
+                except Exception:
+                    pass
+
+    def _should_prefer_clipboard(self, text: str) -> bool:
+        value = str(text or "")
+        if len(value) >= 8:
+            return True
+        return any(ord(ch) > 127 for ch in value)
+
+    def _send_chars_to_control(self, control_hwnd: int, text: str, stop_checker=None) -> bool:
+        # 标准输入框只发 WM_CHAR，不要再附带 KEYDOWN，否则会写成两个字。
+        targets = [int(control_hwnd)] if self._is_window_alive(control_hwnd) else []
+        if not targets:
+            return False
+        for char in str(text):
+            if stop_checker and stop_checker():
+                raise InterruptedError("stop requested")
+            try:
+                self._send_message(targets[0], win32con.WM_CHAR, ord(char), 0)
+            except Exception:
+                return False
+            _precise_sleep(0.008)
+        return self._confirm_background_message_delivery(targets)
+
+    def _send_text_as_keys(self, text: str, stop_checker=None) -> bool:
+        """模拟器/自绘窗口：只发按键，不发 WM_CHAR。"""
+        if not self._is_window_alive(self.hwnd):
+            return False
+        self._activate_background_control(self.hwnd)
+        for char in str(text):
+            if stop_checker and stop_checker():
+                raise InterruptedError("stop requested")
+            try:
+                scanned = int(win32api.VkKeyScan(char))
+            except Exception:
+                scanned = -1
+            if scanned == -1:
+                try:
+                    self._send_message(self.hwnd, win32con.WM_CHAR, ord(char), 0)
+                except Exception:
+                    return False
+                _precise_sleep(0.008)
+                continue
+            vk = scanned & 0xFF
+            shift = (scanned >> 8) & 0x01
+            if shift and not self.send_key_down(win32con.VK_SHIFT):
+                return False
+            sent = self.send_key(vk)
+            if shift:
+                self.send_key_up(win32con.VK_SHIFT)
+            if not sent:
+                return False
+            _precise_sleep(0.008)
+        return True
+
     def _send_mouse_message_to_chain(self, window_chain, window_coords, msg: int, wparam: int) -> bool:
         """向窗口链发送鼠标消息，至少一个句柄成功即视为成功。"""
         delivered = False
@@ -710,23 +978,15 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             lparam_down = self._make_lparam(scan_code, extended, 1, False, False)
             lparam_up = self._make_lparam(scan_code, extended, 1, True, False)
 
-            control_chain = self._get_control_chain(control_hwnd)
-            for hwnd_to_send in control_chain:
-                try:
-                    self._send_message(hwnd_to_send, win32con.WM_KEYDOWN, vk_code, lparam_down)
-                except Exception:
-                    pass
-            if not self._confirm_background_message_delivery(control_chain):
+            targets = [int(control_hwnd)]
+            self._send_message(targets[0], win32con.WM_KEYDOWN, vk_code, lparam_down)
+            if not self._confirm_background_message_delivery(targets):
                 return False
 
             _precise_sleep(0.01)
 
-            for hwnd_to_send in control_chain:
-                try:
-                    self._send_message(hwnd_to_send, win32con.WM_KEYUP, vk_code, lparam_up)
-                except Exception:
-                    pass
-            if not self._confirm_background_message_delivery(control_chain):
+            self._send_message(targets[0], win32con.WM_KEYUP, vk_code, lparam_up)
+            if not self._confirm_background_message_delivery(targets):
                 return False
 
             return True
@@ -741,7 +1001,11 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 return self.driver.move_mouse(int(x), int(y), absolute=True)
             client_x, client_y = int(x), int(y)
             window_chain, window_coords = self._resolve_mouse_message_targets(client_x, client_y)
-            return self._send_mouse_message_to_chain(window_chain, window_coords, win32con.WM_MOUSEMOVE, 0)
+            if not self._send_mouse_message_to_chain(window_chain, window_coords, win32con.WM_MOUSEMOVE, 0):
+                return False
+            self._remember_cursor(client_x, client_y)
+            self._remember_target_control(window_chain)
+            return True
         except Exception:
             return False
 
@@ -759,7 +1023,11 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 win32con.MK_RBUTTON if button == 'right' else win32con.MK_MBUTTON
             )
             window_chain, window_coords = self._resolve_mouse_message_targets(client_x, client_y)
-            return self._send_mouse_message_to_chain(window_chain, window_coords, msg, wparam)
+            if not self._send_mouse_message_to_chain(window_chain, window_coords, msg, wparam):
+                return False
+            self._remember_cursor(client_x, client_y)
+            self._remember_target_control(window_chain)
+            return True
         except Exception:
             return False
 
@@ -774,7 +1042,11 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 win32con.WM_RBUTTONUP if button == 'right' else win32con.WM_MBUTTONUP
             )
             window_chain, window_coords = self._resolve_mouse_message_targets(client_x, client_y)
-            return self._send_mouse_message_to_chain(window_chain, window_coords, msg, 0)
+            if not self._send_mouse_message_to_chain(window_chain, window_coords, msg, 0):
+                return False
+            self._remember_cursor(client_x, client_y)
+            self._remember_target_control(window_chain)
+            return True
         except Exception:
             return False
 
@@ -843,9 +1115,15 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 )
             if not self.mouse_down(start_x, start_y, button=button):
                 return False
-            _precise_sleep(max(0.01, duration / 10.0))
-            self.move_mouse(end_x, end_y)
-            _precise_sleep(0.01)
+            steps = max(2, int(max(0.04, float(duration or 0.2)) / 0.02))
+            sleep_each = max(0.01, float(duration or 0.2) / steps)
+            for step in range(1, steps + 1):
+                progress = step / steps
+                mid_x = int(start_x + (end_x - start_x) * progress)
+                mid_y = int(start_y + (end_y - start_y) * progress)
+                if not self.move_mouse(mid_x, mid_y):
+                    return False
+                _precise_sleep(sleep_each)
             return self.mouse_up(end_x, end_y, button=button)
         except Exception:
             return False
@@ -966,10 +1244,26 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                     self.driver.mouse_up(end_x, end_y, button=button)
                 return True
 
-            # 后台模式：退化为首尾拖拽
-            start_x, start_y = path_points[0]
-            end_x, end_y = path_points[-1]
-            return self.drag(start_x, start_y, end_x, end_y, duration=duration, button=button)
+            points = []
+            for point in path_points:
+                if not point or len(point) < 2:
+                    continue
+                points.append((int(point[0]), int(point[1])))
+            if len(points) < 2:
+                return False
+            start_x, start_y = points[0]
+            end_x, end_y = points[-1]
+            if not self.mouse_down(start_x, start_y, button=button):
+                return False
+            step_sleep = max(0.01, float(duration or 0.2) / max(1, len(points) - 1))
+            try:
+                for point_x, point_y in points[1:]:
+                    if not self.move_mouse(point_x, point_y):
+                        return False
+                    _precise_sleep(step_sleep)
+            finally:
+                self.mouse_up(end_x, end_y, button=button)
+            return True
         except Exception:
             return False
 
@@ -1022,7 +1316,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             if scan_code == 0:
                 scan_code = win32api.MapVirtualKey(vk_code, 0)
             lparam = self._make_lparam(scan_code, extended, 1, False, False)
-            window_chain = self._get_window_chain()
+            window_chain = self._background_key_targets()
             for hwnd_to_send in window_chain:
                 try:
                     self._send_message(hwnd_to_send, win32con.WM_KEYDOWN, vk_code, lparam)
@@ -1047,7 +1341,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             if scan_code == 0:
                 scan_code = win32api.MapVirtualKey(vk_code, 0)
             lparam = self._make_lparam(scan_code, extended, 1, True, True)
-            window_chain = self._get_window_chain()
+            window_chain = self._background_key_targets()
             for hwnd_to_send in window_chain:
                 try:
                     self._send_message(hwnd_to_send, win32con.WM_KEYUP, vk_code, lparam)
@@ -1146,17 +1440,25 @@ class StandardWindowInputSimulator(BaseInputSimulator):
     def _find_and_send_to_input_control(self, text: str, stop_checker=None) -> bool:
         """Find an input control and send text."""
         try:
+            if self._is_desktop_target():
+                self.logger.error("桌面没法后台输入文字，请绑到真正的窗口，或改用前台模式")
+                return False
             if stop_checker and stop_checker():
                 raise InterruptedError("stop requested")
-            focused = self._find_focused_child_control()
-            if focused:
-                if self._send_text_to_specific_control(focused, text, stop_checker=stop_checker):
-                    return True
-            for control_hwnd, _, _ in self._find_all_input_controls():
+            targets = self._collect_text_targets()
+            edit_targets = [
+                hwnd for hwnd in targets
+                if self._looks_like_edit(self._control_class_name(hwnd))
+            ]
+            for control_hwnd in edit_targets:
                 if stop_checker and stop_checker():
                     raise InterruptedError("stop requested")
                 if self._send_text_to_specific_control(control_hwnd, text, stop_checker=stop_checker):
                     return True
+            if self._send_text_as_keys(text, stop_checker=stop_checker):
+                self.logger.info("[发送到控件] 已用按键写入文字")
+                return True
+            self.logger.error("后台文字没有进到输入框")
             return False
         except InterruptedError:
             raise
@@ -1213,6 +1515,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 down_msg, up_msg = win32con.WM_MBUTTONDOWN, win32con.WM_MBUTTONUP
                 wparam_down = win32con.MK_MBUTTON
 
+            self._activate_background_point(client_x, client_y)
             window_chain, window_coords = self._resolve_mouse_message_targets(client_x, client_y)
             if len(window_chain) > 1:
                 self.logger.info(f"[click-chain] multi-layer targets={len(window_chain)}")
@@ -1245,6 +1548,11 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                     0,
                 ):
                     return False
+            self._remember_cursor(client_x, client_y)
+            self._remember_target_control(window_chain)
+            if self.enable_message_guard and not self._confirm_background_message_delivery(window_chain):
+                self.logger.error("后台点击消息没有送到窗口")
+                return False
             return True
         except Exception:
             return False
@@ -1284,7 +1592,15 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 return False
 
             if not self._ensure_foreground_ready(timeout=0.15):
-                self.logger.error("[foreground_click] target window is not foreground")
+                front = ""
+                try:
+                    front = (win32gui.GetWindowText(win32gui.GetForegroundWindow()) or "").strip()
+                except Exception:
+                    front = ""
+                if front:
+                    self.logger.error(f"要点的窗口不在最前面（现在最前面是「{front}」），已取消点击")
+                else:
+                    self.logger.error("要点的窗口不在最前面，已取消点击")
                 return False
 
             try:
@@ -1320,7 +1636,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 safe_duration = 0.0
 
             if not hasattr(self.driver, "click_mouse"):
-                self.logger.error("[foreground_click] driver missing click_mouse")
+                self.logger.error("前台点击驱动不可用")
                 return False
 
             # 前台点击前先强制落位一次，避免首击阶段被底层驱动“旧坐标”消费。
@@ -1349,7 +1665,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                     return False
             if self.enable_message_guard:
                 if not self._confirm_click_delivery(target_x, target_y):
-                    self.logger.warning("[foreground_click] 点击完成确认失败")
+                    self.logger.warning("点击发出去了，但没确认到结果")
                     return False
             return True
         except Exception as e:
@@ -1357,7 +1673,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             return False
 
     def _ensure_foreground_ready(self, timeout: float = 0.15) -> bool:
-        """确保目标窗口在发送前台输入前已成为前台窗口。"""
+        """普通窗口须在前台才发真实点击；桌面层不检查。"""
         if not self.use_foreground:
             return True
         if not self.hwnd:
@@ -1368,6 +1684,14 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 return False
         except Exception:
             return False
+
+        try:
+            from utils.window.window_identity import is_desktop_window
+
+            if is_desktop_window(self.hwnd):
+                return True
+        except Exception:
+            pass
 
         try:
             if self._is_foreground_target_window(win32gui.GetForegroundWindow()):
@@ -1567,55 +1891,35 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         try:
             if stop_checker and stop_checker():
                 raise InterruptedError("stop requested")
-            import win32gui
-            import win32con
-
-            self.logger.debug(f"[发送到控件] 开始向控件 {control_hwnd} 发送文本: '{text}'")
-
-            # 获取控件信息
-            try:
-                class_name = win32gui.GetClassName(control_hwnd)
-                window_text = win32gui.GetWindowText(control_hwnd)
-                self.logger.debug(f"[发送到控件] 控件信息: 类名={class_name}, 文本='{window_text}'")
-            except Exception:
-                class_name = "Unknown"
-                window_text = ""
-
-            # 获取多层窗口链（控件及其所有父窗口）
-            control_chain = self._get_control_chain(control_hwnd)
-            self.logger.debug(f"[send_to_control] control chain len: {len(control_chain)}")
-
-            # WM_CHAR 逐字符发送
-            try:
-                self.logger.debug("[发送到控件] 尝试WM_CHAR逐字符发送中文")
-
-                for char in text:
-                    if stop_checker and stop_checker():
-                        raise InterruptedError("stop requested")
-                    char_code = ord(char)
-                    # 向控件链的第一个有效窗口发送WM_CHAR
-                    for hwnd_char in control_chain:
-                        try:
-                            self._send_message(hwnd_char, win32con.WM_CHAR, char_code, 0)
-                            break  # 发送成功后停止遍历
-                        except Exception as char_err:
-                            self.logger.debug(f"[发送到控件] WM_CHAR失败 (hwnd={hwnd_char}, char={char}): {char_err}")
-                    _precise_sleep(0.05)
-
-                if not self._confirm_background_message_delivery(control_chain):
-                    self.logger.debug("[文本发送] WM_CHAR 完成确认失败")
-                    return False
-
-                self.logger.info("[发送到控件] WM_CHAR逐字符发送完成")
-                self._last_input_control_hwnd = control_hwnd
-                return True
-
-            except InterruptedError:
-                raise
-            except Exception as char_error:
-                self.logger.debug(f"[发送到控件] WM_CHAR方法失败: {char_error}")
+            if not self._is_window_alive(control_hwnd):
                 return False
 
+            class_name = self._control_class_name(control_hwnd)
+            is_edit = self._looks_like_edit(class_name)
+            self.logger.debug(f"[发送到控件] 开始向控件 {control_hwnd} ({class_name}) 发送文本: '{text}'")
+            self._activate_background_control(control_hwnd)
+
+            if is_edit and self._try_edit_replace_text(control_hwnd, text):
+                self._last_input_control_hwnd = int(control_hwnd)
+                self.logger.info("[发送到控件] 已用输入框替换文字")
+                return True
+
+            if self._should_prefer_clipboard(text) or is_edit:
+                if self._try_clipboard_paste(control_hwnd, text):
+                    self._last_input_control_hwnd = int(control_hwnd)
+                    self.logger.info("[发送到控件] 已用粘贴写入文字")
+                    return True
+
+            if not self._send_chars_to_control(control_hwnd, text, stop_checker=stop_checker):
+                self.logger.debug("[发送到控件] 按键/字符发送失败")
+                return False
+            if is_edit and not self._control_contains_text(control_hwnd, text):
+                self.logger.debug("[发送到控件] 输入框里没有出现要写的文字")
+                return False
+
+            self._last_input_control_hwnd = int(control_hwnd)
+            self.logger.info("[发送到控件] 已用按键/字符写入文字")
+            return True
         except InterruptedError:
             raise
         except Exception as e:

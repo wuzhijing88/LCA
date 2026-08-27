@@ -6,8 +6,8 @@
 from abc import ABC, abstractmethod
 from typing import Optional, Any, List
 import logging
-from utils.hwnd_utils import as_hwnd
-from utils.input_timing import DEFAULT_KEY_HOLD_SECONDS
+from utils.window.hwnd_utils import as_hwnd
+from utils.input.input_timing import DEFAULT_KEY_HOLD_SECONDS
 
 logger = logging.getLogger(__name__)
 

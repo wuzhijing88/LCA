@@ -1,4 +1,4 @@
-﻿"""
+"""
 统一DPI处理器 - 简化所有DPI相关操作
 提供统一的DPI检测、坐标转换和区域调整功能
 """
@@ -188,7 +188,7 @@ class UnifiedDPIHandler:
 
             # 方法2：使用窗口所在显示器的DPI（多显示器环境下更准确）
             try:
-                from utils.multi_monitor_manager import get_multi_monitor_manager
+                from utils.window.multi_monitor_manager import get_multi_monitor_manager
                 monitor = get_multi_monitor_manager().get_monitor_for_window(hwnd)
                 if monitor and monitor.dpi_x > 0:
                     scale_factor = monitor.scale_factor

@@ -9,7 +9,7 @@ import os
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-from utils.hwnd_utils import as_hwnd
+from utils.window.hwnd_utils import as_hwnd
 
 logger = logging.getLogger(__name__)
 

@@ -162,7 +162,7 @@ def cleanup_runtime_image_memory(
         logger.debug("清理检测叠加层失败: %s", exc)
 
     try:
-        from utils.screenshot_helper import clear_screenshot_cache
+        from utils.capture.screenshot_helper import clear_screenshot_cache
 
         clear_screenshot_cache()
         result["screenshot_cache"] = True
@@ -171,13 +171,13 @@ def cleanup_runtime_image_memory(
 
     if cleanup_screenshot_engines:
         try:
-            from utils.async_screenshot import shutdown_global_pipeline
+            from utils.capture.async_screenshot import shutdown_global_pipeline
 
             shutdown_global_pipeline()
         except Exception:
             pass
         try:
-            from utils.screenshot_helper import cleanup_all_screenshot_engines
+            from utils.capture.screenshot_helper import cleanup_all_screenshot_engines
 
             cleanup_all_screenshot_engines()
             result["screenshot_engine"] = True
@@ -186,7 +186,7 @@ def cleanup_runtime_image_memory(
 
     if cleanup_template_cache:
         try:
-            from utils.template_preloader import clear_global_cache
+            from utils.match.template_preloader import clear_global_cache
 
             clear_global_cache()
             result["template_cache"] = True
