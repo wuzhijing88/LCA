@@ -69,6 +69,7 @@ _PRIMARY_TASK_MODULE_PATHS = {
     "附加条件": "tasks.watchdog_monitor",
     "子工作流": "tasks.sub_workflow_task",
     "自定义脚本": "tasks.script_task",
+    "A*寻路": "tasks.astar_pathfind",
 }
 
 TASK_CONTRACT_METADATA = {
@@ -110,6 +111,7 @@ _EXPORT_MODULES = {
     "thread_window_limit_task": "tasks.thread_window_limit_task",
     "click_coordinate": "tasks.click_coordinate",
     "task_utils": "tasks.task_utils",
+    "astar_pathfind": "tasks.astar_pathfind",
 }
 
 
