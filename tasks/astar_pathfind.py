@@ -33,7 +33,8 @@ def requires_input_lock(_params: dict[str, Any]) -> bool:
     return True
 
 
-def open_map_stitcher(params: dict[str, Any], target_hwnd=None):
+def open_map_stitcher(params: dict[str, Any], target_hwnd=None, **kwargs):
+    del params, target_hwnd, kwargs
     return True
 
 
@@ -247,14 +248,16 @@ def execute_task(
         logger.error("A*寻路参数校验失败: %s", validation_error)
         return handle_failure_action(params, card_id)
 
+    if not target_hwnd:
+        logger.error("A*寻路缺少目标窗口句柄，无法截图")
+        return handle_failure_action(params, card_id)
+
     minimap_x = _as_int(params.get("minimap_x"), 0)
     minimap_y = _as_int(params.get("minimap_y"), 0)
     minimap_width = _as_int(params.get("minimap_width"), 50)
     minimap_height = _as_int(params.get("minimap_height"), 50)
 
     def capture_frame():
-        if target_hwnd is None:
-            return None
         return capture_window_smart(target_hwnd)
 
     def capture_minimap():
