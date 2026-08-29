@@ -1,4 +1,5 @@
 from ..parameter_panel_support import *
+from app_core.lca_format.constants import LCA_FILE_FILTER
 from utils.window.window_activation_utils import show_and_raise_widget
 from task_workflow.workspace import favorite_path_key
 from task_workflow.workspace import (
@@ -649,7 +650,7 @@ class ParameterPanelFavoritesMixin:
 
         filepaths, _ = QFileDialog.getOpenFileNames(
 
-            self, "打开工作流文件", "", "工作流文件 (*.json)"
+            self, "打开工作流文件", "", LCA_FILE_FILTER
 
         )
 

@@ -7,3 +7,6 @@ LCA_HEADER_SIZE = len(LCA_MAGIC) + 2 + 2 + 2 + 12  # magic + ver + flags + key_i
 
 LCA_EXTENSION = ".lca"
 USER_ERROR_INVALID = "无法打开：不是有效的 LCA 工程文件"
+
+LCA_FILE_FILTER = "LCA 工程 (*.lca);;JSON 工作流 (*.json);;所有文件 (*.*)"
+LCA_SAVE_FILTER = "LCA 工程 (*.lca)"

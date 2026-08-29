@@ -108,6 +108,20 @@ def load_workflow_json(path: str | Path) -> Dict[str, Any]:
 
 
 def load_workflow_file(path: str | Path) -> Dict[str, Any]:
+    path_text = str(path)
+    if path_text.startswith("memory://"):
+        import json
+
+        from app_core.lca_format.session import get_current_session
+
+        session = get_current_session()
+        payload_bytes = session.get_bytes(path_text) if session is not None else None
+        if payload_bytes is None:
+            raise FileNotFoundError(f"包内工作流文件不存在: {path_text}")
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("工作流文件根节点必须是对象")
+        return payload
     if is_lca_path(path):
         payload, session = load_lca_project(path)
         session.activate()

@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from app_core.control_plane import unwrap_assignment_record, wrap_assignment_record
+from app_core.lca_format.constants import LCA_FILE_FILTER
+from task_workflow.workflow_payload import load_workflow_file
 from utils.app_paths import get_workflows_dir
 
 logger = logging.getLogger(__name__)
@@ -18,7 +20,7 @@ class ControlCenterWorkflowAssignmentMixin:
             self,
             title,
             get_workflows_dir(),
-            "JSON 文件 (*.json);;所有文件 (*)"
+            LCA_FILE_FILTER
         )
         return file_paths
 
@@ -27,8 +29,7 @@ class ControlCenterWorkflowAssignmentMixin:
         error_files: List[str] = []
         for file_path in file_paths:
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    workflow_data = json.load(f)
+                workflow_data = load_workflow_file(file_path)
                 if isinstance(workflow_data, dict):
                     from task_workflow.workflow_sanitize import sanitize_workflow_data
 
@@ -217,8 +218,7 @@ class ControlCenterWorkflowAssignmentMixin:
                 if file_path:
                     logger.warning(f"工作流文件不存在: {file_path}")
                 continue
-            with open(file_path, "r", encoding="utf-8") as wf:
-                workflow_data = json.load(wf)
+            workflow_data = load_workflow_file(file_path)
             if isinstance(workflow_data, dict):
                 from task_workflow.workflow_sanitize import sanitize_workflow_data
 

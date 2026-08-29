@@ -4,11 +4,13 @@ import logging
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox
 
+from app_core.lca_format.constants import LCA_SAVE_FILTER
 from app_core.runtime.execution_coordinator import (
     ExecutionSource,
     create_coordinated_workflow_runtime,
 )
 from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from task_workflow.workflow_payload import save_workflow_file
 
 logger = logging.getLogger(__name__)
 
@@ -366,9 +368,12 @@ class MainWindowRunWorkflowMixin:
 
                     "保存工作流",
 
-                    os.path.join(get_workflows_dir(), task.name),
+                    os.path.join(
+                        get_workflows_dir(),
+                        os.path.splitext(task.name or "workflow")[0] + ".lca",
+                    ),
 
-                    "JSON文件 (*.json);;所有文件 (*)"
+                    LCA_SAVE_FILTER
 
                 )
 
@@ -378,24 +383,16 @@ class MainWindowRunWorkflowMixin:
 
                     workflow_data = task_workflow_view.serialize_workflow()
 
-                    import json
-
                     try:
-
-                        from task_workflow.workflow_sanitize import sanitize_workflow_data
-
-                        sanitize_workflow_data(workflow_data)
-                        with open(filepath, 'w', encoding='utf-8') as f:
-
-                            json.dump(workflow_data, f, indent=2, ensure_ascii=False)
-
-                        task.filepath = filepath
+                        saved_path = save_workflow_file(filepath, workflow_data)
+                        task.filepath = str(saved_path)
+                        task.name = os.path.basename(task.filepath)
 
                         task.modified = False
 
                         save_successful = True
 
-                        logger.info(f"任务保存成功: {filepath}")
+                        logger.info(f"任务保存成功: {saved_path}")
 
                     except Exception as e:
 

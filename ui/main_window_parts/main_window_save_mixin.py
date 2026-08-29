@@ -1,9 +1,11 @@
 import datetime
-import json
 import logging
 import os
 
 from PySide6.QtWidgets import QMessageBox
+
+from app_core.lca_format.constants import LCA_SAVE_FILTER
+from task_workflow.workflow_payload import save_workflow_file
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +56,8 @@ class MainWindowSaveMixin:
             # 为没有路径的任务分配文件名
             for task, _ in tasks_without_path:
                 base_name = task.name if task.name else "工作流"
-                if base_name.endswith('.json'):
-                    base_name = base_name[:-5]
-                filepath = os.path.join(save_dir, f"{base_name}.json")
+                base_name = os.path.splitext(base_name)[0]
+                filepath = os.path.join(save_dir, f"{base_name}.lca")
                 task.filepath = filepath
                 task.name = os.path.basename(filepath)
         # 检测同名冲突并处理
@@ -71,14 +72,14 @@ class MainWindowSaveMixin:
         for filepath, task_list in filepath_count.items():
             if len(task_list) > 1:
                 # 有冲突，重命名
-                base_path = filepath[:-5] if filepath.endswith('.json') else filepath
+                base_path = os.path.splitext(filepath)[0]
                 for i, (task, _) in enumerate(task_list):
                     if i == 0:
                         # 第一个保持原名
                         pass
                     else:
                         # 后续的添加序号
-                        new_filepath = f"{base_path}({i}).json"
+                        new_filepath = f"{base_path}({i}).lca"
                         task.filepath = new_filepath
                         task.name = os.path.basename(new_filepath)
                         logger.info(f"同名冲突，重命名任务: {filepath} -> {new_filepath}")
@@ -144,15 +145,13 @@ class MainWindowSaveMixin:
             if reply == QMessageBox.StandardButton.No:
                 return False
         # --- ADDED: Log the data JUST BEFORE writing ---
-        logger.debug(f"[SAVE_DEBUG] Data to be written to JSON: {workflow_data}")
+        logger.debug(f"[SAVE_DEBUG] Data to be written to LCA: {workflow_data}")
         from task_workflow.workflow_sanitize import sanitize_workflow_data
 
         sanitize_workflow_data(workflow_data)
         # --- END ADDED ---
-        # Write to JSON file
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(workflow_data, f, indent=4, ensure_ascii=False)
+            filepath = str(save_workflow_file(filepath, workflow_data))
         except Exception as e:
             logger.error(f"写入文件失败: {e}", exc_info=True)
             self._show_error_message("保存失败", f"写入文件时发生错误: {e}")
@@ -185,8 +184,7 @@ class MainWindowSaveMixin:
             # --- END MODIFICATION ---
 
             logger.info(f"尝试创建备份文件: {backup_filepath}")
-            with open(backup_filepath, 'w', encoding='utf-8') as backup_f:
-                json.dump(workflow_data, backup_f, indent=4, ensure_ascii=False)
+            save_workflow_file(backup_filepath, workflow_data)
         except Exception as backup_e:
             logger.error(f"创建备份文件时发生错误: {backup_e}", exc_info=True)
             # Optionally show a warning to the user?
@@ -197,15 +195,19 @@ class MainWindowSaveMixin:
         """Saves the current workflow to a new file chosen by the user."""
         from PySide6.QtWidgets import QFileDialog
         from utils.app_paths import get_workflows_dir
-        default_filename = os.path.join(get_workflows_dir(), "workflow.json")
+        default_filename = os.path.join(get_workflows_dir(), "workflow.lca")
+        current_path = self.current_save_path or default_filename
+        current_path = os.path.splitext(current_path)[0] + ".lca"
         filepath, filetype = QFileDialog.getSaveFileName(
             self,
             "保存工作流",
-            self.current_save_path or default_filename, # Start in last dir or default
-            "JSON 文件 (*.json);;所有文件 (*)"
+            current_path,
+            LCA_SAVE_FILTER
         )
         if not filepath:
             return # User cancelled
+        if not filepath.lower().endswith(".lca"):
+            filepath += ".lca"
         # 保存为普通工作流文件
         self.current_save_path = filepath # Remember path for next time
 

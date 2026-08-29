@@ -8,6 +8,8 @@
 import logging
 import os
 import json
+from app_core.lca_format.constants import LCA_FILE_FILTER, LCA_SAVE_FILTER
+from task_workflow.workflow_payload import load_workflow_file
 from utils.app_paths import get_config_path
 from utils.window.hwnd_utils import as_hwnd
 from typing import Dict, Optional, List, Any
@@ -351,7 +353,7 @@ class WorkflowTabWidget(QTabWidget):
                     parent_widget,
                     "导入工作流（可多选）",
                     get_workflows_dir(),
-                    "JSON文件 (*.json);;所有文件 (*)"
+                    LCA_FILE_FILTER
                 )
                 logger.info(f"   QFileDialog.getOpenFileNames() 返回: {len(filepaths)} 个文件")
             except Exception as e:
@@ -416,15 +418,13 @@ class WorkflowTabWidget(QTabWidget):
         """
 
         # 检查文件是否存在
-        if not os.path.exists(filepath):
+        if not str(filepath).startswith("memory://") and not os.path.exists(filepath):
             QMessageBox.critical(self, "导入失败", f"文件不存在: {filepath}")
             return None
 
         try:
             # 加载工作流数据
-            import json
-            with open(filepath, 'r', encoding='utf-8') as f:
-                workflow_data = json.load(f)
+            workflow_data = load_workflow_file(filepath)
             jump_config, window_binding = self._validate_workflow_import_data(workflow_data, filepath)
 
             # 生成任务名称
@@ -569,6 +569,18 @@ class WorkflowTabWidget(QTabWidget):
         """只按调用方给出的明确路径解析，不搜索或猜测同名文件。"""
         if not isinstance(filepath, str) or not filepath.strip():
             raise ValueError("未指定子工作流文件")
+        filepath = filepath.strip()
+        if filepath.startswith("memory://"):
+            return filepath
+        try:
+            from app_core.lca_format.session import get_current_session
+
+            session = get_current_session()
+            logical_path = filepath.replace("\\", "/").lstrip("/")
+            if session is not None and session.get_bytes(logical_path) is not None:
+                return "memory://" + logical_path
+        except Exception:
+            pass
         if os.path.isabs(filepath):
             resolved = os.path.abspath(os.path.normpath(filepath))
         else:
@@ -577,7 +589,7 @@ class WorkflowTabWidget(QTabWidget):
             parent_path = os.path.abspath(os.path.normpath(parent_workflow_file))
             parent_dir = parent_path if os.path.isdir(parent_path) else os.path.dirname(parent_path)
             resolved = os.path.abspath(os.path.normpath(os.path.join(parent_dir, filepath)))
-        if not os.path.isfile(resolved):
+        if not resolved.startswith("memory://") and not os.path.isfile(resolved):
             raise FileNotFoundError(f"子工作流文件不存在: {resolved}")
         return resolved
 
@@ -623,9 +635,7 @@ class WorkflowTabWidget(QTabWidget):
 
         # 文件未打开，导入它
         try:
-            import json
-            with open(filepath, 'r', encoding='utf-8') as f:
-                workflow_data = json.load(f)
+            workflow_data = load_workflow_file(filepath)
             jump_config, window_binding = self._validate_workflow_import_data(workflow_data, filepath)
 
             # 生成标签页名称（带子流程前缀）
@@ -684,10 +694,10 @@ class WorkflowTabWidget(QTabWidget):
                     # 检查是否已存在同名任务
                     exists = False
                     for task in self.task_manager.get_all_tasks():
-                        if task.name == name or task.name == f"{name}.json":
+                        if task.name == name or task.name == f"{name}.lca":
                             exists = True
                             break
-                    if os.path.exists(os.path.join(get_workflows_dir(), f"{name}.json")):
+                    if os.path.exists(os.path.join(get_workflows_dir(), f"{name}.lca")):
                         exists = True
                     if not exists:
                         break
@@ -704,7 +714,7 @@ class WorkflowTabWidget(QTabWidget):
             }
 
             # 添加任务到管理器（预设 workflows 目录作为首次保存目标）
-            default_filepath = os.path.join(get_workflows_dir(), f"{name}.json")
+            default_filepath = os.path.join(get_workflows_dir(), f"{name}.lca")
             task_id = self.task_manager.add_task(name, default_filepath, workflow_data)
             self.workflow_imported.emit(task_id)
 
@@ -1496,16 +1506,19 @@ class WorkflowTabWidget(QTabWidget):
 
         # 选择保存路径
         from utils.app_paths import get_workflows_dir
-        default_save_path = task.filepath or os.path.join(get_workflows_dir(), task.name or "workflow.json")
+        default_save_path = task.filepath or os.path.join(get_workflows_dir(), task.name or "workflow.lca")
+        default_save_path = os.path.splitext(default_save_path)[0] + ".lca"
         filepath, _ = QFileDialog.getSaveFileName(
             self,
             "另存为",
             default_save_path,
-            "工作流文件 (*.json);;所有文件 (*)"
+            LCA_SAVE_FILTER
         )
 
         if not filepath:
             return
+        if not filepath.lower().endswith(".lca"):
+            filepath += ".lca"
 
         # 更新任务文件路径
         task.filepath = filepath
@@ -1826,8 +1839,7 @@ class WorkflowTabWidget(QTabWidget):
 
             # 整批先校验，防止格式错误导致只加载一部分标签页。
             for filepath in recent_workflows:
-                with open(filepath, 'r', encoding='utf-8') as workflow_file:
-                    workflow_data = json.load(workflow_file)
+                workflow_data = load_workflow_file(filepath)
                 self._validate_workflow_import_data(workflow_data, filepath)
 
             # 设置自动加载标志，防止重复记录

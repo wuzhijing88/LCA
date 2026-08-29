@@ -76,6 +76,16 @@ class ImagePathResolver:
         if not raw_path or not raw_path.strip():
             return None
         raw_path = raw_path.strip()
+        try:
+            from app_core.lca_format.session import get_current_session
+
+            session = get_current_session()
+            if session is not None:
+                package_path = session.resolve_asset(raw_path)
+                if package_path:
+                    return package_path
+        except Exception as exc:
+            logger.debug("[路径解析器] LCA 包资源解析失败: %s", exc)
         if raw_path.startswith("memory://"):
             return raw_path
         if self._cache_enabled:

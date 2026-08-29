@@ -168,6 +168,38 @@ def test_save_recursively_collects_json_sub_workflow(tmp_path):
     assert session.get_bytes(child_ref_image) == b"BMCHILD"
 
 
+def test_active_session_resolves_package_assets_to_readable_files():
+    from pathlib import Path
+
+    from app_core.lca_format.session import LcaPackageSession
+    from task_workflow.sub_workflow_path import resolve_sub_workflow_path
+    from utils.image_paths import ImagePathResolver
+
+    ImagePathResolver.reset_instance()
+    first = LcaPackageSession(
+        {
+            "assets/images/shared.bmp": b"FIRST",
+            "workflows/subs/child.json": b'{"cards":[],"connections":[]}',
+        }
+    ).activate()
+    resolver = ImagePathResolver()
+
+    first_path = resolver.resolve("assets/images/shared.bmp")
+    assert first_path is not None
+    assert Path(first_path).read_bytes() == b"FIRST"
+    assert resolver.resolve("memory://assets/images/shared.bmp") == first_path
+    assert (
+        resolve_sub_workflow_path("workflows/subs/child.json", "project.lca")
+        == "memory://workflows/subs/child.json"
+    )
+
+    LcaPackageSession({"assets/images/shared.bmp": b"SECOND"}).activate()
+    second_path = resolver.resolve("assets/images/shared.bmp")
+    assert second_path is not None
+    assert Path(second_path).read_bytes() == b"SECOND"
+    assert second_path != first_path
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     [

@@ -52,6 +52,18 @@ def test_load_workflow_file_keeps_json_compatibility(tmp_path):
     assert workflow_payload.load_workflow_file(json_path) == workflow
 
 
+def test_load_workflow_file_reads_active_lca_session_memory_uri():
+    workflow = {"cards": [], "connections": [], "name": "child"}
+    lca_session.LcaPackageSession(
+        {"workflows/subs/child.json": json.dumps(workflow).encode("utf-8")}
+    ).activate()
+
+    assert (
+        workflow_payload.load_workflow_file("memory://workflows/subs/child.json")
+        == workflow
+    )
+
+
 def test_workflow_task_save_updates_json_filepath_to_lca(tmp_path):
     json_path = tmp_path / "demo.json"
     task = _workflow_task(tmp_path, json_path)

@@ -290,11 +290,9 @@ class MainWindowExecutionHelperMixin:
 
                 base_name = task.name if task.name else "工作流"
 
-                if base_name.endswith('.json'):
+                base_name = os.path.splitext(base_name)[0]
 
-                    base_name = base_name[:-5]
-
-                filepath = os.path.join(save_dir, f"{base_name}.json")
+                filepath = os.path.join(save_dir, f"{base_name}.lca")
 
                 task.filepath = filepath
 
@@ -324,7 +322,7 @@ class MainWindowExecutionHelperMixin:
 
                 # 有冲突，重命名
 
-                base_path = filepath[:-5] if filepath.endswith('.json') else filepath
+                base_path = os.path.splitext(filepath)[0]
 
                 for i, (task, _) in enumerate(task_list):
 
@@ -338,7 +336,7 @@ class MainWindowExecutionHelperMixin:
 
                         # 后续的添加序号
 
-                        new_filepath = f"{base_path}({i}).json"
+                        new_filepath = f"{base_path}({i}).lca"
 
                         task.filepath = new_filepath
 

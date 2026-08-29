@@ -48,6 +48,25 @@ def resolve_sub_workflow_path(
     if not path_text:
         return None
 
+    parent_text = _clean_path_text(parent_workflow_file)
+    if path_text.startswith("memory://") or parent_text.startswith("memory://"):
+        if path_text.startswith("memory://"):
+            return path_text
+        relative = path_text.replace("\\", "/").lstrip("/")
+        if relative.startswith("workflows/"):
+            return "memory://" + relative
+        return "memory://workflows/" + relative
+
+    try:
+        from app_core.lca_format.session import get_current_session
+
+        session = get_current_session()
+        logical_path = path_text.replace("\\", "/").lstrip("/")
+        if session is not None and session.get_bytes(logical_path) is not None:
+            return "memory://" + logical_path
+    except Exception:
+        pass
+
     existing = _existing_file(path_text)
     if existing:
         return existing

@@ -16,12 +16,14 @@ import threading
 import time
 from typing import Dict, Any, Tuple, Optional, Set
 
+from app_core.lca_format.constants import LCA_FILE_FILTER
 from tasks.task_utils import (
     handle_failure_action,
     handle_success_action,
 )
 from task_workflow.sub_workflow_path import resolve_sub_workflow_path
 from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from task_workflow.workflow_payload import load_workflow_file
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +160,8 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
         "workflow_file": {
             "label": "工作流文件",
             "type": "file",
-            "file_filter": "工作流文件 (*.json);;所有文件 (*)",
-            "tooltip": "选择要执行的工作流文件（.json）",
+            "file_filter": LCA_FILE_FILTER,
+            "tooltip": "选择要执行的工作流文件（.lca 或 .json）",
             "required": True
         },
 
@@ -301,8 +303,17 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int],
     try:
         # 加载工作流文件
         logger.info(f"[子工作流] 加载工作流文件: {workflow_file}")
-        with open(workflow_file, 'r', encoding='utf-8') as f:
-            workflow_data = json.load(f)
+        if str(workflow_file).startswith("memory://"):
+            try:
+                workflow_data = load_workflow_file(workflow_file)
+            except FileNotFoundError:
+                from app_core.player.memory_store import get_player_memory_json
+
+                workflow_data = get_player_memory_json(str(workflow_file))
+                if not isinstance(workflow_data, dict):
+                    return _handle_failure(params, card_id, f"内存工作流不存在: {workflow_file}")
+        else:
+            workflow_data = load_workflow_file(workflow_file)
         from task_workflow.workflow_sanitize import sanitize_workflow_data
 
         sanitize_workflow_data(workflow_data)
