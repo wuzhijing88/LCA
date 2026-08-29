@@ -168,6 +168,44 @@ def test_save_recursively_collects_json_sub_workflow(tmp_path):
     assert session.get_bytes(child_ref_image) == b"BMCHILD"
 
 
+def test_export_collector_reads_asset_from_lca_file(tmp_path):
+    from ui.export_parts.collector import (
+        collect_workflow_package,
+        collection_to_memory_files,
+    )
+
+    image_path = tmp_path / "packed-only.bmp"
+    image_path.write_bytes(b"BM-PACKED-ONLY")
+    workflow = {
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "图像匹配点击",
+                "parameters": {"image_path": str(image_path)},
+            }
+        ],
+        "connections": [],
+    }
+
+    saved = save_lca_project(tmp_path / "export-source.lca", workflow)
+    loaded, _session = load_lca_project(saved)
+    image_path.unlink()
+
+    result = collect_workflow_package(
+        loaded,
+        parent_workflow_file=str(saved),
+        images_dir=str(tmp_path / "empty-images"),
+    )
+    files = collection_to_memory_files(result)
+
+    assert not result.errors
+    assert files["assets/images/packed-only.bmp"] == b"BM-PACKED-ONLY"
+    assert (
+        result.workflow_data["cards"][0]["parameters"]["image_path"]
+        == "memory://images/packed-only.bmp"
+    )
+
+
 def test_active_session_resolves_package_assets_to_readable_files():
     from pathlib import Path
 

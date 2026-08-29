@@ -36,6 +36,10 @@ class LcaPackageSession:
             data = self._files.get(f"assets/{path}")
         return data
 
+    def snapshot_files(self) -> dict[str, bytes]:
+        """返回包内文件快照，供导出等只读收集流程使用。"""
+        return dict(self._files)
+
     def resolve_asset(self, logical_path: object) -> Optional[str]:
         path = _normalize_logical_path(logical_path)
         data = self.get_bytes(path)
