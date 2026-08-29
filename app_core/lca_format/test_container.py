@@ -1,3 +1,6 @@
+import struct
+
+from app_core.lca_format.constants import USER_ERROR_INVALID
 from app_core.lca_format.container import LcaFormatError, seal_lca_bytes, unseal_lca_bytes
 
 
@@ -31,3 +34,34 @@ def test_truncated_raises():
         assert False
     except LcaFormatError:
         pass
+
+
+def _craft_header(*, ver: int = 1, flags: int = 0, key_id: int = 1) -> bytes:
+    return b"LCA1" + struct.pack("<HHH", ver, flags, key_id) + b"\x00" * 12
+
+
+def test_unsupported_version_raises_before_decrypt():
+    blob = _craft_header(ver=2) + b"\x00" * 32
+    try:
+        unseal_lca_bytes(blob)
+        assert False
+    except LcaFormatError as exc:
+        assert USER_ERROR_INVALID in str(exc)
+
+
+def test_unknown_key_id_raises():
+    blob = _craft_header(key_id=999) + b"\x00" * 32
+    try:
+        unseal_lca_bytes(blob)
+        assert False
+    except LcaFormatError as exc:
+        assert USER_ERROR_INVALID in str(exc)
+
+
+def test_unknown_flags_raises():
+    blob = _craft_header(flags=1) + b"\x00" * 32
+    try:
+        unseal_lca_bytes(blob)
+        assert False
+    except LcaFormatError as exc:
+        assert USER_ERROR_INVALID in str(exc)

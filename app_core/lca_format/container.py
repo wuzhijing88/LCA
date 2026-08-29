@@ -58,6 +58,13 @@ def unseal_lca_bytes(blob: bytes) -> Dict[str, bytes]:
         raise LcaFormatError(USER_ERROR_INVALID)
 
     ver, flags, key_id = struct.unpack("<HHH", blob[len(LCA_MAGIC) : len(LCA_MAGIC) + 6])
+
+    if ver != LCA_FORMAT_VERSION:
+        raise LcaFormatError(USER_ERROR_INVALID)
+
+    if flags != LCA_FLAGS:
+        raise LcaFormatError(USER_ERROR_INVALID)
+
     nonce = blob[len(LCA_MAGIC) + 6 : LCA_HEADER_SIZE]
     ciphertext_with_tag = blob[LCA_HEADER_SIZE:]
 
