@@ -46,12 +46,8 @@ def open_map_stitcher(params: dict[str, Any], target_hwnd=None, **kwargs):
     return option or True
 
 
-def _map_options() -> list[str]:
-    try:
-        return [format_map_option(map_id, name) for map_id, name in list_maps()]
-    except Exception:
-        logger.exception("读取地图库失败")
-        return []
+def list_map_options(source_value=None, root=None) -> list[str]:
+    return [format_map_option(map_id, name) for map_id, name in list_maps(root=root)]
 
 
 def get_params_definition() -> dict[str, dict[str, Any]]:
@@ -70,8 +66,16 @@ def get_params_definition() -> dict[str, dict[str, Any]]:
         "map_option": {
             "label": "地图",
             "type": "select",
-            "options": _map_options(),
+            "options": list_map_options(),
             "default": "",
+        },
+        "refresh_maps": {
+            "label": "刷新地图列表",
+            "type": "button",
+            "widget_hint": "refresh_dynamic_options",
+            "options_func": "list_map_options",
+            "target_param": "map_option",
+            "button_text": "刷新地图列表",
         },
         "open_stitcher": {
             "label": "拼图工具",

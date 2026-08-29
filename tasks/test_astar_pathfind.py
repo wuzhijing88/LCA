@@ -23,6 +23,18 @@ def test_params_include_death_and_keys():
     assert requires_input_lock({}) is True
 
 
+def test_list_map_options_uses_library(tmp_path, monkeypatch):
+    import numpy as np
+    from app_core.maps.record import create_map, format_map_option
+    from tasks.astar_pathfind import list_map_options
+
+    monkeypatch.setenv("LCA_USER_DATA_DIR", str(tmp_path))
+    record = create_map("谷", np.zeros((8, 8, 3), dtype=np.uint8), goal=(1, 1), root=tmp_path / "maps")
+    # list_map_options 应读 get_maps_dir；若测试用 root 注入，给 list_map_options 加 optional root 仅用于测试不导出
+    labels = list_map_options(root=tmp_path / "maps")
+    assert format_map_option(record.map_id, "谷") in labels
+
+
 def test_validate_card_params_requires_death():
     error = validate_card_params({"map_option": "x — x", "death_image_paths": ""})
     assert error and "死亡" in error

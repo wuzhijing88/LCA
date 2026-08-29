@@ -56,9 +56,10 @@ class ParameterPanelActionsMixin:
                 QMessageBox.warning(self, "错误", "未配置目标下拉框")
                 return
 
+            options_func_name = param_def.get('options_func', '')
             source_value = self._get_dynamic_source_value(param_def.get('source_param', ''))
             source_label = self._get_dynamic_source_label(param_def)
-            if not source_value:
+            if not source_value and options_func_name != 'list_map_options':
                 QMessageBox.warning(self, "提示", f"请先设置{source_label}")
                 return
 
@@ -67,7 +68,6 @@ class ParameterPanelActionsMixin:
                 QMessageBox.warning(self, "错误", f"未找到目标下拉框: {', '.join(missing_targets)}")
                 return
 
-            options_func_name = param_def.get('options_func', '')
             new_options = self._load_dynamic_options(source_value, options_func_name, param_def)
             changed_payload = self._apply_dynamic_options(target_widgets, new_options)
             self._emit_dynamic_options_changed(changed_payload)
@@ -154,7 +154,10 @@ class ParameterPanelActionsMixin:
         if func is None:
             return fallback_options
         try:
-            options = func(source_value)
+            if options_func_name == 'list_map_options':
+                options = func(source_value or None)
+            else:
+                options = func(source_value)
             if isinstance(options, (list, tuple, set)):
                 normalized = [str(item or "").strip() for item in options if str(item or "").strip()]
                 if normalized:
@@ -253,6 +256,18 @@ class ParameterPanelActionsMixin:
             if result is False:
                 logger.warning(f"执行action失败: {action}")
                 return
+            if action == 'open_map_stitcher' and isinstance(result, str) and result.strip():
+                map_option = result.strip()
+                map_combo = self._get_value_widget('map_option')
+                list_map_options = self._resolve_dynamic_options_func('list_map_options')
+                if isinstance(map_combo, QComboBox) and callable(list_map_options):
+                    self._refresh_dynamic_combo_box(map_combo, list_map_options(None))
+                    map_index = map_combo.findText(map_option)
+                    if map_index < 0:
+                        map_combo.addItem(map_option)
+                        map_index = map_combo.findText(map_option)
+                    map_combo.setCurrentIndex(map_index)
+                self.current_parameters['map_option'] = map_option
             logger.info(f"成功执行action: {action}")
         except Exception as e:
             logger.error(f"执行action失败: {action}, 错误: {e}", exc_info=True)

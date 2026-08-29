@@ -943,7 +943,9 @@ class ParameterPanelWidgetFactoryMixin:
         # 判断是否需要截图工具：
         # 1. 模拟鼠标操作任务的操作模式为找图功能时的 image_path
         # 2. 模拟鼠标操作任务的操作模式为鼠标拖拽时的 drag_start_image_path 和 drag_end_image_path
-        elif name == 'image_path' or name in ['drag_start_image_path', 'drag_end_image_path']:
+        elif name == 'image_path' or name in ['drag_start_image_path', 'drag_end_image_path'] or (
+            self.current_task_type == 'A*寻路' and name in ['arrow_template_path', 'death_image_paths']
+        ):
             should_show_screenshot = False
             if name == 'image_path':
                 if self.current_task_type == '模拟鼠标操作':
@@ -959,6 +961,8 @@ class ParameterPanelWidgetFactoryMixin:
                     operation_mode = self.current_parameters.get('operation_mode', '')
                     if operation_mode == '鼠标拖拽':
                         should_show_screenshot = True
+            elif self.current_task_type == 'A*寻路':
+                should_show_screenshot = True
 
             if should_show_screenshot:
                 # 添加浏览按钮
@@ -1241,9 +1245,11 @@ class ParameterPanelWidgetFactoryMixin:
         'target_image_path',
         'drag_start_image_path',
         'drag_end_image_path',
+        'arrow_template_path',
+        'death_image_paths',
     }
 
-    IMAGE_PREVIEW_TASK_TYPES = {'\u6a21\u62df\u9f20\u6807\u64cd\u4f5c'}
+    IMAGE_PREVIEW_TASK_TYPES = {'\u6a21\u62df\u9f20\u6807\u64cd\u4f5c', 'A*寻路'}
 
     def _should_append_image_preview(self, name: str, param_type: str) -> bool:
         return (
