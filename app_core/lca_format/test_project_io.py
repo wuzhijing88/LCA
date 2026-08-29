@@ -62,6 +62,72 @@ def test_save_rejects_missing_resource_and_lists_path(tmp_path):
         save_lca_project(tmp_path / "bad.lca", workflow)
 
 
+def test_save_resolves_relative_image_from_custom_gallery(tmp_path, monkeypatch):
+    gallery = tmp_path / "custom_gallery"
+    gallery.mkdir()
+    image_path = gallery / "gallery-only.bmp"
+    image_path.write_bytes(b"BM-GALLERY")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    workflow = {
+        "metadata": {"custom_gallery_path": "custom_gallery"},
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "图像匹配点击",
+                "parameters": {"image_path": "images/gallery-only.bmp"},
+            }
+        ],
+        "connections": [],
+    }
+
+    saved = save_lca_project(output_dir / "gallery.lca", workflow)
+    loaded, session = load_lca_project(saved)
+
+    packed_path = loaded["cards"][0]["parameters"]["image_path"]
+    assert packed_path == "assets/images/gallery-only.bmp"
+    assert session.get_bytes(packed_path) == b"BM-GALLERY"
+
+
+def test_save_rejects_missing_drag_gif_resource(tmp_path):
+    workflow = {
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "模拟鼠标操作",
+                "parameters": {"drag_start_image_path": "missing-start.gif"},
+            }
+        ],
+        "connections": [],
+    }
+
+    with pytest.raises(LcaFormatError, match="missing-start[.]gif"):
+        save_lca_project(tmp_path / "bad-drag.lca", workflow)
+
+
+def test_save_packs_present_drag_gif_resource(tmp_path):
+    image_path = tmp_path / "drag-start.gif"
+    image_path.write_bytes(b"GIF89a-FAKE")
+    workflow = {
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "模拟鼠标操作",
+                "parameters": {"drag_start_image_path": str(image_path)},
+            }
+        ],
+        "connections": [],
+    }
+
+    saved = save_lca_project(tmp_path / "drag.lca", workflow)
+    loaded, session = load_lca_project(saved)
+
+    packed_path = loaded["cards"][0]["parameters"]["drag_start_image_path"]
+    assert packed_path == "assets/images/drag-start.gif"
+    assert session.get_bytes(packed_path) == b"GIF89a-FAKE"
+
+
 def test_save_recursively_collects_json_sub_workflow(tmp_path):
     child_image = tmp_path / "child.bmp"
     child_image.write_bytes(b"BMCHILD")

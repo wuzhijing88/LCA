@@ -11,12 +11,19 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from app_core.lca_format.constants import LCA_EXTENSION, USER_ERROR_INVALID
 from app_core.lca_format.container import LcaFormatError, seal_lca_bytes, unseal_lca_bytes
 from app_core.lca_format.session import LcaPackageSession
+from task_workflow.workspace import get_effective_workflow_images_dir
 from task_workflow.workflow_sanitize import sanitize_workflow_data
 
 ENTRY_WORKFLOW = "workflows/main.json"
 PATH_PARAM_KEYS = {
     "image_path",
     "image_paths",
+    "raw_image_paths",
+    "target_image_path",
+    "pre_image_path",
+    "condition_image_path",
+    "drag_start_image_path",
+    "drag_end_image_path",
     "template_path",
     "workflow_file",
     "dict_path",
@@ -26,7 +33,7 @@ PATH_PARAM_KEYS = {
     "audio_file",
 }
 SUB_WORKFLOW_KEYS = {"workflow_file", "workflow_path", "sub_workflow_path"}
-IMAGE_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".wma", ".m4a", ".ogg", ".flac"}
 MODEL_EXTENSIONS = {".onnx"}
 
@@ -89,11 +96,15 @@ class _ProjectCollector:
     def collect(self, workflow_data: Mapping[str, Any]) -> Dict[str, Any]:
         copied = copy.deepcopy(dict(workflow_data))
         cleaned = sanitize_workflow_data(copied)
+        from utils.app_paths import get_images_dir, get_sounds_dir
+
         self._collect_workflow(
             cleaned,
             source_dir=self.output_dir,
             source_session=None,
             source_workflow_path=ENTRY_WORKFLOW,
+            images_dir=Path(get_images_dir("LCA")),
+            sounds_dir=Path(get_sounds_dir("LCA")),
         )
         if self._missing:
             paths = "\n".join(f"- {path}" for path in sorted(self._missing))
@@ -107,7 +118,12 @@ class _ProjectCollector:
         source_dir: Optional[Path],
         source_session: Optional[LcaPackageSession],
         source_workflow_path: str,
+        images_dir: Path,
+        sounds_dir: Path,
     ) -> None:
+        local_images_dir = Path(
+            get_effective_workflow_images_dir(workflow_data, str(images_dir))
+        )
         cards = _workflow_body(workflow_data).get("cards")
         if not isinstance(cards, list):
             return
@@ -128,6 +144,8 @@ class _ProjectCollector:
                         source_dir=source_dir,
                         source_session=source_session,
                         source_workflow_path=source_workflow_path,
+                        images_dir=local_images_dir,
+                        sounds_dir=sounds_dir,
                     )
                     continue
                 kind = _kind_for_path(str(value or ""), key)
@@ -142,6 +160,8 @@ class _ProjectCollector:
                         key=key,
                         source_dir=source_dir,
                         source_session=source_session,
+                        images_dir=local_images_dir,
+                        sounds_dir=sounds_dir,
                     )
                     for raw_path in values
                 ]
@@ -161,6 +181,8 @@ class _ProjectCollector:
         key: str,
         source_dir: Optional[Path],
         source_session: Optional[LcaPackageSession],
+        images_dir: Path,
+        sounds_dir: Path,
     ) -> str:
         kind = _kind_for_path(raw_path, key) or "other"
         package_data = source_session.get_bytes(raw_path) if source_session is not None else None
@@ -170,7 +192,13 @@ class _ProjectCollector:
             filename = Path(raw_path.replace("\\", "/")).name
             return self._register_asset(identity, package_data, filename, kind, source_hint)
 
-        resolved = self._resolve_disk_file(raw_path, source_dir, kind)
+        resolved = self._resolve_disk_file(
+            raw_path,
+            source_dir,
+            kind,
+            images_dir=images_dir,
+            sounds_dir=sounds_dir,
+        )
         if resolved is None:
             self._missing.add(raw_path)
             return raw_path
@@ -190,6 +218,8 @@ class _ProjectCollector:
         source_dir: Optional[Path],
         source_session: Optional[LcaPackageSession],
         source_workflow_path: str,
+        images_dir: Path,
+        sounds_dir: Path,
     ) -> object:
         values = _path_values(value)
         if not values:
@@ -200,6 +230,8 @@ class _ProjectCollector:
             source_dir=source_dir,
             source_session=source_session,
             source_workflow_path=source_workflow_path,
+            images_dir=images_dir,
+            sounds_dir=sounds_dir,
         )
         if loaded is None:
             self._missing.add(raw_path)
@@ -218,6 +250,8 @@ class _ProjectCollector:
             source_dir=nested_dir,
             source_session=nested_session,
             source_workflow_path=nested_source_path,
+            images_dir=images_dir,
+            sounds_dir=sounds_dir,
         )
         self.files[logical_path] = _json_bytes(nested)
         self.file_records.append({"path": logical_path, "role": "workflow", "original": raw_path})
@@ -230,6 +264,8 @@ class _ProjectCollector:
         source_dir: Optional[Path],
         source_session: Optional[LcaPackageSession],
         source_workflow_path: str,
+        images_dir: Path,
+        sounds_dir: Path,
     ):
         normalized = raw_path.replace("\\", "/").lstrip("/")
         if source_session is not None:
@@ -256,7 +292,13 @@ class _ProjectCollector:
                         candidate,
                     )
 
-        resolved = self._resolve_disk_file(raw_path, source_dir, "workflow")
+        resolved = self._resolve_disk_file(
+            raw_path,
+            source_dir,
+            "workflow",
+            images_dir=images_dir,
+            sounds_dir=sounds_dir,
+        )
         if resolved is None:
             return None
         identity = ("disk-workflow", os.path.normcase(str(resolved.resolve())))
@@ -285,6 +327,9 @@ class _ProjectCollector:
         raw_path: str,
         source_dir: Optional[Path],
         kind: str,
+        *,
+        images_dir: Path,
+        sounds_dir: Path,
     ) -> Optional[Path]:
         text = str(raw_path or "").strip().strip("\"'")
         if not text or text.startswith("memory://"):
@@ -293,14 +338,17 @@ class _ProjectCollector:
         candidates = [path]
         if source_dir is not None and not path.is_absolute():
             candidates.insert(0, source_dir / path)
+        root = sounds_dir if kind == "audio" else images_dir
+        candidates.extend((root / path.name, root / path))
+        normalized = text.replace("\\", "/")
+        if normalized.lower().startswith(("images/", "sounds/")):
+            candidates.append(root / normalized.split("/", 1)[1])
         try:
-            from utils.app_paths import get_images_dir, get_sounds_dir
+            from utils.image_paths import get_image_path_resolver
 
-            root = Path(get_sounds_dir("LCA") if kind == "audio" else get_images_dir("LCA"))
-            candidates.extend((root / path.name, root / path))
-            normalized = text.replace("\\", "/")
-            if normalized.lower().startswith(("images/", "sounds/")):
-                candidates.append(root / normalized.split("/", 1)[1])
+            resolved = get_image_path_resolver().resolve(text)
+            if resolved and not str(resolved).startswith("memory://"):
+                candidates.append(Path(resolved))
         except Exception:
             pass
         for candidate in candidates:
