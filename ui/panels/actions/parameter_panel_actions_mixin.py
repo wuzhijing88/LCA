@@ -160,7 +160,7 @@ class ParameterPanelActionsMixin:
                 options = func(source_value)
             if isinstance(options, (list, tuple, set)):
                 normalized = [str(item or "").strip() for item in options if str(item or "").strip()]
-                if normalized:
+                if normalized or options_func_name == 'list_map_options':
                     return normalized
             return fallback_options
         except Exception as e:
