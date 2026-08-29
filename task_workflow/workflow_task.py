@@ -900,8 +900,6 @@ class WorkflowTask(QObject):
             return False
 
         try:
-            import json
-
             # 确保文件路径是绝对路径
             abs_filepath = os.path.abspath(self.filepath)
             logger.debug(f"保存任务 '{self.name}': 原始路径={self.filepath}, 绝对路径={abs_filepath}")
@@ -941,13 +939,15 @@ class WorkflowTask(QObject):
                 'target_hwnd': self.target_hwnd
             }
 
-            # 保存文件
+            # 保存文件（旧 JSON 路径会自动转换为同名 .lca）
+            from task_workflow.workflow_payload import save_workflow_file
+
             logger.debug(f"写入文件: {abs_filepath}")
-            with open(abs_filepath, 'w', encoding='utf-8') as f:
-                json.dump(save_data, f, ensure_ascii=False, indent=2)
+            saved_path = save_workflow_file(abs_filepath, save_data)
+            self.filepath = str(saved_path)
 
             self.modified = False
-            logger.info(f"✓ 任务 '{self.name}' 已保存到: {abs_filepath}")
+            logger.info(f"✓ 任务 '{self.name}' 已保存到: {saved_path}")
             logger.debug(f"  跳转配置: enabled={self.jump_enabled}, rules={self.jump_rules}, delay={self.jump_delay}秒, first_execute={self.first_execute}")
             return True
 
@@ -991,11 +991,11 @@ class WorkflowTask(QObject):
             logger.debug(f"创建备份目录: {backups_dir}")
             os.makedirs(backups_dir, exist_ok=True)
 
-            # 生成备份文件名：原文件名_backup_时间戳.json
+            # 备份保持原文件格式；JSON 转换时保留旧 JSON，LCA 则备份 LCA。
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = os.path.basename(abs_filepath)
-            name_without_ext = os.path.splitext(filename)[0]
-            backup_filename = f"{name_without_ext}_backup_{timestamp}.json"
+            name_without_ext, extension = os.path.splitext(filename)
+            backup_filename = f"{name_without_ext}_backup_{timestamp}{extension or '.lca'}"
             backup_filepath = os.path.join(backups_dir, backup_filename)
 
             # 复制文件到备份目录
@@ -1030,7 +1030,6 @@ class WorkflowTask(QObject):
         if not self.filepath:
             logger.info(f"任务 '{self.name}' 未保存，创建临时备份")
             try:
-                import json
                 import tempfile
                 from datetime import datetime
 
@@ -1042,7 +1041,7 @@ class WorkflowTask(QObject):
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 # 清理文件名中的非法字符
                 safe_name = "".join(c for c in self.name if c.isalnum() or c in (' ', '_', '-')).strip()
-                temp_filename = f"{safe_name}_temp_backup_{timestamp}.json"
+                temp_filename = f"{safe_name}_temp_backup_{timestamp}.lca"
                 temp_filepath = os.path.join(temp_dir, temp_filename)
 
                 # 使用提供的数据或默认数据
@@ -1059,9 +1058,10 @@ class WorkflowTask(QObject):
                     'first_execute': self.first_execute
                 }
 
-                # 保存到临时文件
-                with open(temp_filepath, 'w', encoding='utf-8') as f:
-                    json.dump(save_data, f, ensure_ascii=False, indent=2)
+                # 保存到临时 LCA 文件，但不将备份路径设为任务的正式路径。
+                from task_workflow.workflow_payload import save_workflow_file
+
+                save_workflow_file(temp_filepath, save_data)
 
                 # 更新任务的workflow_data，确保执行时使用最新数据
                 if workflow_data is not None:
@@ -1075,9 +1075,17 @@ class WorkflowTask(QObject):
                 logger.error(f"任务 '{self.name}' 临时备份失败: {e}")
                 return False
 
-        # 正常的保存和备份流程
-        save_success = self.save(workflow_data=workflow_data)
-        backup_success = self.backup()
+        # JSON 转换为 LCA 前先备份旧 JSON；其余情况保持“保存后备份”。
+        converting_json = (
+            os.path.splitext(str(self.filepath))[1].lower() == '.json'
+            and os.path.isfile(os.path.abspath(self.filepath))
+        )
+        if converting_json:
+            backup_success = self.backup()
+            save_success = self.save(workflow_data=workflow_data)
+        else:
+            save_success = self.save(workflow_data=workflow_data)
+            backup_success = self.backup()
 
         if save_success and backup_success:
             logger.info(f"任务 '{self.name}' 保存和备份成功")
