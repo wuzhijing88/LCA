@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from app_core.lca_format import (
+    LcaFormatError,
+    is_lca_path,
+    load_lca_project,
+    save_lca_project,
+    unseal_lca_bytes,
+)
+
+
+def test_save_load_rewrites_image_into_package(tmp_path):
+    image_path = tmp_path / "shot.bmp"
+    image_path.write_bytes(b"BMFAKE")
+    workflow = {
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "图像匹配点击",
+                "parameters": {
+                    "image_path": str(image_path),
+                    "save_result_variable_name": "removed-on-save",
+                },
+            }
+        ],
+        "connections": [],
+    }
+
+    output_path = tmp_path / "demo.lca"
+    saved_path = save_lca_project(output_path, workflow, display_name="demo")
+    loaded, session = load_lca_project(saved_path)
+
+    rewritten = loaded["cards"][0]["parameters"]["image_path"]
+    assert rewritten.startswith("assets/images/")
+    assert session.get_bytes(rewritten) == b"BMFAKE"
+    assert "save_result_variable_name" not in loaded["cards"][0]["parameters"]
+
+    manifest = json.loads(unseal_lca_bytes(saved_path.read_bytes())["manifest.json"])
+    assert manifest["format"] == "lca_editor"
+    assert manifest["entry_workflow"] == "workflows/main.json"
+    assert manifest["name"] == "demo"
+
+
+def test_save_rejects_missing_resource_and_lists_path(tmp_path):
+    missing = tmp_path / "missing.bmp"
+    workflow = {
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "图像匹配点击",
+                "parameters": {"image_path": str(missing)},
+            }
+        ],
+        "connections": [],
+    }
+
+    with pytest.raises(LcaFormatError, match="missing[.]bmp"):
+        save_lca_project(tmp_path / "bad.lca", workflow)
+
+
+def test_save_recursively_collects_json_sub_workflow(tmp_path):
+    child_image = tmp_path / "child.bmp"
+    child_image.write_bytes(b"BMCHILD")
+    child_path = tmp_path / "child.json"
+    child_path.write_text(
+        json.dumps(
+            {
+                "cards": [
+                    {
+                        "id": 2,
+                        "task_type": "图像匹配点击",
+                        "parameters": {"image_path": str(child_image)},
+                    }
+                ],
+                "connections": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    workflow = {
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "子工作流",
+                "parameters": {"workflow_file": str(child_path)},
+            }
+        ],
+        "connections": [],
+    }
+
+    saved = save_lca_project(tmp_path / "nested.lca", workflow)
+    loaded, session = load_lca_project(saved)
+
+    child_ref = loaded["cards"][0]["parameters"]["workflow_file"]
+    assert child_ref.startswith("workflows/subs/")
+    child = json.loads(session.get_bytes(child_ref))
+    child_ref_image = child["cards"][0]["parameters"]["image_path"]
+    assert session.get_bytes(child_ref_image) == b"BMCHILD"
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("demo.lca", True),
+        ("DEMO.LCA", True),
+        ("demo.json", False),
+        ("", False),
+    ],
+)
+def test_is_lca_path(path, expected):
+    assert is_lca_path(path) is expected
