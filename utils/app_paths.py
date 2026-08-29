@@ -93,17 +93,15 @@ def resolve_running_executable() -> str:
 
 def get_app_root() -> str:
     if is_packaged_runtime():
-        # 优先真实进程镜像路径。Nuitka 的 sys.executable 可能仍是编译期/原 main.exe 路径，
-        # 独立程序被改名为「设计名.exe」后若仍信 sys.executable，会找不到同目录 package.lcap。
+        frozen_executable = str(sys.executable or "").strip()
+        if frozen_executable and not _is_python_launcher(frozen_executable):
+            return _to_long_path(os.path.dirname(os.path.abspath(frozen_executable)))
         executable = resolve_running_executable()
         if executable:
             return _to_long_path(os.path.dirname(executable))
         argv0 = str(sys.argv[0] if sys.argv else "").strip()
-        if argv0 and not _is_python_launcher(argv0):
+        if argv0:
             return _to_long_path(os.path.dirname(os.path.abspath(argv0)))
-        frozen_executable = str(sys.executable or "").strip()
-        if frozen_executable and not _is_python_launcher(frozen_executable):
-            return _to_long_path(os.path.dirname(os.path.abspath(frozen_executable)))
         return _to_long_path(os.path.dirname(os.path.abspath(sys.executable or ".")))
     return _to_long_path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
