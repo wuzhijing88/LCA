@@ -1,5 +1,10 @@
+import io
 import struct
+import zipfile
 
+import pytest
+
+from app_core.lca_format import container
 from app_core.lca_format.constants import USER_ERROR_INVALID
 from app_core.lca_format.container import LcaFormatError, seal_lca_bytes, unseal_lca_bytes
 
@@ -65,3 +70,34 @@ def test_unknown_flags_raises():
         assert False
     except LcaFormatError as exc:
         assert USER_ERROR_INVALID in str(exc)
+
+
+def test_zip_reader_rejects_excessive_member_count():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("first.txt", b"one")
+        archive.writestr("second.txt", b"two")
+
+    with pytest.raises(LcaFormatError, match=USER_ERROR_INVALID):
+        container._zip_bytes_to_files(buffer.getvalue(), max_members=1)
+
+
+def test_zip_reader_rejects_excessive_total_size():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("large.bin", b"x" * 32)
+
+    with pytest.raises(LcaFormatError, match=USER_ERROR_INVALID):
+        container._zip_bytes_to_files(buffer.getvalue(), max_uncompressed_bytes=16)
+
+
+def test_zip_reader_rejects_suspicious_member_compression_ratio():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("compressed.bin", b"x" * 4096)
+
+    with pytest.raises(LcaFormatError, match=USER_ERROR_INVALID):
+        container._zip_bytes_to_files(
+            buffer.getvalue(),
+            max_compression_ratio=2,
+        )

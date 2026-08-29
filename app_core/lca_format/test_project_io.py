@@ -128,6 +128,47 @@ def test_save_packs_present_drag_gif_resource(tmp_path):
     assert session.get_bytes(packed_path) == b"GIF89a-FAKE"
 
 
+def test_save_collects_resources_referenced_by_custom_script(tmp_path):
+    image_path = tmp_path / "script-image.png"
+    image_path.write_bytes(b"PNG-SCRIPT")
+    workflow = {
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "自定义脚本",
+                "parameters": {
+                    "script_source": f'IMAGE_PATH = r"{image_path.as_posix()}"',
+                },
+            }
+        ],
+        "connections": [],
+    }
+
+    saved = save_lca_project(tmp_path / "script.lca", workflow)
+    loaded, session = load_lca_project(saved)
+
+    source = loaded["cards"][0]["parameters"]["script_source"]
+    assert "assets/images/script-image.png" in source
+    assert session.get_bytes("assets/images/script-image.png") == b"PNG-SCRIPT"
+
+
+def test_save_rejects_missing_custom_script_resource(tmp_path):
+    missing = (tmp_path / "missing-script-image.png").as_posix()
+    workflow = {
+        "cards": [
+            {
+                "id": 1,
+                "task_type": "自定义脚本",
+                "parameters": {"script_source": f'IMAGE_PATH = r"{missing}"'},
+            }
+        ],
+        "connections": [],
+    }
+
+    with pytest.raises(LcaFormatError, match="missing-script-image[.]png"):
+        save_lca_project(tmp_path / "missing-script.lca", workflow)
+
+
 def test_save_recursively_collects_json_sub_workflow(tmp_path):
     child_image = tmp_path / "child.bmp"
     child_image.write_bytes(b"BMCHILD")

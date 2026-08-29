@@ -134,6 +134,14 @@ class _ProjectCollector:
             if not isinstance(parameters, dict):
                 continue
             task_type = str(card.get("task_type") or "").strip()
+            if task_type == "自定义脚本":
+                self._collect_script_resources(
+                    parameters,
+                    source_dir=source_dir,
+                    source_session=source_session,
+                    images_dir=local_images_dir,
+                    sounds_dir=sounds_dir,
+                )
             for key, value in list(parameters.items()):
                 if key in SUB_WORKFLOW_KEYS and (
                     task_type == "子工作流"
@@ -173,6 +181,42 @@ class _ProjectCollector:
                     parameters[key] = "\n".join(rewritten)
                 else:
                     parameters[key] = rewritten[0]
+
+    def _collect_script_resources(
+        self,
+        parameters: Dict[str, Any],
+        *,
+        source_dir: Optional[Path],
+        source_session: Optional[LcaPackageSession],
+        images_dir: Path,
+        sounds_dir: Path,
+    ) -> None:
+        from ui.dialogs.script_resources import list_script_resources
+
+        source = str(parameters.get("script_source") or "")
+        if not source.strip():
+            return
+        rewritten = source
+        resources = list_script_resources(
+            source,
+            images_dir=str(images_dir),
+            sounds_dir=str(sounds_dir),
+        )
+        for item in resources:
+            raw_path = str(item.get("path") or "").strip()
+            if not raw_path:
+                continue
+            packaged_path = self._collect_asset(
+                raw_path,
+                key="script_source",
+                source_dir=source_dir,
+                source_session=source_session,
+                images_dir=images_dir,
+                sounds_dir=sounds_dir,
+            )
+            if packaged_path != raw_path:
+                rewritten = rewritten.replace(raw_path, packaged_path)
+        parameters["script_source"] = rewritten
 
     def _collect_asset(
         self,

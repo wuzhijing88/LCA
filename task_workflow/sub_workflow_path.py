@@ -58,9 +58,9 @@ def resolve_sub_workflow_path(
         return "memory://workflows/" + relative
 
     try:
-        from app_core.lca_format.session import get_current_session
+        from app_core.lca_format.session import get_active
 
-        session = get_current_session()
+        session = get_active()
         logical_path = path_text.replace("\\", "/").lstrip("/")
         if session is not None and session.get_bytes(logical_path) is not None:
             return "memory://" + logical_path

@@ -75,6 +75,18 @@ class WorkflowTask(QObject):
         self.filepath = filepath
         self.source_ref = filepath
         self.workflow_data = workflow_data
+        self.lca_session = None
+        self.lca_session_path = ""
+        if str(filepath or "").lower().endswith(".lca"):
+            from app_core.lca_format.session import get_for_path
+
+            self.lca_session = get_for_path(filepath)
+            self.lca_session_path = os.path.abspath(filepath)
+        elif str(filepath or "").startswith("memory://"):
+            from app_core.lca_format.session import get_active, get_active_path
+
+            self.lca_session = get_active()
+            self.lca_session_path = get_active_path()
         self.read_only_mode = False
         self.read_only_reason = ""
         self.task_modules = task_modules
@@ -899,6 +911,8 @@ class WorkflowTask(QObject):
             logger.warning(f"任务 '{self.name}' 没有保存路径，需要先另存为")
             return False
 
+        restore_active_path = ""
+        temporarily_activated = False
         try:
             # 确保文件路径是绝对路径
             abs_filepath = os.path.abspath(self.filepath)
@@ -941,17 +955,66 @@ class WorkflowTask(QObject):
 
             # 保存文件（旧 JSON 路径会自动转换为同名 .lca）
             from task_workflow.workflow_payload import save_workflow_file
+            from app_core.lca_format.session import (
+                activate,
+                get_active_path,
+                register,
+            )
+
+            if self.lca_session is not None and self.lca_session_path:
+                restore_active_path = get_active_path()
+                own_session_path = os.path.normcase(
+                    os.path.abspath(self.lca_session_path)
+                )
+                if restore_active_path != own_session_path:
+                    register(self.lca_session_path, self.lca_session)
+                    activate(self.lca_session_path)
+                    temporarily_activated = True
 
             logger.debug(f"写入文件: {abs_filepath}")
             saved_path = save_workflow_file(abs_filepath, save_data)
             self.filepath = str(saved_path)
+            from app_core.lca_format.project_io import load_lca_project
+            from app_core.lca_format.session import deactivate, get_active
 
+            previous_session = self.lca_session
+            previous_was_active = get_active() is previous_session
+            previous_session_path = self.lca_session_path
+            _saved_data, saved_session = load_lca_project(saved_path)
+            register(saved_path, saved_session)
+            if (
+                previous_session_path
+                and os.path.normcase(os.path.abspath(previous_session_path))
+                != os.path.normcase(os.path.abspath(saved_path))
+            ):
+                from app_core.lca_format.session import clear_path
+
+                clear_path(previous_session_path)
+            self.lca_session = saved_session
+            self.lca_session_path = os.path.abspath(saved_path)
+            if temporarily_activated:
+                if restore_active_path:
+                    activate(restore_active_path)
+                else:
+                    deactivate()
+            elif previous_was_active:
+                activate(saved_path)
             self.modified = False
             logger.info(f"✓ 任务 '{self.name}' 已保存到: {saved_path}")
             logger.debug(f"  跳转配置: enabled={self.jump_enabled}, rules={self.jump_rules}, delay={self.jump_delay}秒, first_execute={self.first_execute}")
             return True
 
         except Exception as e:
+            if temporarily_activated:
+                try:
+                    from app_core.lca_format.session import activate, deactivate
+
+                    if restore_active_path:
+                        activate(restore_active_path)
+                    else:
+                        deactivate()
+                except Exception:
+                    pass
             logger.error(f"✗ 保存任务 '{self.name}' 失败: {e}", exc_info=True)
             return False
 

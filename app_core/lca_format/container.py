@@ -16,6 +16,10 @@ from app_core.lca_format.constants import (
 from app_core.lca_format.crypto import CryptoError, aes_gcm_decrypt, aes_gcm_encrypt
 from app_core.lca_format.keys import get_aes_key
 
+MAX_ZIP_MEMBERS = 10_000
+MAX_ZIP_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_ZIP_MEMBER_COMPRESSION_RATIO = 1_000.0
+
 
 class LcaFormatError(RuntimeError):
     """LCA1 容器格式错误。"""
@@ -33,10 +37,34 @@ def _files_to_zip_bytes(files: Mapping[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
-def _zip_bytes_to_files(plain_zip: bytes) -> Dict[str, bytes]:
+def _zip_bytes_to_files(
+    plain_zip: bytes,
+    *,
+    max_members: int = MAX_ZIP_MEMBERS,
+    max_uncompressed_bytes: int = MAX_ZIP_UNCOMPRESSED_BYTES,
+    max_compression_ratio: float = MAX_ZIP_MEMBER_COMPRESSION_RATIO,
+) -> Dict[str, bytes]:
     buffer = io.BytesIO(plain_zip)
     with zipfile.ZipFile(buffer, "r") as archive:
-        return {name: archive.read(name) for name in archive.namelist()}
+        members = archive.infolist()
+        if len(members) > max_members:
+            raise LcaFormatError(USER_ERROR_INVALID)
+
+        total_size = 0
+        for member in members:
+            total_size += member.file_size
+            if total_size > max_uncompressed_bytes:
+                raise LcaFormatError(USER_ERROR_INVALID)
+            if member.file_size:
+                ratio = member.file_size / max(member.compress_size, 1)
+                if ratio > max_compression_ratio:
+                    raise LcaFormatError(USER_ERROR_INVALID)
+
+        return {
+            member.filename: archive.read(member)
+            for member in members
+            if not member.is_dir()
+        }
 
 
 def seal_lca_bytes(files: Mapping[str, bytes], *, key_id: int = DEFAULT_KEY_ID) -> bytes:

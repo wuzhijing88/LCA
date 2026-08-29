@@ -48,6 +48,25 @@ def load_workflow_json(filepath: str) -> Optional[Dict[str, Any]]:
     return sanitize_workflow_data(data)
 
 
+def load_workspace_workflow(filepath: str) -> Optional[Dict[str, Any]]:
+    workflow_path = str(filepath or "").strip()
+    if not workflow_path or not os.path.exists(workflow_path):
+        return None
+    if workflow_path.lower().endswith(".lca"):
+        try:
+            from app_core.lca_format.project_io import load_lca_project
+
+            data, _session = load_lca_project(workflow_path)
+        except Exception:
+            return None
+        if not is_workflow_json_data(data):
+            return None
+        from task_workflow.workflow_sanitize import sanitize_workflow_data
+
+        return sanitize_workflow_data(data)
+    return load_workflow_json(workflow_path)
+
+
 def get_workflow_body(workflow_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(workflow_data, dict):
         return {}
@@ -101,10 +120,10 @@ def iter_workspace_workflow_files(workspace_dir: str) -> List[str]:
             if dirname not in {"__pycache__", ".git", ".idea", ".vscode", "backups"}
         ]
         for filename in filenames:
-            if not filename.lower().endswith(".json"):
+            if not filename.lower().endswith((".json", ".lca")):
                 continue
             full_path = os.path.abspath(os.path.join(root, filename))
-            workflow_data = load_workflow_json(full_path)
+            workflow_data = load_workspace_workflow(full_path)
             if workflow_data is None:
                 continue
             workflow_files.append(full_path)
@@ -160,7 +179,7 @@ def build_workspace_favorites(
     favorites: List[Dict[str, Any]] = []
     for workspace_dir in workspaces:
         for workflow_path in iter_workspace_workflow_files(workspace_dir):
-            workflow_data = load_workflow_json(workflow_path)
+            workflow_data = load_workspace_workflow(workflow_path)
             gallery_path = extract_workflow_gallery_path(workflow_data)
             saved_state = saved_state_map.get(favorite_path_key(workflow_path), {})
             display_name = str(saved_state.get("name") or "").strip()

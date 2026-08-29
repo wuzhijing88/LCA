@@ -8,6 +8,7 @@
 import logging
 import os
 import json
+from pathlib import Path
 from app_core.lca_format.constants import LCA_FILE_FILTER, LCA_SAVE_FILTER
 from task_workflow.workflow_payload import load_workflow_file
 from utils.app_paths import get_config_path
@@ -25,6 +26,13 @@ from ..system_parts.menu_style import apply_unified_menu_style
 logger = logging.getLogger(__name__)
 
 _VIEW_STATE_SETTINGS_KEY = "workflow_view_states_v1"
+_WORKFLOW_FILE_SUFFIXES = {".json", ".lca"}
+
+
+def _strip_workflow_suffix(name: object) -> str:
+    text = str(name or "")
+    suffix = Path(text).suffix.lower()
+    return text[: -len(suffix)] if suffix in _WORKFLOW_FILE_SUFFIXES else text
 
 
 class WorkflowTabWidget(QTabWidget):
@@ -266,6 +274,7 @@ class WorkflowTabWidget(QTabWidget):
             restored_index = self.indexOf(previous_widget)
             if restored_index >= 0:
                 self.setCurrentIndex(restored_index)
+                self._activate_current_task_session()
                 return
 
         previous_index = restore_state.get("index", -1)
@@ -274,6 +283,7 @@ class WorkflowTabWidget(QTabWidget):
 
         if 0 <= previous_index < self.count():
             self.setCurrentIndex(previous_index)
+            self._activate_current_task_session()
 
     def persist_open_view_states(self) -> None:
         """将当前所有打开工作流的画布视图状态持久化到 QSettings。"""
@@ -849,6 +859,7 @@ class WorkflowTabWidget(QTabWidget):
         # 切换到新标签页
         if self._activate_new_tab_on_add:
             self.setCurrentIndex(tab_index)
+            self._activate_current_task_session()
 
         # 更新标签页状态
         self._update_tab_status(task_id)
@@ -892,6 +903,17 @@ class WorkflowTabWidget(QTabWidget):
                 task_signal_source.card_finished.disconnect(self._on_task_card_finished)
             except (TypeError, RuntimeError):
                 pass
+            session_path = str(
+                getattr(task_signal_source, "lca_session_path", "") or ""
+            ).strip()
+            if session_path and not any(
+                str(getattr(task, "lca_session_path", "") or "").strip()
+                == session_path
+                for task in self.task_manager.get_all_tasks()
+            ):
+                from app_core.lca_format.session import clear_path
+
+                clear_path(session_path)
 
         if task_id not in self.task_to_tab:
             logger.warning(f"尝试删除不存在的任务: task_id={task_id}")
@@ -1244,6 +1266,19 @@ class WorkflowTabWidget(QTabWidget):
                 logger.info(f"   导入成功！task_id={task_id}")
             # else: 导入成功，_on_task_added 会自动切换到新标签页
 
+    def _activate_current_task_session(self) -> None:
+        from app_core.lca_format.session import activate, deactivate, register
+
+        task_id = self.get_current_task_id()
+        task = self.task_manager.get_task(task_id) if task_id is not None else None
+        session = getattr(task, "lca_session", None) if task is not None else None
+        session_path = str(getattr(task, "lca_session_path", "") or "").strip()
+        if session is not None and session_path:
+            register(session_path, session)
+            activate(session_path)
+            return
+        deactivate()
+
     def _on_current_changed(self, index: int):
         """当前标签页变化"""
         logger.info(f"标签页变化事件触发: index={index}, count={self.count()}")
@@ -1265,6 +1300,7 @@ class WorkflowTabWidget(QTabWidget):
         # 发送当前工作流变化信号
         if index in self.tab_to_task:
             task_id = self.tab_to_task[index]
+            self._activate_current_task_session()
             logger.debug(f"切换到任务: task_id={task_id}")
             self.current_workflow_changed.emit(task_id)
         else:
@@ -1446,11 +1482,7 @@ class WorkflowTabWidget(QTabWidget):
             return
 
         # 构建标签页文本
-        name = task.name
-
-        # 去掉文件后缀（如 .json）
-        if '.' in name:
-            name = os.path.splitext(name)[0]
+        name = _strip_workflow_suffix(task.name)
 
         # 添加修改标记
         modified_mark = '*' if task.modified else ''
@@ -1542,10 +1574,8 @@ class WorkflowTabWidget(QTabWidget):
 
         from PySide6.QtWidgets import QInputDialog
 
-        # 获取当前名称（去掉.json后缀）
-        current_name = task.name
-        if current_name.endswith('.json'):
-            current_name = current_name[:-5]
+        # 获取当前名称（去掉工作流文件后缀）
+        current_name = _strip_workflow_suffix(task.name)
 
         new_name, ok = QInputDialog.getText(
             self,
@@ -1554,17 +1584,20 @@ class WorkflowTabWidget(QTabWidget):
             text=current_name
         )
 
-        if ok and new_name and new_name != current_name:
+        requested_name = _strip_workflow_suffix(Path(str(new_name or "").strip()).name)
+        if ok and requested_name and requested_name != current_name:
             # 更新任务名称
             old_name = task.name
-            task.name = new_name if not new_name.endswith('.json') else new_name
+            task.name = requested_name
 
             # 如果有文件路径，更新文件路径（保持目录不变，只改文件名）
             if task.filepath:
-                dir_path = os.path.dirname(task.filepath)
-                # 确保新文件名有.json后缀
-                new_filename = new_name if new_name.endswith('.json') else f"{new_name}.json"
-                new_filepath = os.path.join(dir_path, new_filename)
+                old_path = Path(task.filepath)
+                suffix = old_path.suffix.lower()
+                if suffix not in _WORKFLOW_FILE_SUFFIXES:
+                    suffix = ".json"
+                new_filename = f"{requested_name}{suffix}"
+                new_filepath = str(old_path.with_name(new_filename))
 
                 # 重命名文件
                 try:
@@ -1585,7 +1618,23 @@ class WorkflowTabWidget(QTabWidget):
                     return
             else:
                 # 没有文件路径（新建的空白工作流），只更新名称
-                task.name = new_name
+                task.name = requested_name
+
+            task_session = getattr(task, "lca_session", None)
+            if task_session is not None and old_filepath.lower().endswith(".lca"):
+                from app_core.lca_format.session import (
+                    activate,
+                    clear_path,
+                    get_active,
+                    register,
+                )
+
+                was_active = get_active() is task_session
+                clear_path(old_filepath)
+                register(task.filepath, task_session)
+                task.lca_session_path = os.path.abspath(task.filepath)
+                if was_active:
+                    activate(task.filepath)
 
             # 标记为已修改
             task.modified = True
@@ -1594,8 +1643,8 @@ class WorkflowTabWidget(QTabWidget):
             self._update_tab_status(task_id)
 
             # 发送重命名信号
-            self.workflow_renamed.emit(task_id, old_filepath, task.filepath or "", new_name)
-            logger.info(f"任务已重命名: {task_id} -> '{new_name}'")
+            self.workflow_renamed.emit(task_id, old_filepath, task.filepath or "", requested_name)
+            logger.info(f"任务已重命名: {task_id} -> '{requested_name}'")
 
     def _close_other_tabs(self, keep_index: int):
         """关闭除指定索引外的所有标签页"""

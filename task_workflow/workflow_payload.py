@@ -112,9 +112,9 @@ def load_workflow_file(path: str | Path) -> Dict[str, Any]:
     if path_text.startswith("memory://"):
         import json
 
-        from app_core.lca_format.session import get_current_session
+        from app_core.lca_format.session import get_active
 
-        session = get_current_session()
+        session = get_active()
         payload_bytes = session.get_bytes(path_text) if session is not None else None
         if payload_bytes is None:
             raise FileNotFoundError(f"包内工作流文件不存在: {path_text}")
@@ -123,9 +123,15 @@ def load_workflow_file(path: str | Path) -> Dict[str, Any]:
             raise TypeError("工作流文件根节点必须是对象")
         return payload
     if is_lca_path(path):
+        from app_core.lca_format.session import activate, register
+
         payload, session = load_lca_project(path)
-        session.activate()
+        register(path, session)
+        activate(path)
         return payload
+    from app_core.lca_format.session import deactivate
+
+    deactivate()
     return load_workflow_json(path)
 
 

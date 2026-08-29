@@ -77,9 +77,9 @@ class ImagePathResolver:
             return None
         raw_path = raw_path.strip()
         try:
-            from app_core.lca_format.session import get_current_session
+            from app_core.lca_format.session import get_active
 
-            session = get_current_session()
+            session = get_active()
             if session is not None:
                 package_path = session.resolve_asset(raw_path)
                 if package_path:

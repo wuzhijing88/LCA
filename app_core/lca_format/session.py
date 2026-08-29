@@ -1,12 +1,31 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 from pathlib import Path
 from typing import Mapping, Optional
 
 
-_current_session: Optional["LcaPackageSession"] = None
+_registry: dict[str, "LcaPackageSession"] = {}
+_active_path: Optional[str] = None
+_registry_lock = threading.RLock()
+
+
+def _normalize_project_path(path: object) -> str:
+    text = str(path or "").strip()
+    if not text:
+        raise ValueError("LCA 工程路径不能为空")
+    return os.path.normcase(os.path.abspath(os.path.normpath(text)))
+
+
+def _clear_resolver_cache() -> None:
+    try:
+        from utils.image_paths import get_image_path_resolver
+
+        get_image_path_resolver().clear_cache()
+    except Exception:
+        pass
 
 
 def _normalize_logical_path(logical_path: object) -> str:
@@ -59,17 +78,84 @@ class LcaPackageSession:
             self._resolved_assets[path] = resolved
             return resolved
 
-    def activate(self) -> "LcaPackageSession":
-        global _current_session
-        _current_session = self
-        try:
-            from utils.image_paths import get_image_path_resolver
-
-            get_image_path_resolver().clear_cache()
-        except Exception:
-            pass
+    def activate(self, path: object = None) -> "LcaPackageSession":
+        """兼容旧调用；新代码应使用 register(path, session) + activate(path)。"""
+        with _registry_lock:
+            registered_path = next(
+                (key for key, session in _registry.items() if session is self),
+                None,
+            )
+        if registered_path is None:
+            registered_path = _normalize_project_path(
+                path or (Path(self._temp_dir.name) / "anonymous.lca")
+            )
+            register(registered_path, self)
+        activate(registered_path)
         return self
 
 
+def register(path: object, session: LcaPackageSession) -> LcaPackageSession:
+    if not isinstance(session, LcaPackageSession):
+        raise TypeError("session 必须是 LcaPackageSession")
+    normalized = _normalize_project_path(path)
+    with _registry_lock:
+        _registry[normalized] = session
+    return session
+
+
+def activate(path: object) -> LcaPackageSession:
+    global _active_path
+    normalized = _normalize_project_path(path)
+    with _registry_lock:
+        session = _registry.get(normalized)
+        if session is None:
+            raise KeyError(f"LCA 工程会话未注册: {path}")
+        _active_path = normalized
+    _clear_resolver_cache()
+    return session
+
+
+def get_active() -> Optional[LcaPackageSession]:
+    with _registry_lock:
+        if _active_path is None:
+            return None
+        return _registry.get(_active_path)
+
+
+def get_active_path() -> str:
+    with _registry_lock:
+        return _active_path or ""
+
+
+def get_for_path(path: object) -> Optional[LcaPackageSession]:
+    try:
+        normalized = _normalize_project_path(path)
+    except ValueError:
+        return None
+    with _registry_lock:
+        return _registry.get(normalized)
+
+
+def clear_path(path: object) -> None:
+    global _active_path
+    try:
+        normalized = _normalize_project_path(path)
+    except ValueError:
+        return
+    with _registry_lock:
+        _registry.pop(normalized, None)
+        if _active_path == normalized:
+            _active_path = None
+    _clear_resolver_cache()
+
+
+def deactivate() -> None:
+    global _active_path
+    with _registry_lock:
+        _active_path = None
+    _clear_resolver_cache()
+
+
 def get_current_session() -> Optional[LcaPackageSession]:
-    return _current_session
+    """兼容旧名称；返回当前激活的工程会话。"""
+    return get_active()
