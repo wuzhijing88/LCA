@@ -90,6 +90,8 @@ def run_path_loop(
 
         frame = capture_frame()
         if frame is not None and is_death_state(frame, death_templates):
+            last_pos = None
+            stuck_count = 0
             continue
 
         minimap = capture_minimap()
@@ -134,6 +136,12 @@ def run_path_loop(
         )
         if not hold_key(key, config.hold_seconds):
             return finish(False, "已停止")
+
+        frame = capture_frame()
+        if frame is not None and is_death_state(frame, death_templates):
+            last_pos = None
+            stuck_count = 0
+            continue
 
         if last_pos is not None and is_stuck(last_pos, position, thresh_px=config.stuck_px):
             record.walkability = flood_blocked(

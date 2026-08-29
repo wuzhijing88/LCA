@@ -1,6 +1,7 @@
 import numpy as np
 
 from app_core.maps.keys import DEFAULT_KEYS_4
+from app_core.maps.localize import LocateResult
 from app_core.maps.loop import PathLoopConfig, run_path_loop, validate_run
 from app_core.maps.record import CELL_BLOCKED, CELL_UNKNOWN, MapRecord
 
@@ -66,11 +67,62 @@ def test_death_does_not_paint_wall_or_press():
     assert frames["walls"][0] == 0
 
 
-def test_stuck_paints_green_not_blue():
+def test_death_after_key_resets_motion_baseline():
+    record = _green_map()
+    record.goal = (40, 40)
+    death = np.full((8, 8, 3), 255, dtype=np.uint8)
+    alive = np.zeros((40, 40, 3), dtype=np.uint8)
+    dead = alive.copy()
+    dead[0:8, 0:8] = 255
+    frame_sequence = iter([alive, alive, alive, dead, dead, alive, alive])
+    state = {"keys": 0, "frame_calls": 0}
+
+    def capture_frame():
+        state["frame_calls"] += 1
+        return next(frame_sequence, alive)
+
+    def hold_key(key, seconds):
+        state["keys"] += 1
+        return True
+
+    saved = []
+    ok, reason = run_path_loop(
+        record=record,
+        capture_minimap=lambda: record.image_bgr[24:40, 24:40].copy(),
+        capture_frame=capture_frame,
+        death_templates=[death],
+        arrow_template=None,
+        config=PathLoopConfig(
+            direction_mode="四向",
+            key_map=DEFAULT_KEYS_4,
+            stuck_limit=2,
+        ),
+        hold_key=hold_key,
+        persist=lambda item: saved.append(item.walkability.copy()),
+        stop_checker=lambda: state["keys"] >= 3,
+    )
+
+    assert ok is False
+    assert "卡住" not in reason
+    assert state["keys"] == 3
+    assert state["frame_calls"] == 7
+    assert saved
+    assert int((saved[-1] == CELL_BLOCKED).sum()) == 0
+
+
+def test_stuck_paints_green_not_blue(monkeypatch):
     record = _green_map()
     record.goal = (40, 40)
     death = np.full((2, 2, 3), 1, dtype=np.uint8)
     frames = {"n": 0, "keys": 0}
+    monkeypatch.setattr(
+        "app_core.maps.loop.locate_on_map",
+        lambda *args, **kwargs: LocateResult(found=True, x=28, y=30),
+    )
+    monkeypatch.setattr(
+        "app_core.maps.loop.plan_path",
+        lambda *args, **kwargs: [(28, 30), (38, 30)],
+    )
 
     def capture_frame():
         return np.zeros((20, 20, 3), dtype=np.uint8)
@@ -97,13 +149,15 @@ def test_stuck_paints_green_not_blue():
         config=PathLoopConfig(direction_mode="四向", key_map=DEFAULT_KEYS_4, stuck_limit=3),
         hold_key=hold_key,
         persist=lambda item: walls.append(item.walkability.copy()),
-        stop_checker=lambda: frames["keys"] >= 3,
+        stop_checker=lambda: frames["keys"] > 3,
     )
-    assert frames["keys"] >= 1
+    assert ok is False
+    assert "卡住超限" in reason
+    assert frames["keys"] == 4
+    assert walls
     last = walls[-1]
     assert int(last[30, 30]) == CELL_BLOCKED
     assert int(last[12, 12]) == CELL_UNKNOWN
-    assert "卡住" in reason or ok is False
 
 
 def test_stop_persists():
