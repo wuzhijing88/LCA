@@ -36,10 +36,13 @@ def requires_input_lock(_params: dict[str, Any]) -> bool:
 def open_map_stitcher(params: dict[str, Any], target_hwnd=None, **kwargs):
     try:
         from ui.maps.stitcher_dialog import open_stitcher_dialog
+        map_id = parse_map_option(str(params.get("map_option") or "")) or None
+        option = open_stitcher_dialog(
+            kwargs.get("parameter_panel") or kwargs.get("main_window"),
+            map_id,
+        )
     except Exception:
         return False
-    map_id = parse_map_option(str(params.get("map_option") or "")) or None
-    option = open_stitcher_dialog(kwargs.get("parameter_panel") or kwargs.get("main_window"), map_id)
     return option or True
 
 

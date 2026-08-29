@@ -25,6 +25,8 @@ def apply_editor_payload(record: MapRecord | None, payload: dict[str, Any]) -> M
 
     route = _points(payload.get("route"))
     raw_goal = payload.get("goal")
+    if not route and raw_goal is None:
+        raise ValueError("没有线路时必须标注终点")
     goal = None if route or raw_goal is None else (int(raw_goal[0]), int(raw_goal[1]))
 
     if record is None:

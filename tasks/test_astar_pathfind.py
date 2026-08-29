@@ -29,6 +29,8 @@ def test_validate_card_params_requires_death():
 
 
 def test_open_map_stitcher_accepts_dispatcher_kwargs():
+    from ui.maps.stitcher_dialog import _QT_AVAILABLE
+
     result = open_map_stitcher(
         {},
         target_hwnd=123,
@@ -37,7 +39,7 @@ def test_open_map_stitcher_accepts_dispatcher_kwargs():
         parameter_dialog=object(),
         param_name="open_stitcher",
     )
-    assert result is True
+    assert result is _QT_AVAILABLE
 
 
 def test_execute_task_without_hwnd_skips_path_loop(monkeypatch, caplog):

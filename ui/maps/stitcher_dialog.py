@@ -4,6 +4,7 @@ from typing import Callable
 
 import cv2
 import numpy as np
+_QT_AVAILABLE = True
 try:
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QImage, QMouseEvent, QPixmap
@@ -22,6 +23,8 @@ try:
         QWidget,
     )
 except ImportError:
+    _QT_AVAILABLE = False
+
     class _UnavailableWidget:
         def __init__(self, *args, **kwargs):
             raise RuntimeError("地图拼图工具需要 PySide6")
@@ -266,6 +269,8 @@ class MapStitcherDialog(QDialog):
 
 
 def open_stitcher_dialog(parent, map_id: str | None) -> str | None:
+    if not _QT_AVAILABLE:
+        raise ImportError("地图拼图工具需要 PySide6")
     record = load_map(map_id) if map_id else None
     app = QApplication.instance()
     if not isinstance(app, QApplication):
