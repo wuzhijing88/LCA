@@ -98,7 +98,7 @@ class MapStitcherDialog(QDialog):
         self._origin_x_spin = QSpinBox()
         self._origin_y_spin = QSpinBox()
         for spin in (self._origin_x_spin, self._origin_y_spin):
-            spin.setRange(0, 1_000_000)
+            spin.setRange(-1_000_000, 1_000_000)
             spin.setEnabled(False)
             spin.valueChanged.connect(self._on_origin_changed)
 
@@ -176,8 +176,8 @@ class MapStitcherDialog(QDialog):
                 origin = next_tile_origin(canvas, tile) if canvas is not None else (0, 0)
             self._tiles.append(tile)
             self._origins.append(origin)
+            self._normalize_origins()
         self._sync_origin_controls()
-        self._resize_layers()
         self._refresh_canvas()
 
     def _sync_origin_controls(self) -> None:
@@ -200,8 +200,46 @@ class MapStitcherDialog(QDialog):
         if not self._origins:
             return
         self._origins[-1] = (self._origin_x_spin.value(), self._origin_y_spin.value())
-        self._resize_layers()
+        self._normalize_origins()
+        self._sync_origin_controls()
         self._refresh_canvas()
+
+    def _normalize_origins(self) -> None:
+        if not self._origins:
+            return
+        min_x = min(x for x, _y in self._origins)
+        min_y = min(y for _x, y in self._origins)
+        dx = -int(min_x)
+        dy = -int(min_y)
+        if dx or dy:
+            self._origins = [(x + dx, y + dy) for x, y in self._origins]
+            self._painted_cells = {(x + dx, y + dy) for x, y in self._painted_cells}
+            self._route = [(x + dx, y + dy) for x, y in self._route]
+            if self._goal is not None:
+                self._goal = (self._goal[0] + dx, self._goal[1] + dy)
+            self._shift_walkability(dx, dy)
+        self._resize_layers()
+
+    def _shift_walkability(self, dx: int, dy: int) -> None:
+        if self._walkability is None:
+            return
+        image = self._current_image()
+        if image is None:
+            return
+        shifted = np.zeros(image.shape[:2], dtype=np.uint8)
+        source = self._walkability
+        source_x = max(0, -dx)
+        source_y = max(0, -dy)
+        target_x = max(0, dx)
+        target_y = max(0, dy)
+        width = min(source.shape[1] - source_x, shifted.shape[1] - target_x)
+        height = min(source.shape[0] - source_y, shifted.shape[0] - target_y)
+        if width > 0 and height > 0:
+            shifted[target_y : target_y + height, target_x : target_x + width] = source[
+                source_y : source_y + height,
+                source_x : source_x + width,
+            ]
+        self._walkability = shifted
 
     def _resize_layers(self) -> None:
         image = self._current_image()

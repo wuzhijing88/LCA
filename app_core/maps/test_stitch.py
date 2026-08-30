@@ -34,6 +34,36 @@ def test_estimate_origin_finds_same_size_horizontal_overlap():
     assert abs(origin[1]) <= 1
 
 
+def test_same_size_left_overlap_stitches_from_negative_origin():
+    scene = np.random.default_rng(143).integers(0, 256, size=(48, 96, 3), dtype=np.uint8)
+    base = scene[:, 32:96].copy()
+    tile = scene[:, :64].copy()
+
+    origin = estimate_origin(base, tile)
+
+    assert origin is not None
+    assert abs(origin[0] + 32) <= 1
+    assert abs(origin[1]) <= 1
+    canvas = stitch_by_origins([base, tile], [(0, 0), origin])
+    assert canvas.shape == scene.shape
+    assert np.array_equal(canvas, scene)
+
+
+def test_same_size_upper_overlap_stitches_from_negative_origin():
+    scene = np.random.default_rng(144).integers(0, 256, size=(96, 48, 3), dtype=np.uint8)
+    base = scene[32:96, :].copy()
+    tile = scene[:64, :].copy()
+
+    origin = estimate_origin(base, tile)
+
+    assert origin is not None
+    assert abs(origin[0]) <= 1
+    assert abs(origin[1] + 32) <= 1
+    canvas = stitch_by_origins([base, tile], [(0, 0), origin])
+    assert canvas.shape == scene.shape
+    assert np.array_equal(canvas, scene)
+
+
 def test_estimate_origin_rejects_unrelated_same_size_tiles():
     base = np.random.default_rng(1).integers(0, 256, size=(48, 64, 3), dtype=np.uint8)
     tile = np.random.default_rng(2).integers(0, 256, size=(48, 64, 3), dtype=np.uint8)

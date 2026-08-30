@@ -13,22 +13,25 @@ def stitch_by_origins(
     if not tiles:
         return np.zeros((0, 0, 3), dtype=np.uint8)
 
-    max_y = 0
-    max_x = 0
+    placements = list(zip(tiles, origins))
+    min_x = min(int(x) for _tile, (x, _y) in placements)
+    min_y = min(int(y) for _tile, (_x, y) in placements)
+    max_x = max(int(x) + tile.shape[1] for tile, (x, _y) in placements)
+    max_y = max(int(y) + tile.shape[0] for tile, (_x, y) in placements)
     channels = int(tiles[0].shape[2]) if tiles[0].ndim == 3 else 1
-    for tile, (x, y) in zip(tiles, origins):
-        h, w = tile.shape[:2]
-        max_y = max(max_y, y + h)
-        max_x = max(max_x, x + w)
+    canvas_height = max_y - min_y
+    canvas_width = max_x - min_x
 
     if channels == 1:
-        canvas = np.zeros((max_y, max_x), dtype=np.uint8)
+        canvas = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
     else:
-        canvas = np.zeros((max_y, max_x, channels), dtype=np.uint8)
+        canvas = np.zeros((canvas_height, canvas_width, channels), dtype=np.uint8)
 
-    for tile, (x, y) in zip(tiles, origins):
+    for tile, (x, y) in placements:
         h, w = tile.shape[:2]
-        canvas[y : y + h, x : x + w] = tile
+        paste_x = int(x) - min_x
+        paste_y = int(y) - min_y
+        canvas[paste_y : paste_y + h, paste_x : paste_x + w] = tile
 
     return canvas
 
