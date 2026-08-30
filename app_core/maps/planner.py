@@ -42,22 +42,16 @@ def build_grid(walkability: np.ndarray, cell_size: int = 8) -> np.ndarray:
     return grid
 
 
-def _op_astar_available() -> bool:
-    client = None
-    try:
-        from utils.op.runtime import OpClient
+_op_astar_available_cache: bool | None = None
 
-        client = OpClient()
-        return client.astar_available
-    except Exception:
-        return False
-    finally:
-        close = getattr(client, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
+
+def _op_astar_available() -> bool:
+    global _op_astar_available_cache
+    if _op_astar_available_cache is not None:
+        return _op_astar_available_cache
+    # No verified OpAStarFindPath ABI in this repo; C backend always returns None.
+    _op_astar_available_cache = False
+    return False
 
 
 def try_op_astar(
