@@ -10,9 +10,9 @@ try:
     from PySide6.QtGui import QImage, QMouseEvent, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
-        QComboBox,
+        QButtonGroup,
         QDialog,
-        QFileDialog,
+        QFrame,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -36,7 +36,7 @@ except ImportError:
             return None
 
     Qt = QImage = QMouseEvent = QPixmap = _UnavailableWidget
-    QComboBox = QDialog = QFileDialog = QHBoxLayout = _UnavailableWidget
+    QButtonGroup = QDialog = QFrame = QHBoxLayout = _UnavailableWidget
     QLabel = QLineEdit = QMessageBox = QPushButton = _UnavailableWidget
     QScrollArea = QSpinBox = QVBoxLayout = QWidget = _UnavailableWidget
 
@@ -48,15 +48,10 @@ from app_core.maps.record import (
     load_map,
 )
 from app_core.maps.stitch import next_tile_origin, stitch_by_origins
+from tasks.task_utils import capture_window_smart
+from themes import get_theme_manager, theme_color
 from ui.maps.editor_payload import apply_editor_payload
-
-
-def _read_image(path: str) -> np.ndarray | None:
-    try:
-        data = np.fromfile(path, dtype=np.uint8)
-    except OSError:
-        return None
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+from ui.maps.stitcher_capture import can_capture_minimap, crop_minimap
 
 
 class _MapCanvas(QLabel):
@@ -64,7 +59,8 @@ class _MapCanvas(QLabel):
         super().__init__(parent)
         self._on_click = on_click
         self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.setText("请先导入地图图片")
+        self.setObjectName("stitcherCanvas")
+        self.setText("① 截取小地图\n② 标注终点或线路\n③ 保存进度")
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self.pixmap() is not None:
@@ -97,13 +93,11 @@ class MapStitcherDialog(QDialog):
         self._painted_cells: set[tuple[int, int]] = set()
         self._walkability: np.ndarray | None = None
         self.saved_option: str | None = None
+        self._active_mode = "goal"
 
         self._name_edit = QLineEdit(record.name if record is not None else "未命名地图")
+        self._name_edit.setObjectName("stitcherNameEdit")
         self._name_edit.setPlaceholderText("地图名称")
-        self._mode = QComboBox()
-        self._mode.addItem("设置终点", "goal")
-        self._mode.addItem("绘制折线", "route")
-        self._mode.addItem("涂抹墙体", "paint")
         self._origin_x_spin = QSpinBox()
         self._origin_y_spin = QSpinBox()
         for spin in (self._origin_x_spin, self._origin_y_spin):
@@ -111,44 +105,82 @@ class MapStitcherDialog(QDialog):
             spin.setEnabled(False)
             spin.valueChanged.connect(self._on_origin_changed)
 
-        import_button = QPushButton("导入图片")
-        clear_route_button = QPushButton("清除标注")
-        save_button = QPushButton("保存")
-        cancel_button = QPushButton("取消")
-        import_button.clicked.connect(self._import_images)
-        clear_route_button.clicked.connect(self._clear_annotations)
-        save_button.clicked.connect(self._save)
-        cancel_button.clicked.connect(self.reject)
+        self._capture_button = QPushButton("截取小地图")
+        self._capture_button.setObjectName("stitcherCaptureButton")
+        self._capture_button.setProperty("primary", True)
+        self._capture_button.clicked.connect(self._capture_minimap)
 
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("名称"))
-        toolbar.addWidget(self._name_edit, 1)
-        toolbar.addWidget(import_button)
-        toolbar.addWidget(QLabel("点击模式"))
-        toolbar.addWidget(self._mode)
-        toolbar.addWidget(QLabel("末图 X"))
-        toolbar.addWidget(self._origin_x_spin)
-        toolbar.addWidget(QLabel("Y"))
-        toolbar.addWidget(self._origin_y_spin)
-        toolbar.addWidget(clear_route_button)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_buttons: dict[str, QPushButton] = {}
+        for text, mode in (("终点", "goal"), ("线路", "route"), ("涂墙", "paint")):
+            button = QPushButton(text)
+            button.setObjectName("stitcherModeButton")
+            button.setCheckable(True)
+            button.clicked.connect(
+                lambda _checked=False, selected_mode=mode: self._set_mode(selected_mode)
+            )
+            self._mode_group.addButton(button)
+            self._mode_buttons[mode] = button
+        self._mode_buttons["goal"].setChecked(True)
+
+        clear_route_button = QPushButton("清除标注")
+        clear_route_button.clicked.connect(self._clear_annotations)
+
+        save_progress_button = QPushButton("保存进度")
+        save_progress_button.setObjectName("stitcherSaveButton")
+        save_progress_button.setProperty("primary", True)
+        save_progress_button.clicked.connect(self._save_progress)
+        complete_button = QPushButton("完成")
+        complete_button.setObjectName("stitcherCompleteButton")
+        complete_button.setProperty("primary", True)
+        complete_button.clicked.connect(self._complete)
+
+        toolbar_frame = QFrame()
+        toolbar_frame.setObjectName("stitcherToolbar")
+        toolbar_layout = QVBoxLayout(toolbar_frame)
+        toolbar_layout.setContentsMargins(10, 10, 10, 10)
+        toolbar_layout.setSpacing(8)
+
+        primary_row = QHBoxLayout()
+        primary_row.setSpacing(6)
+        primary_row.addWidget(QLabel("名称"))
+        primary_row.addWidget(self._name_edit, 1)
+        primary_row.addWidget(self._capture_button)
+        primary_row.addWidget(save_progress_button)
+        primary_row.addWidget(complete_button)
+        toolbar_layout.addLayout(primary_row)
+
+        edit_row = QHBoxLayout()
+        edit_row.setSpacing(6)
+        edit_row.addWidget(QLabel("标注"))
+        for mode in ("goal", "route", "paint"):
+            edit_row.addWidget(self._mode_buttons[mode])
+        edit_row.addSpacing(8)
+        edit_row.addWidget(QLabel("末图 X"))
+        edit_row.addWidget(self._origin_x_spin)
+        edit_row.addWidget(QLabel("Y"))
+        edit_row.addWidget(self._origin_y_spin)
+        edit_row.addStretch(1)
+        edit_row.addWidget(clear_route_button)
+        toolbar_layout.addLayout(edit_row)
 
         self._canvas = _MapCanvas(self._on_canvas_click)
         scroll = QScrollArea()
+        scroll.setObjectName("stitcherScrollArea")
         scroll.setWidgetResizable(False)
         scroll.setWidget(self._canvas)
 
-        footer = QHBoxLayout()
-        footer.addWidget(QLabel("折线末端即终点；墙体点击可切换。"))
-        footer.addStretch(1)
-        footer.addWidget(save_button)
-        footer.addWidget(cancel_button)
+        self._status_label = QLabel()
+        self._status_label.setObjectName("stitcherStatusLabel")
+        self._status_label.setText("折线末端即终点；墙体点击可切换。")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
-        layout.addLayout(toolbar)
+        layout.addWidget(toolbar_frame)
         layout.addWidget(scroll, 1)
-        layout.addLayout(footer)
+        layout.addWidget(self._status_label)
 
         if record is not None:
             self._tiles = [record.image_bgr.copy()]
@@ -158,6 +190,8 @@ class MapStitcherDialog(QDialog):
             self._walkability = record.walkability.copy()
             ys, xs = np.nonzero(record.painted_blocked)
             self._painted_cells = {(int(x), int(y)) for y, x in zip(ys, xs)}
+        self._apply_theme_styles()
+        self._update_capture_availability()
         self._sync_origin_controls()
         self._refresh_canvas()
 
@@ -167,27 +201,58 @@ class MapStitcherDialog(QDialog):
         image = stitch_by_origins(self._tiles, self._origins)
         return image if image.size else None
 
-    def _import_images(self) -> None:
-        paths, _selected = QFileDialog.getOpenFileNames(
-            self,
-            "导入地图图片",
-            "",
-            "图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*.*)",
+    def _set_mode(self, mode: str) -> None:
+        if mode not in self._mode_buttons:
+            return
+        self._active_mode = mode
+        self._mode_buttons[mode].setChecked(True)
+
+    def _capture_gate_reason(self) -> str | None:
+        x, y, width, height = self._minimap_rect
+        return can_capture_minimap(
+            hwnd=self._target_hwnd,
+            minimap_x=x,
+            minimap_y=y,
+            minimap_width=width,
+            minimap_height=height,
         )
-        for path in paths:
-            tile = _read_image(path)
-            if tile is None:
-                continue
-            if not self._tiles:
-                origin = (0, 0)
-            else:
-                canvas = self._current_image()
-                origin = next_tile_origin(canvas, tile) if canvas is not None else (0, 0)
-            self._tiles.append(tile)
-            self._origins.append(origin)
-            self._normalize_origins()
+
+    def _update_capture_availability(self) -> None:
+        reason = self._capture_gate_reason()
+        self._capture_button.setEnabled(reason is None)
+        self._capture_button.setToolTip(reason or "截取绑定窗口中的小地图区域")
+        if reason:
+            self._status_label.setText(reason)
+
+    def _capture_minimap(self) -> None:
+        reason = self._capture_gate_reason()
+        if reason:
+            self._status_label.setText(reason)
+            return
+        try:
+            frame = capture_window_smart(self._target_hwnd)
+        except Exception as exc:
+            self._status_label.setText(f"截取小地图失败：{exc}")
+            return
+        if frame is None or frame.size == 0:
+            self._status_label.setText("截取小地图失败：未获取到窗口画面")
+            return
+        x, y, width, height = self._minimap_rect
+        tile = crop_minimap(frame, x=x, y=y, width=width, height=height)
+        if tile is None:
+            self._status_label.setText("截取小地图失败：裁切区域为空")
+            return
+        if tile.ndim == 3 and tile.shape[2] == 4:
+            tile = cv2.cvtColor(tile, cv2.COLOR_BGRA2BGR)
+
+        canvas = self._current_image()
+        origin = (0, 0) if canvas is None else next_tile_origin(canvas, tile)
+        self._tiles.append(tile)
+        self._origins.append(origin)
+        self._normalize_origins()
         self._sync_origin_controls()
         self._refresh_canvas()
+        self._status_label.setText(f"已截取第 {len(self._tiles)} 张小地图")
 
     def _sync_origin_controls(self) -> None:
         enabled = bool(self._origins)
@@ -278,7 +343,7 @@ class MapStitcherDialog(QDialog):
         image = self._current_image()
         if image is None or x < 0 or y < 0 or x >= image.shape[1] or y >= image.shape[0]:
             return
-        mode = self._mode.currentData()
+        mode = self._active_mode
         if mode == "goal":
             self._goal = (x, y)
             self._route.clear()
@@ -318,37 +383,160 @@ class MapStitcherDialog(QDialog):
         display = self._display_image()
         if display is None:
             self._canvas.clear()
-            self._canvas.setText("请先导入地图图片")
+            self._canvas.setText("① 截取小地图\n② 标注终点或线路\n③ 保存进度")
+            self._canvas.setMinimumSize(560, 360)
             self._canvas.adjustSize()
             return
+        self._canvas.setMinimumSize(0, 0)
         rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
         image = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
         self._canvas.setPixmap(QPixmap.fromImage(image))
         self._canvas.resize(width, height)
 
-    def _save(self) -> None:
+    def _save_progress(self) -> bool:
         image = self._current_image()
         if image is None:
-            QMessageBox.warning(self, "地图拼图工具", "请先导入至少一张图片。")
-            return
+            QMessageBox.warning(self, "地图拼图工具", "请先截取至少一张小地图。")
+            return False
         if not self._route and self._goal is None:
             QMessageBox.warning(self, "地图拼图工具", "请设置终点或绘制折线。")
-            return
-        record = apply_editor_payload(
-            self._record,
-            {
-                "name": self._name_edit.text(),
-                "image_bgr": image,
-                "route": self._route,
-                "goal": self._goal,
-                "walkability": self._walkability,
-                "painted_cells": sorted(self._painted_cells),
-            },
-        )
+            return False
+        try:
+            record = apply_editor_payload(
+                self._record,
+                {
+                    "name": self._name_edit.text(),
+                    "image_bgr": image,
+                    "route": self._route,
+                    "goal": self._goal,
+                    "walkability": self._walkability,
+                    "painted_cells": sorted(self._painted_cells),
+                },
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "保存进度失败", str(exc))
+            return False
         self._record = record
         self.saved_option = format_map_option(record.map_id, record.name)
+        self._status_label.setText(f"已保存：{record.name}")
+        return True
+
+    def _complete(self) -> None:
+        if not self._save_progress():
+            return
         self.accept()
+
+    def _apply_theme_styles(self) -> None:
+        try:
+            manager = get_theme_manager()
+            colors = {
+                key: manager.get_color(key)
+                for key in (
+                    "background",
+                    "surface",
+                    "card",
+                    "canvas",
+                    "text",
+                    "text_secondary",
+                    "border",
+                    "accent",
+                    "accent_hover",
+                    "accent_pressed",
+                    "accent_text",
+                    "hover",
+                    "pressed",
+                    "text_disabled",
+                )
+            }
+        except Exception:
+            colors = {
+                "background": theme_color("background", "#202124"),
+                "surface": theme_color("surface", "#292a2d"),
+                "card": theme_color("card", "#303134"),
+                "canvas": theme_color("canvas", "#171717"),
+                "text": theme_color("text", "#f1f3f4"),
+                "text_secondary": theme_color("text_secondary", "#bdc1c6"),
+                "border": theme_color("border", "#5f6368"),
+                "accent": theme_color("accent", "#4c8bf5"),
+                "accent_hover": theme_color("accent_hover", "#5b96f7"),
+                "accent_pressed": theme_color("accent_pressed", "#3976d3"),
+                "accent_text": theme_color("accent_text", "#ffffff"),
+                "hover": theme_color("hover", "#3c4043"),
+                "pressed": theme_color("pressed", "#4a4d51"),
+                "text_disabled": theme_color("text_disabled", "#80868b"),
+            }
+
+        self.setStyleSheet(
+            f"""
+            QDialog {{
+                background-color: {colors["background"]};
+                color: {colors["text"]};
+            }}
+            QFrame#stitcherToolbar {{
+                background-color: {colors["surface"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {colors["text"]};
+            }}
+            QLabel#stitcherStatusLabel {{
+                color: {colors["text_secondary"]};
+            }}
+            QLineEdit, QSpinBox {{
+                background-color: {colors["card"]};
+                color: {colors["text"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 4px;
+                padding: 4px 6px;
+                min-height: 24px;
+            }}
+            QPushButton {{
+                background-color: {colors["card"]};
+                color: {colors["text"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 5px;
+                padding: 6px 12px;
+                min-height: 24px;
+            }}
+            QPushButton:hover {{
+                background-color: {colors["hover"]};
+            }}
+            QPushButton:pressed, QPushButton#stitcherModeButton:checked {{
+                background-color: {colors["pressed"]};
+                border-color: {colors["accent"]};
+            }}
+            QPushButton[primary="true"] {{
+                background-color: {colors["accent"]};
+                color: {colors["accent_text"]};
+                border-color: {colors["accent"]};
+            }}
+            QPushButton[primary="true"]:hover {{
+                background-color: {colors["accent_hover"]};
+                border-color: {colors["accent_hover"]};
+            }}
+            QPushButton[primary="true"]:pressed {{
+                background-color: {colors["accent_pressed"]};
+                border-color: {colors["accent_pressed"]};
+            }}
+            QPushButton:disabled {{
+                background-color: {colors["canvas"]};
+                color: {colors["text_disabled"]};
+                border-color: {colors["border"]};
+            }}
+            QScrollArea#stitcherScrollArea {{
+                background-color: {colors["canvas"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 8px;
+            }}
+            QLabel#stitcherCanvas {{
+                background-color: {colors["canvas"]};
+                color: {colors["text_secondary"]};
+                padding: 24px;
+            }}
+            """
+        )
 
 
 def open_stitcher_dialog(
