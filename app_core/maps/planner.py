@@ -42,7 +42,55 @@ def build_grid(walkability: np.ndarray, cell_size: int = 8) -> np.ndarray:
     return grid
 
 
-def astar(
+def _op_astar_available() -> bool:
+    client = None
+    try:
+        from utils.op.runtime import OpClient
+
+        client = OpClient()
+        return client.astar_available
+    except Exception:
+        return False
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+def try_op_astar(
+    grid: np.ndarray,
+    start: tuple[int, int],
+    goal: tuple[int, int],
+) -> Optional[list[tuple[int, int]]]:
+    try:
+        if not _op_astar_available():
+            return None
+        height, width = grid.shape[:2]
+        cells = "\n".join(
+            "".join("0" if int(grid[y, x]) == 0 else "1" for x in range(width))
+            for y in range(height)
+        )
+        from utils.op.runtime import OpClient
+
+        client = OpClient()
+        try:
+            path = client.astar_find_path(width, height, cells, start, goal)
+            return path or None
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+    except Exception:
+        return None
+
+
+def _astar_python(
     grid: np.ndarray,
     start: tuple[int, int],
     goal: tuple[int, int],
@@ -96,6 +144,16 @@ def astar(
                 came_from[(nx, ny)] = (x, y)
                 heapq.heappush(open_heap, (ng + heuristic(nx, ny), ng, nx, ny))
     return None
+
+
+def astar(
+    grid: np.ndarray,
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    eight: bool = True,
+) -> Optional[list[tuple[int, int]]]:
+    op = try_op_astar(grid, start, goal)
+    return op if op is not None else _astar_python(grid, start, goal, eight=eight)
 
 
 def nearest_route_index(
