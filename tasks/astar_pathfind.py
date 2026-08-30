@@ -35,7 +35,8 @@ def requires_input_lock(_params: dict[str, Any]) -> bool:
 
 def open_map_stitcher(params: dict[str, Any], target_hwnd=None, **kwargs):
     try:
-        from ui.maps.stitcher_dialog import open_stitcher_dialog
+        from ui.maps.cartographer import open_cartographer_dialog
+
         map_id = parse_map_option(str(params.get("map_option") or "")) or None
         minimap_rect = (
             int(params.get("minimap_x") or 0),
@@ -43,7 +44,7 @@ def open_map_stitcher(params: dict[str, Any], target_hwnd=None, **kwargs):
             int(params.get("minimap_width") or 0),
             int(params.get("minimap_height") or 0),
         )
-        option = open_stitcher_dialog(
+        option = open_cartographer_dialog(
             kwargs.get("parameter_panel") or kwargs.get("main_window"),
             map_id,
             minimap_rect=minimap_rect,
@@ -86,10 +87,10 @@ def get_params_definition() -> dict[str, dict[str, Any]]:
             "button_text": "刷新地图列表",
         },
         "open_stitcher": {
-            "label": "拼图工具",
+            "label": "小地图制图",
             "type": "button",
             "action": "open_map_stitcher",
-            "button_text": "打开拼图工具",
+            "button_text": "打开小地图制图器",
         },
         "marker_type": {
             "label": "角色标记",

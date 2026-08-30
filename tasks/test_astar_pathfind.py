@@ -65,8 +65,11 @@ def test_open_map_stitcher_passes_minimap_and_hwnd(monkeypatch):
         captured["target_hwnd"] = target_hwnd
         return "名 — id"
 
-    monkeypatch.setattr("ui.maps.stitcher_dialog.open_stitcher_dialog", fake_open)
-    from tasks.astar_pathfind import open_map_stitcher
+    monkeypatch.setattr("ui.maps.cartographer.open_cartographer_dialog", fake_open)
+    monkeypatch.setattr(
+        "ui.maps.cartographer.dialog.open_cartographer_dialog",
+        fake_open,
+    )
 
     result = open_map_stitcher(
         {
@@ -84,9 +87,15 @@ def test_open_map_stitcher_passes_minimap_and_hwnd(monkeypatch):
     assert captured["target_hwnd"] == 99
 
 
-def test_open_map_stitcher_accepts_dispatcher_kwargs():
-    from ui.maps.stitcher_dialog import _QT_AVAILABLE
-
+def test_open_map_stitcher_accepts_dispatcher_kwargs(monkeypatch):
+    monkeypatch.setattr(
+        "ui.maps.cartographer.open_cartographer_dialog",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ui.maps.cartographer.dialog.open_cartographer_dialog",
+        lambda *args, **kwargs: None,
+    )
     result = open_map_stitcher(
         {},
         target_hwnd=123,
@@ -95,7 +104,7 @@ def test_open_map_stitcher_accepts_dispatcher_kwargs():
         parameter_dialog=object(),
         param_name="open_stitcher",
     )
-    assert result is _QT_AVAILABLE
+    assert result is True
 
 
 def test_execute_task_without_hwnd_skips_path_loop(monkeypatch, caplog):
