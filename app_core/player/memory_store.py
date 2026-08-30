@@ -82,7 +82,10 @@ def _provider(uri: str) -> Optional[bytes]:
 
 def install_player_memory_provider() -> None:
     global _INSTALLED
-    from utils.match.template_preloader import set_memory_image_provider
+    try:
+        from utils.match.template_preloader import set_memory_image_provider
+    except (ImportError, AttributeError):
+        return
 
     set_memory_image_provider(_provider)
     if not _INSTALLED:

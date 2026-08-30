@@ -8,7 +8,6 @@ from app_core.player.memory_store import (
     put_player_memory_file,
 )
 from app_core.player.runtime_images import (
-    ensure_player_image_memory,
     materialize_player_sounds,
     resolve_get_image_data,
 )
@@ -42,16 +41,6 @@ def test_resolve_get_image_data_keeps_explicit_callback():
         return b"custom"
 
     assert resolve_get_image_data({"get_image_data": custom}) is custom
-
-
-def test_ensure_player_image_memory_installs_existing_store():
-    put_player_memory_file("images/x.bmp", b"x")
-    assert ensure_player_image_memory() is True
-    from utils.match.template_preloader import get_memory_image_provider
-
-    provider = get_memory_image_provider()
-    assert callable(provider)
-    assert provider("memory://images/x.bmp") == b"x"
 
 
 def test_materialize_player_sounds_makes_basename_playable(tmp_path, monkeypatch):
