@@ -60,7 +60,7 @@ def test_death_does_not_paint_wall_or_press():
         persist=persist,
         stop_checker=lambda: frames["n"] > 6,
     )
-    assert ok is True
+    assert ok is True, reason
     assert "到达" in reason
     assert frames["keys"] == []
     assert frames["walls"]
@@ -181,3 +181,92 @@ def test_stop_persists():
     assert ok is False
     assert "停止" in reason
     assert saved["n"] == 1
+
+
+def test_route_progress_never_rejoins_completed_loop_segment(monkeypatch):
+    record = _green_map()
+    record.route = [(8, 8), (24, 8), (24, 24), (8, 24), (8, 8), (40, 8)]
+    record.goal = None
+    positions = iter([(24, 24), (8, 8)])
+    progress_calls = []
+    key_calls = []
+
+    monkeypatch.setattr(
+        "app_core.maps.loop.locate_on_map",
+        lambda *args, **kwargs: LocateResult(found=True, x=(point := next(positions))[0], y=point[1]),
+    )
+
+    def fake_plan(_record, position, **kwargs):
+        progress_calls.append(kwargs["route_progress"])
+        return [position, (position[0] + 1, position[1])]
+
+    monkeypatch.setattr("app_core.maps.loop.plan_path", fake_plan)
+
+    ok, reason = run_path_loop(
+        record=record,
+        capture_minimap=lambda: np.zeros((4, 4, 3), dtype=np.uint8),
+        capture_frame=lambda: np.zeros((8, 8, 3), dtype=np.uint8),
+        death_templates=[np.full((2, 2, 3), 255, dtype=np.uint8)],
+        arrow_template=None,
+        config=PathLoopConfig(
+            direction_mode="四向",
+            key_map=DEFAULT_KEYS_4,
+            cell_size=1,
+            arrive_px=1,
+        ),
+        hold_key=lambda key, seconds: key_calls.append(key) is None,
+        persist=lambda item: None,
+        stop_checker=lambda: len(key_calls) >= 2,
+    )
+
+    assert ok is False
+    assert "停止" in reason
+    assert progress_calls == [2, 4]
+
+
+def test_death_keeps_unfinished_route_progress(monkeypatch):
+    record = _green_map()
+    record.route = [(8, 8), (24, 8), (24, 24), (8, 24), (8, 8), (40, 8)]
+    record.goal = None
+    positions = iter([(24, 24), (8, 8)])
+    progress_calls = []
+    frame_calls = {"count": 0}
+    key_calls = []
+    alive = np.zeros((8, 8, 3), dtype=np.uint8)
+    dead = np.full((8, 8, 3), 255, dtype=np.uint8)
+
+    monkeypatch.setattr(
+        "app_core.maps.loop.locate_on_map",
+        lambda *args, **kwargs: LocateResult(found=True, x=(point := next(positions))[0], y=point[1]),
+    )
+
+    def fake_plan(_record, position, **kwargs):
+        progress_calls.append(kwargs["route_progress"])
+        return [position, (position[0] + 1, position[1])]
+
+    def capture_frame():
+        frame_calls["count"] += 1
+        return dead if frame_calls["count"] == 2 else alive
+
+    monkeypatch.setattr("app_core.maps.loop.plan_path", fake_plan)
+
+    ok, reason = run_path_loop(
+        record=record,
+        capture_minimap=lambda: np.zeros((4, 4, 3), dtype=np.uint8),
+        capture_frame=capture_frame,
+        death_templates=[np.full((2, 2, 3), 255, dtype=np.uint8)],
+        arrow_template=None,
+        config=PathLoopConfig(
+            direction_mode="四向",
+            key_map=DEFAULT_KEYS_4,
+            cell_size=1,
+            arrive_px=1,
+        ),
+        hold_key=lambda key, seconds: key_calls.append(key) is None,
+        persist=lambda item: None,
+        stop_checker=lambda: len(key_calls) >= 2,
+    )
+
+    assert ok is False
+    assert "停止" in reason
+    assert progress_calls == [2, 4]

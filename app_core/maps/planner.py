@@ -6,10 +6,14 @@ from typing import Optional
 
 import numpy as np
 
-from app_core.maps.record import CELL_BLOCKED, MapRecord, effective_goal
+from app_core.maps.record import CELL_BLOCKED, CELL_WALKABLE, MapRecord, effective_goal
 from app_core.maps.walkability import merged_walkability
 
 _SQRT2 = math.sqrt(2)
+_GRID_WALKABLE = 0
+_GRID_BLOCKED = 1
+_GRID_UNKNOWN = 2
+_UNKNOWN_COST = 3.0
 _CARDINAL = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0))
 _DIAGONAL = ((1, 1, _SQRT2), (1, -1, _SQRT2), (-1, 1, _SQRT2), (-1, -1, _SQRT2))
 
@@ -30,15 +34,18 @@ def build_grid(walkability: np.ndarray, cell_size: int = 8) -> np.ndarray:
     height, width = walkability.shape[:2]
     rows = (height + size - 1) // size
     cols = (width + size - 1) // size
-    grid = np.zeros((rows, cols), dtype=np.uint8)
+    grid = np.full((rows, cols), _GRID_UNKNOWN, dtype=np.uint8)
     for cy in range(rows):
         y0 = cy * size
         y1 = min(y0 + size, height)
         for cx in range(cols):
             x0 = cx * size
             x1 = min(x0 + size, width)
-            if np.any(walkability[y0:y1, x0:x1] == CELL_BLOCKED):
-                grid[cy, cx] = 1
+            cell = walkability[y0:y1, x0:x1]
+            if np.any(cell == CELL_BLOCKED):
+                grid[cy, cx] = _GRID_BLOCKED
+            elif np.any(cell == CELL_WALKABLE):
+                grid[cy, cx] = _GRID_WALKABLE
     return grid
 
 
@@ -64,7 +71,7 @@ def try_op_astar(
             return None
         height, width = grid.shape[:2]
         cells = "\n".join(
-            "".join("0" if int(grid[y, x]) == 0 else "1" for x in range(width))
+            "".join("1" if int(grid[y, x]) == _GRID_BLOCKED else "0" for x in range(width))
             for y in range(height)
         )
         from utils.op.runtime import OpClient
@@ -95,7 +102,10 @@ def _astar_python(
     gx, gy = int(goal[0]), int(goal[1])
 
     def walkable(x: int, y: int) -> bool:
-        return 0 <= x < width and 0 <= y < height and int(grid[y, x]) == 0
+        return 0 <= x < width and 0 <= y < height and int(grid[y, x]) != _GRID_BLOCKED
+
+    def terrain_cost(x: int, y: int) -> float:
+        return _UNKNOWN_COST if int(grid[y, x]) == _GRID_UNKNOWN else 1.0
 
     if not walkable(sx, sy) or not walkable(gx, gy):
         return None
@@ -132,7 +142,9 @@ def _astar_python(
             nx, ny = x + dx, y + dy
             if not walkable(nx, ny) or (nx, ny) in closed:
                 continue
-            ng = g + cost
+            if dx and dy and (not walkable(x + dx, y) or not walkable(x, y + dy)):
+                continue
+            ng = g + cost * terrain_cost(nx, ny)
             if ng < g_score.get((nx, ny), float("inf")):
                 g_score[(nx, ny)] = ng
                 came_from[(nx, ny)] = (x, y)

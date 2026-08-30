@@ -2,6 +2,7 @@
 import numpy as np
 import pytest
 
+from app_core.maps.record import CELL_UNKNOWN, CELL_WALKABLE
 from ui.maps.editor_payload import apply_editor_payload
 
 
@@ -42,3 +43,32 @@ def test_payload_update_rejects_missing_route_and_goal(tmp_path):
     payload["goal"] = None
     with pytest.raises(ValueError, match="终点"):
         apply_editor_payload(record, payload)
+
+
+def test_expanding_image_preserves_learned_walkability(tmp_path):
+    record = apply_editor_payload(
+        None,
+        {
+            "name": "扩图",
+            "image_bgr": np.zeros((4, 5, 3), dtype=np.uint8),
+            "route": [],
+            "goal": (3, 2),
+            "root": tmp_path,
+        },
+    )
+    record.walkability[1, 2] = CELL_WALKABLE
+
+    updated = apply_editor_payload(
+        record,
+        {
+            "name": "扩图",
+            "image_bgr": np.zeros((7, 8, 3), dtype=np.uint8),
+            "route": [],
+            "goal": (6, 5),
+            "root": tmp_path,
+        },
+    )
+
+    assert updated.walkability.shape == (7, 8)
+    assert int(updated.walkability[1, 2]) == CELL_WALKABLE
+    assert int(updated.walkability[6, 7]) == CELL_UNKNOWN

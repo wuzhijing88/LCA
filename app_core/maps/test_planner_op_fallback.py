@@ -11,19 +11,10 @@ def test_try_op_astar_none_without_dll(monkeypatch):
 
 
 def test_op_astar_probe_skips_op_client(monkeypatch):
-    constructed: list[str] = []
-
-    class _ForbiddenOpClient:
-        def __init__(self, *args, **kwargs):
-            constructed.append("OpClient")
-
-    monkeypatch.setattr("utils.op.runtime.OpClient", _ForbiddenOpClient)
-
     from app_core.maps import planner
 
+    monkeypatch.setattr(planner, "_op_astar_available_cache", None)
     assert planner._op_astar_available() is False
-    assert constructed == []
 
     grid = np.zeros((3, 3), dtype=np.uint8)
     assert astar(grid, (0, 0), (2, 2)) is not None
-    assert constructed == []

@@ -9,6 +9,7 @@ import numpy as np
 
 _ANGLE_STEP = 5
 _MOVE_EPS = 1.0
+_MATCH_THRESHOLD = 0.4
 
 
 @dataclass
@@ -77,6 +78,8 @@ def locate_on_map(
     if hit is None:
         return LocateResult(found=False)
     x, y, score = hit
+    if score < _MATCH_THRESHOLD:
+        return LocateResult(found=False, x=x, y=y, score=score)
     heading: float | None = None
     if marker == "箭头":
         heading = heading_from_arrow(minimap_bgr, arrow_template_bgr) if arrow_template_bgr is not None else None
@@ -123,10 +126,15 @@ def _best_match(image: np.ndarray, template: np.ndarray) -> Optional[tuple[int, 
     search = np.ascontiguousarray(image)
     patch = np.ascontiguousarray(template)
     if _is_spatially_flat(patch):
-        heat = cv2.matchTemplate(search, patch, cv2.TM_SQDIFF)
-        min_val, _, min_loc, _ = cv2.minMaxLoc(heat)
+        if np.any(patch):
+            heat = cv2.matchTemplate(search, patch, cv2.TM_SQDIFF_NORMED)
+            min_val, _, min_loc, _ = cv2.minMaxLoc(heat)
+            score = max(0.0, 1.0 - float(min_val)) if np.isfinite(min_val) else 0.0
+        else:
+            heat = cv2.matchTemplate(search, patch, cv2.TM_SQDIFF)
+            min_val, _, min_loc, _ = cv2.minMaxLoc(heat)
+            score = 1.0 if min_val <= 0 else 1.0 / (1.0 + float(min_val))
         loc = min_loc
-        score = 1.0 if min_val <= 0 else 1.0 / (1.0 + float(min_val))
     else:
         heat = cv2.matchTemplate(search, patch, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(heat)
@@ -148,4 +156,6 @@ def _locate_rotating_dot(minimap_bgr: np.ndarray, map_bgr: np.ndarray) -> Locate
     if best is None:
         return LocateResult(found=False)
     x, y, score, heading = best
+    if score < _MATCH_THRESHOLD:
+        return LocateResult(found=False, x=x, y=y, heading_deg=heading, score=score)
     return LocateResult(found=True, x=x, y=y, heading_deg=heading, score=score)

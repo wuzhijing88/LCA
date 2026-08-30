@@ -35,3 +35,28 @@ def test_arrow_heading_detects_rotation():
     heading = heading_from_arrow(rotated, up, angle_step=15)
     assert heading is not None
     assert abs((heading - 90 + 180) % 360 - 180) < 20
+
+
+def test_rotating_dot_finds_matching_rotated_patch():
+    mini = np.random.default_rng(7).integers(0, 256, size=(15, 15, 3), dtype=np.uint8)
+    matrix = cv2.getRotationMatrix2D((7.5, 7.5), 90.0, 1.0)
+    rotated = cv2.warpAffine(mini, matrix, (15, 15), borderValue=(0, 0, 0))
+    big = np.zeros((60, 70, 3), dtype=np.uint8)
+    big[20:35, 30:45] = rotated
+
+    result = locate_on_map(mini, big, marker="圆点", map_rotates=True)
+
+    assert result.found
+    assert abs(result.x - 37) <= 1
+    assert abs(result.y - 27) <= 1
+    assert result.score >= 0.4
+
+
+def test_unrelated_image_is_not_reported_as_found():
+    mini = np.random.default_rng(11).integers(0, 256, size=(18, 18, 3), dtype=np.uint8)
+    big = np.random.default_rng(12).integers(0, 256, size=(80, 80, 3), dtype=np.uint8)
+
+    result = locate_on_map(mini, big, marker="圆点", map_rotates=False)
+
+    assert result.found is False
+    assert result.score < 0.4

@@ -5,12 +5,20 @@ from typing import Any
 
 import numpy as np
 
-from app_core.maps.record import MapRecord, create_map, save_map
+from app_core.maps.record import CELL_UNKNOWN, MapRecord, create_map, save_map
 from app_core.maps.stitch import stitch_by_origins
 
 
 def _points(value: Any) -> list[tuple[int, int]]:
     return [(int(x), int(y)) for x, y in (value or [])]
+
+
+def _resize_walkability(source: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    resized = np.full(shape, CELL_UNKNOWN, dtype=np.uint8)
+    height = min(shape[0], source.shape[0])
+    width = min(shape[1], source.shape[1])
+    resized[:height, :width] = source[:height, :width]
+    return resized
 
 
 def apply_editor_payload(record: MapRecord | None, payload: dict[str, Any]) -> MapRecord:
@@ -28,6 +36,8 @@ def apply_editor_payload(record: MapRecord | None, payload: dict[str, Any]) -> M
     if not route and raw_goal is None:
         raise ValueError("没有线路时必须标注终点")
     goal = None if route or raw_goal is None else (int(raw_goal[0]), int(raw_goal[1]))
+    payload_walkability = payload.get("walkability")
+    prior_walkability = None if record is None else record.walkability
 
     if record is None:
         record = create_map(
@@ -42,10 +52,13 @@ def apply_editor_payload(record: MapRecord | None, payload: dict[str, Any]) -> M
         record.image_bgr = np.ascontiguousarray(image)
         record.route = route
         record.goal = goal
-        if record.walkability.shape[:2] != image.shape[:2]:
-            height, width = image.shape[:2]
-            record.walkability = np.zeros((height, width), dtype=np.uint8)
         record.painted_blocked = np.zeros(image.shape[:2], dtype=np.uint8)
+
+    walkability_source = payload_walkability
+    if walkability_source is None:
+        walkability_source = prior_walkability if prior_walkability is not None else record.walkability
+    walkability_array = np.asarray(walkability_source, dtype=np.uint8)
+    record.walkability = _resize_walkability(walkability_array, image.shape[:2])
 
     height, width = record.painted_blocked.shape[:2]
     for x, y in _points(payload.get("painted_cells")):

@@ -16,11 +16,12 @@ def hold_key_via_keyboard_task(
 
     from tasks.keyboard_input import KEY_MOUSE_INPUT_TYPE, execute_task as keyboard_execute
 
+    duration = max(0.0, float(seconds))
+    sequence = f"key_down({key}), wait({duration:g}), key_up({key})"
     result = keyboard_execute(
         {
             "input_type": KEY_MOUSE_INPUT_TYPE,
-            "main_key": key,
-            "main_key_hold_duration": seconds,
+            "combo_key_sequence_text": sequence,
             "on_success": "执行下一步",
             "on_failure": "执行下一步",
         },

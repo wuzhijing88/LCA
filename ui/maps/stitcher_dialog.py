@@ -19,6 +19,7 @@ try:
         QMessageBox,
         QPushButton,
         QScrollArea,
+        QSpinBox,
         QVBoxLayout,
         QWidget,
     )
@@ -37,7 +38,7 @@ except ImportError:
     Qt = QImage = QMouseEvent = QPixmap = _UnavailableWidget
     QComboBox = QDialog = QFileDialog = QHBoxLayout = _UnavailableWidget
     QLabel = QLineEdit = QMessageBox = QPushButton = _UnavailableWidget
-    QScrollArea = QVBoxLayout = QWidget = _UnavailableWidget
+    QScrollArea = QSpinBox = QVBoxLayout = QWidget = _UnavailableWidget
 
 from app_core.maps.record import (
     CELL_BLOCKED,
@@ -46,7 +47,7 @@ from app_core.maps.record import (
     format_map_option,
     load_map,
 )
-from app_core.maps.stitch import estimate_origin, stitch_by_origins
+from app_core.maps.stitch import next_tile_origin, stitch_by_origins
 from ui.maps.editor_payload import apply_editor_payload
 
 
@@ -94,6 +95,12 @@ class MapStitcherDialog(QDialog):
         self._mode.addItem("设置终点", "goal")
         self._mode.addItem("绘制折线", "route")
         self._mode.addItem("涂抹墙体", "paint")
+        self._origin_x_spin = QSpinBox()
+        self._origin_y_spin = QSpinBox()
+        for spin in (self._origin_x_spin, self._origin_y_spin):
+            spin.setRange(0, 1_000_000)
+            spin.setEnabled(False)
+            spin.valueChanged.connect(self._on_origin_changed)
 
         import_button = QPushButton("导入图片")
         clear_route_button = QPushButton("清除标注")
@@ -110,6 +117,10 @@ class MapStitcherDialog(QDialog):
         toolbar.addWidget(import_button)
         toolbar.addWidget(QLabel("点击模式"))
         toolbar.addWidget(self._mode)
+        toolbar.addWidget(QLabel("末图 X"))
+        toolbar.addWidget(self._origin_x_spin)
+        toolbar.addWidget(QLabel("Y"))
+        toolbar.addWidget(self._origin_y_spin)
         toolbar.addWidget(clear_route_button)
 
         self._canvas = _MapCanvas(self._on_canvas_click)
@@ -138,6 +149,7 @@ class MapStitcherDialog(QDialog):
             self._walkability = record.walkability.copy()
             ys, xs = np.nonzero(record.painted_blocked)
             self._painted_cells = {(int(x), int(y)) for y, x in zip(ys, xs)}
+        self._sync_origin_controls()
         self._refresh_canvas()
 
     def _current_image(self) -> np.ndarray | None:
@@ -161,10 +173,33 @@ class MapStitcherDialog(QDialog):
                 origin = (0, 0)
             else:
                 canvas = self._current_image()
-                estimated = estimate_origin(canvas, tile) if canvas is not None else None
-                origin = estimated if estimated is not None else (int(canvas.shape[1]), 0)
+                origin = next_tile_origin(canvas, tile) if canvas is not None else (0, 0)
             self._tiles.append(tile)
             self._origins.append(origin)
+        self._sync_origin_controls()
+        self._resize_layers()
+        self._refresh_canvas()
+
+    def _sync_origin_controls(self) -> None:
+        enabled = bool(self._origins)
+        self._origin_x_spin.setEnabled(enabled)
+        self._origin_y_spin.setEnabled(enabled)
+        if not enabled:
+            return
+        x, y = self._origins[-1]
+        self._origin_x_spin.blockSignals(True)
+        self._origin_y_spin.blockSignals(True)
+        try:
+            self._origin_x_spin.setValue(int(x))
+            self._origin_y_spin.setValue(int(y))
+        finally:
+            self._origin_x_spin.blockSignals(False)
+            self._origin_y_spin.blockSignals(False)
+
+    def _on_origin_changed(self, _value: int) -> None:
+        if not self._origins:
+            return
+        self._origins[-1] = (self._origin_x_spin.value(), self._origin_y_spin.value())
         self._resize_layers()
         self._refresh_canvas()
 
@@ -260,6 +295,7 @@ class MapStitcherDialog(QDialog):
                 "image_bgr": image,
                 "route": self._route,
                 "goal": self._goal,
+                "walkability": self._walkability,
                 "painted_cells": sorted(self._painted_cells),
             },
         )

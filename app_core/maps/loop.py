@@ -8,7 +8,7 @@ import numpy as np
 from app_core.maps.death import is_death_state
 from app_core.maps.keys import DEFAULT_KEYS_8, key_for_step, normalize_key_map
 from app_core.maps.localize import heading_from_delta, locate_on_map
-from app_core.maps.planner import pixel_to_cell, plan_path, reached_goal
+from app_core.maps.planner import nearest_route_index, pixel_to_cell, plan_path, reached_goal
 from app_core.maps.record import MapRecord, effective_goal
 from app_core.maps.walkability import flood_blocked, is_stuck, mark_footprints
 
@@ -79,6 +79,7 @@ def run_path_loop(
     match_fail_count = 0
     stuck_count = 0
     last_pos: tuple[int, int] | None = None
+    route_progress = 0
 
     def finish(ok: bool, reason: str) -> tuple[bool, str]:
         persist(record)
@@ -113,12 +114,18 @@ def run_path_loop(
         position = (located.x, located.y)
         if reached_goal(position, goal, radius_px=config.arrive_px):
             return finish(True, "到达终点")
+        if record.route:
+            route_progress = max(
+                route_progress,
+                nearest_route_index(position, record.route, from_index=route_progress),
+            )
 
         path = plan_path(
             record,
             position,
             eight=config.direction_mode == "八向",
             cell_size=config.cell_size,
+            route_progress=route_progress,
         )
         next_pixel = _next_step(path, position, config.cell_size)
         if next_pixel is None:
