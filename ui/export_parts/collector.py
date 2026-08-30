@@ -310,10 +310,13 @@ def _collect_map_directory(
     used_relpaths: Set[str],
 ) -> None:
     map_id = parse_map_option(str(parameters.get("map_option") or ""))
-    if not map_id or Path(map_id).name != map_id or map_id in {".", ".."}:
+    if not map_id:
+        return
+    if Path(map_id).name != map_id or map_id in {".", ".."}:
         return
     map_dir = Path(get_maps_dir()) / map_id
     if not map_dir.is_dir():
+        result.errors.append(f"地图目录不存在: {map_id}")
         return
     for source in sorted(path for path in map_dir.rglob("*") if path.is_file()):
         relative = source.relative_to(map_dir).as_posix()
