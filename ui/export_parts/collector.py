@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set
 
+from app_core.maps.record import parse_map_option
 from task_workflow.sub_workflow_path import resolve_sub_workflow_path
 from task_workflow.workflow_payload import workflow_body
 from task_workflow.workflow_sanitize import sanitize_workflow_data
@@ -14,6 +15,7 @@ from task_workflow.workspace import get_effective_workflow_images_dir
 from ui.dialogs.script_resources import IMAGE_EXTS, list_script_resources, resource_kind
 from utils.app_paths import (
     get_images_dir,
+    get_maps_dir,
     get_sounds_dir,
 )
 from utils.image_paths import get_image_path_resolver
@@ -32,6 +34,8 @@ PATH_PARAM_KEYS = {
     "sound_path",
     "audio_path",
     "audio_file",
+    "arrow_template_path",
+    "death_image_paths",
 }
 
 
@@ -138,6 +142,7 @@ def _unique_relpath(used: Set[str], kind: str, source_path: str) -> str:
         "audio": "assets/sounds",
         "model": "assets/models",
         "dict": "assets/images/dicts",
+        "map": "assets/maps",
         "workflow": "workflows/subs",
     }.get(kind, "assets/misc")
     relpath = f"{folder}/{name}".replace("\\", "/")
@@ -285,6 +290,8 @@ def _collect_workflow(
                 visited_workflows=visited_workflows,
                 package_files=package_files,
             )
+        if task_type == "A*寻路":
+            _collect_map_directory(result, parameters, used_relpaths)
         _collect_parameter_files(
             result,
             parameters,
@@ -295,6 +302,32 @@ def _collect_workflow(
             package_files=package_files,
         )
     _collect_gallery_tree(result, local_images, used_relpaths, package_files)
+
+
+def _collect_map_directory(
+    result: CollectionResult,
+    parameters: Mapping[str, Any],
+    used_relpaths: Set[str],
+) -> None:
+    map_id = parse_map_option(str(parameters.get("map_option") or ""))
+    if not map_id or Path(map_id).name != map_id or map_id in {".", ".."}:
+        return
+    map_dir = Path(get_maps_dir()) / map_id
+    if not map_dir.is_dir():
+        return
+    for source in sorted(path for path in map_dir.rglob("*") if path.is_file()):
+        relative = source.relative_to(map_dir).as_posix()
+        relpath = f"assets/maps/{map_id}/{relative}"
+        if relpath in used_relpaths:
+            continue
+        used_relpaths.add(relpath)
+        result.assets.append(
+            CollectedAsset(
+                kind="map",
+                source=str(source),
+                package_relpath=relpath,
+            )
+        )
 
 
 def _collect_script_resources(
