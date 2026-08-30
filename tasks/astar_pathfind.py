@@ -37,9 +37,17 @@ def open_map_stitcher(params: dict[str, Any], target_hwnd=None, **kwargs):
     try:
         from ui.maps.stitcher_dialog import open_stitcher_dialog
         map_id = parse_map_option(str(params.get("map_option") or "")) or None
+        minimap_rect = (
+            int(params.get("minimap_x") or 0),
+            int(params.get("minimap_y") or 0),
+            int(params.get("minimap_width") or 0),
+            int(params.get("minimap_height") or 0),
+        )
         option = open_stitcher_dialog(
             kwargs.get("parameter_panel") or kwargs.get("main_window"),
             map_id,
+            minimap_rect=minimap_rect,
+            target_hwnd=target_hwnd,
         )
     except Exception:
         return False
@@ -102,7 +110,7 @@ def get_params_definition() -> dict[str, dict[str, Any]]:
             "condition": {"param": "marker_type", "value": "箭头"},
         },
         "death_image_paths": {
-            "label": "死亡状态图",
+            "label": "死亡状态图（可选）",
             "type": "file",
             "default": "",
             "multiline": True,
@@ -174,9 +182,6 @@ def validate_card_params(params: dict[str, Any]) -> str | None:
     marker = str(params.get("marker_type") or "圆点")
     arrow_path = str(params.get("arrow_template_path") or "").strip()
 
-    if not death_paths:
-        return validate_run(None, [], marker, None)  # type: ignore[arg-type]
-
     map_id = parse_map_option(str(params.get("map_option") or ""))
     if not map_id:
         return "未配置地图"
@@ -185,6 +190,7 @@ def validate_card_params(params: dict[str, Any]) -> str | None:
     except Exception:
         return "地图不存在或无法读取"
 
+    # Presence-only placeholders; images are loaded at execute time.
     death_templates = [object() for _path in death_paths]
     arrow_template = object() if arrow_path else None
     return validate_run(record, death_templates, marker, arrow_template)  # type: ignore[arg-type]

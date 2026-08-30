@@ -35,9 +35,53 @@ def test_list_map_options_uses_library(tmp_path, monkeypatch):
     assert format_map_option(record.map_id, "谷") in labels
 
 
-def test_validate_card_params_requires_death():
-    error = validate_card_params({"map_option": "x — x", "death_image_paths": ""})
-    assert error and "死亡" in error
+def test_validate_card_params_allows_empty_death(tmp_path, monkeypatch):
+    from app_core.maps.record import create_map, format_map_option
+
+    monkeypatch.setenv("LCA_USER_DATA_DIR", str(tmp_path))
+    record = create_map(
+        "谷",
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        goal=(1, 1),
+        root=tmp_path / "maps",
+    )
+    error = validate_card_params(
+        {
+            "map_option": format_map_option(record.map_id, "谷"),
+            "death_image_paths": "",
+            "marker_type": "圆点",
+        }
+    )
+    assert error is None
+    assert "死亡状态图（可选）" in get_params_definition()["death_image_paths"]["label"]
+
+
+def test_open_map_stitcher_passes_minimap_and_hwnd(monkeypatch):
+    captured = {}
+
+    def fake_open(parent, map_id, *, minimap_rect, target_hwnd):
+        captured["map_id"] = map_id
+        captured["minimap_rect"] = minimap_rect
+        captured["target_hwnd"] = target_hwnd
+        return "名 — id"
+
+    monkeypatch.setattr("ui.maps.stitcher_dialog.open_stitcher_dialog", fake_open)
+    from tasks.astar_pathfind import open_map_stitcher
+
+    result = open_map_stitcher(
+        {
+            "map_option": "谷 — ab12",
+            "minimap_x": 3,
+            "minimap_y": 4,
+            "minimap_width": 50,
+            "minimap_height": 60,
+        },
+        target_hwnd=99,
+    )
+    assert result == "名 — id"
+    assert captured["map_id"] == "ab12"
+    assert captured["minimap_rect"] == (3, 4, 50, 60)
+    assert captured["target_hwnd"] == 99
 
 
 def test_open_map_stitcher_accepts_dispatcher_kwargs():

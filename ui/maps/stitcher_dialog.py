@@ -75,11 +75,20 @@ class _MapCanvas(QLabel):
 
 
 class MapStitcherDialog(QDialog):
-    def __init__(self, parent=None, record: MapRecord | None = None):
+    def __init__(
+        self,
+        parent=None,
+        record: MapRecord | None = None,
+        *,
+        minimap_rect: tuple[int, int, int, int] = (0, 0, 0, 0),
+        target_hwnd=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("地图拼图工具")
         self.resize(900, 680)
         self.setMinimumSize(640, 480)
+        self._minimap_rect = minimap_rect
+        self._target_hwnd = target_hwnd
         self._record = record
         self._tiles: list[np.ndarray] = []
         self._origins: list[tuple[int, int]] = []
@@ -342,7 +351,13 @@ class MapStitcherDialog(QDialog):
         self.accept()
 
 
-def open_stitcher_dialog(parent, map_id: str | None) -> str | None:
+def open_stitcher_dialog(
+    parent,
+    map_id: str | None,
+    *,
+    minimap_rect: tuple[int, int, int, int],
+    target_hwnd,
+) -> str | None:
     if not _QT_AVAILABLE:
         raise ImportError("地图拼图工具需要 PySide6")
     record = load_map(map_id) if map_id else None
@@ -350,7 +365,12 @@ def open_stitcher_dialog(parent, map_id: str | None) -> str | None:
     if not isinstance(app, QApplication):
         return None
     dialog_parent = parent if isinstance(parent, QWidget) else None
-    dialog = MapStitcherDialog(dialog_parent, record)
+    dialog = MapStitcherDialog(
+        dialog_parent,
+        record,
+        minimap_rect=minimap_rect,
+        target_hwnd=target_hwnd,
+    )
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
     return dialog.saved_option
