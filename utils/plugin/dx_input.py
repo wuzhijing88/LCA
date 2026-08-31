@@ -27,6 +27,7 @@ class PluginDxInput:
     ):
         self.hwnd = int(hwnd or 0)
         self.display = display
+        self._injected_client = client
         self._client = client
         try:
             explicit_input = int(input_hwnd or 0)
@@ -45,16 +46,16 @@ class PluginDxInput:
             return self.hwnd
 
     def _session(self) -> PluginSession:
-        if self._client is None:
+        if self._injected_client is None:
             return get_shared_plugin_client(self.hwnd)
-        if isinstance(self._client, PluginSession):
-            return self._client
-        return PluginSession(client=self._client)
+        if isinstance(self._injected_client, PluginSession):
+            return self._injected_client
+        return PluginSession(client=self._injected_client)
 
     def _ready(self) -> bool:
         if self.hwnd <= 0:
             return False
-        if self._client is None and not is_plugin_runtime_available():
+        if self._injected_client is None and not is_plugin_runtime_available():
             logger.error("DX 模式需要插件运行库（tools/plugin 或 LCA_PLUGIN_DIR）")
             return False
         session = self._session()
@@ -76,6 +77,7 @@ class PluginDxInput:
                 input_hwnd,
                 display,
             )
+            self._client = None
             return False
         self._client = session._client
         return True

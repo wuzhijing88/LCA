@@ -166,7 +166,7 @@ class PluginSession:
                 terminate_plugin_host()
             except Exception:
                 logger.debug("terminate_plugin_host 失败", exc_info=True)
-            abandon_shared_plugin_client(display_hwnd)
+            abandon_shared_plugin_client()
             return None
         if box.get("err") is not None:
             logger.debug("插件绑定异常: %s", box["err"], exc_info=True)

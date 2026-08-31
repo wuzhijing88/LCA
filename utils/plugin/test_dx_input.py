@@ -129,6 +129,59 @@ def test_ensure_input_bind_times_out_instead_of_hanging(monkeypatch):
         session_mod.close_shared_plugin_client()
 
 
+def test_plugin_dx_input_rebuilds_client_after_timeout(monkeypatch):
+    import time
+
+    from utils.plugin import dx_input as dx_mod
+    from utils.plugin import session as session_mod
+
+    created = []
+    factory_calls = [0]
+
+    class _Client:
+        def __init__(self, hang_after=0):
+            self.binds = 0
+            self.hang_after = hang_after
+            created.append(self)
+
+        def bind(self, *args, **kwargs):
+            self.binds += 1
+            if self.hang_after and self.binds > self.hang_after:
+                time.sleep(2.0)
+            return True
+
+        def move_to(self, x, y):
+            return True
+
+    def _factory():
+        factory_calls[0] += 1
+        return _Client(hang_after=1 if factory_calls[0] == 1 else 0)
+
+    original_bind = PluginSession.ensure_input_bind
+
+    def _short_bind(self, *args, **kwargs):
+        kwargs["timeout"] = 0.3
+        return original_bind(self, *args, **kwargs)
+
+    monkeypatch.setattr(session_mod, "_create_plugin_client", _factory)
+    monkeypatch.setattr(session_mod, "terminate_plugin_host", lambda: None)
+    monkeypatch.setattr(session_mod.PluginSession, "ensure_input_bind", _short_bind)
+    monkeypatch.setattr(dx_mod, "is_plugin_runtime_available", lambda: True)
+    session_mod.close_shared_plugin_client()
+    try:
+        dx = PluginDxInput(9, display="normal")
+        assert dx._ready() is True
+        first = dx._client
+        assert first is created[0]
+        assert dx._ready() is False
+        assert dx._client is None
+        assert dx._ready() is True
+        assert dx._client is not first
+        assert dx._client is created[1]
+    finally:
+        session_mod.close_shared_plugin_client()
+
+
 def test_plugin_dx_input_hold_click_and_keys():
     handler = _FakeHandler()
     client = _make_client(handler)
