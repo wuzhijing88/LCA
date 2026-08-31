@@ -197,16 +197,9 @@ internal static class Program
         string mouse = GetString(args, "mouse");
         string keypad = GetString(args, "keypad");
         int mode = GetInt(args, "mode");
-        if (displayHwnd == inputHwnd || inputHwnd <= 0)
-            return CallOk(dm, "BindWindow", displayHwnd, display, mouse, keypad, mode);
-        try
-        {
-            return IsSuccessInt(Invoke(dm, "BindWindowEx", displayHwnd, display, mouse, keypad, "", mode));
-        }
-        catch (Exception)
-        {
-            return CallOk(dm, "BindWindow", displayHwnd, display, mouse, keypad, mode);
-        }
+        if (inputHwnd > 0 && inputHwnd != displayHwnd)
+            throw new InvalidOperationException("无法分离绑定: 大漠 BindWindowEx 不支持独立 input_hwnd");
+        return CallOk(dm, "BindWindow", displayHwnd, display, mouse, keypad, mode);
     }
 
     static Dictionary<string, object> DoCapture(object dm, MemoryMappedFile map, Dictionary<string, object> args)
@@ -316,11 +309,11 @@ internal static class Program
     {
         try
         {
-            object[] invokeArgs = { x1, y1, x2, y2, 0, 0 };
+            object[] invokeArgs = { x1, y1, x2, y2, null, 0 };
             ParameterModifier mods = new ParameterModifier(6);
             mods[4] = true;
             mods[5] = true;
-            dm.GetType().InvokeMember(
+            object ret = dm.GetType().InvokeMember(
                 "GetScreenDataBmp",
                 BindingFlags.InvokeMethod,
                 null,
@@ -329,6 +322,8 @@ internal static class Program
                 new[] { mods },
                 null,
                 null);
+            if (!IsSuccessInt(ret))
+                return null;
             return CopyOutBytes(invokeArgs[4], invokeArgs[5]);
         }
         catch (Exception)
