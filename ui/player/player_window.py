@@ -260,11 +260,18 @@ class PlayerWindow(QMainWindow):
     def _persist_ui_state(self):
         settings = extract_settings_from_ui(self._ui)
         settings["notify_on_finish"] = bool(self._notify_on_finish)
+        prev = dict(self._ui_state or {})
         state = {
             "group_loops": group_loops_from_refs(self._custom_refs) or self._group_loops_from_ui(),
             "loops_by_id": script_loops_from_refs(self._custom_refs) or self._loops_from_ui(),
             "settings": settings,
             "schedule_alarms": schedule_alarms_from_refs(self._custom_refs),
+            "list_order": list(prev.get("list_order") or self._ui.get("list_order") or []),
+            "list_order_mode": str(prev.get("list_order_mode") or self._ui.get("list_order_mode") or "fixed"),
+            "list_item_order": dict(prev.get("list_item_order") or {}),
+            "list_order_modes": dict(prev.get("list_order_modes") or {}),
+            "window_width": int(prev.get("window_width") or 0),
+            "window_height": int(prev.get("window_height") or 0),
         }
         self._ui_state = state
         try:
@@ -305,13 +312,37 @@ class PlayerWindow(QMainWindow):
     def open_settings_dialog(self):
         from PySide6.QtWidgets import QDialog
 
-        dialog = PlayerSettingsDialog(self, ui=self._ui)
+        from ui.player.player_chrome import apply_player_rounded_window, window_outer_size
+
+        dialog = PlayerSettingsDialog(
+            self,
+            ui=self._ui,
+            state=self._ui_state,
+            on_bind=self.open_window_binding_dialog,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         payload = dialog.settings_payload()
         self._ui = merge_settings_into_ui(self._ui, payload)
         self._exit_on_finish = bool(self._ui.get("exit_on_finish"))
         self._notify_on_finish = bool(self._ui.get("notify_on_finish", True))
+        order_state = dialog.result_state()
+        self._ui_state = dict(self._ui_state or {})
+        self._ui_state.update(order_state)
+        width = int(order_state.get("window_width") or 0)
+        height = int(order_state.get("window_height") or 0)
+        if width > 0 and height > 0 and self._custom_mode:
+            window = dict(self._ui.get("window") or {})
+            window["width"] = width
+            window["height"] = height
+            self._ui["window"] = window
+            pref_w, pref_h = window_outer_size(width, height)
+            available = get_available_geometry_for_widget(self)
+            out_w, out_h = clamp_preferred_window_size(pref_w, pref_h, available)
+            if self._body is not None:
+                self._body.setFixedSize(width, height)
+            self.setFixedSize(out_w, out_h)
+            apply_player_rounded_window(self)
         self._persist_ui_state()
         self._install_hotkeys()
         self._append_log("信息", "设置已保存")
