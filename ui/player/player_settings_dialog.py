@@ -240,19 +240,25 @@ class PlayerSettingsDialog(QDialog):
             self._item_order.addItem(row)
 
     def _build_schedule_tab(self) -> QWidget:
+        from ui.player.schedule_alarms_editor import ScheduleAlarmsEditor
+
         page = QWidget(self)
         layout = QVBoxLayout(page)
-        layout.addWidget(QLabel("定时闹钟仍可在界面「定时执行」面板中编辑；此处显示当前条数。"))
+        layout.addWidget(QLabel("与运行界面「定时执行」面板共用同一套编辑器；保存后两边同步。"))
         alarms = self._state.get("schedule_alarms")
         if not isinstance(alarms, list):
-            for widget in _script_lists(self._ui):
-                pass
+            alarms = None
             for widget in (self._ui.get("widgets") or []):
                 if isinstance(widget, dict) and widget.get("type") == "schedule":
                     alarms = widget.get("alarms") or []
                     break
-        count = len(alarms) if isinstance(alarms, list) else 0
-        layout.addWidget(QLabel(f"当前定时条目：{count}（运行界面中的定时面板可改）"))
+        self._schedule_editor = ScheduleAlarmsEditor(
+            page,
+            alarms=alarms,
+            title="定时（到点自动开始）",
+            interactive=True,
+        )
+        layout.addWidget(self._schedule_editor)
         layout.addStretch(1)
         return page
 
@@ -304,6 +310,9 @@ class PlayerSettingsDialog(QDialog):
             for i in range(self._list_order.count())
             if self._list_order.item(i) is not None
         ]
+        alarms = []
+        if hasattr(self, "_schedule_editor") and self._schedule_editor is not None:
+            alarms = self._schedule_editor.alarms()
         return {
             "list_order": [x for x in list_order if x],
             "list_order_mode": str(self._list_mode.currentData() or "fixed"),
@@ -311,4 +320,5 @@ class PlayerSettingsDialog(QDialog):
             "list_order_modes": dict(self._item_modes_cache),
             "window_width": int(self._width.value()),
             "window_height": int(self._height.value()),
+            "schedule_alarms": alarms,
         }

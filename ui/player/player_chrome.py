@@ -1715,6 +1715,7 @@ def populate_custom_player_body(
             _track(page, in_zone, frame)
         elif kind == "schedule":
             from app_core.player.package import normalize_schedule_alarms
+            from ui.player.schedule_alarms_editor import ScheduleAlarmsEditor
 
             frame = QFrame(body)
             frame.setObjectName("PlayerSchedule")
@@ -1751,41 +1752,25 @@ def populate_custom_player_body(
             layout.setContentsMargins(8, 6, 8, 6)
             layout.setSpacing(4)
             title = str(widget.get("title") or "定时").strip() or "定时"
-            layout.addWidget(QLabel(title if not interactive_buttons else f"{title}（到点自动开始）"))
             alarms = normalize_schedule_alarms(widget.get("alarms"))
-            alarm_rows: List[Dict[str, Any]] = []
+            editor = ScheduleAlarmsEditor(
+                frame,
+                alarms=alarms,
+                title=title if not interactive_buttons else f"{title}（到点自动开始）",
+                interactive=interactive_buttons,
+            )
+            layout.addWidget(editor)
 
             def _emit_schedule():
-                refs["schedule_alarms"] = schedule_alarms_from_refs(refs)
+                refs["schedule_alarms"] = editor.alarms()
                 if on_schedule_changed is not None:
                     on_schedule_changed()
 
-            for alarm in alarms:
-                row = QFrame(frame)
-                row.setFrameShape(QFrame.Shape.NoFrame)
-                row.setAutoFillBackground(False)
-                row_l = QHBoxLayout(row)
-                row_l.setContentsMargins(0, 0, 0, 0)
-                row_l.setSpacing(6)
-                enabled = QCheckBox("启用")
-                enabled.setChecked(bool(alarm.get("enabled")))
-                enabled.setEnabled(interactive_buttons)
-                time_edit = QTimeEdit(row)
-                time_edit.setDisplayFormat("HH:mm")
-                time_edit.setTime(
-                    QTime(int(alarm.get("hour") or 0), int(alarm.get("minute") or 0))
-                )
-                time_edit.setEnabled(interactive_buttons)
-                time_edit.setAutoFillBackground(False)
-                row_l.addWidget(enabled)
-                row_l.addWidget(time_edit, 1)
-                layout.addWidget(row)
-                alarm_rows.append({"enabled": enabled, "time": time_edit})
-                if interactive_buttons:
-                    enabled.toggled.connect(lambda *_a: _emit_schedule())
-                    time_edit.timeChanged.connect(lambda *_a: _emit_schedule())
+            if interactive_buttons:
+                editor.alarms_changed.connect(_emit_schedule)
             refs["schedule_frame"] = frame
-            refs["schedule_alarm_rows"] = alarm_rows
+            refs["schedule_editor"] = editor
+            refs["schedule_alarm_rows"] = editor.alarm_rows()
             refs["schedule_alarms"] = alarms
             node = frame
             _track(page, in_zone, frame)

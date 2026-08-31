@@ -329,6 +329,17 @@ class PlayerWindow(QMainWindow):
         order_state = dialog.result_state()
         self._ui_state = dict(self._ui_state or {})
         self._ui_state.update(order_state)
+        alarms = order_state.get("schedule_alarms")
+        if isinstance(alarms, list):
+            self._ui_state["schedule_alarms"] = alarms
+            editor = (self._custom_refs or {}).get("schedule_editor")
+            if editor is not None and hasattr(editor, "set_alarms"):
+                try:
+                    editor.set_alarms(alarms)
+                    self._custom_refs["schedule_alarms"] = alarms
+                    self._custom_refs["schedule_alarm_rows"] = editor.alarm_rows()
+                except RuntimeError:
+                    pass
         width = int(order_state.get("window_width") or 0)
         height = int(order_state.get("window_height") or 0)
         if width > 0 and height > 0 and self._custom_mode:
