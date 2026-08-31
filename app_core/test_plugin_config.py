@@ -9,6 +9,12 @@ def test_normalize_migrates_legacy_plugin_engine():
     assert cfg["plugin_dir"] == ""
 
 
+def test_normalize_migrates_legacy_engine_in_execution_section():
+    cfg = _normalize_config({"execution": {"screenshot_engine": "normal.wgc"}})
+    assert cfg["screenshot_engine"] == "gdi2"
+    assert cfg["execution"]["screenshot_engine"] == "gdi2"
+
+
 def test_normalize_keeps_native_engine():
     cfg = _normalize_config({"screenshot_engine": "wgc", "plugin_reg_code": "secret"})
     assert cfg["screenshot_engine"] == "wgc"

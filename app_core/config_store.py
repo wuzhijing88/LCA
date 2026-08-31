@@ -91,12 +91,18 @@ def _normalize_config(config: Mapping, *, prefer: str = "section") -> dict:
     apply_schedule_schema(normalized)
     normalize_bound_windows_hwnds(normalized.get("bound_windows"))
     normalize_bound_windows_hwnds(normalized.get("active_bound_windows"))
+    normalized = apply_sections(normalized, prefer=prefer)
     from utils.capture.engine_ids import migrate_screenshot_engine
 
-    normalized["screenshot_engine"] = migrate_screenshot_engine(
-        normalized.get("screenshot_engine")
-    )
-    return apply_sections(normalized, prefer=prefer)
+    migrated = migrate_screenshot_engine(normalized.get("screenshot_engine"))
+    normalized["screenshot_engine"] = migrated
+    execution = normalized.get("execution")
+    if isinstance(execution, dict):
+        execution["screenshot_engine"] = migrate_screenshot_engine(
+            execution.get("screenshot_engine")
+        )
+        normalized["execution"] = execution
+    return normalized
 
 
 def load_config() -> dict:
