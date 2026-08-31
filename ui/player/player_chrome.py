@@ -6,10 +6,21 @@ from __future__ import annotations
 import html
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-from PySide6.QtCore import QPoint, QRectF, QTime, Qt, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QMouseEvent, QPainter, QPainterPath, QPalette, QPixmap, QWheelEvent
+from PySide6.QtCore import QMimeData, QPoint, QRectF, QTime, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDrag,
+    QGuiApplication,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPixmap,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QFrame,
     QHBoxLayout,
@@ -28,6 +39,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+SCRIPT_ROW_MIME = "application/x-lca-script-list-row"
 
 from themes import theme_color
 
@@ -622,8 +635,90 @@ class OnceAwareCheckBox(QCheckBox):
         super().mousePressEvent(event)
 
 
+class PlayerScriptListView(QListWidget):
+    """支持带 itemWidget 的行内拖拽调序（Qt InternalMove 在 setItemWidget 下不可用）。"""
+
+    order_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._reorder_enabled = True
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # 不用内置 InternalMove：与 setItemWidget 不兼容
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDragEnabled(False)
+
+    def set_reorder_enabled(self, enabled: bool) -> None:
+        self._reorder_enabled = bool(enabled)
+
+    def reorder_enabled(self) -> bool:
+        return bool(self._reorder_enabled)
+
+    def move_row(self, from_row: int, to_row: int) -> bool:
+        """把 from_row 移到目标下标 to_row（移动前的目标位置，可等于 count 表示末尾）。"""
+        count = self.count()
+        if from_row < 0 or from_row >= count:
+            return False
+        insert_at = max(0, min(count, int(to_row)))
+        if insert_at == from_row or insert_at == from_row + 1:
+            return False
+        item = self.item(from_row)
+        widget = self.itemWidget(item) if item is not None else None
+        taken = self.takeItem(from_row)
+        if taken is None:
+            return False
+        if insert_at > from_row:
+            insert_at -= 1
+        self.insertItem(insert_at, taken)
+        if widget is not None:
+            self.setItemWidget(taken, widget)
+        self.setCurrentRow(insert_at)
+        self.order_changed.emit()
+        return True
+
+    def dropEvent(self, event):
+        if not self._reorder_enabled or event.mimeData() is None:
+            event.ignore()
+            return
+        if not event.mimeData().hasFormat(SCRIPT_ROW_MIME):
+            event.ignore()
+            return
+        try:
+            from_row = int(bytes(event.mimeData().data(SCRIPT_ROW_MIME)).decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            event.ignore()
+            return
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        target_item = self.itemAt(pos)
+        if target_item is None:
+            to_row = self.count()
+        else:
+            to_row = self.row(target_item)
+            rect = self.visualItemRect(target_item)
+            if pos.y() > rect.center().y():
+                to_row += 1
+        if self.move_row(from_row, to_row):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragEnterEvent(self, event):
+        if self._reorder_enabled and event.mimeData() and event.mimeData().hasFormat(SCRIPT_ROW_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._reorder_enabled and event.mimeData() and event.mimeData().hasFormat(SCRIPT_ROW_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
 class PlayerScriptTaskRow(QWidget):
-    """MAA 式任务行：勾选 + 名称 + 状态 + 次数。"""
+    """MAA 式任务行：勾选 + 名称 + 状态 + 次数；名称区可拖拽调序。"""
 
     def __init__(
         self,
@@ -638,6 +733,9 @@ class PlayerScriptTaskRow(QWidget):
         super().__init__(parent)
         self.script_id = str(script_id or "")
         self._title = str(title or script_id or "脚本")
+        self._interactive = bool(interactive)
+        self._locked = False
+        self._drag_start: Optional[QPoint] = None
         self.setObjectName("PlayerScriptTaskRow")
         self.setAutoFillBackground(False)
         layout = QHBoxLayout(self)
@@ -653,12 +751,16 @@ class PlayerScriptTaskRow(QWidget):
         self._name = QLabel(self._title)
         self._name.setObjectName("PlayerScriptTaskName")
         self._name.setMinimumWidth(40)
+        self._name.setToolTip("按住拖拽可调整执行顺序")
+        self._name.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._once = QLabel("仅一次")
         self._once.setObjectName("PlayerScriptOnceBadge")
         self._once.setStyleSheet(f"color:{theme_color('warning')};")
+        self._once.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._once.hide()
         self._status = QLabel("")
         self._status.setObjectName("PlayerScriptTaskStatus")
+        self._status.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._status.hide()
         self._spin = QSpinBox()
         self._spin.setObjectName("PlayerScriptTaskSpin")
@@ -678,6 +780,79 @@ class PlayerScriptTaskRow(QWidget):
         layout.addWidget(self._spin, 0)
         self.setMinimumHeight(28)
         self._sync_once_badge()
+
+    def _list_view(self) -> Optional[PlayerScriptListView]:
+        parent = self.parent()
+        while parent is not None:
+            if isinstance(parent, PlayerScriptListView):
+                return parent
+            if isinstance(parent, QListWidget):
+                return parent  # type: ignore[return-value]
+            parent = parent.parent()
+        return None
+
+    def _is_drag_source_pos(self, pos: QPoint) -> bool:
+        child = self.childAt(pos)
+        if child is None:
+            return True
+        if child is self._check or self._check.isAncestorOf(child):
+            return False
+        if child is self._spin or self._spin.isAncestorOf(child):
+            return False
+        return True
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if (
+            self._interactive
+            and not self._locked
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._is_drag_source_pos(event.position().toPoint())
+        ):
+            self._drag_start = event.position().toPoint()
+        else:
+            self._drag_start = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if (
+            self._drag_start is None
+            or self._locked
+            or not (event.buttons() & Qt.MouseButton.LeftButton)
+        ):
+            super().mouseMoveEvent(event)
+            return
+        if (event.position().toPoint() - self._drag_start).manhattanLength() < QApplication.startDragDistance():
+            return
+        list_w = self._list_view()
+        reorder_ok = True
+        if isinstance(list_w, PlayerScriptListView):
+            reorder_ok = list_w.reorder_enabled()
+        if list_w is None or not reorder_ok:
+            self._drag_start = None
+            return
+        row = -1
+        for index in range(list_w.count()):
+            item = list_w.item(index)
+            if item is not None and list_w.itemWidget(item) is self:
+                row = index
+                break
+        if row < 0:
+            self._drag_start = None
+            return
+        mime = QMimeData()
+        mime.setData(SCRIPT_ROW_MIME, str(row).encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pixmap = self.grab()
+        if not pixmap.isNull():
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(event.position().toPoint())
+        self._drag_start = None
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
 
     def _sync_once_badge(self, *_args):
         try:
@@ -717,6 +892,7 @@ class PlayerScriptTaskRow(QWidget):
             return 1
 
     def set_locked(self, locked: bool):
+        self._locked = bool(locked)
         try:
             self._check.setEnabled(not locked)
             self._spin.setEnabled(not locked)
@@ -1058,20 +1234,13 @@ def set_script_list_locked(refs: Dict[str, Any], locked: bool):
     """运行中锁定勾选/拖拽/次数，但保持列表可见以便显示执行状态。"""
     for list_w in iter_script_list_widgets(refs):
         try:
-            list_w.setDragEnabled(not locked)
-            list_w.setDragDropMode(
-                QAbstractItemView.DragDropMode.NoDragDrop
-                if locked
-                else QAbstractItemView.DragDropMode.InternalMove
-            )
+            if isinstance(list_w, PlayerScriptListView):
+                list_w.set_reorder_enabled(not locked)
             for index in range(list_w.count()):
                 item = list_w.item(index)
                 if item is None:
                     continue
-                flags = Qt.ItemFlag.ItemIsEnabled
-                if not locked:
-                    flags |= Qt.ItemFlag.ItemIsDragEnabled
-                item.setFlags(flags)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 row = _script_row_from_item(list_w, item)
                 if row is not None:
                     row.set_locked(locked)
@@ -1453,19 +1622,17 @@ def populate_custom_player_body(
             if title:
                 hint = QLabel(title if not interactive_buttons else f"{title}（可拖拽调顺序）")
                 layout.addWidget(hint)
-            list_w = QListWidget(frame)
+            list_w = PlayerScriptListView(frame)
             list_w.setObjectName("PlayerScriptListView")
             list_w.setAutoFillBackground(False)
             list_w.viewport().setAutoFillBackground(False)
-            # No row selection chrome; checkboxes/spins handle interaction, drag still works.
             list_w.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
             list_w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             list_w.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             list_w.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            list_w.set_reorder_enabled(interactive_buttons)
             if interactive_buttons:
-                list_w.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-                list_w.setDefaultDropAction(Qt.DropAction.MoveAction)
-                list_w.setToolTip("勾选要执行的脚本；右侧改次数；拖拽调整顺序")
+                list_w.setToolTip("勾选要执行的脚本；右侧改次数；按住名称拖拽调整顺序")
             else:
                 list_w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             for item in widget.get("items") or []:
@@ -1478,10 +1645,7 @@ def populate_custom_player_body(
                 loops = normalize_script_loop_count(item.get("loops"), 1)
                 checked = bool(item.get("checked", True))
                 list_item = QListWidgetItem()
-                flags = Qt.ItemFlag.ItemIsEnabled
-                if interactive_buttons:
-                    flags |= Qt.ItemFlag.ItemIsDragEnabled
-                list_item.setFlags(flags)
+                list_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 list_item.setData(Qt.ItemDataRole.UserRole, item_id)
                 list_item.setData(SCRIPT_ITEM_TITLE_ROLE, item_title)
                 list_item.setData(SCRIPT_ITEM_LOOPS_ROLE, loops)
@@ -1502,6 +1666,10 @@ def populate_custom_player_body(
                     )
                 if interactive_buttons and on_loops_changed is not None:
                     task_row._spin.valueChanged.connect(lambda *_args: on_loops_changed())
+            if interactive_buttons and on_scripts_changed is not None:
+                list_w.order_changed.connect(
+                    lambda: on_scripts_changed(selected_script_ids_from_refs(refs))
+                )
             layout.addWidget(list_w, 1)
             group_bar = QFrame(frame)
             group_bar.setObjectName("PlayerGroupLoopBar")
