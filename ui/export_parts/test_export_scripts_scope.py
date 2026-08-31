@@ -3,11 +3,15 @@ from types import SimpleNamespace
 
 from ui.export_parts.collector import collect_workflow_package
 from ui.export_parts.export_scripts import (
+    apply_catalog_to_ui_exclusive,
+    assert_script_lists_exclusive,
     collect_multi_script_package,
+    default_entry_script_id,
     list_workspace_export_scripts,
     script_list_checked_ids,
     select_scripts_for_export,
     sync_script_list_items,
+    unassigned_catalog_items,
     workspace_dirs_from_main,
 )
 
@@ -68,17 +72,17 @@ def test_empty_sub_workflow_error_includes_card_id():
     assert any("卡片 #42" in err and "未填写工作流文件" in err for err in result.errors)
 
 
-def test_select_scripts_defaults_to_entry_when_no_script_list_items():
+def test_select_scripts_defaults_to_full_catalog_when_no_script_list_items():
     catalog = [
         {"id": "a", "title": "A", "workflow_data": {"cards": [{"id": 1}]}},
         {"id": "b", "title": "B", "workflow_data": {"cards": [{"id": 2}]}},
     ]
     selected = select_scripts_for_export(catalog, entry_id="b", ui={"widgets": []})
-    assert [item["id"] for item in selected] == ["b"]
+    assert [item["id"] for item in selected] == ["a", "b"]
     assert script_list_checked_ids({"widgets": []}) is None
 
 
-def test_select_scripts_uses_checked_items_and_keeps_entry():
+def test_select_scripts_unions_all_list_items_not_just_checked():
     catalog = [
         {"id": "a", "title": "A", "workflow_data": {"cards": [{"id": 1}]}},
         {"id": "b", "title": "B", "workflow_data": {"cards": [{"id": 2}]}},
@@ -87,17 +91,63 @@ def test_select_scripts_uses_checked_items_and_keeps_entry():
     ui = {
         "widgets": [
             {
+                "id": "L1",
                 "type": "script_list",
                 "items": [
                     {"id": "a", "title": "A", "checked": True},
                     {"id": "b", "title": "B", "checked": False},
-                    {"id": "c", "title": "C", "checked": True},
                 ],
             }
+        ],
+        "list_order": ["L1"],
+    }
+    selected = select_scripts_for_export(catalog, entry_id="a", ui=ui)
+    assert [item["id"] for item in selected] == ["a", "b"]
+
+
+def test_apply_catalog_appends_new_only_to_first_list():
+    ui = {
+        "widgets": [
+            {
+                "id": "L1",
+                "type": "script_list",
+                "title": "列表1",
+                "items": [{"id": "a", "title": "A", "checked": True, "loops": 1}],
+            },
+            {
+                "id": "L2",
+                "type": "script_list",
+                "title": "列表2",
+                "items": [{"id": "b", "title": "B", "checked": True, "loops": 1}],
+            },
+        ],
+        "list_order": ["L1", "L2"],
+    }
+    catalog = [
+        {"id": "a", "title": "A"},
+        {"id": "b", "title": "B"},
+        {"id": "c", "title": "C"},
+    ]
+    out = apply_catalog_to_ui_exclusive(ui, catalog)
+    lists = [w for w in out["widgets"] if w.get("type") == "script_list"]
+    ids1 = {i["id"] for i in lists[0]["items"]}
+    ids2 = {i["id"] for i in lists[1]["items"]}
+    assert "c" in ids1 and "c" not in ids2
+    assert ids1.isdisjoint(ids2)
+    assert assert_script_lists_exclusive(out) is None
+    assert default_entry_script_id(out, catalog) == "a"
+    assert [x["id"] for x in unassigned_catalog_items(catalog, out)] == []
+
+
+def test_assert_script_lists_exclusive_detects_duplicate():
+    ui = {
+        "widgets": [
+            {"id": "L1", "type": "script_list", "title": "一", "items": [{"id": "a"}]},
+            {"id": "L2", "type": "script_list", "title": "二", "items": [{"id": "a"}]},
         ]
     }
-    selected = select_scripts_for_export(catalog, entry_id="b", ui=ui)
-    assert [item["id"] for item in selected] == ["a", "b", "c"]
+    msg = assert_script_lists_exclusive(ui)
+    assert msg and "a" in msg
 
 
 def test_collect_multi_prefixes_script_title_on_errors():

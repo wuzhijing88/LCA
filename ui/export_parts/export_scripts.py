@@ -248,8 +248,116 @@ def scripts_meta_from_catalog(catalog: List[Mapping[str, Any]]) -> List[Dict[str
     return meta
 
 
+def script_list_widgets(ui: Optional[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """按 list_order（若有）返回脚本列表控件副本。"""
+    if not isinstance(ui, Mapping):
+        return []
+    widgets = [dict(w) for w in (ui.get("widgets") or []) if isinstance(w, Mapping)]
+    lists = [w for w in widgets if str(w.get("type") or "") == "script_list"]
+    if not lists:
+        return []
+    by_id = {str(w.get("id") or ""): w for w in lists if str(w.get("id") or "").strip()}
+    order_raw = ui.get("list_order")
+    ordered_ids: List[str] = []
+    if isinstance(order_raw, list):
+        for raw_id in order_raw:
+            sid = str(raw_id or "").strip()
+            if sid and sid in by_id and sid not in ordered_ids:
+                ordered_ids.append(sid)
+    for wid in by_id:
+        if wid not in ordered_ids:
+            ordered_ids.append(wid)
+    # 无 id 的列表跟在后面
+    result = [by_id[i] for i in ordered_ids if i in by_id]
+    for widget in lists:
+        wid = str(widget.get("id") or "").strip()
+        if not wid:
+            result.append(widget)
+    return result
+
+
+def assigned_script_ids(ui: Optional[Mapping[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for widget in script_list_widgets(ui):
+        for item in widget.get("items") or []:
+            if not isinstance(item, Mapping):
+                continue
+            sid = str(item.get("id") or "").strip()
+            if sid:
+                ids.add(sid)
+    return ids
+
+
+def unassigned_catalog_items(
+    catalog: List[Mapping[str, Any]],
+    ui: Optional[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    taken = assigned_script_ids(ui)
+    out: List[Dict[str, Any]] = []
+    for entry in catalog or []:
+        if not isinstance(entry, Mapping):
+            continue
+        sid = str(entry.get("id") or "").strip()
+        if not sid or sid in taken:
+            continue
+        out.append(dict(entry))
+    return out
+
+
+def script_list_all_item_ids(ui: Optional[Mapping[str, Any]]) -> Optional[List[str]]:
+    """所有脚本列表 items 的 id（保序、去重）。无列表或全无 items 时返回 None。"""
+    if not isinstance(ui, Mapping):
+        return None
+    found = False
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for widget in script_list_widgets(ui):
+        items = widget.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            found = True
+            sid = str(item.get("id") or "").strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            ordered.append(sid)
+    if not found:
+        return None
+    return ordered
+
+
+def assert_script_lists_exclusive(ui: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """若多列表存在重复 id，返回中文错误信息。"""
+    seen: dict[str, str] = {}
+    for widget in script_list_widgets(ui):
+        title = str(widget.get("title") or widget.get("id") or "脚本列表").strip()
+        for item in widget.get("items") or []:
+            if not isinstance(item, Mapping):
+                continue
+            sid = str(item.get("id") or "").strip()
+            if not sid:
+                continue
+            if sid in seen:
+                return f"工作流「{sid}」同时出现在「{seen[sid]}」与「{title}」，每个工作流只能放进一个脚本列表。"
+            seen[sid] = title
+    return None
+
+
+def ensure_list_order(ui: Mapping[str, Any] | dict) -> dict:
+    payload = dict(ui)
+    lists = script_list_widgets(payload)
+    ids = [str(w.get("id") or "").strip() for w in lists if str(w.get("id") or "").strip()]
+    payload["list_order"] = ids
+    mode = str(payload.get("list_order_mode") or "fixed").strip().lower()
+    payload["list_order_mode"] = mode if mode in ("fixed", "random") else "fixed"
+    return payload
+
+
 def apply_catalog_to_ui(ui: Mapping[str, Any], catalog: List[Mapping[str, Any]]) -> dict:
-    """把目录同步进 ui.widgets 里所有脚本列表（保留 loops / 勾选 / 显示名）。"""
+    """旧行为：把目录同步进每一个脚本列表（会重复）。请优先用 apply_catalog_to_ui_exclusive。"""
     payload = copy.deepcopy(dict(ui or {}))
     widgets = []
     for widget in payload.get("widgets") or []:
@@ -264,22 +372,94 @@ def apply_catalog_to_ui(ui: Mapping[str, Any], catalog: List[Mapping[str, Any]])
     return payload
 
 
-def script_list_checked_ids(ui: Optional[Mapping[str, Any]]) -> Optional[List[str]]:
-    """从设计器 UI 读取脚本列表勾选。
+def apply_catalog_to_ui_exclusive(ui: Mapping[str, Any], catalog: List[Mapping[str, Any]]) -> dict:
+    """互斥同步：剔除不在 catalog 的项；新项只追加到第一个脚本列表。"""
+    payload = copy.deepcopy(dict(ui or {}))
+    catalog_ids = {
+        str(entry.get("id") or "").strip()
+        for entry in (catalog or [])
+        if isinstance(entry, Mapping) and str(entry.get("id") or "").strip()
+    }
+    catalog_by_id = {
+        str(entry.get("id") or "").strip(): entry
+        for entry in (catalog or [])
+        if isinstance(entry, Mapping) and str(entry.get("id") or "").strip()
+    }
+    widgets = []
+    list_indices: List[int] = []
+    claimed: set[str] = set()
+    for widget in payload.get("widgets") or []:
+        if not isinstance(widget, dict):
+            continue
+        item = dict(widget)
+        if str(item.get("type") or "") == "script_list":
+            list_indices.append(len(widgets))
+            kept: List[Dict[str, Any]] = []
+            for entry in item.get("items") or []:
+                if not isinstance(entry, Mapping):
+                    continue
+                sid = str(entry.get("id") or "").strip()
+                if not sid or sid not in catalog_ids or sid in claimed:
+                    continue
+                claimed.add(sid)
+                # 用 catalog 刷新 title/source，保留 checked/loops
+                cat = catalog_by_id.get(sid) or {}
+                row = dict(entry)
+                if cat.get("title"):
+                    row.setdefault("title", cat.get("title"))
+                kept.append(row)
+            item["items"] = kept
+            mode = str(item.get("order_mode") or "fixed").strip().lower()
+            item["order_mode"] = mode if mode in ("fixed", "random") else "fixed"
+        widgets.append(item)
+    payload["widgets"] = widgets
+    # 新项进第一个列表
+    missing = [sid for sid in catalog_by_id if sid not in claimed]
+    if missing:
+        if not list_indices:
+            # 无脚本列表：不自动造控件（由设计器添加）；打包回退用全 catalog
+            pass
+        else:
+            first = widgets[list_indices[0]]
+            items = list(first.get("items") or [])
+            stub_catalog = [catalog_by_id[sid] for sid in missing]
+            items.extend(sync_script_list_items([], stub_catalog))
+            first["items"] = items
+            widgets[list_indices[0]] = first
+            payload["widgets"] = widgets
+    return ensure_list_order(payload)
 
-    返回 None 表示界面里还没有脚本列表项（应回退为只打当前入口脚本）。
-    返回列表（可为）表示按勾选项打包。
+
+def default_entry_script_id(
+    ui: Optional[Mapping[str, Any]],
+    catalog: List[Mapping[str, Any]],
+) -> str:
+    for widget in script_list_widgets(ui):
+        for item in widget.get("items") or []:
+            if not isinstance(item, Mapping):
+                continue
+            sid = str(item.get("id") or "").strip()
+            if sid:
+                return sid
+    for entry in catalog or []:
+        if isinstance(entry, Mapping):
+            sid = str(entry.get("id") or "").strip()
+            if sid:
+                return sid
+    return ""
+
+
+def script_list_checked_ids(ui: Optional[Mapping[str, Any]]) -> Optional[List[str]]:
+    """从设计器 UI 读取脚本列表勾选（运行时默认勾选）。
+
+    返回 None 表示界面里还没有脚本列表项。
     """
     if not isinstance(ui, Mapping):
         return None
     found_list = False
     checked: List[str] = []
     seen: set[str] = set()
-    for widget in ui.get("widgets") or []:
-        if not isinstance(widget, Mapping):
-            continue
-        if str(widget.get("type") or "") != "script_list":
-            continue
+    for widget in script_list_widgets(ui):
         items = widget.get("items")
         if not isinstance(items, list) or not items:
             continue
@@ -305,7 +485,7 @@ def select_scripts_for_export(
     entry_id: str = "",
     ui: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """决定实际打包哪些脚本：设计器勾选项，否则仅当前入口脚本。"""
+    """决定实际打包哪些脚本：所有脚本列表 items 并集；无列表则打全目录。"""
     ordered: List[Dict[str, Any]] = []
     by_id: Dict[str, Mapping[str, Any]] = {}
     for entry in catalog or []:
@@ -319,12 +499,13 @@ def select_scripts_for_export(
     if not ordered:
         return []
 
-    entry_id = str(entry_id or "").strip() or str(ordered[0].get("id") or "")
-    checked = script_list_checked_ids(ui)
-    if checked is None:
-        wanted = {entry_id} if entry_id else set()
+    entry_id = str(entry_id or "").strip() or default_entry_script_id(ui, ordered)
+    item_ids = script_list_all_item_ids(ui)
+    if item_ids is None:
+        # 无脚本列表项：打包剔除后的全部目录
+        wanted = {str(s.get("id") or "") for s in ordered}
     else:
-        wanted = set(checked)
+        wanted = set(item_ids)
         if entry_id:
             wanted.add(entry_id)
 
