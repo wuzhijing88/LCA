@@ -15,6 +15,7 @@ DEFAULT_HOTKEYS = {
     "pause_workflow_hotkey": "F11",
     "record_hotkey": "F12",
     "replay_hotkey": "F8",
+    "close_listen_hotkey": "F7",
 }
 
 SECTION_FIELDS = {
@@ -31,6 +32,7 @@ SECTION_FIELDS = {
         "execution_mode",
         "foreground_mouse_driver_backend",
         "foreground_keyboard_driver_backend",
+        "foreground_py_backend",
         "ibinputsimulator_driver",
         "ibinputsimulator_driver_arg",
         "ibinputsimulator_ahk_path",
@@ -38,6 +40,8 @@ SECTION_FIELDS = {
         "operation_mode",
         "screenshot_format",
         "screenshot_engine",
+        "plugin_reg_code",
+        "plugin_dir",
         "binding_method",
         "window_binding_mode",
         "multi_window_delay",

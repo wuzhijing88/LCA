@@ -20,6 +20,7 @@ _DEFAULT_CONFIG = {
     "execution_mode": "background_sendmessage",
     "foreground_mouse_driver_backend": "interception",
     "foreground_keyboard_driver_backend": "interception",
+    "foreground_py_backend": "pyautogui",
     "ibinputsimulator_driver": "Logitech",
     "ibinputsimulator_driver_arg": "",
     "ibinputsimulator_ahk_path": "",
@@ -29,6 +30,8 @@ _DEFAULT_CONFIG = {
     "custom_height": 0,
     "screenshot_format": "bmp",
     "screenshot_engine": "wgc",
+    "plugin_reg_code": "",
+    "plugin_dir": "",
     "binding_method": "enhanced",
     "window_binding_mode": "single",
     "bound_windows": [],
@@ -88,6 +91,11 @@ def _normalize_config(config: Mapping, *, prefer: str = "section") -> dict:
     apply_schedule_schema(normalized)
     normalize_bound_windows_hwnds(normalized.get("bound_windows"))
     normalize_bound_windows_hwnds(normalized.get("active_bound_windows"))
+    from utils.capture.engine_ids import migrate_screenshot_engine
+
+    normalized["screenshot_engine"] = migrate_screenshot_engine(
+        normalized.get("screenshot_engine")
+    )
     return apply_sections(normalized, prefer=prefer)
 
 
