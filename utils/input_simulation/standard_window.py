@@ -72,6 +72,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         self.enable_message_guard = enable_message_guard
         self.execution_mode = (execution_mode or "").strip().lower()
         self.use_async_message = (not use_foreground) and self.execution_mode == "background_postmessage"
+        self._dx_input = None
 
         # 初始化增强模块
         if not use_foreground:
@@ -139,6 +140,18 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         mouse_backend, _ = get_foreground_driver_backends(self.execution_mode)
         return str(mouse_backend).strip().lower()
 
+    def _using_plugin_dx(self) -> bool:
+        from .mode_utils import is_dx_input_mode
+
+        return (not self.use_foreground) and is_dx_input_mode(self.execution_mode)
+
+    def _plugin_dx(self):
+        if self._dx_input is None:
+            from utils.plugin.dx_input import PluginDxInput
+
+            self._dx_input = PluginDxInput(self.hwnd)
+        return self._dx_input
+
     def _get_virtual_screen_bounds(self) -> Tuple[int, int, int, int]:
         """获取虚拟桌面边界，兼容负坐标多屏布局。"""
         left = int(win32api.GetSystemMetrics(76))   # SM_XVIRTUALSCREEN
@@ -158,6 +171,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             self._ib_runtime_signature = None
             self._last_input_control_hwnd = None
             self._virtual_cursor = None
+            self._dx_input = None
             if hasattr(self, "child_finder"):
                 self.child_finder = None
             if hasattr(self, "window_activator"):
@@ -970,6 +984,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
     def send_key_to_control(self, control_hwnd: int, vk_code: int, scan_code: int = 0, extended: bool = False) -> bool:
         """向指定控件发送按键"""
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().key_press(int(vk_code)))
             if not control_hwnd:
                 return False
             if scan_code == 0:
@@ -995,6 +1011,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
     def move_mouse(self, x: int, y: int) -> bool:
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().move_to(int(x), int(y)))
             if self.use_foreground:
                 if not self._ensure_driver():
                     return False
@@ -1011,6 +1029,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
     def mouse_down(self, x: int, y: int, button: str = 'left') -> bool:
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().move_to(int(x), int(y)) and self._plugin_dx().mouse_down(button))
             if self.use_foreground:
                 if not self._ensure_driver():
                     return False
@@ -1033,6 +1053,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
     def mouse_up(self, x: int, y: int, button: str = 'left') -> bool:
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().move_to(int(x), int(y)) and self._plugin_dx().mouse_up(button))
             if self.use_foreground:
                 if not self._ensure_driver():
                     return False
@@ -1052,6 +1074,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
     def double_click(self, x: int, y: int, button: str = 'left') -> bool:
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().double_click(int(x), int(y), button=button))
             if self.use_foreground:
                 if not self._ensure_driver():
                     return False
@@ -1269,6 +1293,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
     def scroll(self, x: int, y: int, delta: int) -> bool:
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().wheel(int(x), int(y), int(delta)))
             if self.use_foreground:
                 if not self._ensure_driver():
                     return False
@@ -1305,6 +1331,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
     def send_key_down(self, vk_code: int, scan_code: int = 0, extended: bool = False) -> bool:
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().key_down(int(vk_code)))
             if self.use_foreground:
                 if not self._ensure_driver():
                     return False
@@ -1330,6 +1358,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
 
     def send_key_up(self, vk_code: int, scan_code: int = 0, extended: bool = False) -> bool:
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().key_up(int(vk_code)))
             if self.use_foreground:
                 if not self._ensure_driver():
                     return False
@@ -1473,6 +1503,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 if not self._ensure_driver():
                     return False
                 return self.driver.type_text(text)
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().key_press_str(str(text or "")))
             return self._find_and_send_to_input_control(text, stop_checker=stop_checker)
         except InterruptedError:
             raise
@@ -1568,6 +1600,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
     ) -> bool:
         """鼠标点击"""
         try:
+            if self._using_plugin_dx():
+                return bool(self._plugin_dx().click(x, y, button, clicks, interval, duration))
             if self.use_foreground:
                 return self._foreground_click(x, y, button, clicks, interval, duration)
             else:
@@ -1698,6 +1732,11 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 return True
         except Exception:
             pass
+
+        from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+        if skip_cross_desktop_activation(self.hwnd, log_prefix="前台点击"):
+            return False
 
         try:
             if win32gui.IsIconic(self.hwnd):
