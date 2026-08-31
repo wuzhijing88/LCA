@@ -8,8 +8,11 @@ from utils.plugin.runtime import (
     LoopbackTransport,
     PluginClient,
     PluginRpc,
+    ensure_plugin_rpc,
     find_plugin_dir,
     launch_host_command,
+    should_cool_down,
+    terminate_plugin_host,
 )
 
 
@@ -69,3 +72,55 @@ def test_find_plugin_dir_prefers_config(monkeypatch, tmp_path):
         lambda: {"plugin_dir": str(chosen), "plugin_reg_code": ""},
     )
     assert find_plugin_dir() == chosen.resolve()
+
+
+def test_ensure_plugin_rpc_rejects_empty_reg_code_before_launch(monkeypatch):
+    import utils.plugin.runtime as runtime
+
+    terminate_plugin_host()
+    monkeypatch.setattr(runtime, "_COOLDOWN_HITS", 0)
+    monkeypatch.setattr(runtime, "_COOLDOWN_UNTIL", 0.0)
+    monkeypatch.setattr(runtime, "is_plugin_runtime_available", lambda: True)
+    monkeypatch.setattr(runtime, "find_plugin_dir", lambda: Path("C:/tools/plugin"))
+    monkeypatch.setattr(
+        runtime,
+        "_read_plugin_config",
+        lambda: {"plugin_dir": "C:/tools/plugin", "plugin_reg_code": "   "},
+    )
+    popen_calls = []
+
+    def fake_popen(*_args, **_kwargs):
+        popen_calls.append(1)
+        raise AssertionError("PluginHost.exe must not start for empty reg code")
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="未填写插件注册码"):
+        ensure_plugin_rpc()
+    assert popen_calls == []
+    assert runtime._COOLDOWN_HITS == 0
+    assert should_cool_down() is False
+
+
+def test_attach_host_job_closes_handle_when_assign_fails(monkeypatch):
+    import utils.plugin.runtime as runtime
+
+    job_handle = object()
+    closed = []
+
+    class FakeKernel32:
+        def CloseHandle(self, handle):
+            closed.append(handle)
+            return True
+
+    monkeypatch.setattr(runtime, "_create_kill_on_close_job", lambda: job_handle)
+
+    def fail_assign(_job, _proc):
+        raise OSError("assign failed")
+
+    monkeypatch.setattr(runtime, "_assign_process_to_job", fail_assign)
+    monkeypatch.setattr(runtime, "_kernel32", lambda: FakeKernel32())
+
+    result = runtime._attach_host_job(type("Proc", (), {"pid": 1})())
+    assert result is None
+    assert closed == [job_handle]

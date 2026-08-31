@@ -342,6 +342,22 @@ def _assign_process_to_job(job, proc: subprocess.Popen) -> None:
             k32.CloseHandle(handle)
 
 
+def _attach_host_job(proc: subprocess.Popen):
+    job = None
+    try:
+        job = _create_kill_on_close_job()
+        _assign_process_to_job(job, proc)
+        return job
+    except Exception:
+        logger.warning("plugin job object setup failed", exc_info=True)
+        if job:
+            try:
+                _kernel32().CloseHandle(job)
+            except Exception:
+                logger.debug("plugin job close failed", exc_info=True)
+        return None
+
+
 def _connect_named_pipe(name: str, timeout: float = _PIPE_CONNECT_TIMEOUT):
     path = rf"\\.\pipe\{name}"
     k32 = _kernel32()
@@ -430,6 +446,9 @@ def ensure_plugin_rpc() -> PluginRpc:
         if directory is None:
             raise RuntimeError("插件运行库不可用")
         exe = directory / "PluginHost.exe"
+        cfg = _read_plugin_config()
+        if not str(cfg.get("plugin_reg_code") or "").strip():
+            raise RuntimeError("未填写插件注册码")
         pid = os.getpid()
         pipe = pipe_name(pid)
         launched = False
@@ -444,18 +463,12 @@ def ensure_plugin_rpc() -> PluginRpc:
             )
             launched = True
             _HOST_PROC = proc
-            try:
-                job = _create_kill_on_close_job()
-                _assign_process_to_job(job, proc)
-                _JOB_HANDLE = job
-            except Exception:
-                logger.debug("plugin job object setup failed", exc_info=True)
+            _JOB_HANDLE = _attach_host_job(proc)
             pipe_file = _connect_named_pipe(pipe, timeout=_PIPE_CONNECT_TIMEOUT)
             _PIPE_FILE = pipe_file
             mapping = _open_frame_map(pid)
             _FRAME_MAP = mapping
             rpc = PluginRpc(NamedPipeTransport(pipe_file), frame_buf=memoryview(mapping))
-            cfg = _read_plugin_config()
             rpc.call("init", plugin_dir=str(directory), reg_code=str(cfg["plugin_reg_code"]))
             note_host_init_success()
             _CACHED_RPC = rpc
