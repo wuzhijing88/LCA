@@ -822,6 +822,15 @@ def apply_schedule_alarms_to_refs(refs: Dict[str, Any], alarms: Optional[List[Di
     from app_core.player.package import normalize_schedule_alarms
 
     normalized = normalize_schedule_alarms(alarms)
+    editor = refs.get("schedule_editor")
+    if editor is not None and hasattr(editor, "set_alarms"):
+        try:
+            editor.set_alarms(normalized)
+            refs["schedule_alarm_rows"] = editor.alarm_rows()
+            refs["schedule_alarms"] = normalized
+            return
+        except RuntimeError:
+            pass
     rows = refs.get("schedule_alarm_rows") or []
     for index, row in enumerate(rows):
         if not isinstance(row, dict) or index >= len(normalized):
