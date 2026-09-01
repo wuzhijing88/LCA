@@ -31,6 +31,11 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         "IbInputSimulator": "ibinputsimulator",
     }
     FOREGROUND_DRIVER_BACKEND_REVERSE_MAP = {v: k for k, v in FOREGROUND_DRIVER_BACKEND_MAP.items()}
+    FOREGROUND_PY_BACKEND_MAP = {
+        "PyAutoGUI": "pyautogui",
+        "扫描码": "normal.hd",
+    }
+    FOREGROUND_PY_BACKEND_REVERSE_MAP = {v: k for k, v in FOREGROUND_PY_BACKEND_MAP.items()}
     IB_DRIVER_MAP = {
         "Logitech": "Logitech",
         "Razer": "Razer",
