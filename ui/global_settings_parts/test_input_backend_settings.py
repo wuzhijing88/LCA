@@ -112,10 +112,13 @@ def test_plugin_bind_mode_shows_chinese_labels_and_follow_syncs_display():
     assert not dialog.plugin_advanced_panel.isHidden()
 
     assert dialog.plugin_input_enable_check.isChecked()
+    assert not dialog.plugin_input_panel.isHidden()
     assert dialog.plugin_input_display_follow_check.isChecked()
+    assert dialog.plugin_input_display_row.isHidden()
     assert dialog.plugin_input_display_combo.currentData() == "normal"
 
     dialog.plugin_screenshot_enable_check.setChecked(True)
+    assert not dialog.plugin_screenshot_panel.isHidden()
     engine_index = dialog.plugin_screenshot_engine_combo.findData("gdi2")
     assert engine_index >= 0
     dialog.plugin_screenshot_engine_combo.setCurrentIndex(engine_index)
@@ -126,4 +129,26 @@ def test_plugin_bind_mode_shows_chinese_labels_and_follow_syncs_display():
     assert settings["plugin_input_display_follow"] is True
     assert settings["plugin_input_display"] == "gdi2"
     assert settings["screenshot_engine"] == "gdi2"
+    dialog.close()
+
+
+def test_plugin_mode_hides_details_when_disabled():
+    _qapp()
+    dialog = GlobalSettingsDialog(
+        {
+            "execution_mode": "background_sendmessage",
+            "screenshot_engine": "wgc",
+            "input_backend": "native",
+            "bound_windows": [],
+        }
+    )
+    assert not dialog.plugin_input_enable_check.isChecked()
+    assert dialog.plugin_input_panel.isHidden()
+    assert not dialog.plugin_screenshot_enable_check.isChecked()
+    assert dialog.plugin_screenshot_panel.isHidden()
+
+    dialog.plugin_input_enable_check.setChecked(True)
+    assert not dialog.plugin_input_panel.isHidden()
+    dialog.plugin_screenshot_enable_check.setChecked(True)
+    assert not dialog.plugin_screenshot_panel.isHidden()
     dialog.close()

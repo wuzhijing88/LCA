@@ -389,15 +389,18 @@ class GlobalSettingsDialogTabsMixin:
         form.setSpacing(8)
         form.setContentsMargins(15, 10, 15, 10)
         plugin_hint = (
-            "需要 tools/plugin 下 PluginHost.exe、dm.dll、RegDll.dll。"
-            "注册码仅保存在本机，不会进入导出包。"
+            "目录需含 PluginHost.exe、dm.dll、RegDll.dll（默认 tools/plugin）。"
+            "注册码只保存在本机。"
         )
         hint = QLabel(plugin_hint)
         hint.setWordWrap(True)
-        hint.setToolTip(plugin_hint)
+        hint.setToolTip(
+            "插件运行库：PluginHost.exe、dm.dll、RegDll.dll。"
+            "注册码不会进入导出包。"
+        )
         form.addWidget(hint)
         reg_row = QHBoxLayout()
-        reg_label = QLabel("插件注册码:")
+        reg_label = QLabel("注册码:")
         reg_label.setFixedWidth(80)
         self.plugin_reg_code_edit = QLineEdit(self)
         self.plugin_reg_code_edit.setObjectName("plugin_reg_code_edit")
@@ -408,7 +411,7 @@ class GlobalSettingsDialogTabsMixin:
         reg_row.addWidget(self.plugin_reg_code_edit)
         form.addLayout(reg_row)
         dir_row = QHBoxLayout()
-        dir_label = QLabel("插件目录:")
+        dir_label = QLabel("目录:")
         dir_label.setFixedWidth(80)
         self.plugin_dir_edit = QLineEdit(self)
         self.plugin_dir_edit.setObjectName("plugin_dir_edit")
@@ -478,7 +481,19 @@ class GlobalSettingsDialogTabsMixin:
         keypad_row.addWidget(self.plugin_keypad_combo)
         plugin_input_layout.addLayout(keypad_row)
 
-        display_row = QHBoxLayout()
+        self.plugin_input_display_follow_check = QCheckBox("绑定图显跟随截图", self)
+        self.plugin_input_display_follow_check.setObjectName("plugin_input_display_follow_check")
+        self.plugin_input_display_follow_check.setChecked(
+            bool(self.current_config.get("plugin_input_display_follow", True))
+        )
+        self.plugin_input_display_follow_check.setToolTip(
+            "开启后绑定图显自动对齐当前生效的截图引擎；截图为原生时用「正常」。"
+        )
+        plugin_input_layout.addWidget(self.plugin_input_display_follow_check)
+
+        self.plugin_input_display_row = QWidget()
+        display_row = QHBoxLayout(self.plugin_input_display_row)
+        display_row.setContentsMargins(0, 0, 0, 0)
         display_label = QLabel("绑定图显:")
         display_label.setFixedWidth(80)
         self.plugin_input_display_combo = QComboBox(self)
@@ -492,21 +507,12 @@ class GlobalSettingsDialogTabsMixin:
         display_index = self.plugin_input_display_combo.findData(configured_display)
         if display_index >= 0:
             self.plugin_input_display_combo.setCurrentIndex(display_index)
-        self.plugin_input_display_combo.setToolTip(
-            "插件键鼠绑定时使用的图显方式。默认跟随当前生效的截图引擎；"
-            "截图为原生时跟随「正常」。"
-        )
-        self.plugin_input_display_follow_check = QCheckBox("跟随截图", self)
-        self.plugin_input_display_follow_check.setObjectName("plugin_input_display_follow_check")
-        self.plugin_input_display_follow_check.setChecked(
-            bool(self.current_config.get("plugin_input_display_follow", True))
-        )
+        self.plugin_input_display_combo.setToolTip("仅在取消「绑定图显跟随截图」后可手动选择。")
         display_row.addWidget(display_label)
-        display_row.addWidget(self.plugin_input_display_combo, 1)
-        display_row.addWidget(self.plugin_input_display_follow_check)
-        plugin_input_layout.addLayout(display_row)
+        display_row.addWidget(self.plugin_input_display_combo)
+        plugin_input_layout.addWidget(self.plugin_input_display_row)
 
-        self.plugin_advanced_toggle = QCheckBox("显示高级：绑定模式", self)
+        self.plugin_advanced_toggle = QCheckBox("高级：绑定模式", self)
         self.plugin_advanced_toggle.setObjectName("plugin_advanced_toggle")
         self.plugin_advanced_toggle.setChecked(False)
         plugin_input_layout.addWidget(self.plugin_advanced_toggle)
@@ -563,6 +569,10 @@ class GlobalSettingsDialogTabsMixin:
         )
         shot_layout.addWidget(self.plugin_screenshot_enable_check)
 
+        self.plugin_screenshot_panel = QWidget()
+        plugin_shot_panel_layout = QVBoxLayout(self.plugin_screenshot_panel)
+        plugin_shot_panel_layout.setContentsMargins(0, 0, 0, 0)
+        plugin_shot_panel_layout.setSpacing(8)
         plugin_shot_row = QHBoxLayout()
         plugin_shot_label = QLabel("截图引擎:")
         plugin_shot_label.setFixedWidth(80)
@@ -580,7 +590,8 @@ class GlobalSettingsDialogTabsMixin:
         )
         plugin_shot_row.addWidget(plugin_shot_label)
         plugin_shot_row.addWidget(self.plugin_screenshot_engine_combo)
-        shot_layout.addLayout(plugin_shot_row)
+        plugin_shot_panel_layout.addLayout(plugin_shot_row)
+        shot_layout.addWidget(self.plugin_screenshot_panel)
         layout.addWidget(shot_group)
 
         self.plugin_input_enable_check.toggled.connect(self._on_plugin_input_enable_toggled)
@@ -626,12 +637,20 @@ class GlobalSettingsDialogTabsMixin:
         if hasattr(self, "plugin_input_enable_check"):
             use_plugin_input = bool(self.plugin_input_enable_check.isChecked())
         if hasattr(self, "plugin_input_panel"):
-            self.plugin_input_panel.setEnabled(use_plugin_input)
+            self.plugin_input_panel.setVisible(use_plugin_input)
         use_plugin_shot = False
         if hasattr(self, "plugin_screenshot_enable_check"):
             use_plugin_shot = bool(self.plugin_screenshot_enable_check.isChecked())
-        if hasattr(self, "plugin_screenshot_engine_combo"):
-            self.plugin_screenshot_engine_combo.setEnabled(use_plugin_shot)
+        if hasattr(self, "plugin_screenshot_panel"):
+            self.plugin_screenshot_panel.setVisible(use_plugin_shot)
+        elif hasattr(self, "plugin_screenshot_engine_combo"):
+            self.plugin_screenshot_engine_combo.setVisible(use_plugin_shot)
+        if use_plugin_input:
+            self._sync_plugin_input_display_follow()
+            if hasattr(self, "plugin_advanced_panel") and hasattr(self, "plugin_advanced_toggle"):
+                self.plugin_advanced_panel.setVisible(
+                    bool(self.plugin_advanced_toggle.isChecked())
+                )
         if resize_dialog and self.isVisible():
             QTimer.singleShot(0, self._adjust_dialog_height_only)
 
@@ -652,24 +671,17 @@ class GlobalSettingsDialogTabsMixin:
         follow = True
         if hasattr(self, "plugin_input_display_follow_check"):
             follow = bool(self.plugin_input_display_follow_check.isChecked())
-        # 跟随开启时禁用下拉；未启用插件键鼠时整块已灰，这里只控制跟随逻辑
-        self.plugin_input_display_combo.setEnabled(
-            (not follow)
-            and (
-                not hasattr(self, "plugin_input_enable_check")
-                or bool(self.plugin_input_enable_check.isChecked())
-            )
-        )
-        if not follow:
-            return
-        target = self._followed_plugin_input_display()
-        index = self.plugin_input_display_combo.findData(target)
-        if index >= 0 and self.plugin_input_display_combo.currentIndex() != index:
-            self.plugin_input_display_combo.blockSignals(True)
-            try:
-                self.plugin_input_display_combo.setCurrentIndex(index)
-            finally:
-                self.plugin_input_display_combo.blockSignals(False)
+        if hasattr(self, "plugin_input_display_row"):
+            self.plugin_input_display_row.setVisible(not follow)
+        if follow:
+            target = self._followed_plugin_input_display()
+            index = self.plugin_input_display_combo.findData(target)
+            if index >= 0 and self.plugin_input_display_combo.currentIndex() != index:
+                self.plugin_input_display_combo.blockSignals(True)
+                try:
+                    self.plugin_input_display_combo.setCurrentIndex(index)
+                finally:
+                    self.plugin_input_display_combo.blockSignals(False)
 
     def _update_screenshot_engine_visibility(self):
         """按前后台刷新原生截图引擎列表。"""
