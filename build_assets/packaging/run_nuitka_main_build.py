@@ -360,7 +360,7 @@ def _build_command(project_root: Path, output_dir: str) -> list[str]:
     command.extend(f"--noinclude-qt-plugins={plugin_name}" for plugin_name in NOINCLUDE_QT_PLUGINS)
     command.append("--noinclude-qt-translations")
     command.extend(f"--include-data-dir={source}={target}" for source, target in DATA_DIR_SPECS)
-    if Path("tools/plugin").is_dir():
+    if (project_root / "tools" / "plugin").is_dir():
         command.append("--include-data-dir=tools/plugin=tools/plugin")
     command.extend(f"--include-data-files={source}={target}" for source, target in DATA_FILE_SPECS)
     command.extend(f"--noinclude-dlls={pattern}" for pattern in NOINCLUDE_DLLS)

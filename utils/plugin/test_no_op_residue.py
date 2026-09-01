@@ -34,3 +34,5 @@ def test_no_op_runtime_residue():
                 if token in text:
                     hits.append(f"{path.relative_to(root)}: {token}")
     assert hits == []
+    assert not (root / "utils" / "op").exists()
+    assert not (root / "utils" / "capture" / "op_capture.py").exists()
