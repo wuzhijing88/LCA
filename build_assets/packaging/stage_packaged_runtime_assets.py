@@ -90,6 +90,41 @@ def _stage_interception_files(project_root: Path, dist_root: Path) -> None:
     )
 
 
+def _stage_plugin_runtime(project_root: Path, dist_root: Path) -> None:
+    """拷贝 PluginHost 运行文件。缺目录则跳过，不中断打包。
+
+    不拷贝 .py：发行目录禁止残留 Python 源文件（verify_no_source_files）。
+    Nuitka --include-data-dir 若已带入 .py，这里一并清掉。
+    """
+    source = project_root / "tools" / "plugin"
+    target = dist_root / "tools" / "plugin"
+    if not source.is_dir():
+        print("[5.55/6] Skip plugin runtime: tools/plugin is missing")
+        if target.is_dir():
+            for leftover in target.rglob("*.py"):
+                if leftover.is_file():
+                    leftover.unlink()
+        return
+    target.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for name in ("PluginHost.exe", "dm.dll", "RegDll.dll"):
+        item = source / name
+        if not item.is_file():
+            continue
+        dest = target / name
+        dest.write_bytes(item.read_bytes())
+        copied += 1
+    removed = 0
+    for leftover in target.rglob("*.py"):
+        if leftover.is_file():
+            leftover.unlink()
+            removed += 1
+    print(
+        f"[5.55/6] Staged plugin runtime files: {copied} -> {target}"
+        + (f" (removed {removed} .py)" if removed else "")
+    )
+
+
 def _remove_unused_bundled_tools(dist_root: Path) -> None:
     leftover = dist_root / "tools" / "大漠综合工具.exe"
     if leftover.is_file():
@@ -112,6 +147,7 @@ def main() -> int:
     _stage_qt_platform_plugin(project_root, dist_root)
     _stage_ocr_runtime(project_root, dist_root)
     _stage_interception_files(project_root, dist_root)
+    _stage_plugin_runtime(project_root, dist_root)
     _remove_unused_bundled_tools(dist_root)
     return 0
 

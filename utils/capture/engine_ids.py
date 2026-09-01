@@ -167,8 +167,3 @@ def iter_plugin_capture_display_candidates(display: object) -> tuple[str, ...]:
         if item not in ordered:
             ordered.append(item)
     return tuple(ordered)
-
-
-# Thin aliases until Task 8 rewires imports across the dirty tree.
-is_op_screenshot_engine = is_plugin_screenshot_engine
-iter_op_capture_display_candidates = iter_plugin_capture_display_candidates

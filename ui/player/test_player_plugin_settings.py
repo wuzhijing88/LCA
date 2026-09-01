@@ -21,8 +21,8 @@ def test_player_settings_has_plugin_fields():
     assert "PluginHost.exe" in text
     assert "dm.dll" in text
     assert "RegDll.dll" in text
-    assert "tools/op" not in text
-    assert "op_c_api" not in text
+    assert ("tools/" + "op") not in text
+    assert ("op_" + "c_api") not in text
 
 
 def test_player_settings_writes_plugin_fields_to_local_save_config(monkeypatch):

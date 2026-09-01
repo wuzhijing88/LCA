@@ -26,15 +26,22 @@ from services.ocr_runtime_contract import (
 )
 
 
-INCLUDE_PACKAGES = (
+# 仓库内业务包：展开为模块列表并跳过 test_*.py，避免 include-package 扫进测试再被拒收告警
+LOCAL_INCLUDE_PACKAGES = (
     "tasks",
     "task_workflow",
+    "app_core",
+)
+
+# 第三方包：整包纳入
+THIRD_PARTY_INCLUDE_PACKAGES = (
     "uiautomation",
     "winrt",
     "dxcam",
     "rapidocr",
-    "app_core",
 )
+
+INCLUDE_PACKAGES = LOCAL_INCLUDE_PACKAGES + THIRD_PARTY_INCLUDE_PACKAGES
 
 INCLUDE_PACKAGE_DATA = (
     "rapidocr",
@@ -48,6 +55,13 @@ INCLUDE_MODULES = (
     "services.screenshot_pool",
     "ui.dialogs.dict_maker_dialog",
     "utils.dxgi_capture",
+    "utils.capture.engine_ids",
+    "utils.plugin.capture",
+    "utils.plugin.runtime",
+    "utils.plugin.session",
+    "utils.plugin.dx_input",
+    "utils.plugin.protocol",
+    "utils.input.normal_hd_driver",
     "services.multiprocess_match_worker",
     "task_workflow.process_worker",
     "win32gui",
@@ -71,6 +85,24 @@ INCLUDE_MODULES = (
     "app_core.app_config",
     "themes.theme_manager",
     "ui.widgets.custom_title_bar",
+    # 独立程序：同一 main.exe 内的播放器入口与导出工具
+    "ui.player.player_app",
+    "ui.player.player_window",
+    "ui.player.player_chrome",
+    "ui.player.player_window_binding_dialog",
+    "ui.selectors.window_picker",
+    "app_core.player.loader",
+    "app_core.player.package",
+    "app_core.player.secure_package",
+    "app_core.player.memory_store",
+    "app_core.player.entry_stamp",
+    "app_core.player.exe_branding",
+    "task_workflow.workflow_payload",
+    "ui.export_parts.export_dialog",
+    "ui.export_parts.player_ui_designer",
+    "ui.export_parts.assembler",
+    "ui.export_parts.collector",
+    "ui.export_parts.standalone_installer",
 )
 
 # 变量编辑器已移除：禁止再跟进 Monaco / WebEngine / QML / Multimedia。
@@ -86,6 +118,9 @@ NOFOLLOW_IMPORTS = (
     # cryptography 会可选 import bcrypt；Nuitka 跟进后若找不到 _bcrypt.pyd 会直接崩溃。
     "cryptography",
     "bcrypt",
+    # 本地包已跳过 test_*.py；仍禁 pytest，防止漏网测试拖进依赖
+    "pytest",
+    "_pytest",
     "qtmonaco",
     "PySide6.QtWebEngine",
     "PySide6.QtWebEngineCore",
@@ -172,8 +207,6 @@ CCACHE_OWNER_PATTERN = re.compile(r"^ccache-(\d+)\.txt$", re.IGNORECASE)
 DELETE_RETRY_COUNT = 5
 DELETE_RETRY_DELAY_SECONDS = 1.0
 PROCESS_EXIT_GRACE_SECONDS = 2.0
-RESULT_EXE_NAME = "main.exe"
-RESULT_EXE_RELATIVE_PATH = Path("main.dist") / RESULT_EXE_NAME
 BUILD_ARTIFACT_WAIT_TIMEOUT_SECONDS = 30.0
 BUILD_ARTIFACT_POLL_INTERVAL_SECONDS = 0.25
 WINDOWS_PROCESS_QUERY = (
@@ -181,7 +214,6 @@ WINDOWS_PROCESS_QUERY = (
     "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | "
     "ConvertTo-Json -Compress"
 )
-
 
 @dataclass(frozen=True)
 class ProcessInfo:
@@ -258,8 +290,7 @@ def _validate_paths(project_root: Path) -> None:
         if not (project_root / source).is_file():
             missing_paths.append(source)
 
-    main_py = project_root / "main.py"
-    if not main_py.is_file():
+    if not (project_root / "main.py").is_file():
         missing_paths.append("main.py")
 
     if missing_paths:
@@ -269,7 +300,39 @@ def _validate_paths(project_root: Path) -> None:
     _validate_ocr_build_inputs(project_root)
 
 
-def _build_command(output_dir: str) -> list[str]:
+def _is_packaging_test_path(path: Path) -> bool:
+    name = path.name.lower()
+    if name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    return any(part.lower() == "tests" for part in path.parts)
+
+
+def _iter_local_package_modules(project_root: Path, package_name: str) -> list[str]:
+    package_root = project_root.joinpath(*package_name.split("."))
+    if not package_root.is_dir():
+        raise FileNotFoundError(f"Missing local package for Nuitka include: {package_name}")
+    modules: list[str] = []
+    seen: set[str] = set()
+    for path in sorted(package_root.rglob("*.py")):
+        if not path.is_file() or _is_packaging_test_path(path):
+            continue
+        relative = path.relative_to(project_root).with_suffix("")
+        parts = list(relative.parts)
+        if parts and parts[-1] == "__init__":
+            parts = parts[:-1]
+        if not parts:
+            continue
+        module_name = ".".join(parts)
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        modules.append(module_name)
+    if package_name not in seen:
+        modules.insert(0, package_name)
+    return modules
+
+
+def _build_command(project_root: Path, output_dir: str) -> list[str]:
     command = [
         sys.executable,
         "-m",
@@ -281,13 +344,24 @@ def _build_command(output_dir: str) -> list[str]:
         "--enable-plugins=pyside6",
     ]
 
-    command.extend(f"--include-package={package_name}" for package_name in INCLUDE_PACKAGES)
+    local_modules: list[str] = []
+    for package_name in LOCAL_INCLUDE_PACKAGES:
+        local_modules.extend(_iter_local_package_modules(project_root, package_name))
+    print(
+        "nuitka_local_packages="
+        f"{','.join(LOCAL_INCLUDE_PACKAGES)} modules={len(local_modules)} (tests excluded)"
+    )
+
+    command.extend(f"--include-package={package_name}" for package_name in THIRD_PARTY_INCLUDE_PACKAGES)
     command.extend(f"--include-package-data={package_name}" for package_name in INCLUDE_PACKAGE_DATA)
+    command.extend(f"--include-module={module_name}" for module_name in local_modules)
     command.extend(f"--include-module={module_name}" for module_name in INCLUDE_MODULES)
     command.extend(f"--nofollow-import-to={module_name}" for module_name in NOFOLLOW_IMPORTS)
     command.extend(f"--noinclude-qt-plugins={plugin_name}" for plugin_name in NOINCLUDE_QT_PLUGINS)
     command.append("--noinclude-qt-translations")
     command.extend(f"--include-data-dir={source}={target}" for source, target in DATA_DIR_SPECS)
+    if Path("tools/plugin").is_dir():
+        command.append("--include-data-dir=tools/plugin=tools/plugin")
     command.extend(f"--include-data-files={source}={target}" for source, target in DATA_FILE_SPECS)
     command.extend(f"--noinclude-dlls={pattern}" for pattern in NOINCLUDE_DLLS)
     command.extend(f"--noinclude-data-files={pattern}" for pattern in NOINCLUDE_DATA_FILES)
@@ -304,7 +378,7 @@ def _resolve_output_dir(project_root: Path, output_dir: str) -> Path:
 
 
 def _resolve_result_exe(output_dir: Path) -> Path:
-    return (output_dir / RESULT_EXE_RELATIVE_PATH).resolve()
+    return (output_dir / "main.dist" / "main.exe").resolve()
 
 
 def _wait_for_build_artifact(
@@ -633,9 +707,10 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    print("nuitka_entry=main script=main.py")
     try:
         result = subprocess.run(
-            _build_command(str(output_dir)),
+            _build_command(project_root, str(output_dir)),
             cwd=project_root,
             check=False,
         )

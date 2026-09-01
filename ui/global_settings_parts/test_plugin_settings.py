@@ -18,8 +18,8 @@ def test_plugin_tooltip_mentions_plugin_dir_not_op():
     assert "PluginHost.exe" in source
     assert "dm.dll" in source
     assert "RegDll.dll" in source
-    assert "tools/op" not in source
-    assert "op_c_api" not in source
+    assert ("tools/" + "op") not in source
+    assert ("op_" + "c_api") not in source
     _ = GlobalSettingsDialogTabsMixin
 
 

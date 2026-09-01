@@ -143,13 +143,9 @@ class WorkflowTaskManager(QObject):
     @staticmethod
     def _format_screenshot_engine_label(engine: str) -> str:
         normalized_engine = str(engine or "").strip().lower()
-        engine_map = {
-            "wgc": "WGC",
-            "printwindow": "PrintWindow",
-            "gdi": "GDI",
-            "dxgi": "DXGI",
-        }
-        return engine_map.get(normalized_engine, normalized_engine or "未知引擎")
+        from utils.capture.engine_ids import screenshot_engine_label
+
+        return screenshot_engine_label(normalized_engine)
 
     def _set_last_execute_error(self, message: str) -> None:
         self._last_execute_error_message = str(message or "").strip()
@@ -173,12 +169,31 @@ class WorkflowTaskManager(QObject):
             task_names = f"{task_names} 等{len(yolo_tasks)}个任务"
 
         screenshot_engine = str(self.config.get("screenshot_engine", "") or "").strip().lower()
-        allowed_engines = {"dxgi", "gdi", "wgc", "printwindow"}
-        if screenshot_engine and screenshot_engine not in allowed_engines:
+        from utils.capture.engine_ids import (
+            is_native_screenshot_engine,
+            is_supported_screenshot_engine,
+        )
+        from task_workflow.yolo_backend import (
+            YOLO_BACKEND_NATIVE,
+            collect_yolo_backends,
+        )
+
+        if screenshot_engine and not is_supported_screenshot_engine(screenshot_engine):
             return False, (
                 f"任务“{task_names}”包含YOLO，当前截图引擎为"
                 f"{self._format_screenshot_engine_label(screenshot_engine)}。"
-                "YOLO可用 DXGI、GDI、WGC、PrintWindow，请到全局设置切换后重试。"
+                "YOLO可用当前支持的截图引擎，请到全局设置切换后重试。"
+            )
+
+        backends = []
+        for task in yolo_tasks:
+            backends.extend(collect_yolo_backends((getattr(task, "workflow_data", None) or {}).get("cards")))
+        unique = set(backends)
+        if YOLO_BACKEND_NATIVE in unique and screenshot_engine and not is_native_screenshot_engine(screenshot_engine):
+            return False, (
+                f"任务“{task_names}”使用原生YOLO，当前截图引擎为"
+                f"{self._format_screenshot_engine_label(screenshot_engine)}。"
+                "请到全局设置改成 DXGI / GDI / WGC / PrintWindow。"
             )
 
         return True, ""
@@ -306,14 +321,17 @@ class WorkflowTaskManager(QObject):
 
     def find_task_by_filepath(self, filepath: str) -> Optional[WorkflowTask]:
         """按文件路径或来源引用查找任务。"""
-        import os
-        normalized_filepath = os.path.normpath(filepath)
+        from task_workflow.workspace import favorite_path_key, workflow_path_keys
+
+        candidates = set(workflow_path_keys(filepath))
+        if not candidates:
+            return None
         for task in self.tasks.values():
             task_filepath = str(getattr(task, 'filepath', '') or '')
-            if task_filepath and os.path.normpath(task_filepath) == normalized_filepath:
+            if task_filepath and favorite_path_key(task_filepath) in candidates:
                 return task
             source_ref = str(getattr(task, 'source_ref', '') or '')
-            if source_ref and source_ref == filepath:
+            if source_ref and favorite_path_key(source_ref) in candidates:
                 return task
         return None
 
@@ -510,7 +528,7 @@ class WorkflowTaskManager(QObject):
             logger.error(f"保存失败: 任务ID {task_id} 不存在")
             return False
 
-        return task.save()
+        return task.save_and_backup()
 
     def save_all_modified(self) -> int:
         """
@@ -523,7 +541,7 @@ class WorkflowTaskManager(QObject):
 
         for task in self.get_all_tasks():
             if task.modified:
-                if task.save():
+                if task.save_and_backup():
                     saved_count += 1
 
         logger.info(f"已保存 {saved_count} 个已修改的任务")

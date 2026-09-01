@@ -9,7 +9,6 @@ import ast
 import math
 import json
 import logging
-import random
 import time
 import threading
 from pathlib import Path
@@ -17,108 +16,15 @@ from typing import Dict, Any, Optional, Tuple, List
 
 import cv2
 import numpy as np
-from tasks.click_param_resolver import resolve_click_params
 from utils.window.hwnd_utils import as_hwnd
-from utils.input.input_guard import (
-    acquire_input_guard,
-    get_input_lock_wait_warn_ms,
-    resolve_input_lock_resource,
-)
-from utils.input.input_timing import (
-    DEFAULT_CLICK_HOLD_SECONDS,
-    DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
-)
-from tasks.task_utils import (
-    precise_sleep,
-    coerce_int,
-    get_standard_click_offset_params,
-)
+from tasks.task_utils import precise_sleep
 
 logger = logging.getLogger(__name__)
 
 _missing_classes_file_warned = set()
 
 
-def _normalize_position_mode(value: Any) -> str:
-    mode = str(value or "").strip()
-    if mode in ("精准坐标", "精准点击", "精确坐标", "精确点击", "无偏移", "原始坐标"):
-        return "精准坐标"
-    if mode in ("固定偏移", "固定坐标偏移"):
-        return "固定偏移"
-    if mode in ("随机偏移", "随机坐标偏移"):
-        return "随机偏移"
-    return "精准坐标"
-
-
-def _apply_click_offsets(
-    base_x: int,
-    base_y: int,
-    position_mode: str,
-    fixed_offset_x: int = 0,
-    fixed_offset_y: int = 0,
-    random_offset_x: int = 0,
-    random_offset_y: int = 0,
-) -> Tuple[int, int, int, int]:
-    """统一处理 YOLO 点击偏移，固定偏移模式下可叠加随机偏移。"""
-    click_x = int(base_x)
-    click_y = int(base_y)
-    applied_offset_x = 0
-    applied_offset_y = 0
-
-    if position_mode == "固定偏移":
-        click_x += int(fixed_offset_x)
-        click_y += int(fixed_offset_y)
-        applied_offset_x += int(fixed_offset_x)
-        applied_offset_y += int(fixed_offset_y)
-        if random_offset_x > 0 or random_offset_y > 0:
-            extra_offset_x = random.randint(-int(random_offset_x), int(random_offset_x)) if random_offset_x > 0 else 0
-            extra_offset_y = random.randint(-int(random_offset_y), int(random_offset_y)) if random_offset_y > 0 else 0
-            click_x += extra_offset_x
-            click_y += extra_offset_y
-            applied_offset_x += extra_offset_x
-            applied_offset_y += extra_offset_y
-    elif position_mode == "随机偏移":
-        applied_offset_x = random.randint(-int(random_offset_x), int(random_offset_x)) if random_offset_x > 0 else 0
-        applied_offset_y = random.randint(-int(random_offset_y), int(random_offset_y)) if random_offset_y > 0 else 0
-        click_x += applied_offset_x
-        click_y += applied_offset_y
-
-    return click_x, click_y, applied_offset_x, applied_offset_y
-
-
-def _normalize_yolo_action_for_lock(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    mapping = {
-        "点击": "click",
-        "click": "click",
-        "按键": "keypress",
-        "keypress": "keypress",
-        "key": "keypress",
-        "无": "none",
-        "none": "none",
-    }
-    return mapping.get(text, text)
-
-
-def _normalize_yolo_approach_for_lock(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    mapping = {
-        "鼠标移动": "mouse",
-        "mouse": "mouse",
-        "否": "none",
-        "none": "none",
-    }
-    return mapping.get(text, text)
-
-
-def _yolo_action_requires_input_lock(action_type: Any, approach_mode: Any) -> bool:
-    action = _normalize_yolo_action_for_lock(action_type)
-    approach = _normalize_yolo_approach_for_lock(approach_mode)
-    return action in {"click", "keypress"} or approach == "mouse"
-
-
 def requires_input_lock(_params: Dict[str, Any]) -> bool:
-    # YOLO 在内部仅对“执行动作”阶段加输入锁，避免整卡长时间占锁。
     return False
 
 
@@ -293,6 +199,7 @@ def get_model_classes(model_path: str = "") -> List[str]:
         traceback.print_exc()
         return ["全部类别"]
 
+
 def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mode: str,
                  target_hwnd: Optional[int], window_region: Optional[Tuple[int, int, int, int]],
                  card_id: Optional[int] = None, **kwargs) -> Tuple[bool, str, Optional[int]]:
@@ -365,7 +272,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
             "YOLO限制：只支持前台或后台模式。\n"
             "当前执行模式: {mode}\n"
             "当前截图引擎: {engine}\n\n"
-            "请在全局设置切换为前台或后台，截图可用 DXGI / GDI / WGC / PrintWindow。"
+            "请在全局设置切换为前台或后台。"
         ).format(mode=execution_mode, engine=current_engine)
         return _stop_with_warning(warning_message)
 
@@ -421,16 +328,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
 
     selection_map = {'最近': 'nearest', '最大': 'largest', '置信度最高': 'highest_conf'}
     target_selection = selection_map.get(params.get('target_selection', '最近'), 'nearest')
-
-    action_type = _normalize_yolo_action_for_lock(params.get('action_type', '点击'))
-    if action_type not in {"click", "keypress", "none"}:
-        logger.warning("YOLO动作类型无法识别，按无动作处理: %s", params.get('action_type'))
-        action_type = "none"
-
-    approach_mode = _normalize_yolo_approach_for_lock(params.get('approach_mode', '否'))
-    if approach_mode not in {"mouse", "none"}:
-        approach_mode = "none"
-    action_requires_input_lock = _yolo_action_requires_input_lock(action_type, approach_mode)
 
     # 窗口绘制参数
     draw_on_window = params.get('draw_on_window', False)
@@ -561,60 +458,8 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 executor=executor,
             )
 
-        if action_requires_input_lock:
-            lock_resource = resolve_input_lock_resource(
-                execution_mode=execution_mode,
-                target_hwnd=target_hwnd,
-                task_type=TASK_TYPE,
-            )
-            lock_owner = (
-                f"yolo:card={card_id}, thread={threading.get_ident()}, resource={lock_resource}"
-            )
-            wait_slice = 0.2
-            total_wait_ms = 0.0
-            wait_warn_ms = get_input_lock_wait_warn_ms()
-            while True:
-                if _is_stop_requested():
-                    return _handle_result(False, on_failure, failure_jump_id, card_id)
-                with acquire_input_guard(
-                    owner=lock_owner,
-                    timeout=wait_slice,
-                    resource=lock_resource,
-                ) as (acquired, wait_ms):
-                    total_wait_ms += max(0.0, float(wait_ms))
-                    if not acquired:
-                        continue
-                    if total_wait_ms >= wait_warn_ms:
-                        logger.warning(
-                            "[输入调度] YOLO等待输入锁 %.1fms (告警阈值 %.1fms): %s",
-                            total_wait_ms,
-                            wait_warn_ms,
-                            lock_owner,
-                        )
-                    elif total_wait_ms > 20.0:
-                        logger.debug(
-                            "[输入调度] YOLO等待输入锁 %.1fms: %s",
-                            total_wait_ms,
-                            lock_owner,
-                        )
-                    success = _execute_action(
-                        selected, target_hwnd, execution_mode, action_type, approach_mode, params,
-                        screenshot_shape,
-                        stop_checker=kwargs.get('stop_checker'),
-                    )
-                    break
-        else:
-            success = _execute_action(
-                selected, target_hwnd, execution_mode, action_type, approach_mode, params,
-                screenshot_shape,
-                stop_checker=kwargs.get('stop_checker'),
-            )
-
-        if success:
-            from .task_utils import handle_success_action
-            return handle_success_action(params, card_id, kwargs.get('stop_checker'))
-
-        return _handle_result(False, on_failure, failure_jump_id, card_id)
+        from .task_utils import handle_success_action
+        return handle_success_action(params, card_id, kwargs.get('stop_checker'))
 
     except Exception as e:
         error_text = str(e or "").strip().lower()
@@ -671,294 +516,6 @@ def _select_target(detections: List, strategy: str, shape: Optional[Tuple]) -> O
         return max(detections, key=lambda d: d.confidence)
 
     return detections[0]
-
-
-def _execute_action(detection, hwnd: int, exec_mode: str, action: str,
-                    approach: str, params: Dict, shape: Optional[Tuple],
-                    stop_checker=None) -> bool:
-    """执行动作"""
-    logger.debug(f"YOLO执行动作: action={action}, approach={approach}, exec_mode={exec_mode}")
-    if action == 'none' and approach == 'none':
-        logger.debug("动作和靠近方式都为none，直接返回成功")
-        return True
-
-    # 默认使用检测目标中心作为点击目标
-    target_x, target_y = detection.center_x, detection.center_y
-    logger.debug(f"使用检测目标中心点击: 坐标=({target_x},{target_y})")
-    actual_mode = _get_execution_mode(exec_mode)
-    click_button = 'left'
-    click_action = '完整点击'
-    enable_auto_release = True
-    click_interval = DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
-    hold_duration = DEFAULT_CLICK_HOLD_SECONDS
-    position_mode = '精准坐标'
-    fixed_offset_x = 0
-    fixed_offset_y = 0
-    random_offset_x = 0
-    random_offset_y = 0
-    if action == 'click':
-        click_button, _, click_interval, click_action, enable_auto_release, hold_duration = resolve_click_params(
-            params,
-            button_key="click_button",
-            clicks_key="__yolo_clicks__",
-            interval_key="__yolo_interval__",
-            action_key="click_action",
-            auto_release_key="click_enable_auto_release",
-            hold_duration_key="click_hold_duration",
-            default_clicks=1,
-            default_interval=DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
-            default_auto_release=True,
-            mode_label="YOLO点击",
-            logger_obj=logger,
-            log_hold_mode=False,
-        )
-        position_mode = _normalize_position_mode(params.get('position_mode', '精准坐标'))
-        fixed_offset_x = coerce_int(params.get('fixed_offset_x', 0), 0)
-        fixed_offset_y = coerce_int(params.get('fixed_offset_y', 0), 0)
-        random_offset_x = max(0, coerce_int(params.get('random_offset_x', 0), 0))
-        random_offset_y = max(0, coerce_int(params.get('random_offset_y', 0), 0))
-
-        target_x, target_y, applied_offset_x, applied_offset_y = _apply_click_offsets(
-            target_x,
-            target_y,
-            position_mode,
-            fixed_offset_x,
-            fixed_offset_y,
-            random_offset_x,
-            random_offset_y,
-        )
-        logger.debug(
-            "YOLO点击偏移: 模式=%s, 固定偏移=(%s,%s), 随机范围=(%s,%s), 实际偏移=(%s,%s), 最终坐标=(%s,%s)",
-            position_mode,
-            fixed_offset_x,
-            fixed_offset_y,
-            random_offset_x,
-            random_offset_y,
-            applied_offset_x,
-            applied_offset_y,
-            target_x,
-            target_y,
-        )
-
-    # 截图坐标直接使用，不需要缩放
-    # 截图已是客户区的实际像素大小，检测坐标也基于此截图
-    logger.debug(f"使用检测坐标: ({target_x}, {target_y})")
-
-    logger.debug(f"YOLO动作: 目标坐标=({target_x},{target_y}), 模式={actual_mode}")
-
-    # 验证坐标是否在窗口范围内
-    try:
-        import win32gui
-        rect = win32gui.GetClientRect(hwnd)
-        client_w, client_h = rect[2] - rect[0], rect[3] - rect[1]
-        if target_x < 0 or target_y < 0 or target_x > client_w or target_y > client_h:
-            logger.warning(f"坐标超出窗口范围: ({target_x},{target_y}), 窗口大小: {client_w}x{client_h}")
-    except Exception:
-        pass
-
-    # 前台模式需要激活目标窗口
-    if actual_mode.startswith('foreground'):
-        try:
-            import win32gui
-            if win32gui.IsWindow(hwnd):
-                win32gui.SetForegroundWindow(hwnd)
-                precise_sleep(0.1)
-        except Exception:
-            pass
-
-    if approach == 'mouse':
-        logger.debug(f"YOLO鼠标移动: 目标坐标=({target_x},{target_y}), 模式={actual_mode}")
-        if not _mouse_move(hwnd, target_x, target_y, actual_mode, shape):
-            logger.error("YOLO鼠标移动失败")
-            return False
-        if action == 'click':
-            precise_sleep(0.01)
-
-    if action == 'click':
-        return _click(
-            hwnd,
-            target_x,
-            target_y,
-            click_button,
-            actual_mode,
-            click_action,
-            click_interval,
-            hold_duration,
-            enable_auto_release,
-        )
-
-    if action == 'keypress':
-        key = params.get('keypress_key', 'f')
-        return _keypress(hwnd, key, actual_mode, stop_checker=stop_checker)
-
-    return True
-
-
-def _get_execution_mode(mode: str) -> str:
-    """获取实际执行模式（YOLO严格跟随传入模式，不做插件强制改写）。"""
-    return mode
-
-
-def _click(
-    hwnd: int,
-    x: int,
-    y: int,
-    button: str,
-    mode: str,
-    click_action: str = '完整点击',
-    interval: float = DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
-    hold_duration: float = DEFAULT_CLICK_HOLD_SECONDS,
-    enable_auto_release: bool = True,
-) -> bool:
-    """执行点击"""
-    try:
-        import win32gui
-        rect = win32gui.GetClientRect(hwnd)
-        client_w, client_h = rect[2] - rect[0], rect[3] - rect[1]
-        logger.info(f"YOLO点击: 目标坐标=({x},{y}), 窗口客户区大小=({client_w},{client_h}), 模式={mode}, 动作={click_action}")
-
-        click_x, click_y = x, y
-        if mode.startswith('foreground'):
-            client_left, client_top = win32gui.ClientToScreen(hwnd, (rect[0], rect[1]))
-            click_x = client_left + x
-            click_y = client_top + y
-            logger.info(f"前台点击: 客户区({x},{y}) -> 屏幕({click_x},{click_y})")
-
-        from tasks.click_coordinate import _click_with_new_simulator
-
-        normalized_action = click_action if click_action in {'完整点击', '双击', '仅按下', '仅松开'} else '完整点击'
-        actual_clicks = 2 if normalized_action == '双击' else 1
-        actual_interval = 0.0
-        if normalized_action == '双击':
-            try:
-                parsed_interval = float(interval)
-            except Exception:
-                parsed_interval = 0.0
-            actual_interval = (
-                parsed_interval
-                if parsed_interval > 0
-                else DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
-            )
-        actual_action = '完整点击' if normalized_action == '双击' else normalized_action
-        result = _click_with_new_simulator(
-            hwnd,
-            click_x,
-            click_y,
-            button,
-            actual_clicks,
-            actual_interval,
-            mode,
-            actual_action,
-            hold_duration,
-        )
-
-        return result if result is not None else False
-    except Exception as e:
-        logger.error(f"点击失败: {e}")
-        return False
-
-
-def _keypress(hwnd: int, key: str, mode: str, stop_checker=None) -> bool:
-    """执行按键"""
-    try:
-        from tasks.keyboard_input import execute_task as kb_exec, build_single_key_params
-        params = build_single_key_params(
-            key=key,
-            press_count=1,
-            single_key_interval=0.05,
-            single_key_action='完整按键',
-            on_success='执行下一步',
-            on_failure='执行下一步',
-        )
-        logger.info(f"YOLO按键: key={key}, 模式={mode}")
-        success, _, _ = kb_exec(params, {}, mode, hwnd, None, None, stop_checker=stop_checker)
-        return success
-    except Exception as e:
-        logger.error(f"按键失败: {e}")
-        return False
-
-
-
-def _mouse_move(hwnd: int, tx: int, ty: int, mode: str, shape: Optional[Tuple]) -> bool:
-    """移动鼠标到目标位置（靠近方式使用，相对移动）"""
-    logger.debug(f"YOLO _mouse_move调用: hwnd={hwnd}, 目标=({tx},{ty}), mode={mode}")
-    try:
-        # 标准化执行模式
-        normalized_mode = mode
-        if mode.startswith('foreground'):
-            normalized_mode = 'foreground'
-        elif mode.startswith('background'):
-            normalized_mode = 'background'
-
-        if normalized_mode == 'background':
-            from utils.input_simulation import global_input_simulator_manager
-
-            sim = global_input_simulator_manager.get_simulator(hwnd, "auto", mode)
-            if not sim or not hasattr(sim, "move_mouse"):
-                logger.warning("后台模式无法创建输入模拟器，鼠标移动失败")
-                return False
-            return bool(sim.move_mouse(int(tx), int(ty)))
-
-        # 前台模式 - 使用相对移动（FPS场景）
-        import win32gui
-        import win32api
-
-        delta_x = 0
-        delta_y = 0
-
-        # 优先使用检测帧中心作为准星参考，避免系统鼠标坐标抖动干扰。
-        if shape and len(shape) >= 2:
-            try:
-                frame_h = int(shape[0])
-                frame_w = int(shape[1])
-                if frame_w > 0 and frame_h > 0:
-                    center_x = frame_w // 2
-                    center_y = frame_h // 2
-                    delta_x = int(tx) - center_x
-                    delta_y = int(ty) - center_y
-            except Exception:
-                delta_x = 0
-                delta_y = 0
-
-        if delta_x == 0 and delta_y == 0:
-            # 回退到系统鼠标位置差值
-            rect = win32gui.GetClientRect(hwnd)
-            client_left, client_top = win32gui.ClientToScreen(hwnd, (rect[0], rect[1]))
-            target_screen_x = client_left + tx
-            target_screen_y = client_top + ty
-            current_x, current_y = win32api.GetCursorPos()
-            delta_x = target_screen_x - current_x
-            delta_y = target_screen_y - current_y
-
-        if abs(delta_x) <= 1 and abs(delta_y) <= 1:
-            return True
-
-        # 限制单帧最大移动，防止目标抖动导致鼠标瞬时大跳。
-        max_step = 120
-        if delta_x > max_step:
-            delta_x = max_step
-        elif delta_x < -max_step:
-            delta_x = -max_step
-        if delta_y > max_step:
-            delta_y = max_step
-        elif delta_y < -max_step:
-            delta_y = -max_step
-
-        try:
-            from utils.input.foreground_input_manager import get_foreground_input_manager
-            fg_input = get_foreground_input_manager()
-            fg_input.set_execution_mode(mode)
-            if fg_input.move_mouse(delta_x, delta_y, absolute=False):
-                return True
-            logger.warning("前台移动失败")
-            return False
-        except Exception as e:
-            logger.warning(f"前台移动失败: {e}")
-            return False
-
-    except Exception as e:
-        logger.error(f"鼠标移动失败: {e}")
-        return False
 
 
 def _save_yolo_result_to_context(card_id: int, selected, all_detections: List,
@@ -1052,19 +609,17 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
 
     params = {
         "---model---": {"type": "separator", "label": "模型设置"},
+        "yolo_backend": {
+            "label": "YOLO后端",
+            "type": "select",
+            "options": ["原生"],
+            "default": "原生",
+            "tooltip": "本地 ONNX 推理",
+        },
         "model_path": {
             "label": "模型路径", "type": "file",
             "file_types": ["ONNX模型 (*.onnx)", "所有文件 (*.*)"],
-            "default": "", "tooltip": "仅支持ONNX格式模型"
-        },
-        "refresh_classes": {
-            "label": "刷新类别", "type": "button",
-            "button_text": "加载模型类别",
-            "widget_hint": "refresh_dynamic_options",
-            "target_param": "target_classes",
-            "target_params": ["target_classes"],
-            "source_param": "model_path",
-            "options_func": "get_model_classes"
+            "default": "", "tooltip": "仅支持ONNX格式模型",
         },
         "confidence_threshold": {
             "label": "置信度阈值", "type": "float",
@@ -1121,63 +676,10 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "type": "int", "default": 0, "hidden": True
         },
 
-        "---target---": {"type": "separator", "label": "目标设置"},
-        "target_classes": {
-            "label": "目标类别", "type": "select",
-            "options": ["全部类别"], "default": "全部类别"
-        },
-        "target_selection": {
-            "label": "选择策略", "type": "select",
-            "options": ["最近", "最大", "置信度最高"], "default": "最近",
-            "tooltip": "ONNX版本不支持目标追踪"
-        },
-
         "---display---": {"type": "separator", "label": "显示设置"},
         "draw_on_window": {
             "label": "窗口内绘制", "type": "bool", "default": False,
             "tooltip": "直接在目标窗口上绘制检测框"
-        },
-
-        "---action---": {"type": "separator", "label": "动作设置"},
-        "approach_mode": {
-            "label": "靠近方式", "type": "select",
-            "options": ["否", "鼠标移动"], "default": "否"
-        },
-        "action_type": {
-            "label": "执行动作", "type": "select",
-            "options": ["点击", "按键", "无"], "default": "点击"
-        },
-        "click_button": {
-            "label": "鼠标按钮", "type": "select",
-            "options": ["左键", "右键", "中键"], "default": "左键",
-            "condition": {"param": "action_type", "value": "点击"}
-        },
-        "click_action": {
-            "label": "点击动作", "type": "select",
-            "options": ["完整点击", "双击", "仅按下", "仅松开"], "default": "完整点击",
-            "tooltip": "完整点击=按下+松开，双击=连续两次完整点击，仅按下=只按下不松开，仅松开=只松开不按下",
-            "condition": {"param": "action_type", "value": "点击"}
-        },
-        "click_enable_auto_release": {
-            "label": "启用自动弹起", "type": "bool", "default": True,
-            "tooltip": "启用后，按下鼠标一定时间后自动释放",
-            "condition": [
-                {"param": "action_type", "value": "点击"},
-                {"param": "click_action", "value": "仅按下"}
-            ]
-        },
-        "click_hold_duration": {
-            "label": "按下持续时间(秒)", "type": "float", "default": DEFAULT_CLICK_HOLD_SECONDS,
-            "min": 0.01, "max": 10.0, "step": 0.01, "decimals": 2,
-            "tooltip": "仅在'仅按下'动作且启用自动弹起时，按下后保持的时间",
-            "condition": [
-                {"param": "action_type", "value": "点击"},
-                {"param": "click_action", "value": "仅按下"}
-            ]
-        },
-        "keypress_key": {
-            "label": "按键", "type": "text", "default": "f",
-            "condition": {"param": "action_type", "value": "按键"}
         },
 
         "---result---": {"type": "separator", "label": "结果处理"},
@@ -1203,27 +705,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
         }
     }
 
-    click_offset_params = get_standard_click_offset_params()
-    for key in (
-        "---click_offset---",
-        "offset_selector_tool",
-        "position_mode",
-        "fixed_offset_x",
-        "fixed_offset_y",
-        "random_offset_x",
-        "random_offset_y",
-    ):
-        if key not in click_offset_params:
-            continue
-        if key == "---click_offset---":
-            click_offset_params[key]["condition"] = {"param": "action_type", "value": "点击"}
-            continue
-        click_offset_params[key]["condition"] = {"param": "action_type", "value": "点击"}
-
-    if "position_mode" in click_offset_params and isinstance(click_offset_params["position_mode"], dict):
-        click_offset_params["position_mode"]["default"] = "精准坐标"
-
-    return merge_params_definitions(params, click_offset_params, get_standard_next_step_delay_params())
+    return merge_params_definitions(params, get_standard_next_step_delay_params())
 
 
 # 窗口绘制overlay相关
