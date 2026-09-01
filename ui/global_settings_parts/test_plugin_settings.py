@@ -43,7 +43,7 @@ def test_get_settings_includes_plugin_fields():
     dialog.close()
 
 
-def test_plugin_auth_lives_on_plugin_tab_not_exec_tab():
+def test_plugin_auth_lives_on_plugin_mode_tab_not_native_tab():
     _qapp()
     dialog = GlobalSettingsDialog(
         {
@@ -53,12 +53,15 @@ def test_plugin_auth_lives_on_plugin_tab_not_exec_tab():
         }
     )
     tab_titles = [dialog.tab_widget.tabText(i) for i in range(dialog.tab_widget.count())]
-    assert "插件" in tab_titles
-    plugin_index = tab_titles.index("插件")
-    exec_index = tab_titles.index("执行模式")
+    assert "插件模式" in tab_titles
+    assert "原生模式" in tab_titles
+    assert "执行模式" not in tab_titles
+    plugin_index = tab_titles.index("插件模式")
+    native_index = tab_titles.index("原生模式")
     plugin_tab = dialog.tab_widget.widget(plugin_index)
-    exec_tab = dialog.tab_widget.widget(exec_index)
+    native_tab = dialog.tab_widget.widget(native_index)
     assert plugin_tab.isAncestorOf(dialog.plugin_reg_code_edit)
-    assert not exec_tab.isAncestorOf(dialog.plugin_reg_code_edit)
+    assert not native_tab.isAncestorOf(dialog.plugin_reg_code_edit)
+    assert plugin_tab.isAncestorOf(dialog.plugin_mouse_combo)
+    assert not native_tab.isAncestorOf(dialog.plugin_mouse_combo)
     dialog.close()
-

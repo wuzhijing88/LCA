@@ -1,7 +1,6 @@
 from PySide6.QtCore import QTimer
 
 
-
 class GlobalSettingsDialogVisibilityMixin:
     def _adjust_dialog_height_only(self):
         """切换执行模式时只改高度，不要按各页 sizeHint 把对话框拉宽。"""
@@ -18,32 +17,26 @@ class GlobalSettingsDialogVisibilityMixin:
         self._update_input_backend_visibility(resize_dialog=True)
 
     def _selected_input_backend(self) -> str:
-        if not hasattr(self, "input_backend_combo"):
-            return "native"
-        backend = self.input_backend_combo.currentData()
-        if backend:
-            return str(backend).strip().lower()
-        text = str(self.input_backend_combo.currentText() or "").strip()
-        if text == "插件":
-            return "plugin"
+        if hasattr(self, "plugin_input_enable_check"):
+            return "plugin" if self.plugin_input_enable_check.isChecked() else "native"
         return "native"
 
     def _update_foreground_driver_visibility(self, *args, resize_dialog: bool = False):
         self._update_input_backend_visibility(resize_dialog=resize_dialog)
 
     def _update_input_backend_visibility(self, *args, resize_dialog: bool = False):
-        use_plugin_input = self._selected_input_backend() == "plugin"
+        """原生模式页：按前台/后台显示驱动控件。插件键鼠开关在插件模式页处理。"""
         if hasattr(self, "native_input_panel"):
-            self.native_input_panel.setVisible(not use_plugin_input)
-        if hasattr(self, "plugin_input_panel"):
-            self.plugin_input_panel.setVisible(use_plugin_input)
+            self.native_input_panel.setVisible(True)
+        if hasattr(self, "_update_plugin_mode_panels"):
+            self._update_plugin_mode_panels()
 
         internal_mode = self.mode_combo.currentData()
         if not internal_mode:
             internal_mode = self.MODE_INTERNAL_MAP.get(self.mode_combo.currentText(), "")
 
-        use_foreground_driver = (not use_plugin_input) and internal_mode == "foreground_driver"
-        use_foreground_py = (not use_plugin_input) and internal_mode == "foreground_py"
+        use_foreground_driver = internal_mode == "foreground_driver"
+        use_foreground_py = internal_mode == "foreground_py"
         if hasattr(self, "foreground_driver_widget"):
             self.foreground_driver_widget.setVisible(use_foreground_driver)
         if hasattr(self, "foreground_keyboard_driver_widget"):

@@ -132,20 +132,28 @@ class GlobalSettingsDialogSaveMixin:
         window_binding_mode = 'multiple' if window_count > 1 else 'single'
         active_bound_windows = bound_windows
         active_window_binding_mode = window_binding_mode
-        # 获取截图引擎设置（优先 itemData，兼容旧文本映射）
-        screenshot_engine = self.screenshot_engine_combo.currentData()
-        if not screenshot_engine:
-            screenshot_engine_display = self.screenshot_engine_combo.currentText()
-            screenshot_engine = self.screenshot_engine_map.get(screenshot_engine_display)
-        if not screenshot_engine:
-            raise ValueError(
-                f"未知的截图引擎选项: {self.screenshot_engine_combo.currentText()!r}"
-            )
+        use_plugin_screenshot = bool(
+            getattr(self, "plugin_screenshot_enable_check", None)
+            and self.plugin_screenshot_enable_check.isChecked()
+        )
+        if use_plugin_screenshot and hasattr(self, "plugin_screenshot_engine_combo"):
+            screenshot_engine = self.plugin_screenshot_engine_combo.currentData()
+            if not screenshot_engine:
+                raise ValueError(
+                    f"未知的插件截图引擎选项: {self.plugin_screenshot_engine_combo.currentText()!r}"
+                )
+        else:
+            screenshot_engine = self.screenshot_engine_combo.currentData()
+            if not screenshot_engine:
+                screenshot_engine_display = self.screenshot_engine_combo.currentText()
+                screenshot_engine = self.screenshot_engine_map.get(screenshot_engine_display)
+            if not screenshot_engine:
+                raise ValueError(
+                    f"未知的截图引擎选项: {self.screenshot_engine_combo.currentText()!r}"
+                )
         input_backend = "native"
-        if hasattr(self, "input_backend_combo"):
-            input_backend = str(self.input_backend_combo.currentData() or "native").strip().lower()
-            if input_backend not in ("native", "plugin"):
-                input_backend = "native"
+        if hasattr(self, "plugin_input_enable_check") and self.plugin_input_enable_check.isChecked():
+            input_backend = "plugin"
         plugin_mouse = normalize_plugin_mouse(
             (self.plugin_mouse_combo.currentData() if hasattr(self, "plugin_mouse_combo") else None)
             or self.current_config.get("plugin_mouse", "normal")

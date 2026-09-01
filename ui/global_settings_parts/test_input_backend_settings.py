@@ -12,11 +12,14 @@ def _qapp():
     return QApplication.instance() or QApplication([])
 
 
-def test_exec_mode_combo_no_longer_requires_background_dx_label():
+def test_native_and_plugin_mode_tabs_split_controls():
     source = Path("ui/global_settings_parts/global_settings_dialog_tabs_mixin.py").read_text(
         encoding="utf-8"
     )
-    assert "input_backend" in source or "键鼠类型" in source
+    assert 'addTab(self.exec_tab, "原生模式")' in source
+    assert 'addTab(plugin_tab, "插件模式")' in source
+    assert "plugin_input_enable_check" in source
+    assert "plugin_screenshot_enable_check" in source
 
 
 def test_get_settings_includes_input_backend_and_plugin_bind_fields():
@@ -33,9 +36,7 @@ def test_get_settings_includes_input_backend_and_plugin_bind_fields():
             "bound_windows": [],
         }
     )
-    backend_index = dialog.input_backend_combo.findData("plugin")
-    assert backend_index >= 0
-    dialog.input_backend_combo.setCurrentIndex(backend_index)
+    dialog.plugin_input_enable_check.setChecked(True)
     mouse_index = dialog.plugin_mouse_combo.findData("dx2")
     assert mouse_index >= 0
     dialog.plugin_mouse_combo.setCurrentIndex(mouse_index)
@@ -57,6 +58,7 @@ def test_get_settings_includes_input_backend_and_plugin_bind_fields():
     assert settings["plugin_input_display"] == "plugin.gdi"
     assert settings["plugin_input_display_follow"] is False
     assert settings["plugin_bind_mode"] == 101
+    assert settings["screenshot_engine"] == "wgc"
     dialog.close()
 
 
@@ -69,19 +71,23 @@ def test_plugin_screenshot_list_includes_plugin_gdi():
             "bound_windows": [],
         }
     )
-    group_index = dialog.screenshot_engine_group_combo.findData("插件")
-    assert group_index >= 0
-    dialog.screenshot_engine_group_combo.setCurrentIndex(group_index)
+    assert dialog.plugin_screenshot_enable_check.isChecked()
     engines = [
-        dialog.screenshot_engine_combo.itemData(i)
-        for i in range(dialog.screenshot_engine_combo.count())
+        dialog.plugin_screenshot_engine_combo.itemData(i)
+        for i in range(dialog.plugin_screenshot_engine_combo.count())
     ]
     assert "plugin.gdi" in engines
     labels = [
-        dialog.screenshot_engine_combo.itemText(i)
-        for i in range(dialog.screenshot_engine_combo.count())
+        dialog.plugin_screenshot_engine_combo.itemText(i)
+        for i in range(dialog.plugin_screenshot_engine_combo.count())
     ]
     assert "GDI" in labels
+    native_engines = [
+        dialog.screenshot_engine_combo.itemData(i)
+        for i in range(dialog.screenshot_engine_combo.count())
+    ]
+    assert "plugin.gdi" not in native_engines
+    assert "wgc" in native_engines
     dialog.close()
 
 
@@ -105,19 +111,19 @@ def test_plugin_bind_mode_shows_chinese_labels_and_follow_syncs_display():
     dialog.plugin_advanced_toggle.setChecked(True)
     assert not dialog.plugin_advanced_panel.isHidden()
 
+    assert dialog.plugin_input_enable_check.isChecked()
     assert dialog.plugin_input_display_follow_check.isChecked()
-    assert not dialog.plugin_input_display_combo.isEnabled()
     assert dialog.plugin_input_display_combo.currentData() == "normal"
 
-    group_index = dialog.screenshot_engine_group_combo.findData("插件")
-    dialog.screenshot_engine_group_combo.setCurrentIndex(group_index)
-    engine_index = dialog.screenshot_engine_combo.findData("gdi2")
+    dialog.plugin_screenshot_enable_check.setChecked(True)
+    engine_index = dialog.plugin_screenshot_engine_combo.findData("gdi2")
     assert engine_index >= 0
-    dialog.screenshot_engine_combo.setCurrentIndex(engine_index)
+    dialog.plugin_screenshot_engine_combo.setCurrentIndex(engine_index)
     dialog._sync_plugin_input_display_follow()
     assert dialog.plugin_input_display_combo.currentData() == "gdi2"
 
     settings = dialog.get_settings()
     assert settings["plugin_input_display_follow"] is True
     assert settings["plugin_input_display"] == "gdi2"
+    assert settings["screenshot_engine"] == "gdi2"
     dialog.close()
