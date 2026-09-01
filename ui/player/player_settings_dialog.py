@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -43,7 +44,7 @@ class PlayerSettingsDialog(QDialog):
         self.setObjectName("PlayerSettingsDialog")
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.resize(420, 280)
+        self.resize(420, 360)
         self._ui = dict(ui or {})
         seed = extract_settings_from_ui(self._ui)
 
@@ -54,7 +55,8 @@ class PlayerSettingsDialog(QDialog):
         hint.setWordWrap(True)
         hint.setToolTip(PLUGIN_LOCAL_HINT)
         root.addWidget(hint)
-        root.addWidget(self._build_hotkey_page(seed), 1)
+        root.addWidget(self._build_hotkey_page(seed))
+        root.addWidget(self._build_plugin_group(), 1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -89,6 +91,12 @@ class PlayerSettingsDialog(QDialog):
         form.addRow("", self._auto_start)
         form.addRow("", self._exit_on_finish)
         form.addRow("", self._notify_on_finish)
+        return page
+
+    def _build_plugin_group(self) -> QGroupBox:
+        group = QGroupBox("插件", self)
+        form = QFormLayout(group)
+        form.setSpacing(8)
         local_cfg = {}
         try:
             loaded = load_config()
@@ -96,6 +104,10 @@ class PlayerSettingsDialog(QDialog):
                 local_cfg = loaded
         except Exception:
             local_cfg = {}
+        plugin_hint = QLabel(PLUGIN_LOCAL_HINT)
+        plugin_hint.setWordWrap(True)
+        plugin_hint.setToolTip(PLUGIN_LOCAL_HINT)
+        form.addRow(plugin_hint)
         self.plugin_reg_code_edit = QLineEdit(str(local_cfg.get("plugin_reg_code", "") or ""))
         self.plugin_reg_code_edit.setObjectName("plugin_reg_code_edit")
         self.plugin_reg_code_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -105,14 +117,14 @@ class PlayerSettingsDialog(QDialog):
         self.plugin_dir_edit.setToolTip(PLUGIN_LOCAL_HINT)
         browse = QPushButton("浏览")
         browse.clicked.connect(self._browse_plugin_dir)
-        dir_row = QWidget(page)
+        dir_row = QWidget(group)
         dir_layout = QHBoxLayout(dir_row)
         dir_layout.setContentsMargins(0, 0, 0, 0)
         dir_layout.addWidget(self.plugin_dir_edit)
         dir_layout.addWidget(browse)
         form.addRow("插件注册码:", self.plugin_reg_code_edit)
         form.addRow("插件目录:", dir_row)
-        return page
+        return group
 
     def _browse_plugin_dir(self):
         start = self.plugin_dir_edit.text().strip() if hasattr(self, "plugin_dir_edit") else ""

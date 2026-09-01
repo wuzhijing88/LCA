@@ -8,6 +8,11 @@ from utils.input_simulation.mode_utils import (
     require_foreground_backend,
     require_foreground_py_backend,
 )
+from utils.plugin.bind_modes import (
+    normalize_plugin_bind_mode,
+    normalize_plugin_keypad,
+    normalize_plugin_mouse,
+)
 from utils.window.window_binding_utils import (
     get_active_target_window_title,
     sync_runtime_window_binding_state,
@@ -34,6 +39,7 @@ class GlobalSettingsDialogSaveMixin:
                 )
                 return
             settings = self.get_settings()
+            self._warn_plugin_display_mismatch_if_needed(settings)
             self.current_config.update(settings)
             logger.info(
                 "全局设置对话框确定：准备保存配置，当前绑定窗口数量: %s",
@@ -44,6 +50,27 @@ class GlobalSettingsDialogSaveMixin:
         except Exception as e:
             logger.error(f"处理确定按钮失败: {e}", exc_info=True)
             QMessageBox.warning(self, "保存失败", f"全局设置没有保存：{e}")
+
+    def _warn_plugin_display_mismatch_if_needed(self, settings: dict) -> None:
+        from utils.capture.engine_ids import (
+            is_plugin_screenshot_engine,
+            to_dm_display_mode,
+        )
+
+        if str(settings.get("input_backend") or "").strip().lower() != "plugin":
+            return
+        engine = settings.get("screenshot_engine")
+        if not is_plugin_screenshot_engine(engine):
+            return
+        input_display = settings.get("plugin_input_display")
+        if to_dm_display_mode(engine) == to_dm_display_mode(input_display):
+            return
+        QMessageBox.warning(
+            self,
+            "插件绑定提示",
+            "插件键鼠的绑定图显与当前插件截图引擎不同。"
+            "大漠通常不能对同一窗口分离绑定；保存后仍会尝试用户选择，失败时运行时可能回退为同一 display。",
+        )
     def get_target_window_title(self):
         """获取目标窗口标题"""
         if self.window_binding_mode == 'single':
@@ -114,6 +141,31 @@ class GlobalSettingsDialogSaveMixin:
             raise ValueError(
                 f"未知的截图引擎选项: {self.screenshot_engine_combo.currentText()!r}"
             )
+        input_backend = "native"
+        if hasattr(self, "input_backend_combo"):
+            input_backend = str(self.input_backend_combo.currentData() or "native").strip().lower()
+            if input_backend not in ("native", "plugin"):
+                input_backend = "native"
+        plugin_mouse = normalize_plugin_mouse(
+            (self.plugin_mouse_combo.currentData() if hasattr(self, "plugin_mouse_combo") else None)
+            or self.current_config.get("plugin_mouse", "normal")
+        )
+        plugin_keypad = normalize_plugin_keypad(
+            (self.plugin_keypad_combo.currentData() if hasattr(self, "plugin_keypad_combo") else None)
+            or self.current_config.get("plugin_keypad", "normal")
+        )
+        plugin_input_display = str(
+            (self.plugin_input_display_combo.currentData() if hasattr(self, "plugin_input_display_combo") else None)
+            or self.current_config.get("plugin_input_display", "normal")
+            or "normal"
+        ).strip().lower()
+        if hasattr(self, "plugin_bind_mode_combo"):
+            bind_raw = self.plugin_bind_mode_combo.currentData()
+            if bind_raw is None:
+                bind_raw = self.plugin_bind_mode_combo.currentText()
+        else:
+            bind_raw = self.current_config.get("plugin_bind_mode", 0)
+        plugin_bind_mode = normalize_plugin_bind_mode(bind_raw)
         settings = {
             'execution_mode': internal_mode,
             'operation_mode': 'auto',  # 默认使用自动检测
@@ -121,6 +173,11 @@ class GlobalSettingsDialogSaveMixin:
             'custom_height': self.height_spinbox.value(),
             'screenshot_format': self.screenshot_format_combo.currentData() if hasattr(self, 'screenshot_format_combo') else self.current_config.get('screenshot_format', 'bmp'),
             'screenshot_engine': screenshot_engine,  # 添加截图引擎设置
+            "input_backend": input_backend,
+            "plugin_mouse": plugin_mouse,
+            "plugin_keypad": plugin_keypad,
+            "plugin_input_display": plugin_input_display,
+            "plugin_bind_mode": plugin_bind_mode,
             "plugin_reg_code": self.plugin_reg_code_edit.text() if hasattr(self, "plugin_reg_code_edit") else self.current_config.get("plugin_reg_code", ""),
             "plugin_dir": self.plugin_dir_edit.text().strip() if hasattr(self, "plugin_dir_edit") else self.current_config.get("plugin_dir", ""),
             'foreground_mouse_driver_backend': require_foreground_backend(

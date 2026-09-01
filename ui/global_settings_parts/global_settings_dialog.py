@@ -23,7 +23,6 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         'foreground_py': "前台二模式",
         'background_sendmessage': "后台一模式",
         'background_postmessage': "后台二模式",
-        'background_dx': "DX 模式",
     }
     MODE_INTERNAL_MAP = {v: k for k, v in MODE_DISPLAY_MAP.items()}
     FOREGROUND_DRIVER_BACKEND_MAP = {
@@ -48,8 +47,8 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         self.setMinimumWidth(680)
         self.setMaximumWidth(760)
         self.setMinimumHeight(300)
-        self.setMaximumHeight(680)  # 放宽高度上限，避免新增驱动下拉后裁切
-        self.resize(700, 460)
+        self.setMaximumHeight(720)  # 放宽高度上限，避免键鼠/插件绑定控件裁切
+        self.resize(700, 500)
         from utils.input_simulation.mode_utils import migrate_legacy_normal_hd_config
 
         self.current_config = migrate_legacy_normal_hd_config(current_config)

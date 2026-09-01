@@ -12,15 +12,38 @@ class GlobalSettingsDialogVisibilityMixin:
         self.resize(width, min(max(self.height(), self.minimumHeight()), self.maximumHeight()))
 
     def _on_execution_driver_setting_changed(self, *_args):
-        self._update_foreground_driver_visibility(resize_dialog=True)
+        self._update_input_backend_visibility(resize_dialog=True)
+
+    def _on_input_backend_changed(self, *_args):
+        self._update_input_backend_visibility(resize_dialog=True)
+
+    def _selected_input_backend(self) -> str:
+        if not hasattr(self, "input_backend_combo"):
+            return "native"
+        backend = self.input_backend_combo.currentData()
+        if backend:
+            return str(backend).strip().lower()
+        text = str(self.input_backend_combo.currentText() or "").strip()
+        if text == "插件":
+            return "plugin"
+        return "native"
 
     def _update_foreground_driver_visibility(self, *args, resize_dialog: bool = False):
+        self._update_input_backend_visibility(resize_dialog=resize_dialog)
+
+    def _update_input_backend_visibility(self, *args, resize_dialog: bool = False):
+        use_plugin_input = self._selected_input_backend() == "plugin"
+        if hasattr(self, "native_input_panel"):
+            self.native_input_panel.setVisible(not use_plugin_input)
+        if hasattr(self, "plugin_input_panel"):
+            self.plugin_input_panel.setVisible(use_plugin_input)
+
         internal_mode = self.mode_combo.currentData()
         if not internal_mode:
             internal_mode = self.MODE_INTERNAL_MAP.get(self.mode_combo.currentText(), "")
 
-        use_foreground_driver = internal_mode == "foreground_driver"
-        use_foreground_py = internal_mode == "foreground_py"
+        use_foreground_driver = (not use_plugin_input) and internal_mode == "foreground_driver"
+        use_foreground_py = (not use_plugin_input) and internal_mode == "foreground_py"
         if hasattr(self, "foreground_driver_widget"):
             self.foreground_driver_widget.setVisible(use_foreground_driver)
         if hasattr(self, "foreground_keyboard_driver_widget"):
@@ -53,8 +76,10 @@ class GlobalSettingsDialogVisibilityMixin:
     def _update_execution_mode_visibility(self):
         if hasattr(self, "exec_mode_group"):
             self.exec_mode_group.setVisible(True)
+        if hasattr(self, "input_backend_group"):
+            self.input_backend_group.setVisible(True)
         if hasattr(self, "screenshot_engine_group"):
             self.screenshot_engine_group.setVisible(True)
         if hasattr(self, "_update_screenshot_engine_visibility"):
             self._update_screenshot_engine_visibility()
-        self._update_foreground_driver_visibility()
+        self._update_input_backend_visibility()

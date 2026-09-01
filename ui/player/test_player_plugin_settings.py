@@ -3,7 +3,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QDialog, QLineEdit
+from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QLineEdit
 
 from ui.player.player_settings_dialog import PlayerSettingsDialog
 from ui.player.player_window import PlayerWindow
@@ -17,12 +17,30 @@ def test_player_settings_has_plugin_fields():
     text = Path("ui/player/player_settings_dialog.py").read_text(encoding="utf-8")
     assert "plugin_reg_code" in text
     assert "plugin_dir" in text
+    assert 'QGroupBox("插件"' in text or "QGroupBox('插件'" in text
     assert "tools/plugin" in text
     assert "PluginHost.exe" in text
     assert "dm.dll" in text
     assert "RegDll.dll" in text
     assert ("tools/" + "op") not in text
     assert ("op_" + "c_api") not in text
+
+
+def test_player_settings_plugin_group_contains_auth_controls():
+    _qapp()
+    dlg = PlayerSettingsDialog(ui={"start_hotkey": "F6"}, state={})
+    group = None
+    parent = dlg.plugin_reg_code_edit.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QGroupBox):
+            group = parent
+            break
+        parent = parent.parentWidget()
+    assert group is not None
+    assert group.title() == "插件"
+    assert group.isAncestorOf(dlg.plugin_dir_edit)
+    assert "plugin_reg_code" not in dlg.settings_payload()
+    dlg.close()
 
 
 def test_player_settings_writes_plugin_fields_to_local_save_config(monkeypatch):

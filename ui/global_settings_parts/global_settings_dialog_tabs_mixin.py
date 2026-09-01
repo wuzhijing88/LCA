@@ -220,6 +220,8 @@ class GlobalSettingsDialogTabsMixin:
             self.current_config.get('execution_mode', 'background_sendmessage')
 
         )
+        if internal_mode in ("background_dx", "background_op_dx"):
+            internal_mode = "background_sendmessage"
 
         index = self.mode_combo.findData(internal_mode)
 
@@ -239,99 +241,97 @@ class GlobalSettingsDialogTabsMixin:
 
         exec_mode_layout.addWidget(self.mode_select_widget)
 
-        self.foreground_driver_widget = QWidget()
+        exec_layout.addWidget(self.exec_mode_group)
 
-        foreground_driver_layout = QHBoxLayout(self.foreground_driver_widget)
+        # --- 键鼠：原生 | 插件 ---
+        self.input_backend_group = QGroupBox("键鼠")
+        input_backend_layout = QVBoxLayout(self.input_backend_group)
+        input_backend_layout.setSpacing(8)
+        input_backend_layout.setContentsMargins(15, 10, 15, 10)
 
-        foreground_driver_layout.setContentsMargins(0, 0, 0, 0)
-
-        foreground_driver_label = QLabel("鼠标驱动:")
-
-        foreground_driver_label.setFixedWidth(80)
-
-        self.foreground_driver_combo = QComboBox(self)
-
-        for display_name, backend in self.FOREGROUND_DRIVER_BACKEND_MAP.items():
-
-            self.foreground_driver_combo.addItem(display_name, backend)
-
-        configured_mouse_backend, configured_keyboard_backend = parse_foreground_backends(self.current_config)
-
-        backend_index = self.foreground_driver_combo.findData(configured_mouse_backend)
-
+        input_type_row = QHBoxLayout()
+        input_type_label = QLabel("键鼠类型:")
+        input_type_label.setFixedWidth(80)
+        self.input_backend_combo = QComboBox(self)
+        self.input_backend_combo.setObjectName("input_backend_combo")
+        self.input_backend_combo.addItem("原生", "native")
+        self.input_backend_combo.addItem("插件", "plugin")
+        configured_input_backend = str(
+            self.current_config.get("input_backend", "native") or "native"
+        ).strip().lower()
+        if configured_input_backend not in ("native", "plugin"):
+            configured_input_backend = "native"
+        backend_index = self.input_backend_combo.findData(configured_input_backend)
         if backend_index >= 0:
+            self.input_backend_combo.setCurrentIndex(backend_index)
+        self.input_backend_combo.setToolTip(
+            "原生：前台驱动 / 前台二输入 / 后台消息路径\n"
+            "插件：经 PluginHost 绑定，可配置 mouse / keypad / display / mode"
+        )
+        input_type_row.addWidget(input_type_label)
+        input_type_row.addWidget(self.input_backend_combo)
+        input_backend_layout.addLayout(input_type_row)
 
+        self.native_input_panel = QWidget()
+        native_input_layout = QVBoxLayout(self.native_input_panel)
+        native_input_layout.setContentsMargins(0, 0, 0, 0)
+        native_input_layout.setSpacing(8)
+
+        self.foreground_driver_widget = QWidget()
+        foreground_driver_layout = QHBoxLayout(self.foreground_driver_widget)
+        foreground_driver_layout.setContentsMargins(0, 0, 0, 0)
+        foreground_driver_label = QLabel("鼠标驱动:")
+        foreground_driver_label.setFixedWidth(80)
+        self.foreground_driver_combo = QComboBox(self)
+        for display_name, backend in self.FOREGROUND_DRIVER_BACKEND_MAP.items():
+            self.foreground_driver_combo.addItem(display_name, backend)
+        configured_mouse_backend, configured_keyboard_backend = parse_foreground_backends(
+            self.current_config
+        )
+        backend_index = self.foreground_driver_combo.findData(configured_mouse_backend)
+        if backend_index >= 0:
             self.foreground_driver_combo.setCurrentIndex(backend_index)
-
         foreground_driver_layout.addWidget(foreground_driver_label)
-
         foreground_driver_layout.addWidget(self.foreground_driver_combo)
-
-        exec_mode_layout.addWidget(self.foreground_driver_widget)
+        native_input_layout.addWidget(self.foreground_driver_widget)
 
         self.foreground_keyboard_driver_widget = QWidget()
-
         foreground_keyboard_driver_layout = QHBoxLayout(self.foreground_keyboard_driver_widget)
-
         foreground_keyboard_driver_layout.setContentsMargins(0, 0, 0, 0)
-
         foreground_keyboard_driver_label = QLabel("键盘驱动:")
-
         foreground_keyboard_driver_label.setFixedWidth(80)
-
         self.foreground_keyboard_driver_combo = QComboBox(self)
-
         for display_name, backend in self.FOREGROUND_DRIVER_BACKEND_MAP.items():
-
             self.foreground_keyboard_driver_combo.addItem(display_name, backend)
-
-        keyboard_backend_index = self.foreground_keyboard_driver_combo.findData(configured_keyboard_backend)
-
+        keyboard_backend_index = self.foreground_keyboard_driver_combo.findData(
+            configured_keyboard_backend
+        )
         if keyboard_backend_index >= 0:
-
             self.foreground_keyboard_driver_combo.setCurrentIndex(keyboard_backend_index)
-
         foreground_keyboard_driver_layout.addWidget(foreground_keyboard_driver_label)
-
         foreground_keyboard_driver_layout.addWidget(self.foreground_keyboard_driver_combo)
-
-        exec_mode_layout.addWidget(self.foreground_keyboard_driver_widget)
+        native_input_layout.addWidget(self.foreground_keyboard_driver_widget)
 
         self.ib_driver_widget = QWidget()
-
         ib_driver_layout = QHBoxLayout(self.ib_driver_widget)
-
         ib_driver_layout.setContentsMargins(0, 0, 0, 0)
-
         ib_driver_label = QLabel("Ib驱动类型:")
-
         ib_driver_label.setFixedWidth(80)
-
         self.ib_driver_combo = QComboBox(self)
-
         for display_name, ib_driver in self.IB_DRIVER_MAP.items():
-
             self.ib_driver_combo.addItem(display_name, ib_driver)
-
-        configured_ib_driver = str(self.current_config.get('ibinputsimulator_driver', 'Logitech') or 'Logitech').strip()
-
+        configured_ib_driver = str(
+            self.current_config.get("ibinputsimulator_driver", "Logitech") or "Logitech"
+        ).strip()
         ib_driver_index = self.ib_driver_combo.findData(configured_ib_driver)
-
         if ib_driver_index < 0:
-
-            ib_driver_index = self.ib_driver_combo.findData('Logitech')
-
+            ib_driver_index = self.ib_driver_combo.findData("Logitech")
         if ib_driver_index >= 0:
-
             self.ib_driver_combo.setCurrentIndex(ib_driver_index)
-
         ib_driver_layout.addWidget(ib_driver_label)
-
         ib_driver_layout.addWidget(self.ib_driver_combo)
+        native_input_layout.addWidget(self.ib_driver_widget)
 
-        exec_mode_layout.addWidget(self.ib_driver_widget)
-
-        # 前台二：PyAutoGUI / 扫描码（非驱动）
         self.foreground_py_backend_widget = QWidget()
         foreground_py_backend_layout = QHBoxLayout(self.foreground_py_backend_widget)
         foreground_py_backend_layout.setContentsMargins(0, 0, 0, 0)
@@ -350,18 +350,100 @@ class GlobalSettingsDialogTabsMixin:
         )
         foreground_py_backend_layout.addWidget(foreground_py_backend_label)
         foreground_py_backend_layout.addWidget(self.foreground_py_backend_combo)
-        exec_mode_layout.addWidget(self.foreground_py_backend_widget)
+        native_input_layout.addWidget(self.foreground_py_backend_widget)
+        input_backend_layout.addWidget(self.native_input_panel)
 
-        exec_layout.addWidget(self.exec_mode_group)
+        self.plugin_input_panel = QWidget()
+        plugin_input_layout = QVBoxLayout(self.plugin_input_panel)
+        plugin_input_layout.setContentsMargins(0, 0, 0, 0)
+        plugin_input_layout.setSpacing(8)
+        from utils.capture.engine_ids import screenshot_engine_label as _plugin_display_label
+        from utils.plugin.bind_modes import (
+            PLUGIN_BIND_MODE_PRESETS,
+            PLUGIN_INPUT_DISPLAYS,
+            PLUGIN_KEYPAD_MODES,
+            PLUGIN_MOUSE_MODES,
+        )
 
-        # --- 截图方式选择（原生模式）---
+        mouse_row = QHBoxLayout()
+        mouse_label = QLabel("鼠标模式:")
+        mouse_label.setFixedWidth(80)
+        self.plugin_mouse_combo = QComboBox(self)
+        self.plugin_mouse_combo.setObjectName("plugin_mouse_combo")
+        for mode in PLUGIN_MOUSE_MODES:
+            self.plugin_mouse_combo.addItem(mode, mode)
+        configured_mouse = str(self.current_config.get("plugin_mouse", "normal") or "normal").strip().lower()
+        mouse_index = self.plugin_mouse_combo.findData(configured_mouse)
+        if mouse_index >= 0:
+            self.plugin_mouse_combo.setCurrentIndex(mouse_index)
+        mouse_row.addWidget(mouse_label)
+        mouse_row.addWidget(self.plugin_mouse_combo)
+        plugin_input_layout.addLayout(mouse_row)
 
+        keypad_row = QHBoxLayout()
+        keypad_label = QLabel("键盘模式:")
+        keypad_label.setFixedWidth(80)
+        self.plugin_keypad_combo = QComboBox(self)
+        self.plugin_keypad_combo.setObjectName("plugin_keypad_combo")
+        for mode in PLUGIN_KEYPAD_MODES:
+            self.plugin_keypad_combo.addItem(mode, mode)
+        configured_keypad = str(self.current_config.get("plugin_keypad", "normal") or "normal").strip().lower()
+        keypad_index = self.plugin_keypad_combo.findData(configured_keypad)
+        if keypad_index >= 0:
+            self.plugin_keypad_combo.setCurrentIndex(keypad_index)
+        keypad_row.addWidget(keypad_label)
+        keypad_row.addWidget(self.plugin_keypad_combo)
+        plugin_input_layout.addLayout(keypad_row)
+
+        display_row = QHBoxLayout()
+        display_label = QLabel("绑定图显:")
+        display_label.setFixedWidth(80)
+        self.plugin_input_display_combo = QComboBox(self)
+        self.plugin_input_display_combo.setObjectName("plugin_input_display_combo")
+        for display in PLUGIN_INPUT_DISPLAYS:
+            self.plugin_input_display_combo.addItem(_plugin_display_label(display), display)
+        configured_display = str(
+            self.current_config.get("plugin_input_display", "normal") or "normal"
+        ).strip().lower()
+        display_index = self.plugin_input_display_combo.findData(configured_display)
+        if display_index >= 0:
+            self.plugin_input_display_combo.setCurrentIndex(display_index)
+        self.plugin_input_display_combo.setToolTip(
+            "插件键鼠 BindWindow 的 display；可与截图引擎不同，但不建议分离绑定"
+        )
+        display_row.addWidget(display_label)
+        display_row.addWidget(self.plugin_input_display_combo)
+        plugin_input_layout.addLayout(display_row)
+
+        bind_mode_row = QHBoxLayout()
+        bind_mode_label = QLabel("绑定 mode:")
+        bind_mode_label.setFixedWidth(80)
+        self.plugin_bind_mode_combo = QComboBox(self)
+        self.plugin_bind_mode_combo.setObjectName("plugin_bind_mode_combo")
+        self.plugin_bind_mode_combo.setEditable(True)
+        for mode in PLUGIN_BIND_MODE_PRESETS:
+            self.plugin_bind_mode_combo.addItem(str(mode), mode)
+        try:
+            configured_bind_mode = int(self.current_config.get("plugin_bind_mode", 0) or 0)
+        except (TypeError, ValueError):
+            configured_bind_mode = 0
+        bind_mode_index = self.plugin_bind_mode_combo.findData(configured_bind_mode)
+        if bind_mode_index >= 0:
+            self.plugin_bind_mode_combo.setCurrentIndex(bind_mode_index)
+        else:
+            self.plugin_bind_mode_combo.setEditText(str(configured_bind_mode))
+        self.plugin_bind_mode_combo.setToolTip("BindWindowEx mode；常用预设，也可手输非负整数")
+        bind_mode_row.addWidget(bind_mode_label)
+        bind_mode_row.addWidget(self.plugin_bind_mode_combo)
+        plugin_input_layout.addLayout(bind_mode_row)
+        input_backend_layout.addWidget(self.plugin_input_panel)
+
+        exec_layout.addWidget(self.input_backend_group)
+
+        # --- 截图方式：原生 | 插件 ---
         self.screenshot_engine_group = QGroupBox("截图方式")
-
         screenshot_engine_layout = QVBoxLayout(self.screenshot_engine_group)
-
         screenshot_engine_layout.setSpacing(8)
-
         screenshot_engine_layout.setContentsMargins(15, 10, 15, 10)
 
         from utils.capture.engine_ids import (
@@ -371,7 +453,6 @@ class GlobalSettingsDialogTabsMixin:
             screenshot_engine_ui_group,
         )
 
-        # 短标签映射（兼容旧保存逻辑）
         self.screenshot_engine_map = {
             engine_label_text(engine): engine
             for engine in SUPPORTED_SCREENSHOT_ENGINES
@@ -381,9 +462,8 @@ class GlobalSettingsDialogTabsMixin:
             for engine in SUPPORTED_SCREENSHOT_ENGINES
         }
 
-        # 第一行：引擎类型（原生 / 插件）
         group_row = QHBoxLayout()
-        group_label = QLabel("引擎类型:")
+        group_label = QLabel("截图类型:")
         group_label.setFixedWidth(80)
         self.screenshot_engine_group_combo = QComboBox(self)
         self.screenshot_engine_group_combo.setMinimumWidth(200)
@@ -392,7 +472,8 @@ class GlobalSettingsDialogTabsMixin:
             self.screenshot_engine_group_combo.addItem(group_title, group_title)
         self.screenshot_engine_group_combo.setToolTip(
             "原生：WGC / PrintWindow / GDI / DXGI\n"
-            "插件：正常 / GDI2（无需挂钩）；DX / OpenGL（需注入）。需要 tools/plugin 下 PluginHost.exe、dm.dll、RegDll.dll"
+            "插件：正常 / GDI / GDI2（无需挂钩）；DX / OpenGL（需注入）。"
+            "授权请到「插件」页配置"
         )
         group_row.addWidget(group_label)
         group_row.addWidget(self.screenshot_engine_group_combo)
@@ -408,8 +489,8 @@ class GlobalSettingsDialogTabsMixin:
         self.screenshot_engine_combo.setToolTip(
             "WGC: Win10 1903+/Win11，支持后台\n"
             "PrintWindow: Win10，支持后台\n"
-            "GDI / DXGI: 仅前台\n"
-            "插件 WGC / DXGI / GDI2: 无需 DX/OpenGL 挂钩，兼容性较好\n"
+            "GDI / DXGI: 仅前台（原生）\n"
+            "插件 正常 / GDI / GDI2: 无需 DX/OpenGL 挂钩\n"
             "插件 DX / OpenGL: 需目标进程对应渲染且允许注入"
         )
         screenshot_engine_row.addWidget(engine_label_widget)
@@ -418,11 +499,12 @@ class GlobalSettingsDialogTabsMixin:
 
         exec_layout.addWidget(self.screenshot_engine_group)
 
-        # 连接执行模式变化信号，用于控制截图引擎选项可见性
+        # 连接执行模式 / 键鼠类型变化信号
         self.mode_combo.currentTextChanged.connect(self._update_screenshot_engine_visibility)
         self.mode_combo.currentTextChanged.connect(self._on_execution_driver_setting_changed)
         self.mode_combo.currentIndexChanged.connect(self._update_screenshot_engine_visibility)
         self.mode_combo.currentIndexChanged.connect(self._on_execution_driver_setting_changed)
+        self.input_backend_combo.currentIndexChanged.connect(self._on_input_backend_changed)
         self.foreground_driver_combo.currentTextChanged.connect(self._on_execution_driver_setting_changed)
         self.foreground_driver_combo.currentIndexChanged.connect(self._on_execution_driver_setting_changed)
         self.foreground_keyboard_driver_combo.currentTextChanged.connect(self._on_execution_driver_setting_changed)
@@ -439,7 +521,7 @@ class GlobalSettingsDialogTabsMixin:
         if group_index >= 0:
             self.screenshot_engine_group_combo.setCurrentIndex(group_index)
         self._update_screenshot_engine_visibility()
-        self._update_foreground_driver_visibility()
+        self._update_input_backend_visibility()
 
         self.screenshot_engine_group_combo.currentIndexChanged.connect(
             self._on_screenshot_engine_group_changed
