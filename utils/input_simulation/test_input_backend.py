@@ -9,11 +9,13 @@ def test_is_plugin_input_backend_from_config():
 
 
 def test_standard_window_uses_plugin_input_in_foreground(monkeypatch):
-    from utils.input_simulation.standard_window import StandardWindow
+    from utils.input_simulation.standard_window import StandardWindowInputSimulator
 
     monkeypatch.setattr(
         "app_core.config_store.load_config",
         lambda: {"input_backend": "plugin", "execution_mode": "foreground_driver"},
     )
-    window = StandardWindow(hwnd=1, use_foreground=True, execution_mode="foreground_driver")
+    window = StandardWindowInputSimulator(
+        hwnd=1, use_foreground=True, execution_mode="foreground_driver"
+    )
     assert window._using_plugin_dx() is True
