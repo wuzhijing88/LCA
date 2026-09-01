@@ -42,6 +42,7 @@ def test_get_settings_includes_input_backend_and_plugin_bind_fields():
     keypad_index = dialog.plugin_keypad_combo.findData("dx")
     assert keypad_index >= 0
     dialog.plugin_keypad_combo.setCurrentIndex(keypad_index)
+    dialog.plugin_input_display_follow_check.setChecked(False)
     display_index = dialog.plugin_input_display_combo.findData("plugin.gdi")
     assert display_index >= 0
     dialog.plugin_input_display_combo.setCurrentIndex(display_index)
@@ -54,6 +55,7 @@ def test_get_settings_includes_input_backend_and_plugin_bind_fields():
     assert settings["plugin_mouse"] == "dx2"
     assert settings["plugin_keypad"] == "dx"
     assert settings["plugin_input_display"] == "plugin.gdi"
+    assert settings["plugin_input_display_follow"] is False
     assert settings["plugin_bind_mode"] == 101
     dialog.close()
 
@@ -80,4 +82,42 @@ def test_plugin_screenshot_list_includes_plugin_gdi():
         for i in range(dialog.screenshot_engine_combo.count())
     ]
     assert "GDI" in labels
+    dialog.close()
+
+
+def test_plugin_bind_mode_shows_chinese_labels_and_follow_syncs_display():
+    _qapp()
+    dialog = GlobalSettingsDialog(
+        {
+            "execution_mode": "background_sendmessage",
+            "screenshot_engine": "wgc",
+            "input_backend": "plugin",
+            "plugin_input_display_follow": True,
+            "bound_windows": [],
+        }
+    )
+    mode_texts = [
+        dialog.plugin_bind_mode_combo.itemText(i)
+        for i in range(dialog.plugin_bind_mode_combo.count())
+    ]
+    assert any("默认" in text for text in mode_texts)
+    assert dialog.plugin_advanced_panel.isHidden()
+    dialog.plugin_advanced_toggle.setChecked(True)
+    assert not dialog.plugin_advanced_panel.isHidden()
+
+    assert dialog.plugin_input_display_follow_check.isChecked()
+    assert not dialog.plugin_input_display_combo.isEnabled()
+    assert dialog.plugin_input_display_combo.currentData() == "normal"
+
+    group_index = dialog.screenshot_engine_group_combo.findData("插件")
+    dialog.screenshot_engine_group_combo.setCurrentIndex(group_index)
+    engine_index = dialog.screenshot_engine_combo.findData("gdi2")
+    assert engine_index >= 0
+    dialog.screenshot_engine_combo.setCurrentIndex(engine_index)
+    dialog._sync_plugin_input_display_follow()
+    assert dialog.plugin_input_display_combo.currentData() == "gdi2"
+
+    settings = dialog.get_settings()
+    assert settings["plugin_input_display_follow"] is True
+    assert settings["plugin_input_display"] == "gdi2"
     dialog.close()

@@ -8,6 +8,9 @@ from utils.plugin.bind_modes import (
     normalize_plugin_bind_mode,
     normalize_plugin_keypad,
     normalize_plugin_mouse,
+    plugin_bind_mode_label,
+    plugin_keypad_label,
+    plugin_mouse_label,
 )
 
 
@@ -29,3 +32,10 @@ def test_normalize_plugin_bind_params():
         normalize_plugin_mouse("not-a-mode")
     with pytest.raises(ValueError):
         normalize_plugin_bind_mode(-1)
+
+
+def test_plugin_bind_ui_labels_are_human_readable():
+    assert plugin_mouse_label("normal") == "正常"
+    assert plugin_keypad_label("dx") == "DX"
+    assert plugin_bind_mode_label(0) == "0 · 默认（推荐）"
+    assert plugin_bind_mode_label(101).startswith("101")

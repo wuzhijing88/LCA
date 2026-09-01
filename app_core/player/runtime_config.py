@@ -26,6 +26,7 @@ PACKAGED_RUNTIME_KEYS = (
     "plugin_mouse",
     "plugin_keypad",
     "plugin_input_display",
+    "plugin_input_display_follow",
     "plugin_bind_mode",
     "binding_method",
     "multi_window_delay",

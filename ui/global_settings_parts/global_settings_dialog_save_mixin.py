@@ -154,11 +154,17 @@ class GlobalSettingsDialogSaveMixin:
             (self.plugin_keypad_combo.currentData() if hasattr(self, "plugin_keypad_combo") else None)
             or self.current_config.get("plugin_keypad", "normal")
         )
-        plugin_input_display = str(
-            (self.plugin_input_display_combo.currentData() if hasattr(self, "plugin_input_display_combo") else None)
-            or self.current_config.get("plugin_input_display", "normal")
-            or "normal"
-        ).strip().lower()
+        follow_display = True
+        if hasattr(self, "plugin_input_display_follow_check"):
+            follow_display = bool(self.plugin_input_display_follow_check.isChecked())
+        if follow_display and hasattr(self, "_followed_plugin_input_display"):
+            plugin_input_display = str(self._followed_plugin_input_display() or "normal").strip().lower()
+        else:
+            plugin_input_display = str(
+                (self.plugin_input_display_combo.currentData() if hasattr(self, "plugin_input_display_combo") else None)
+                or self.current_config.get("plugin_input_display", "normal")
+                or "normal"
+            ).strip().lower()
         if hasattr(self, "plugin_bind_mode_combo"):
             bind_raw = self.plugin_bind_mode_combo.currentData()
             if bind_raw is None:
@@ -177,6 +183,7 @@ class GlobalSettingsDialogSaveMixin:
             "plugin_mouse": plugin_mouse,
             "plugin_keypad": plugin_keypad,
             "plugin_input_display": plugin_input_display,
+            "plugin_input_display_follow": follow_display,
             "plugin_bind_mode": plugin_bind_mode,
             "plugin_reg_code": self.plugin_reg_code_edit.text() if hasattr(self, "plugin_reg_code_edit") else self.current_config.get("plugin_reg_code", ""),
             "plugin_dir": self.plugin_dir_edit.text().strip() if hasattr(self, "plugin_dir_edit") else self.current_config.get("plugin_dir", ""),

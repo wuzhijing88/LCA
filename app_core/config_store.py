@@ -34,6 +34,7 @@ _DEFAULT_CONFIG = {
     "plugin_mouse": "normal",
     "plugin_keypad": "normal",
     "plugin_input_display": "normal",
+    "plugin_input_display_follow": True,
     "plugin_bind_mode": 0,
     "plugin_reg_code": "",
     "plugin_dir": "",
@@ -145,6 +146,9 @@ def _migrate_plugin_input_settings(normalized: dict) -> None:
     if not is_plugin_screenshot_engine(display):
         display = "normal"
     normalized["plugin_input_display"] = display
+    normalized["plugin_input_display_follow"] = bool(
+        normalized.get("plugin_input_display_follow", True)
+    )
 
     try:
         normalized["plugin_bind_mode"] = normalize_plugin_bind_mode(
@@ -160,6 +164,7 @@ def _migrate_plugin_input_settings(normalized: dict) -> None:
             "plugin_mouse",
             "plugin_keypad",
             "plugin_input_display",
+            "plugin_input_display_follow",
             "plugin_bind_mode",
             "execution_mode",
         ):

@@ -44,6 +44,7 @@ SECTION_FIELDS = {
         "plugin_mouse",
         "plugin_keypad",
         "plugin_input_display",
+        "plugin_input_display_follow",
         "plugin_bind_mode",
         "plugin_reg_code",
         "plugin_dir",
