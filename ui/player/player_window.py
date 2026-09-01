@@ -54,6 +54,7 @@ from themes import get_theme_manager, theme_color
 from ui.player.player_chrome import (
     apply_player_rounded_window,
     apply_schedule_alarms_to_refs,
+    apply_script_item_orders_to_refs,
     apply_script_loops_to_refs,
     apply_script_run_status,
     clear_once_script_checks,
@@ -62,6 +63,7 @@ from ui.player.player_chrome import (
     populate_custom_player_body,
     player_shell_qss,
     schedule_alarms_from_refs,
+    script_item_orders_from_refs,
     script_loops_from_refs,
     selected_script_ids_from_refs,
     set_progress_widget_state,
@@ -261,14 +263,27 @@ class PlayerWindow(QMainWindow):
         settings = extract_settings_from_ui(self._ui)
         settings["notify_on_finish"] = bool(self._notify_on_finish)
         prev = dict(self._ui_state or {})
+        visual_item_order = script_item_orders_from_refs(self._custom_refs)
+        item_order = dict(prev.get("list_item_order") or {})
+        if visual_item_order:
+            item_order.update(visual_item_order)
+        list_order = list(prev.get("list_order") or self._ui.get("list_order") or [])
+        refs_order = list((self._custom_refs or {}).get("script_list_order") or [])
+        if refs_order:
+            # 保序：state 优先，再补 refs 中尚未出现的列表 id
+            merged = [str(x) for x in list_order if str(x) in set(refs_order)]
+            for lid in refs_order:
+                if lid not in merged:
+                    merged.append(lid)
+            list_order = merged
         state = {
             "group_loops": group_loops_from_refs(self._custom_refs) or self._group_loops_from_ui(),
             "loops_by_id": script_loops_from_refs(self._custom_refs) or self._loops_from_ui(),
             "settings": settings,
             "schedule_alarms": schedule_alarms_from_refs(self._custom_refs),
-            "list_order": list(prev.get("list_order") or self._ui.get("list_order") or []),
+            "list_order": list_order,
             "list_order_mode": str(prev.get("list_order_mode") or self._ui.get("list_order_mode") or "fixed"),
-            "list_item_order": dict(prev.get("list_item_order") or {}),
+            "list_item_order": item_order,
             "list_order_modes": dict(prev.get("list_order_modes") or {}),
             "window_width": int(prev.get("window_width") or 0),
             "window_height": int(prev.get("window_height") or 0),
@@ -309,51 +324,35 @@ class PlayerWindow(QMainWindow):
             QTimer.singleShot(0, self.safe_start_tasks)
             return
 
+    def _refresh_local_plugin_config(self) -> None:
+        from app_core.config_store import load_config
+
+        try:
+            disk = dict(load_config() or {})
+        except Exception:
+            disk = {}
+        self._config["plugin_reg_code"] = str(disk.get("plugin_reg_code") or "")
+        self._config["plugin_dir"] = str(disk.get("plugin_dir") or "").strip()
+        self.config = self._config
+        self._runtime.update_config(self._config)
+        try:
+            from utils.plugin.runtime import terminate_plugin_host
+
+            terminate_plugin_host()
+        except Exception:
+            logger.debug("terminate_plugin_host failed after settings save", exc_info=True)
+
     def open_settings_dialog(self):
         from PySide6.QtWidgets import QDialog
 
-        from ui.player.player_chrome import apply_player_rounded_window, window_outer_size
-
-        dialog = PlayerSettingsDialog(
-            self,
-            ui=self._ui,
-            state=self._ui_state,
-            on_bind=self.open_window_binding_dialog,
-        )
+        dialog = PlayerSettingsDialog(self, ui=self._ui, state=self._ui_state)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         payload = dialog.settings_payload()
         self._ui = merge_settings_into_ui(self._ui, payload)
         self._exit_on_finish = bool(self._ui.get("exit_on_finish"))
         self._notify_on_finish = bool(self._ui.get("notify_on_finish", True))
-        order_state = dialog.result_state()
-        self._ui_state = dict(self._ui_state or {})
-        self._ui_state.update(order_state)
-        alarms = order_state.get("schedule_alarms")
-        if isinstance(alarms, list):
-            self._ui_state["schedule_alarms"] = alarms
-            editor = (self._custom_refs or {}).get("schedule_editor")
-            if editor is not None and hasattr(editor, "set_alarms"):
-                try:
-                    editor.set_alarms(alarms)
-                    self._custom_refs["schedule_alarms"] = alarms
-                    self._custom_refs["schedule_alarm_rows"] = editor.alarm_rows()
-                except RuntimeError:
-                    pass
-        width = int(order_state.get("window_width") or 0)
-        height = int(order_state.get("window_height") or 0)
-        if width > 0 and height > 0 and self._custom_mode:
-            window = dict(self._ui.get("window") or {})
-            window["width"] = width
-            window["height"] = height
-            self._ui["window"] = window
-            pref_w, pref_h = window_outer_size(width, height)
-            available = get_available_geometry_for_widget(self)
-            out_w, out_h = clamp_preferred_window_size(pref_w, pref_h, available)
-            if self._body is not None:
-                self._body.setFixedSize(width, height)
-            self.setFixedSize(out_w, out_h)
-            apply_player_rounded_window(self)
+        self._refresh_local_plugin_config()
         self._persist_ui_state()
         self._install_hotkeys()
         self._append_log("信息", "设置已保存")
@@ -452,6 +451,12 @@ class PlayerWindow(QMainWindow):
             loops_by_id=self._ui_state.get("loops_by_id") or {},
             group_loops=self._ui_state.get("group_loops"),
         )
+        saved_item_order = self._ui_state.get("list_item_order") or {}
+        if saved_item_order:
+            apply_script_item_orders_to_refs(refs, saved_item_order)
+        saved_list_order = self._ui_state.get("list_order") or []
+        if isinstance(saved_list_order, list) and saved_list_order:
+            refs["script_list_order"] = [str(x) for x in saved_list_order if str(x)]
         saved_alarms = self._ui_state.get("schedule_alarms") or []
         if saved_alarms:
             apply_schedule_alarms_to_refs(refs, saved_alarms)
