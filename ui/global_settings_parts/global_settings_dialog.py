@@ -1,6 +1,5 @@
 import logging
 
-from PySide6.QtCore import QTimer
 from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QHBoxLayout, QTabWidget, QVBoxLayout
 
@@ -23,7 +22,8 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         'foreground_driver': "前台一模式",
         'foreground_py': "前台二模式",
         'background_sendmessage': "后台一模式",
-        'background_postmessage': "后台二模式"
+        'background_postmessage': "后台二模式",
+        'background_dx': "DX 模式",
     }
     MODE_INTERNAL_MAP = {v: k for k, v in MODE_DISPLAY_MAP.items()}
     FOREGROUND_DRIVER_BACKEND_MAP = {
@@ -44,12 +44,15 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
     def __init__(self, current_config: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("全局设置")
-        self.setMinimumWidth(585)
-        self.setMaximumWidth(712)
+        # 快捷键四列按键框默认 minWidth=140，窄于约 680 时右侧会被裁切
+        self.setMinimumWidth(680)
+        self.setMaximumWidth(760)
         self.setMinimumHeight(300)
         self.setMaximumHeight(680)  # 放宽高度上限，避免新增驱动下拉后裁切
-        self.resize(638, 460)  # 提高初始高度，减少首次显示不全
-        self.current_config = current_config
+        self.resize(700, 460)
+        from utils.input_simulation.mode_utils import migrate_legacy_normal_hd_config
+
+        self.current_config = migrate_legacy_normal_hd_config(current_config)
         # 窗口行为默认值兜底（旧配置缺失键时默认启用）
         self.current_config.setdefault('enable_canvas_grid', True)
         self.current_config.setdefault('enable_card_snap', True)
@@ -98,6 +101,7 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         # --- 创建各个标签页 ---
         self._create_window_tab()
         self._create_execution_tab()
+        self._create_plugin_tab()
         self._create_hotkey_tab()
         self._create_other_tab()
         self._create_about_tab()
@@ -141,32 +145,11 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         # 在初始化时检查窗口状态
         self._check_and_cleanup_closed_windows()
         self._update_execution_mode_visibility()
-        # 强制刷新布局，使用延迟确保Qt事件循环完成布局计算
-        def force_layout_refresh():
-            if hasattr(self, 'exec_tab'):
-                # 强制父布局重新计算
-                self.exec_tab.layout().activate()
-                self.exec_tab.layout().update()
-                # 更新所有相关控件的几何形状
-                self.exec_tab.updateGeometry()
-                self.exec_tab.update()
-                # 调整对话框大小
-                self.adjustSize()
-        QTimer.singleShot(100, force_layout_refresh)
-        QTimer.singleShot(0, self._recenter_to_parent_screen)
-        # --- 样式由主题管理器统一管理，不再使用硬编码样式 ---
+        # 不在初始化后 adjustSize / 二次 recenter：首帧改几何会闪黑边
+        # 居中由 MainWindow._present_global_settings_dialog 在 show 前完成
 
     def _recenter_to_parent_screen(self) -> None:
         center_window_on_widget_screen(self, self.parentWidget())
+
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
-        QTimer.singleShot(0, self._recenter_to_parent_screen)
-
-            # 不抛出异常，避免崩溃
-
-            # 不抛出异常，避免崩溃
-
-    # 添加兼容方法，对应open_global_settings调用
-
-    # 删除不再需要的单窗口相关方法
-    # 删除不再需要的_get_child_windows方法

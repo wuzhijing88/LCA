@@ -416,36 +416,6 @@ class GlobalSettingsDialogTabsMixin:
         screenshot_engine_row.addWidget(self.screenshot_engine_combo)
         screenshot_engine_layout.addLayout(screenshot_engine_row)
 
-        plugin_hint = (
-            "插件：正常 / GDI2（无需挂钩）；DX / OpenGL（需注入）。"
-            "需要 tools/plugin 下 PluginHost.exe、dm.dll、RegDll.dll"
-        )
-        reg_row = QHBoxLayout()
-        reg_label = QLabel("插件注册码:")
-        reg_label.setFixedWidth(80)
-        self.plugin_reg_code_edit = QLineEdit(self)
-        self.plugin_reg_code_edit.setObjectName("plugin_reg_code_edit")
-        self.plugin_reg_code_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.plugin_reg_code_edit.setText(str(self.current_config.get("plugin_reg_code", "") or ""))
-        self.plugin_reg_code_edit.setToolTip(plugin_hint)
-        reg_row.addWidget(reg_label)
-        reg_row.addWidget(self.plugin_reg_code_edit)
-        screenshot_engine_layout.addLayout(reg_row)
-
-        dir_row = QHBoxLayout()
-        dir_label = QLabel("插件目录:")
-        dir_label.setFixedWidth(80)
-        self.plugin_dir_edit = QLineEdit(self)
-        self.plugin_dir_edit.setObjectName("plugin_dir_edit")
-        self.plugin_dir_edit.setText(str(self.current_config.get("plugin_dir", "") or "").strip())
-        self.plugin_dir_edit.setToolTip(plugin_hint)
-        browse_btn = QPushButton("浏览")
-        browse_btn.clicked.connect(self._browse_plugin_dir)
-        dir_row.addWidget(dir_label)
-        dir_row.addWidget(self.plugin_dir_edit)
-        dir_row.addWidget(browse_btn)
-        screenshot_engine_layout.addLayout(dir_row)
-
         exec_layout.addWidget(self.screenshot_engine_group)
 
         # 连接执行模式变化信号，用于控制截图引擎选项可见性
@@ -480,6 +450,52 @@ class GlobalSettingsDialogTabsMixin:
         exec_layout.addStretch(1)
 
         self.tab_widget.addTab(self.exec_tab, "执行模式")
+
+    def _create_plugin_tab(self):
+        """插件授权：注册码与目录。"""
+        plugin_tab = QWidget()
+        layout = QVBoxLayout(plugin_tab)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 8, 10, 10)
+        group = QGroupBox("插件授权")
+        form = QVBoxLayout(group)
+        form.setSpacing(8)
+        form.setContentsMargins(15, 10, 15, 10)
+        plugin_hint = (
+            "插件：正常 / GDI2（无需挂钩）；DX / OpenGL（需注入）。"
+            "需要 tools/plugin 下 PluginHost.exe、dm.dll、RegDll.dll"
+        )
+        hint = QLabel(plugin_hint)
+        hint.setWordWrap(True)
+        hint.setToolTip(plugin_hint)
+        form.addWidget(hint)
+        reg_row = QHBoxLayout()
+        reg_label = QLabel("插件注册码:")
+        reg_label.setFixedWidth(80)
+        self.plugin_reg_code_edit = QLineEdit(self)
+        self.plugin_reg_code_edit.setObjectName("plugin_reg_code_edit")
+        self.plugin_reg_code_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.plugin_reg_code_edit.setText(str(self.current_config.get("plugin_reg_code", "") or ""))
+        self.plugin_reg_code_edit.setToolTip(plugin_hint)
+        reg_row.addWidget(reg_label)
+        reg_row.addWidget(self.plugin_reg_code_edit)
+        form.addLayout(reg_row)
+        dir_row = QHBoxLayout()
+        dir_label = QLabel("插件目录:")
+        dir_label.setFixedWidth(80)
+        self.plugin_dir_edit = QLineEdit(self)
+        self.plugin_dir_edit.setObjectName("plugin_dir_edit")
+        self.plugin_dir_edit.setText(str(self.current_config.get("plugin_dir", "") or "").strip())
+        self.plugin_dir_edit.setToolTip(plugin_hint)
+        browse_btn = QPushButton("浏览")
+        browse_btn.clicked.connect(self._browse_plugin_dir)
+        dir_row.addWidget(dir_label)
+        dir_row.addWidget(self.plugin_dir_edit)
+        dir_row.addWidget(browse_btn)
+        form.addLayout(dir_row)
+        layout.addWidget(group)
+        layout.addStretch(1)
+        self.tab_widget.addTab(plugin_tab, "插件")
 
     def _browse_plugin_dir(self):
         start = ""
