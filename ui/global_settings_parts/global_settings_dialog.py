@@ -47,8 +47,8 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         self.setMinimumWidth(680)
         self.setMaximumWidth(760)
         self.setMinimumHeight(280)
-        self.setMaximumHeight(560)
-        self.resize(700, 420)
+        self.setMaximumHeight(640)
+        self.resize(700, 460)
         from utils.input_simulation.mode_utils import migrate_legacy_normal_hd_config
 
         self.current_config = migrate_legacy_normal_hd_config(current_config)

@@ -1,19 +1,21 @@
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 from ..main_window_parts.main_window_dropdown_widget import QComboBox
 from ..main_window_parts.main_window_support import get_secondary_text_color
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
@@ -174,8 +176,8 @@ class GlobalSettingsDialogTabsMixin:
         self.tab_widget.addTab(window_tab, "窗口设置")
 
     def _style_settings_combo(self, combo: QComboBox, *, compact: bool = False) -> None:
-        combo.setMinimumWidth(120 if compact else 180)
-        combo.setMaximumWidth(500)
+        combo.setMinimumWidth(140 if compact else 200)
+        combo.setMaximumWidth(16777215)
         combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def _create_execution_tab(self):
@@ -379,8 +381,8 @@ class GlobalSettingsDialogTabsMixin:
             plugin_mouse_label,
         )
 
-        plugin_tab = QWidget()
-        layout = QVBoxLayout(plugin_tab)
+        page = QWidget()
+        layout = QVBoxLayout(page)
         layout.setSpacing(6)
         layout.setContentsMargins(8, 6, 8, 8)
 
@@ -397,18 +399,18 @@ class GlobalSettingsDialogTabsMixin:
         form.addWidget(hint)
         reg_row = QHBoxLayout()
         reg_label = QLabel("注册码:")
-        reg_label.setFixedWidth(56)
+        reg_label.setFixedWidth(72)
         self.plugin_reg_code_edit = QLineEdit(self)
         self.plugin_reg_code_edit.setObjectName("plugin_reg_code_edit")
         self.plugin_reg_code_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.plugin_reg_code_edit.setText(str(self.current_config.get("plugin_reg_code", "") or ""))
         self.plugin_reg_code_edit.setToolTip(plugin_hint)
         reg_row.addWidget(reg_label)
-        reg_row.addWidget(self.plugin_reg_code_edit)
+        reg_row.addWidget(self.plugin_reg_code_edit, 1)
         form.addLayout(reg_row)
         dir_row = QHBoxLayout()
         dir_label = QLabel("目录:")
-        dir_label.setFixedWidth(56)
+        dir_label.setFixedWidth(72)
         self.plugin_dir_edit = QLineEdit(self)
         self.plugin_dir_edit.setObjectName("plugin_dir_edit")
         self.plugin_dir_edit.setText(str(self.current_config.get("plugin_dir", "") or "").strip())
@@ -416,14 +418,14 @@ class GlobalSettingsDialogTabsMixin:
         browse_btn = QPushButton("浏览")
         browse_btn.clicked.connect(self._browse_plugin_dir)
         dir_row.addWidget(dir_label)
-        dir_row.addWidget(self.plugin_dir_edit)
+        dir_row.addWidget(self.plugin_dir_edit, 1)
         dir_row.addWidget(browse_btn)
         form.addLayout(dir_row)
         layout.addWidget(auth_group)
 
         input_group = QGroupBox("键鼠")
         input_layout = QVBoxLayout(input_group)
-        input_layout.setSpacing(4)
+        input_layout.setSpacing(6)
         input_layout.setContentsMargins(12, 8, 12, 8)
         configured_input_backend = str(
             self.current_config.get("input_backend", "native") or "native"
@@ -439,14 +441,14 @@ class GlobalSettingsDialogTabsMixin:
         self.plugin_input_panel = QWidget()
         plugin_input_layout = QVBoxLayout(self.plugin_input_panel)
         plugin_input_layout.setContentsMargins(0, 0, 0, 0)
-        plugin_input_layout.setSpacing(4)
+        plugin_input_layout.setSpacing(6)
 
-        mk_row = QHBoxLayout()
-        mouse_label = QLabel("鼠标:")
-        mouse_label.setFixedWidth(40)
+        mouse_row = QHBoxLayout()
+        mouse_label = QLabel("鼠标模式:")
+        mouse_label.setFixedWidth(72)
         self.plugin_mouse_combo = QComboBox(self)
         self.plugin_mouse_combo.setObjectName("plugin_mouse_combo")
-        self._style_settings_combo(self.plugin_mouse_combo, compact=True)
+        self._style_settings_combo(self.plugin_mouse_combo)
         for mode in PLUGIN_MOUSE_MODES:
             self.plugin_mouse_combo.addItem(plugin_mouse_label(mode), mode)
         configured_mouse = str(
@@ -455,11 +457,16 @@ class GlobalSettingsDialogTabsMixin:
         mouse_index = self.plugin_mouse_combo.findData(configured_mouse)
         if mouse_index >= 0:
             self.plugin_mouse_combo.setCurrentIndex(mouse_index)
-        keypad_label = QLabel("键盘:")
-        keypad_label.setFixedWidth(40)
+        mouse_row.addWidget(mouse_label)
+        mouse_row.addWidget(self.plugin_mouse_combo, 1)
+        plugin_input_layout.addLayout(mouse_row)
+
+        keypad_row = QHBoxLayout()
+        keypad_label = QLabel("键盘模式:")
+        keypad_label.setFixedWidth(72)
         self.plugin_keypad_combo = QComboBox(self)
         self.plugin_keypad_combo.setObjectName("plugin_keypad_combo")
-        self._style_settings_combo(self.plugin_keypad_combo, compact=True)
+        self._style_settings_combo(self.plugin_keypad_combo)
         for mode in PLUGIN_KEYPAD_MODES:
             self.plugin_keypad_combo.addItem(plugin_keypad_label(mode), mode)
         configured_keypad = str(
@@ -468,12 +475,9 @@ class GlobalSettingsDialogTabsMixin:
         keypad_index = self.plugin_keypad_combo.findData(configured_keypad)
         if keypad_index >= 0:
             self.plugin_keypad_combo.setCurrentIndex(keypad_index)
-        mk_row.addWidget(mouse_label)
-        mk_row.addWidget(self.plugin_mouse_combo, 1)
-        mk_row.addSpacing(8)
-        mk_row.addWidget(keypad_label)
-        mk_row.addWidget(self.plugin_keypad_combo, 1)
-        plugin_input_layout.addLayout(mk_row)
+        keypad_row.addWidget(keypad_label)
+        keypad_row.addWidget(self.plugin_keypad_combo, 1)
+        plugin_input_layout.addLayout(keypad_row)
 
         self.plugin_input_display_follow_check = QCheckBox("绑定图显跟随截图", self)
         self.plugin_input_display_follow_check.setObjectName("plugin_input_display_follow_check")
@@ -488,11 +492,11 @@ class GlobalSettingsDialogTabsMixin:
         self.plugin_input_display_row = QWidget()
         display_row = QHBoxLayout(self.plugin_input_display_row)
         display_row.setContentsMargins(0, 0, 0, 0)
-        display_label = QLabel("图显:")
-        display_label.setFixedWidth(40)
+        display_label = QLabel("绑定图显:")
+        display_label.setFixedWidth(72)
         self.plugin_input_display_combo = QComboBox(self)
         self.plugin_input_display_combo.setObjectName("plugin_input_display_combo")
-        self._style_settings_combo(self.plugin_input_display_combo, compact=True)
+        self._style_settings_combo(self.plugin_input_display_combo)
         for display in PLUGIN_INPUT_DISPLAYS:
             self.plugin_input_display_combo.addItem(plugin_engine_label(display), display)
         configured_display = str(
@@ -503,20 +507,20 @@ class GlobalSettingsDialogTabsMixin:
             self.plugin_input_display_combo.setCurrentIndex(display_index)
         self.plugin_input_display_combo.setToolTip("仅在取消「绑定图显跟随截图」后可手动选择。")
         display_row.addWidget(display_label)
-        display_row.addWidget(self.plugin_input_display_combo)
+        display_row.addWidget(self.plugin_input_display_combo, 1)
         plugin_input_layout.addWidget(self.plugin_input_display_row)
 
         self.plugin_advanced_panel = QWidget()
         advanced_layout = QHBoxLayout(self.plugin_advanced_panel)
         advanced_layout.setContentsMargins(0, 0, 0, 0)
-        advanced_layout.setSpacing(6)
+        advanced_layout.setSpacing(8)
         self.plugin_advanced_toggle = QCheckBox("高级绑定模式", self)
         self.plugin_advanced_toggle.setObjectName("plugin_advanced_toggle")
         self.plugin_advanced_toggle.setChecked(False)
         self.plugin_bind_mode_combo = QComboBox(self)
         self.plugin_bind_mode_combo.setObjectName("plugin_bind_mode_combo")
         self.plugin_bind_mode_combo.setEditable(False)
-        self._style_settings_combo(self.plugin_bind_mode_combo, compact=True)
+        self._style_settings_combo(self.plugin_bind_mode_combo)
         for mode in PLUGIN_BIND_MODE_PRESETS:
             self.plugin_bind_mode_combo.addItem(plugin_bind_mode_label(mode), mode)
         try:
@@ -543,25 +547,28 @@ class GlobalSettingsDialogTabsMixin:
 
         shot_group = QGroupBox("截图方式")
         shot_layout = QVBoxLayout(shot_group)
-        shot_layout.setSpacing(4)
+        shot_layout.setSpacing(6)
         shot_layout.setContentsMargins(12, 8, 12, 8)
         initial_engine = canonicalize_screenshot_engine(
             self.current_config.get("screenshot_engine") or "wgc"
         )
         use_plugin_shot = is_plugin_screenshot_engine(initial_engine)
-        self.plugin_screenshot_panel = QWidget()
-        plugin_shot_row = QHBoxLayout(self.plugin_screenshot_panel)
-        plugin_shot_row.setContentsMargins(0, 0, 0, 0)
-        plugin_shot_row.setSpacing(8)
         self.plugin_screenshot_enable_check = QCheckBox("使用插件截图", self)
         self.plugin_screenshot_enable_check.setObjectName("plugin_screenshot_enable_check")
         self.plugin_screenshot_enable_check.setChecked(use_plugin_shot)
         self.plugin_screenshot_enable_check.setToolTip(
             "开启后使用插件截图引擎；关闭则使用「原生模式」页的截图引擎。"
         )
+        shot_layout.addWidget(self.plugin_screenshot_enable_check)
+        self.plugin_screenshot_panel = QWidget()
+        plugin_shot_row = QHBoxLayout(self.plugin_screenshot_panel)
+        plugin_shot_row.setContentsMargins(0, 0, 0, 0)
+        plugin_shot_row.setSpacing(8)
+        plugin_shot_label = QLabel("截图引擎:")
+        plugin_shot_label.setFixedWidth(72)
         self.plugin_screenshot_engine_combo = QComboBox(self)
         self.plugin_screenshot_engine_combo.setObjectName("plugin_screenshot_engine_combo")
-        self._style_settings_combo(self.plugin_screenshot_engine_combo, compact=True)
+        self._style_settings_combo(self.plugin_screenshot_engine_combo)
         for engine in PLUGIN_SCREENSHOT_ENGINES:
             self.plugin_screenshot_engine_combo.addItem(plugin_engine_label(engine), engine)
         plugin_engine = initial_engine if use_plugin_shot else "normal"
@@ -571,7 +578,7 @@ class GlobalSettingsDialogTabsMixin:
         self.plugin_screenshot_engine_combo.setToolTip(
             "插件截图：正常 / GDI / GDI2（无需挂钩）；DX / OpenGL（需注入）"
         )
-        plugin_shot_row.addWidget(self.plugin_screenshot_enable_check)
+        plugin_shot_row.addWidget(plugin_shot_label)
         plugin_shot_row.addWidget(self.plugin_screenshot_engine_combo, 1)
         shot_layout.addWidget(self.plugin_screenshot_panel)
         layout.addWidget(shot_group)
@@ -588,7 +595,14 @@ class GlobalSettingsDialogTabsMixin:
         self._sync_plugin_input_display_follow()
 
         layout.addStretch(1)
-        self.tab_widget.addTab(plugin_tab, "插件模式")
+
+        scroll = QScrollArea()
+        scroll.setObjectName("plugin_mode_scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        self.tab_widget.addTab(scroll, "插件模式")
 
     def _browse_plugin_dir(self):
         start = ""
@@ -623,7 +637,9 @@ class GlobalSettingsDialogTabsMixin:
         use_plugin_shot = False
         if hasattr(self, "plugin_screenshot_enable_check"):
             use_plugin_shot = bool(self.plugin_screenshot_enable_check.isChecked())
-        if hasattr(self, "plugin_screenshot_engine_combo"):
+        if hasattr(self, "plugin_screenshot_panel"):
+            self.plugin_screenshot_panel.setVisible(use_plugin_shot)
+        elif hasattr(self, "plugin_screenshot_engine_combo"):
             self.plugin_screenshot_engine_combo.setVisible(use_plugin_shot)
         if use_plugin_input:
             self._sync_plugin_input_display_follow()

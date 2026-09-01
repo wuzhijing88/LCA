@@ -2,7 +2,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLineEdit
+from PySide6.QtWidgets import QApplication, QLineEdit, QSizePolicy
 
 from ui.global_settings_parts.global_settings_dialog import GlobalSettingsDialog
 from ui.global_settings_parts.global_settings_dialog_tabs_mixin import GlobalSettingsDialogTabsMixin
@@ -64,4 +64,11 @@ def test_plugin_auth_lives_on_plugin_mode_tab_not_native_tab():
     assert not native_tab.isAncestorOf(dialog.plugin_reg_code_edit)
     assert plugin_tab.isAncestorOf(dialog.plugin_mouse_combo)
     assert not native_tab.isAncestorOf(dialog.plugin_mouse_combo)
+    # 绑定图显下拉必须可拉满宽度，避免「显示不全」
+    dialog.plugin_input_enable_check.setChecked(True)
+    dialog.plugin_input_display_follow_check.setChecked(False)
+    assert (
+        dialog.plugin_input_display_combo.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
     dialog.close()
