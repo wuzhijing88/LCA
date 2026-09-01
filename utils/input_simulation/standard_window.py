@@ -141,9 +141,16 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         return str(mouse_backend).strip().lower()
 
     def _using_plugin_dx(self) -> bool:
-        from .mode_utils import is_dx_input_mode
+        from .mode_utils import is_plugin_input_backend
 
-        return (not self.use_foreground) and is_dx_input_mode(self.execution_mode)
+        try:
+            from app_core.config_store import load_config
+
+            cfg = dict(load_config() or {})
+        except Exception:
+            cfg = {}
+        cfg.setdefault("execution_mode", self.execution_mode)
+        return bool(is_plugin_input_backend(cfg))
 
     def _plugin_dx(self):
         if self._dx_input is None:

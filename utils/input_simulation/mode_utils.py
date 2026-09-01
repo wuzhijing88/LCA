@@ -172,6 +172,16 @@ def is_dx_input_mode(execution_mode: Optional[str]) -> bool:
     return str(execution_mode or "").strip().lower() in {"background_dx", "background_op_dx"}
 
 
+def is_plugin_input_backend(config: Optional[Mapping] = None) -> bool:
+    values = dict(config or {})
+    backend = str(values.get("input_backend") or "").strip().lower()
+    if backend == "plugin":
+        return True
+    if backend == "native":
+        return False
+    return is_dx_input_mode(values.get("execution_mode"))
+
+
 def get_ibinputsimulator_config() -> Tuple[str, str, str, str]:
     config = _read_main_config()
     driver = normalize_ib_driver_name(config.get("ibinputsimulator_driver", _DEFAULT_IB_DRIVER))
