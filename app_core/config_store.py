@@ -30,6 +30,11 @@ _DEFAULT_CONFIG = {
     "custom_height": 0,
     "screenshot_format": "bmp",
     "screenshot_engine": "wgc",
+    "input_backend": "native",
+    "plugin_mouse": "normal",
+    "plugin_keypad": "normal",
+    "plugin_input_display": "normal",
+    "plugin_bind_mode": 0,
     "plugin_reg_code": "",
     "plugin_dir": "",
     "binding_method": "enhanced",
@@ -102,7 +107,64 @@ def _normalize_config(config: Mapping, *, prefer: str = "section") -> dict:
             execution.get("screenshot_engine")
         )
         normalized["execution"] = execution
+    _migrate_plugin_input_settings(normalized)
     return normalized
+
+
+def _migrate_plugin_input_settings(normalized: dict) -> None:
+    from utils.plugin.bind_modes import (
+        normalize_plugin_bind_mode,
+        normalize_plugin_keypad,
+        normalize_plugin_mouse,
+    )
+
+    mode = str(normalized.get("execution_mode") or "").strip().lower()
+    if mode in {"background_dx", "background_op_dx"}:
+        normalized["input_backend"] = "plugin"
+        normalized["plugin_mouse"] = "dx"
+        normalized["plugin_keypad"] = "dx"
+        normalized["execution_mode"] = "background_sendmessage"
+
+    backend = str(normalized.get("input_backend") or "").strip().lower()
+    if backend not in {"native", "plugin"}:
+        backend = "native"
+    normalized["input_backend"] = backend
+
+    try:
+        normalized["plugin_mouse"] = normalize_plugin_mouse(normalized.get("plugin_mouse", "normal"))
+    except ValueError:
+        normalized["plugin_mouse"] = "normal"
+    try:
+        normalized["plugin_keypad"] = normalize_plugin_keypad(normalized.get("plugin_keypad", "normal"))
+    except ValueError:
+        normalized["plugin_keypad"] = "normal"
+
+    display = str(normalized.get("plugin_input_display") or "").strip().lower() or "normal"
+    from utils.capture.engine_ids import is_plugin_screenshot_engine
+
+    if not is_plugin_screenshot_engine(display):
+        display = "normal"
+    normalized["plugin_input_display"] = display
+
+    try:
+        normalized["plugin_bind_mode"] = normalize_plugin_bind_mode(
+            normalized.get("plugin_bind_mode", 0)
+        )
+    except ValueError:
+        normalized["plugin_bind_mode"] = 0
+
+    execution = normalized.get("execution")
+    if isinstance(execution, dict):
+        for key in (
+            "input_backend",
+            "plugin_mouse",
+            "plugin_keypad",
+            "plugin_input_display",
+            "plugin_bind_mode",
+            "execution_mode",
+        ):
+            execution[key] = normalized[key]
+        normalized["execution"] = execution
 
 
 def load_config() -> dict:
