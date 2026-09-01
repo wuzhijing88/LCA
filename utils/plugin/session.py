@@ -7,7 +7,11 @@ import logging
 import threading
 from typing import Dict, Optional
 
-from utils.capture.engine_ids import is_plugin_screenshot_engine, normalize_screenshot_engine
+from utils.capture.engine_ids import (
+    is_plugin_screenshot_engine,
+    normalize_screenshot_engine,
+    to_dm_display_mode,
+)
 from utils.plugin.runtime import PluginClient, ensure_plugin_rpc, terminate_plugin_host
 
 logger = logging.getLogger(__name__)
@@ -203,11 +207,12 @@ class PluginSession:
         candidates = iter_plugin_capture_display_candidates(preferred) or (preferred,)
         client = self._ensure_client()
         for display_mode in candidates:
+            dm_display = to_dm_display_mode(display_mode)
             for bind_mode in (0, 1):
                 outcome = self._bind_with_timeout(
                     target,
                     input_target,
-                    display_mode,
+                    dm_display,
                     "normal",
                     "normal",
                     bind_mode,
@@ -218,7 +223,7 @@ class PluginSession:
                 if not outcome:
                     continue
                 grab_input = int(self._last_input_hwnd or input_target or target)
-                frame = client.capture_bgr(target, display_mode, input_hwnd=grab_input)
+                frame = client.capture_bgr(target, dm_display, input_hwnd=grab_input)
                 if frame is not None:
                     return frame
         return None
@@ -233,32 +238,36 @@ class PluginSession:
         input_hwnd: Optional[int] = None,
         timeout: float = 8.0,
     ) -> bool:
-        _ = display
+        preferred = str(display or "").strip() or DEFAULT_PLUGIN_DISPLAY
+        dm_display = to_dm_display_mode(preferred)
         wanted_mouse = str(mouse or "dx").strip() or "dx"
         wanted_keypad = str(keypad or "dx").strip() or "dx"
         try:
             wait_seconds = max(0.05, float(timeout))
         except Exception:
             wait_seconds = 8.0
+        try:
+            requested_mode = int(mode or 0)
+        except (TypeError, ValueError):
+            requested_mode = 0
         modes: list[int] = []
-        for bind_mode in (int(mode or 0), 0, 1):
+        for bind_mode in (requested_mode, 0, 1):
             if bind_mode not in modes:
                 modes.append(bind_mode)
-        for display_mode in INPUT_BIND_DISPLAYS:
-            for bind_mode in modes:
-                outcome = self._bind_with_timeout(
-                    int(hwnd or 0),
-                    int(input_hwnd or 0),
-                    display_mode,
-                    wanted_mouse,
-                    wanted_keypad,
-                    bind_mode,
-                    wait_seconds,
-                )
-                if outcome is None:
-                    return False
-                if outcome:
-                    return True
+        for bind_mode in modes:
+            outcome = self._bind_with_timeout(
+                int(hwnd or 0),
+                int(input_hwnd or 0),
+                dm_display,
+                wanted_mouse,
+                wanted_keypad,
+                bind_mode,
+                wait_seconds,
+            )
+            if outcome is None:
+                return False
+            if outcome:
+                return True
         return False
 
     def last_error(self) -> int:

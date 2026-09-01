@@ -52,6 +52,23 @@ class PluginDxInput:
             return self._injected_client
         return PluginSession(client=self._injected_client)
 
+    def _load_bind_params(self) -> tuple[str, str, str, int]:
+        try:
+            from app_core.config_store import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+        mouse = str(cfg.get("plugin_mouse") or "dx").strip() or "dx"
+        keypad = str(cfg.get("plugin_keypad") or "dx").strip() or "dx"
+        try:
+            mode = int(cfg.get("plugin_bind_mode") or 0)
+        except (TypeError, ValueError):
+            mode = 0
+        display = self.display or cfg.get("plugin_input_display") or None
+        display = resolve_plugin_display_mode(display)
+        return display, mouse, keypad, mode
+
     def _ready(self) -> bool:
         if self.hwnd <= 0:
             return False
@@ -59,13 +76,14 @@ class PluginDxInput:
             logger.error("DX 模式需要插件运行库（tools/plugin 或 LCA_PLUGIN_DIR）")
             return False
         session = self._session()
-        display = resolve_plugin_display_mode(self.display)
+        display, mouse, keypad, mode = self._load_bind_params()
         input_hwnd = as_hwnd(self._resolved_input_hwnd()) or self.hwnd
         if not session.ensure_input_bind(
             self.hwnd,
             display,
-            mouse="dx",
-            keypad="dx",
+            mouse=mouse,
+            keypad=keypad,
+            mode=mode,
             input_hwnd=input_hwnd,
             timeout=8.0,
         ):

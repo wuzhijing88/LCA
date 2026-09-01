@@ -49,6 +49,28 @@ def test_dx_input_uses_non_hook_displays():
     assert all(not item.startswith("dx") and not item.startswith("opengl") for item in INPUT_BIND_DISPLAYS)
 
 
+def test_ensure_input_bind_uses_explicit_mouse_keypad_mode():
+    class _Client:
+        def __init__(self):
+            self.binds = []
+
+        def bind(self, display_hwnd, input_hwnd, display, mouse, keypad, mode):
+            self.binds.append((display_hwnd, input_hwnd, display, mouse, keypad, mode))
+            return True
+
+    client = _Client()
+    session = PluginSession(client=client)
+    assert session.ensure_input_bind(
+        9,
+        "plugin.gdi",
+        mouse="windows",
+        keypad="windows",
+        mode=101,
+        input_hwnd=9,
+    )
+    assert client.binds[-1] == (9, 9, "gdi", "windows", "windows", 101)
+
+
 def test_timeout_abandons_all_shared_clients(monkeypatch):
     import time
 

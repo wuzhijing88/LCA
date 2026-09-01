@@ -71,19 +71,37 @@ def test_dx_input_mode_aliases():
     assert not is_dx_input_mode("foreground_driver")
 
 
-def test_plugin_dx_input_binds_dx_and_clicks_client_coords():
+def test_plugin_dx_input_binds_dx_and_clicks_client_coords(monkeypatch):
+    monkeypatch.setattr(
+        "app_core.config_store.load_config",
+        lambda: {
+            "plugin_mouse": "dx",
+            "plugin_keypad": "dx",
+            "plugin_input_display": "normal",
+            "plugin_bind_mode": 0,
+        },
+    )
     handler = _FakeHandler()
     client = _make_client(handler)
-    dx = PluginDxInput(9, display="dx.d3d11", client=client)
+    dx = PluginDxInput(9, display="normal", client=client)
     assert dx.click(10, 20, button="left", clicks=1, duration=0)
     assert handler.binds
-    assert all(item[2] in INPUT_BIND_DISPLAYS for item in handler.binds)
     assert handler.binds[0] == (9, 9, "normal", "dx", "dx", 0)
     assert handler.calls == [("move_to", 10, 20), ("click", "left")]
     client.close()
 
 
-def test_plugin_dx_input_retries_split_hwnds_as_equal():
+def test_plugin_dx_input_retries_split_hwnds_as_equal(monkeypatch):
+    monkeypatch.setattr(
+        "app_core.config_store.load_config",
+        lambda: {
+            "plugin_mouse": "dx",
+            "plugin_keypad": "dx",
+            "plugin_input_display": "normal",
+            "plugin_bind_mode": 0,
+        },
+    )
+
     def bind_ok(rec):
         if rec[0] != rec[1]:
             raise RuntimeError("无法分离绑定: 大漠 BindWindowEx 不支持独立 input_hwnd")
@@ -94,22 +112,35 @@ def test_plugin_dx_input_retries_split_hwnds_as_equal():
     dx = PluginDxInput(9, display="normal", client=client, input_hwnd=99)
     assert dx.click(3, 4, button="left", clicks=1, duration=0)
     assert any(item[:3] == (9, 9, "normal") for item in handler.binds)
-    assert all(item[2] in INPUT_BIND_DISPLAYS for item in handler.binds)
     assert handler.calls == [("move_to", 3, 4), ("click", "left")]
     client.close()
 
 
-def test_plugin_dx_input_falls_back_when_preferred_display_fails():
-    handler = _FakeHandler(bind_ok=lambda rec: rec[2] not in {"normal", "dx.d3d9"})
+def test_plugin_dx_input_reads_config_bind_params(monkeypatch):
+    monkeypatch.setattr(
+        "app_core.config_store.load_config",
+        lambda: {
+            "plugin_mouse": "dx2",
+            "plugin_keypad": "dx",
+            "plugin_input_display": "gdi2",
+            "plugin_bind_mode": 0,
+        },
+    )
+    handler = _FakeHandler()
+    client = _make_client(handler)
+    dx = PluginDxInput(9, client=client)
+    assert dx.click(1, 2, button="left", clicks=1, duration=0)
+    assert handler.binds[0] == (9, 9, "gdi2", "dx2", "dx", 0)
+    client.close()
+
+
+def test_ensure_input_bind_fails_when_preferred_display_fails():
+    handler = _FakeHandler(bind_ok=lambda rec: False)
     client = _make_client(handler)
     session = PluginSession(client=client)
-    assert session.ensure_input_bind(5, "dx.d3d9", mouse="dx", keypad="dx")
+    assert session.ensure_input_bind(5, "gdi2", mouse="dx", keypad="dx") is False
     assert handler.binds
-    last = handler.binds[-1]
-    assert last[2] == "gdi"
-    assert last[3:] == ("dx", "dx", 0)
-    assert all(item[2] in INPUT_BIND_DISPLAYS for item in handler.binds)
-    assert all(not str(item[2]).startswith("dx") for item in handler.binds)
+    assert all(item[2] == "gdi2" for item in handler.binds)
     client.close()
 
 
@@ -172,6 +203,15 @@ def test_plugin_dx_input_rebuilds_client_after_timeout(monkeypatch):
     monkeypatch.setattr(session_mod, "terminate_plugin_host", lambda: None)
     monkeypatch.setattr(session_mod.PluginSession, "ensure_input_bind", _short_bind)
     monkeypatch.setattr(dx_mod, "is_plugin_runtime_available", lambda: True)
+    monkeypatch.setattr(
+        "app_core.config_store.load_config",
+        lambda: {
+            "plugin_mouse": "dx",
+            "plugin_keypad": "dx",
+            "plugin_input_display": "normal",
+            "plugin_bind_mode": 0,
+        },
+    )
     session_mod.close_shared_plugin_client()
     try:
         dx = PluginDxInput(9, display="normal")
@@ -187,10 +227,19 @@ def test_plugin_dx_input_rebuilds_client_after_timeout(monkeypatch):
         session_mod.close_shared_plugin_client()
 
 
-def test_plugin_dx_input_hold_click_and_keys():
+def test_plugin_dx_input_hold_click_and_keys(monkeypatch):
+    monkeypatch.setattr(
+        "app_core.config_store.load_config",
+        lambda: {
+            "plugin_mouse": "dx",
+            "plugin_keypad": "dx",
+            "plugin_input_display": "normal",
+            "plugin_bind_mode": 0,
+        },
+    )
     handler = _FakeHandler()
     client = _make_client(handler)
-    dx = PluginDxInput(4, display="dx", client=client)
+    dx = PluginDxInput(4, display="normal", client=client)
     assert dx.click(1, 2, button="right", clicks=1, duration=0.0, interval=0)
     assert dx.key_down(13)
     assert dx.key_up(13)
@@ -199,5 +248,6 @@ def test_plugin_dx_input_hold_click_and_keys():
     assert ("key_down", 13) in handler.calls
     assert ("key_up", 13) in handler.calls
     assert ("wheel", -120) in handler.calls
-    assert all(item[2] in INPUT_BIND_DISPLAYS for item in handler.binds)
+    assert handler.binds
+    assert all(item[2] == "normal" for item in handler.binds)
     client.close()
