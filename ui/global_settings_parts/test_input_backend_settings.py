@@ -167,3 +167,22 @@ def test_settings_dialog_default_height_is_compact():
     assert dialog.maximumHeight() <= 640
     assert dialog.height() <= 520
     dialog.close()
+
+
+def test_native_input_merged_into_execution_group():
+    _qapp()
+    dialog = GlobalSettingsDialog(
+        {
+            "execution_mode": "background_sendmessage",
+            "screenshot_engine": "wgc",
+            "bound_windows": [],
+        }
+    )
+    assert dialog.exec_mode_group.isAncestorOf(dialog.native_input_panel)
+    assert dialog.native_input_panel.isHidden()
+    mode_index = dialog.mode_combo.findData("foreground_driver")
+    assert mode_index >= 0
+    dialog.mode_combo.setCurrentIndex(mode_index)
+    dialog._update_input_backend_visibility()
+    assert not dialog.native_input_panel.isHidden()
+    dialog.close()

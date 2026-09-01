@@ -25,9 +25,7 @@ class GlobalSettingsDialogVisibilityMixin:
         self._update_input_backend_visibility(resize_dialog=resize_dialog)
 
     def _update_input_backend_visibility(self, *args, resize_dialog: bool = False):
-        """原生模式页：按前台/后台显示驱动控件。插件键鼠开关在插件模式页处理。"""
-        if hasattr(self, "native_input_panel"):
-            self.native_input_panel.setVisible(True)
+        """原生模式页：键鼠控件已并入执行模式分组，仅前台模式显示。"""
         if hasattr(self, "_update_plugin_mode_panels"):
             self._update_plugin_mode_panels()
 
@@ -63,14 +61,15 @@ class GlobalSettingsDialogVisibilityMixin:
         if hasattr(self, "ib_driver_combo"):
             self.ib_driver_combo.setEnabled(use_foreground_driver and use_ib_driver)
 
+        if hasattr(self, "native_input_panel"):
+            self.native_input_panel.setVisible(use_foreground_driver or use_foreground_py)
+
         if resize_dialog and self.isVisible():
             QTimer.singleShot(0, self._adjust_dialog_height_only)
 
     def _update_execution_mode_visibility(self):
         if hasattr(self, "exec_mode_group"):
             self.exec_mode_group.setVisible(True)
-        if hasattr(self, "input_backend_group"):
-            self.input_backend_group.setVisible(True)
         if hasattr(self, "screenshot_engine_group"):
             self.screenshot_engine_group.setVisible(True)
         if hasattr(self, "_update_screenshot_engine_visibility"):

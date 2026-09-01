@@ -216,14 +216,10 @@ class GlobalSettingsDialogTabsMixin:
         mode_select_layout.addWidget(mode_label)
         mode_select_layout.addWidget(self.mode_combo)
         exec_mode_layout.addWidget(self.mode_select_widget)
-        exec_layout.addWidget(self.exec_mode_group)
 
-        self.input_backend_group = QGroupBox("键鼠")
-        input_backend_layout = QVBoxLayout(self.input_backend_group)
-        input_backend_layout.setSpacing(4)
-        input_backend_layout.setContentsMargins(12, 8, 12, 8)
-
+        # 键鼠参数并入执行模式：前台一/二时显示驱动选项，后台时隐藏
         self.native_input_panel = QWidget()
+        self.input_backend_group = self.native_input_panel  # 兼容旧可见性逻辑
         native_input_layout = QVBoxLayout(self.native_input_panel)
         native_input_layout.setContentsMargins(0, 0, 0, 0)
         native_input_layout.setSpacing(4)
@@ -306,8 +302,8 @@ class GlobalSettingsDialogTabsMixin:
         foreground_py_backend_layout.addWidget(foreground_py_backend_label)
         foreground_py_backend_layout.addWidget(self.foreground_py_backend_combo)
         native_input_layout.addWidget(self.foreground_py_backend_widget)
-        input_backend_layout.addWidget(self.native_input_panel)
-        exec_layout.addWidget(self.input_backend_group)
+        exec_mode_layout.addWidget(self.native_input_panel)
+        exec_layout.addWidget(self.exec_mode_group)
 
         self.screenshot_engine_group = QGroupBox("截图方式")
         screenshot_engine_layout = QVBoxLayout(self.screenshot_engine_group)
