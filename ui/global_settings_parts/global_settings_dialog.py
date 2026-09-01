@@ -46,9 +46,9 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         # 快捷键四列按键框默认 minWidth=140，窄于约 680 时右侧会被裁切
         self.setMinimumWidth(680)
         self.setMaximumWidth(760)
-        self.setMinimumHeight(300)
-        self.setMaximumHeight(720)  # 放宽高度上限，避免键鼠/插件绑定控件裁切
-        self.resize(700, 500)
+        self.setMinimumHeight(280)
+        self.setMaximumHeight(560)
+        self.resize(700, 420)
         from utils.input_simulation.mode_utils import migrate_legacy_normal_hd_config
 
         self.current_config = migrate_legacy_normal_hd_config(current_config)
@@ -71,8 +71,8 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
             logger.info(f"  {i+1}. {title} (HWND: {hwnd})")
         # --- Main Layout ---
         main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(8)
-        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(8, 8, 8, 8)
         # 创建标签页控件
         self.tab_widget = QTabWidget()
         self.tab_widget.setObjectName("globalSettingsTabs")

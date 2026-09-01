@@ -107,9 +107,9 @@ def test_plugin_bind_mode_shows_chinese_labels_and_follow_syncs_display():
         for i in range(dialog.plugin_bind_mode_combo.count())
     ]
     assert any("默认" in text for text in mode_texts)
-    assert dialog.plugin_advanced_panel.isHidden()
+    assert dialog.plugin_bind_mode_combo.isHidden()
     dialog.plugin_advanced_toggle.setChecked(True)
-    assert not dialog.plugin_advanced_panel.isHidden()
+    assert not dialog.plugin_bind_mode_combo.isHidden()
 
     assert dialog.plugin_input_enable_check.isChecked()
     assert not dialog.plugin_input_panel.isHidden()
@@ -118,7 +118,7 @@ def test_plugin_bind_mode_shows_chinese_labels_and_follow_syncs_display():
     assert dialog.plugin_input_display_combo.currentData() == "normal"
 
     dialog.plugin_screenshot_enable_check.setChecked(True)
-    assert not dialog.plugin_screenshot_panel.isHidden()
+    assert not dialog.plugin_screenshot_engine_combo.isHidden()
     engine_index = dialog.plugin_screenshot_engine_combo.findData("gdi2")
     assert engine_index >= 0
     dialog.plugin_screenshot_engine_combo.setCurrentIndex(engine_index)
@@ -145,10 +145,24 @@ def test_plugin_mode_hides_details_when_disabled():
     assert not dialog.plugin_input_enable_check.isChecked()
     assert dialog.plugin_input_panel.isHidden()
     assert not dialog.plugin_screenshot_enable_check.isChecked()
-    assert dialog.plugin_screenshot_panel.isHidden()
+    assert dialog.plugin_screenshot_engine_combo.isHidden()
 
     dialog.plugin_input_enable_check.setChecked(True)
     assert not dialog.plugin_input_panel.isHidden()
     dialog.plugin_screenshot_enable_check.setChecked(True)
-    assert not dialog.plugin_screenshot_panel.isHidden()
+    assert not dialog.plugin_screenshot_engine_combo.isHidden()
+    dialog.close()
+
+
+def test_settings_dialog_default_height_is_compact():
+    _qapp()
+    dialog = GlobalSettingsDialog(
+        {
+            "execution_mode": "background_sendmessage",
+            "screenshot_engine": "wgc",
+            "bound_windows": [],
+        }
+    )
+    assert dialog.maximumHeight() <= 560
+    assert dialog.height() <= 480
     dialog.close()
