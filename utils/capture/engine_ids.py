@@ -9,6 +9,7 @@ NATIVE_SCREENSHOT_ENGINES = ("wgc", "printwindow", "gdi", "dxgi")
 
 PLUGIN_SCREENSHOT_ENGINES = (
     "normal",
+    "plugin.gdi",
     "gdi2",
     "dx",
     "dx2",
@@ -53,6 +54,7 @@ _SCREENSHOT_ENGINE_LABELS = {
     "gdi": "GDI",
     "dxgi": "DXGI",
     "normal": "正常",
+    "plugin.gdi": "GDI",
     "gdi2": "GDI2",
     "dx": "DX",
     "dx2": "DX2",
@@ -99,6 +101,13 @@ def canonicalize_screenshot_engine(engine: object) -> str:
 def migrate_screenshot_engine(engine: object) -> str:
     mode = normalize_screenshot_engine(engine)
     return _LEGACY_ENGINE_MIGRATION.get(mode, mode)
+
+
+def to_dm_display_mode(engine: object) -> str:
+    mode = canonicalize_screenshot_engine(engine)
+    if mode == "plugin.gdi":
+        return "gdi"
+    return mode
 
 
 def is_supported_screenshot_engine(engine: object) -> bool:

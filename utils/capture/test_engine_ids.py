@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 from utils.capture.engine_ids import (
     BACKGROUND_SCREENSHOT_ENGINES,
+    NATIVE_SCREENSHOT_ENGINES,
     PLUGIN_SCREENSHOT_ENGINES,
     SUPPORTED_SCREENSHOT_ENGINES,
     canonicalize_screenshot_engine,
     engines_for_ui_group,
     is_background_screenshot_engine,
+    is_native_screenshot_engine,
     is_plugin_screenshot_engine,
     is_supported_screenshot_engine,
     iter_plugin_capture_display_candidates,
@@ -13,6 +15,7 @@ from utils.capture.engine_ids import (
     migrate_screenshot_engine,
     screenshot_engine_label,
     screenshot_engine_ui_group,
+    to_dm_display_mode,
 )
 
 
@@ -41,6 +44,25 @@ def test_plugin_gdi_does_not_steal_native_gdi():
     assert screenshot_engine_ui_group("gdi") == "原生"
     assert screenshot_engine_label("gdi") == "GDI"
     assert screenshot_engine_label("normal") == "正常"
+
+
+def test_plugin_gdi_is_distinct_from_native_gdi():
+    assert "plugin.gdi" in PLUGIN_SCREENSHOT_ENGINES
+    assert "gdi" in NATIVE_SCREENSHOT_ENGINES
+    assert is_plugin_screenshot_engine("plugin.gdi")
+    assert not is_plugin_screenshot_engine("gdi")
+    assert is_native_screenshot_engine("gdi")
+    assert screenshot_engine_label("plugin.gdi") == "GDI"
+    assert screenshot_engine_label("gdi") == "GDI"
+    assert screenshot_engine_ui_group("plugin.gdi") == "插件"
+    assert screenshot_engine_ui_group("gdi") == "原生"
+
+
+def test_to_dm_display_mode_strips_plugin_gdi_prefix():
+    assert to_dm_display_mode("plugin.gdi") == "gdi"
+    assert to_dm_display_mode("gdi2") == "gdi2"
+    assert to_dm_display_mode("dx.d3d11") == "dx.d3d11"
+    assert to_dm_display_mode("opengl.nox") == "opengl"
 
 
 def test_screenshot_engine_label_covers_plugin_modes():
@@ -86,6 +108,7 @@ def test_screenshot_engine_ui_groups_native_and_plugin():
     assert "opengl" in groups["插件"]
     assert "normal.wgc" not in groups["插件"]
     assert "gdi" not in groups["插件"]
+    assert "plugin.gdi" in groups["插件"]
     background_groups = dict(iter_screenshot_engine_ui_groups(background_only=True))
     assert "gdi" not in background_groups.get("原生", ())
     assert engines_for_ui_group("插件") == PLUGIN_SCREENSHOT_ENGINES
