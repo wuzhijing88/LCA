@@ -43,7 +43,7 @@ def test_get_settings_includes_plugin_fields():
     dialog.close()
 
 
-def test_plugin_auth_lives_on_plugin_mode_tab_not_native_tab():
+def test_plugin_auth_lives_on_other_tab_not_plugin_mode_tab():
     _qapp()
     dialog = GlobalSettingsDialog(
         {
@@ -54,17 +54,15 @@ def test_plugin_auth_lives_on_plugin_mode_tab_not_native_tab():
     )
     tab_titles = [dialog.tab_widget.tabText(i) for i in range(dialog.tab_widget.count())]
     assert "插件模式" in tab_titles
-    assert "原生模式" in tab_titles
-    assert "执行模式" not in tab_titles
+    assert "其他设置" in tab_titles
+    other_index = tab_titles.index("其他设置")
     plugin_index = tab_titles.index("插件模式")
-    native_index = tab_titles.index("原生模式")
+    other_tab = dialog.tab_widget.widget(other_index)
     plugin_tab = dialog.tab_widget.widget(plugin_index)
-    native_tab = dialog.tab_widget.widget(native_index)
-    assert plugin_tab.isAncestorOf(dialog.plugin_reg_code_edit)
-    assert not native_tab.isAncestorOf(dialog.plugin_reg_code_edit)
+    assert other_tab.isAncestorOf(dialog.plugin_reg_code_edit)
+    assert other_tab.isAncestorOf(dialog.plugin_dir_edit)
+    assert not plugin_tab.isAncestorOf(dialog.plugin_reg_code_edit)
     assert plugin_tab.isAncestorOf(dialog.plugin_mouse_combo)
-    assert not native_tab.isAncestorOf(dialog.plugin_mouse_combo)
-    # 绑定图显下拉必须可拉满宽度，避免「显示不全」
     dialog.plugin_input_enable_check.setChecked(True)
     dialog.plugin_input_display_follow_check.setChecked(False)
     assert (
