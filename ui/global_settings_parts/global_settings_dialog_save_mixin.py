@@ -3,7 +3,11 @@ import logging
 from PySide6.QtWidgets import QMessageBox
 
 from app_core.config_sections import DEFAULT_HOTKEYS
-from utils.input_simulation.mode_utils import require_foreground_backend
+from app_core.hotkey_spec import normalize_hotkey
+from utils.input_simulation.mode_utils import (
+    require_foreground_backend,
+    require_foreground_py_backend,
+)
 from utils.window.window_binding_utils import (
     get_active_target_window_title,
     sync_runtime_window_binding_state,
@@ -19,6 +23,15 @@ class GlobalSettingsDialogSaveMixin:
         try:
             if hasattr(self, "_is_wgc_desktop_combination") and self._is_wgc_desktop_combination():
                 self._warn_wgc_desktop_engine()
+                return
+            width = self.width_spinbox.value() if hasattr(self, "width_spinbox") else 0
+            height = self.height_spinbox.value() if hasattr(self, "height_spinbox") else 0
+            if (width > 0) != (height > 0):
+                QMessageBox.warning(
+                    self,
+                    "分辨率未生效",
+                    "绑定窗口分辨率的宽高需要同时大于 0 才会启用；若要禁用请把宽和高都设为 0。",
+                )
                 return
             settings = self.get_settings()
             self.current_config.update(settings)
@@ -68,9 +81,12 @@ class GlobalSettingsDialogSaveMixin:
             return 500
         return delay_ms if delay_ms >= 0 else 500
     def _get_combo_data(self, combo):
-        """从QComboBox获取数据，兼容currentData方法"""
+        """从下拉框或按键录取按钮读取值。"""
         if combo is None:
             return None
+        if hasattr(combo, "key_value"):
+            value = combo.key_value()
+            return value or None
         current_index = combo.currentIndex()
         if current_index >= 0:
             data = combo.itemData(current_index)
@@ -89,11 +105,15 @@ class GlobalSettingsDialogSaveMixin:
         window_binding_mode = 'multiple' if window_count > 1 else 'single'
         active_bound_windows = bound_windows
         active_window_binding_mode = window_binding_mode
-        # 获取截图引擎设置
-        screenshot_engine_display = self.screenshot_engine_combo.currentText()
-        screenshot_engine = self.screenshot_engine_map.get(screenshot_engine_display)
+        # 获取截图引擎设置（优先 itemData，兼容旧文本映射）
+        screenshot_engine = self.screenshot_engine_combo.currentData()
         if not screenshot_engine:
-            raise ValueError(f"未知的截图引擎选项: {screenshot_engine_display!r}")
+            screenshot_engine_display = self.screenshot_engine_combo.currentText()
+            screenshot_engine = self.screenshot_engine_map.get(screenshot_engine_display)
+        if not screenshot_engine:
+            raise ValueError(
+                f"未知的截图引擎选项: {self.screenshot_engine_combo.currentText()!r}"
+            )
         settings = {
             'execution_mode': internal_mode,
             'operation_mode': 'auto',  # 默认使用自动检测
@@ -101,6 +121,8 @@ class GlobalSettingsDialogSaveMixin:
             'custom_height': self.height_spinbox.value(),
             'screenshot_format': self.screenshot_format_combo.currentData() if hasattr(self, 'screenshot_format_combo') else self.current_config.get('screenshot_format', 'bmp'),
             'screenshot_engine': screenshot_engine,  # 添加截图引擎设置
+            "plugin_reg_code": self.plugin_reg_code_edit.text() if hasattr(self, "plugin_reg_code_edit") else self.current_config.get("plugin_reg_code", ""),
+            "plugin_dir": self.plugin_dir_edit.text().strip() if hasattr(self, "plugin_dir_edit") else self.current_config.get("plugin_dir", ""),
             'foreground_mouse_driver_backend': require_foreground_backend(
                 (self.foreground_driver_combo.currentData() if hasattr(self, 'foreground_driver_combo') else None)
                 or self.current_config.get('foreground_mouse_driver_backend', 'interception')
@@ -108,6 +130,10 @@ class GlobalSettingsDialogSaveMixin:
             'foreground_keyboard_driver_backend': require_foreground_backend(
                 (self.foreground_keyboard_driver_combo.currentData() if hasattr(self, 'foreground_keyboard_driver_combo') else None)
                 or self.current_config.get('foreground_keyboard_driver_backend', 'interception')
+            ),
+            'foreground_py_backend': require_foreground_py_backend(
+                (self.foreground_py_backend_combo.currentData() if hasattr(self, 'foreground_py_backend_combo') else None)
+                or self.current_config.get('foreground_py_backend', 'pyautogui')
             ),
             'ibinputsimulator_driver': (
                 self.ib_driver_combo.currentData() if hasattr(self, 'ib_driver_combo') else self.current_config.get('ibinputsimulator_driver', 'Logitech')
@@ -125,12 +151,13 @@ class GlobalSettingsDialogSaveMixin:
             'active_bound_windows': active_bound_windows,
             'active_window_binding_mode': active_window_binding_mode,
             'multi_window_delay': self.get_multi_window_delay(),
-            # 快捷键设置 - 从QComboBox获取实际值(itemData)
-            'start_task_hotkey': self._get_combo_data(self.start_task_hotkey) or DEFAULT_HOTKEYS['start_task_hotkey'],
-            'stop_task_hotkey': self._get_combo_data(self.stop_task_hotkey) or DEFAULT_HOTKEYS['stop_task_hotkey'],
-            'pause_workflow_hotkey': self._get_combo_data(self.pause_workflow_hotkey) or DEFAULT_HOTKEYS['pause_workflow_hotkey'],
-            'record_hotkey': self._get_combo_data(self.record_hotkey) or DEFAULT_HOTKEYS['record_hotkey'],
-            'replay_hotkey': self._get_combo_data(self.replay_hotkey) or DEFAULT_HOTKEYS['replay_hotkey'],
+            # 快捷键设置
+            'start_task_hotkey': normalize_hotkey(self._get_combo_data(self.start_task_hotkey)) or DEFAULT_HOTKEYS['start_task_hotkey'],
+            'stop_task_hotkey': normalize_hotkey(self._get_combo_data(self.stop_task_hotkey)) or DEFAULT_HOTKEYS['stop_task_hotkey'],
+            'pause_workflow_hotkey': normalize_hotkey(self._get_combo_data(self.pause_workflow_hotkey)) or DEFAULT_HOTKEYS['pause_workflow_hotkey'],
+            'record_hotkey': normalize_hotkey(self._get_combo_data(self.record_hotkey)) or DEFAULT_HOTKEYS['record_hotkey'],
+            'replay_hotkey': normalize_hotkey(self._get_combo_data(self.replay_hotkey)) or DEFAULT_HOTKEYS['replay_hotkey'],
+            'close_listen_hotkey': normalize_hotkey(self._get_combo_data(self.close_listen_hotkey)) or DEFAULT_HOTKEYS['close_listen_hotkey'],
         }
         # 根据窗口数量设置target_window_title
         active_window_count = len(active_bound_windows)

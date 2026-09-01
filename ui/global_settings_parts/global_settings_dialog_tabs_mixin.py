@@ -1,10 +1,13 @@
 from PySide6.QtWidgets import (
     QCheckBox,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -21,7 +24,10 @@ from PySide6.QtWidgets import (
 )
 from ..main_window_parts.main_window_support import normalize_execution_mode_setting
 from app_core.config_sections import DEFAULT_HOTKEYS
-from utils.input_simulation.mode_utils import parse_foreground_backends
+from utils.input_simulation.mode_utils import (
+    parse_foreground_backends,
+    parse_foreground_py_backend,
+)
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QGroupBox,
@@ -30,10 +36,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from ..main_window_parts.main_window_dropdown_widget import CustomDropdown
+from ui.widgets.hotkey_capture_button import HotkeyCaptureButton
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -65,6 +73,7 @@ def _about_label(text: str, *, color: str, size: int, weight: int = 400) -> QLab
         f"color: {color}; font-size: {size}px; font-weight: {weight}; background: transparent;"
     )
     return label
+
 
 class GlobalSettingsDialogTabsMixin:
 
@@ -322,6 +331,27 @@ class GlobalSettingsDialogTabsMixin:
 
         exec_mode_layout.addWidget(self.ib_driver_widget)
 
+        # 前台二：PyAutoGUI / 扫描码（非驱动）
+        self.foreground_py_backend_widget = QWidget()
+        foreground_py_backend_layout = QHBoxLayout(self.foreground_py_backend_widget)
+        foreground_py_backend_layout.setContentsMargins(0, 0, 0, 0)
+        foreground_py_backend_label = QLabel("输入方式:")
+        foreground_py_backend_label.setFixedWidth(80)
+        self.foreground_py_backend_combo = QComboBox(self)
+        for display_name, backend in self.FOREGROUND_PY_BACKEND_MAP.items():
+            self.foreground_py_backend_combo.addItem(display_name, backend)
+        configured_py_backend = parse_foreground_py_backend(self.current_config)
+        py_backend_index = self.foreground_py_backend_combo.findData(configured_py_backend)
+        if py_backend_index >= 0:
+            self.foreground_py_backend_combo.setCurrentIndex(py_backend_index)
+        self.foreground_py_backend_combo.setToolTip(
+            "PyAutoGUI: 原前台二输入\n"
+            "扫描码: SendInput 硬件扫描码（对应 normal.hd），不是驱动"
+        )
+        foreground_py_backend_layout.addWidget(foreground_py_backend_label)
+        foreground_py_backend_layout.addWidget(self.foreground_py_backend_combo)
+        exec_mode_layout.addWidget(self.foreground_py_backend_widget)
+
         exec_layout.addWidget(self.exec_mode_group)
 
         # --- 截图方式选择（原生模式）---
@@ -334,102 +364,130 @@ class GlobalSettingsDialogTabsMixin:
 
         screenshot_engine_layout.setContentsMargins(15, 10, 15, 10)
 
-        # 截图引擎选择
-
-        screenshot_engine_row = QHBoxLayout()
-
-        screenshot_engine_label = QLabel("截图引擎:")
-
-        screenshot_engine_label.setFixedWidth(80)
-
-        self.screenshot_engine_combo = QComboBox(self)
-
-        self.screenshot_engine_combo.setMinimumWidth(200)
-
-        # 截图引擎选项映射
-
-        self.screenshot_engine_map = {
-
-            "WGC (适用Win11)": "wgc",
-
-            "PrintWindow (适用Win10)": "printwindow",
-
-            "GDI (仅前台)": "gdi",
-
-            "DXGI (仅前台)": "dxgi"
-
-        }
-
-        self.screenshot_engine_reverse_map = {v: k for k, v in self.screenshot_engine_map.items()}
-
-        # 添加选项
-
-        for display_name in self.screenshot_engine_map.keys():
-
-            self.screenshot_engine_combo.addItem(display_name)
-
-        # 从配置读取当前截图引擎
-
-        current_engine = self.current_config.get('screenshot_engine', 'wgc')
-        display_engine = self.screenshot_engine_reverse_map.get(current_engine)
-        if display_engine:
-            self.screenshot_engine_combo.setCurrentText(display_engine)
-
-        # 设置工具提示
-
-        self.screenshot_engine_combo.setToolTip(
-
-            "WGC: Windows Graphics Capture，Win10 1903+/Win11，GPU加速，支持后台\n"
-
-            "PrintWindow: Win32 API，适用Win10，支持后台窗口\n"
-
-            "GDI: 传统截图方式，仅支持前台（可见区域）\n"
-
-            "DXGI: Desktop Duplication API，高性能，仅支持前台"
-
+        from utils.capture.engine_ids import (
+            SCREENSHOT_ENGINE_UI_GROUPS,
+            SUPPORTED_SCREENSHOT_ENGINES,
+            screenshot_engine_label as engine_label_text,
+            screenshot_engine_ui_group,
         )
 
-        screenshot_engine_row.addWidget(screenshot_engine_label)
+        # 短标签映射（兼容旧保存逻辑）
+        self.screenshot_engine_map = {
+            engine_label_text(engine): engine
+            for engine in SUPPORTED_SCREENSHOT_ENGINES
+        }
+        self.screenshot_engine_reverse_map = {
+            engine: engine_label_text(engine)
+            for engine in SUPPORTED_SCREENSHOT_ENGINES
+        }
 
+        # 第一行：引擎类型（原生 / 插件）
+        group_row = QHBoxLayout()
+        group_label = QLabel("引擎类型:")
+        group_label.setFixedWidth(80)
+        self.screenshot_engine_group_combo = QComboBox(self)
+        self.screenshot_engine_group_combo.setMinimumWidth(200)
+        self.screenshot_engine_group_combo.setMaximumWidth(500)
+        for group_title, _engines in SCREENSHOT_ENGINE_UI_GROUPS:
+            self.screenshot_engine_group_combo.addItem(group_title, group_title)
+        self.screenshot_engine_group_combo.setToolTip(
+            "原生：WGC / PrintWindow / GDI / DXGI\n"
+            "插件：正常 / GDI2（无需挂钩）；DX / OpenGL（需注入）。需要 tools/plugin 下 PluginHost.exe、dm.dll、RegDll.dll"
+        )
+        group_row.addWidget(group_label)
+        group_row.addWidget(self.screenshot_engine_group_combo)
+        screenshot_engine_layout.addLayout(group_row)
+
+        # 第二行：具体截图引擎（随类型变化）
+        screenshot_engine_row = QHBoxLayout()
+        engine_label_widget = QLabel("截图引擎:")
+        engine_label_widget.setFixedWidth(80)
+        self.screenshot_engine_combo = QComboBox(self)
+        self.screenshot_engine_combo.setMinimumWidth(200)
+        self.screenshot_engine_combo.setMaximumWidth(500)
+        self.screenshot_engine_combo.setToolTip(
+            "WGC: Win10 1903+/Win11，支持后台\n"
+            "PrintWindow: Win10，支持后台\n"
+            "GDI / DXGI: 仅前台\n"
+            "插件 WGC / DXGI / GDI2: 无需 DX/OpenGL 挂钩，兼容性较好\n"
+            "插件 DX / OpenGL: 需目标进程对应渲染且允许注入"
+        )
+        screenshot_engine_row.addWidget(engine_label_widget)
         screenshot_engine_row.addWidget(self.screenshot_engine_combo)
-
         screenshot_engine_layout.addLayout(screenshot_engine_row)
+
+        plugin_hint = (
+            "插件：正常 / GDI2（无需挂钩）；DX / OpenGL（需注入）。"
+            "需要 tools/plugin 下 PluginHost.exe、dm.dll、RegDll.dll"
+        )
+        reg_row = QHBoxLayout()
+        reg_label = QLabel("插件注册码:")
+        reg_label.setFixedWidth(80)
+        self.plugin_reg_code_edit = QLineEdit(self)
+        self.plugin_reg_code_edit.setObjectName("plugin_reg_code_edit")
+        self.plugin_reg_code_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.plugin_reg_code_edit.setText(str(self.current_config.get("plugin_reg_code", "") or ""))
+        self.plugin_reg_code_edit.setToolTip(plugin_hint)
+        reg_row.addWidget(reg_label)
+        reg_row.addWidget(self.plugin_reg_code_edit)
+        screenshot_engine_layout.addLayout(reg_row)
+
+        dir_row = QHBoxLayout()
+        dir_label = QLabel("插件目录:")
+        dir_label.setFixedWidth(80)
+        self.plugin_dir_edit = QLineEdit(self)
+        self.plugin_dir_edit.setObjectName("plugin_dir_edit")
+        self.plugin_dir_edit.setText(str(self.current_config.get("plugin_dir", "") or "").strip())
+        self.plugin_dir_edit.setToolTip(plugin_hint)
+        browse_btn = QPushButton("浏览")
+        browse_btn.clicked.connect(self._browse_plugin_dir)
+        dir_row.addWidget(dir_label)
+        dir_row.addWidget(self.plugin_dir_edit)
+        dir_row.addWidget(browse_btn)
+        screenshot_engine_layout.addLayout(dir_row)
 
         exec_layout.addWidget(self.screenshot_engine_group)
 
         # 连接执行模式变化信号，用于控制截图引擎选项可见性
-
         self.mode_combo.currentTextChanged.connect(self._update_screenshot_engine_visibility)
-
-        self.mode_combo.currentTextChanged.connect(self._update_foreground_driver_visibility)
-
+        self.mode_combo.currentTextChanged.connect(self._on_execution_driver_setting_changed)
         self.mode_combo.currentIndexChanged.connect(self._update_screenshot_engine_visibility)
-
-        self.mode_combo.currentIndexChanged.connect(self._update_foreground_driver_visibility)
-
-        self.foreground_driver_combo.currentTextChanged.connect(self._update_foreground_driver_visibility)
-
-        self.foreground_driver_combo.currentIndexChanged.connect(self._update_foreground_driver_visibility)
-
-        self.foreground_keyboard_driver_combo.currentTextChanged.connect(self._update_foreground_driver_visibility)
-
-        self.foreground_keyboard_driver_combo.currentIndexChanged.connect(self._update_foreground_driver_visibility)
-
-        # 初始化时更新截图引擎可见性
+        self.mode_combo.currentIndexChanged.connect(self._on_execution_driver_setting_changed)
+        self.foreground_driver_combo.currentTextChanged.connect(self._on_execution_driver_setting_changed)
+        self.foreground_driver_combo.currentIndexChanged.connect(self._on_execution_driver_setting_changed)
+        self.foreground_keyboard_driver_combo.currentTextChanged.connect(self._on_execution_driver_setting_changed)
+        self.foreground_keyboard_driver_combo.currentIndexChanged.connect(self._on_execution_driver_setting_changed)
 
         self._screenshot_engine_combo_ready = False
+        from utils.capture.engine_ids import canonicalize_screenshot_engine
 
+        initial_engine = canonicalize_screenshot_engine(
+            self.current_config.get("screenshot_engine") or "wgc"
+        )
+        initial_group = screenshot_engine_ui_group(initial_engine)
+        group_index = self.screenshot_engine_group_combo.findData(initial_group)
+        if group_index >= 0:
+            self.screenshot_engine_group_combo.setCurrentIndex(group_index)
         self._update_screenshot_engine_visibility()
-
         self._update_foreground_driver_visibility()
 
+        self.screenshot_engine_group_combo.currentIndexChanged.connect(
+            self._on_screenshot_engine_group_changed
+        )
         self.screenshot_engine_combo.currentIndexChanged.connect(self._on_screenshot_engine_changed)
-
         self._screenshot_engine_combo_ready = True
 
         exec_layout.addStretch(1)
 
         self.tab_widget.addTab(self.exec_tab, "执行模式")
+
+    def _browse_plugin_dir(self):
+        start = ""
+        if hasattr(self, "plugin_dir_edit"):
+            start = self.plugin_dir_edit.text().strip()
+        chosen = QFileDialog.getExistingDirectory(self, "选择插件目录", start)
+        if chosen:
+            self.plugin_dir_edit.setText(chosen)
 
     def _update_screenshot_engine_visibility(self):
 
@@ -439,7 +497,7 @@ class GlobalSettingsDialogTabsMixin:
 
         - 前台一/二模式：显示所有截图引擎选项（全部）
 
-        - 后台模式：仅显示支持后台的引擎（WGC / PrintWindow）
+        - 后台模式：仅显示支持后台的引擎（WGC / PrintWindow / DX / OpenGL）
 
         """
 
@@ -450,65 +508,109 @@ class GlobalSettingsDialogTabsMixin:
         finally:
             self._screenshot_engine_combo_ready = previous_ready
 
-    def _rebuild_screenshot_engine_options(self):
+    def _is_foreground_execution_mode(self) -> bool:
         internal_mode = self.mode_combo.currentData()
-
         if not internal_mode:
-
             current_mode = self.mode_combo.currentText()
-
             internal_mode = self.MODE_INTERNAL_MAP.get(current_mode, "")
+        return str(internal_mode or "").startswith("foreground")
 
-        is_foreground = internal_mode.startswith("foreground")
+    def _selected_screenshot_engine_group(self) -> str:
+        if not hasattr(self, "screenshot_engine_group_combo"):
+            return "原生"
+        group = self.screenshot_engine_group_combo.currentData()
+        if group:
+            return str(group)
+        return str(self.screenshot_engine_group_combo.currentText() or "原生").strip() or "原生"
 
-        # 获取当前选择的引擎
+    def _rebuild_screenshot_engine_options(self):
+        from utils.capture.engine_ids import (
+            engines_for_ui_group,
+            iter_screenshot_engine_ui_groups,
+            screenshot_engine_label,
+            screenshot_engine_ui_group,
+        )
 
-        current_engine = self.screenshot_engine_combo.currentText()
+        from utils.capture.engine_ids import canonicalize_screenshot_engine
 
-        # 清空选项并重新添加
+        background_only = not self._is_foreground_execution_mode()
+        current_engine = canonicalize_screenshot_engine(self._get_selected_screenshot_engine())
+        if not current_engine:
+            current_engine = canonicalize_screenshot_engine(
+                (getattr(self, "current_config", {}) or {}).get("screenshot_engine") or "wgc"
+            )
 
+        available_groups = [title for title, _engines in iter_screenshot_engine_ui_groups(
+            background_only=background_only
+        )]
+        preferred_group = self._selected_screenshot_engine_group()
+        if current_engine:
+            preferred_group = screenshot_engine_ui_group(current_engine)
+        if preferred_group not in available_groups and available_groups:
+            preferred_group = available_groups[0]
+
+        if hasattr(self, "screenshot_engine_group_combo"):
+            self.screenshot_engine_group_combo.blockSignals(True)
+            try:
+                self.screenshot_engine_group_combo.clear()
+                for group_title in available_groups:
+                    self.screenshot_engine_group_combo.addItem(group_title, group_title)
+                group_index = self.screenshot_engine_group_combo.findData(preferred_group)
+                if group_index < 0 and self.screenshot_engine_group_combo.count() > 0:
+                    group_index = 0
+                if group_index >= 0:
+                    self.screenshot_engine_group_combo.setCurrentIndex(group_index)
+            finally:
+                self.screenshot_engine_group_combo.blockSignals(False)
+
+        group_title = self._selected_screenshot_engine_group()
+        engines = engines_for_ui_group(group_title, background_only=background_only)
         self.screenshot_engine_combo.clear()
+        for engine in engines:
+            self.screenshot_engine_combo.addItem(screenshot_engine_label(engine), engine)
 
-        if is_foreground:
-
-            # 前台一/二模式：显示所有选项
-
-            for display_name in self.screenshot_engine_map.keys():
-
-                self.screenshot_engine_combo.addItem(display_name)
-
-        else:
-
-            # 后台模式：只显示支持后台的引擎
-
-            for display_name, engine in self.screenshot_engine_map.items():
-
-                if engine in ("wgc", "printwindow"):
-
-                    self.screenshot_engine_combo.addItem(display_name)
-
-        # 恢复之前的选择（如果仍然可用）
-
-        index = self.screenshot_engine_combo.findText(current_engine)
-
+        index = self.screenshot_engine_combo.findData(current_engine)
+        if index < 0 and self.screenshot_engine_combo.count() > 0:
+            index = 0
         if index >= 0:
-
             self.screenshot_engine_combo.setCurrentIndex(index)
 
-        # Limit popup height to item count to avoid empty space
-
         item_count = self.screenshot_engine_combo.count()
-
         if item_count > 0:
+            self.screenshot_engine_combo.setMaxVisibleItems(min(item_count, 12))
 
-            self.screenshot_engine_combo.setMaxVisibleItems(item_count)
+    def _on_screenshot_engine_group_changed(self, _index: int = 0) -> None:
+        if not getattr(self, "_screenshot_engine_combo_ready", False):
+            return
+        previous_ready = self._screenshot_engine_combo_ready
+        self._screenshot_engine_combo_ready = False
+        try:
+            from utils.capture.engine_ids import engines_for_ui_group, screenshot_engine_label
+
+            background_only = not self._is_foreground_execution_mode()
+            group_title = self._selected_screenshot_engine_group()
+            engines = engines_for_ui_group(group_title, background_only=background_only)
+            self.screenshot_engine_combo.clear()
+            for engine in engines:
+                self.screenshot_engine_combo.addItem(screenshot_engine_label(engine), engine)
+            if self.screenshot_engine_combo.count() > 0:
+                self.screenshot_engine_combo.setCurrentIndex(0)
+                self.screenshot_engine_combo.setMaxVisibleItems(
+                    min(self.screenshot_engine_combo.count(), 12)
+                )
+        finally:
+            self._screenshot_engine_combo_ready = previous_ready
+        self._on_screenshot_engine_changed()
 
     def _get_selected_screenshot_engine(self) -> str:
         if not hasattr(self, "screenshot_engine_combo"):
             return str((getattr(self, "current_config", {}) or {}).get("screenshot_engine") or "").strip().lower()
+        engine = self.screenshot_engine_combo.currentData()
+        if engine:
+            return str(engine).strip().lower()
         display_name = self.screenshot_engine_combo.currentText()
-        engine = self.screenshot_engine_map.get(display_name)
-        return str(engine or "").strip().lower()
+        mapped = self.screenshot_engine_map.get(display_name)
+        return str(mapped or "").strip().lower()
 
     def _is_wgc_desktop_combination(self) -> bool:
         from utils.window.window_identity import is_wgc_with_desktop_target
@@ -555,182 +657,116 @@ class GlobalSettingsDialogTabsMixin:
         if self._is_wgc_desktop_combination():
             self._warn_wgc_desktop_engine()
 
+    def _hotkey_capture_buttons(self):
+        return [
+            getattr(self, name)
+            for name in (
+                "start_task_hotkey",
+                "stop_task_hotkey",
+                "pause_workflow_hotkey",
+                "record_hotkey",
+                "replay_hotkey",
+                "close_listen_hotkey",
+            )
+            if hasattr(self, name)
+        ]
+
+    def _stop_other_hotkey_captures(self, current=None):
+        for button in self._hotkey_capture_buttons():
+            if button is current:
+                continue
+            if hasattr(button, "stop_listening"):
+                button.stop_listening(restore=True)
+
+    def _sync_hotkey_except_key(self):
+        except_key = self.close_listen_hotkey.key_value() if hasattr(self, "close_listen_hotkey") else ""
+        for button in self._hotkey_capture_buttons():
+            if button is getattr(self, "close_listen_hotkey", None):
+                button.set_except_hotkey("")
+            elif hasattr(button, "set_except_hotkey"):
+                button.set_except_hotkey(except_key)
+
+    def _make_hotkey_field(self, title: str, config_key: str, tooltip: str):
+        cell = QWidget()
+        container = QVBoxLayout(cell)
+        container.setContentsMargins(0, 0, 0, 0)
+        container.setSpacing(6)
+        label = QLabel(title)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setObjectName("hotkey_label")
+        button = HotkeyCaptureButton(
+            self.current_config.get(config_key, DEFAULT_HOTKEYS[config_key]),
+            self,
+        )
+        button.setToolTip(tooltip)
+        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        container.addWidget(label)
+        container.addWidget(button)
+        return cell, button
+
     def _create_hotkey_tab(self):
         """创建快捷键设置标签页"""
         hotkey_tab = QWidget()
         hotkey_layout = QVBoxLayout(hotkey_tab)
         hotkey_layout.setSpacing(8)
         hotkey_layout.setContentsMargins(10, 8, 10, 10)
-        # --- Hotkey Settings Group ---
         self.hotkey_group = QGroupBox("快捷键配置")
         hotkey_main_layout = QVBoxLayout(self.hotkey_group)
-        hotkey_main_layout.setSpacing(15)
-        hotkey_main_layout.setContentsMargins(15, 15, 15, 15)
-        # 第一行：启动任务、停止任务、暂停工作流、录制操作
-        hotkey_row1_layout = QHBoxLayout()
-        hotkey_row1_layout.setSpacing(20)
-        # 第二行：回放操作
-        hotkey_row2_layout = QHBoxLayout()
-        hotkey_row2_layout.setSpacing(20)
-        # 启动任务快捷键
-        start_task_container = QVBoxLayout()
-        start_task_label = QLabel("启动任务")
-        start_task_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        start_task_label.setObjectName("hotkey_label")
-        # 使用下拉选择框代替输入框
-        self.start_task_hotkey = CustomDropdown(self)
-        # 快捷键选项：显示文本 -> 实际值的映射
-        hotkey_display_map = {
-            'F1': 'F1', 'F2': 'F2', 'F3': 'F3', 'F4': 'F4',
-            'F5': 'F5', 'F6': 'F6', 'F7': 'F7', 'F8': 'F8',
-            'F9': 'F9', 'F10': 'F10', 'F11': 'F11', 'F12': 'F12',
-            'Home': 'Home', 'End': 'End',
-            'Insert': 'Insert', 'Delete': 'Delete',
-            'PageUp': 'PageUp', 'PageDown': 'PageDown',
-            'PrintScreen': 'PrintScreen', 'ScrollLock': 'ScrollLock', 'Pause': 'Pause',
-            'NumLock': 'NumLock',
-            '小键盘0': 'Num0', '小键盘1': 'Num1', '小键盘2': 'Num2', '小键盘3': 'Num3',
-            '小键盘4': 'Num4', '小键盘5': 'Num5', '小键盘6': 'Num6', '小键盘7': 'Num7',
-            '小键盘8': 'Num8', '小键盘9': 'Num9',
-            '小键盘*': 'NumMultiply', '小键盘+': 'NumAdd', '小键盘-': 'NumSubtract',
-            '小键盘/': 'NumDivide', '小键盘.': 'NumDecimal',
-            '鼠标侧键1(后退)': 'XButton1',
-            '鼠标侧键2(前进)': 'XButton2'
-        }
-        for display_text, value in hotkey_display_map.items():
-            self.start_task_hotkey.addItem(display_text, value)
-        # 设置当前值
-        current_start_key = self.current_config.get('start_task_hotkey', DEFAULT_HOTKEYS['start_task_hotkey'])
-        # 兼容可能保存了中文名称的情况
-        chinese_to_code = {
-            '鼠标侧键1(后退)': 'XButton1',
-            '鼠标侧键2(前进)': 'XButton2'
-        }
-        if current_start_key in chinese_to_code:
-            current_start_key = chinese_to_code[current_start_key]
-        # 只对F键进行大写转换，XButton保持原样
-        if current_start_key.startswith('F') and len(current_start_key) <= 3:
-            current_start_key = current_start_key.upper()
-        for i in range(self.start_task_hotkey.count()):
-            if self.start_task_hotkey.itemData(i) == current_start_key:
-                self.start_task_hotkey.setCurrentIndex(i)
-                break
-        self.start_task_hotkey.setToolTip("设置启动任务的快捷键\n支持: F1-F12功能键、导航键(Home/End/Insert/Delete等)、小键盘、鼠标侧键")
-        self.start_task_hotkey.setFixedWidth(130)
-        start_task_container.addWidget(start_task_label)
-        start_task_container.addWidget(self.start_task_hotkey)
-        # 停止任务快捷键
-        stop_task_container = QVBoxLayout()
-        stop_task_label = QLabel("停止任务")
-        stop_task_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        stop_task_label.setObjectName("hotkey_label")
-        # 使用下拉选择框代替输入框
-        self.stop_task_hotkey = CustomDropdown(self)
-        for display_text, value in hotkey_display_map.items():
-            self.stop_task_hotkey.addItem(display_text, value)
-        # 设置当前值
-        current_stop_key = self.current_config.get('stop_task_hotkey', DEFAULT_HOTKEYS['stop_task_hotkey'])
-        # 兼容可能保存了中文名称的情况
-        if current_stop_key in chinese_to_code:
-            current_stop_key = chinese_to_code[current_stop_key]
-        # 只对F键进行大写转换，XButton保持原样
-        if current_stop_key.startswith('F') and len(current_stop_key) <= 3:
-            current_stop_key = current_stop_key.upper()
-        for i in range(self.stop_task_hotkey.count()):
-            if self.stop_task_hotkey.itemData(i) == current_stop_key:
-                self.stop_task_hotkey.setCurrentIndex(i)
-                break
-        self.stop_task_hotkey.setToolTip("设置停止任务的快捷键\n支持: F1-F12功能键、导航键(Home/End/Insert/Delete等)、小键盘、鼠标侧键")
-        self.stop_task_hotkey.setFixedWidth(130)
-        stop_task_container.addWidget(stop_task_label)
-        stop_task_container.addWidget(self.stop_task_hotkey)
-        # 录制快捷键
-        record_container = QVBoxLayout()
-        record_label = QLabel("录制操作")
-        record_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        record_label.setObjectName("hotkey_label")
-        # 使用下拉选择框
-        self.record_hotkey = CustomDropdown(self)
-        for display_text, value in hotkey_display_map.items():
-            self.record_hotkey.addItem(display_text, value)
-        # 设置当前值
-        current_record_key = self.current_config.get('record_hotkey', DEFAULT_HOTKEYS['record_hotkey'])
-        # 兼容可能保存了中文名称的情况
-        if current_record_key in chinese_to_code:
-            current_record_key = chinese_to_code[current_record_key]
-        # 只对F键进行大写转换，XButton保持原样
-        if current_record_key.startswith('F') and len(current_record_key) <= 3:
-            current_record_key = current_record_key.upper()
-        for i in range(self.record_hotkey.count()):
-            if self.record_hotkey.itemData(i) == current_record_key:
-                self.record_hotkey.setCurrentIndex(i)
-                break
-        self.record_hotkey.setToolTip("设置录制操作的快捷键\n仅在录制卡片参数面板打开时生效\n支持: F1-F12功能键、导航键(Home/End/Insert/Delete等)、小键盘、鼠标侧键")
-        self.record_hotkey.setFixedWidth(130)
-        record_container.addWidget(record_label)
-        record_container.addWidget(self.record_hotkey)
-        # 回放快捷键
-        replay_container = QVBoxLayout()
-        replay_label = QLabel("回放操作")
-        replay_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        replay_label.setObjectName("hotkey_label")
-        # 使用下拉选择框
-        self.replay_hotkey = CustomDropdown(self)
-        for display_text, value in hotkey_display_map.items():
-            self.replay_hotkey.addItem(display_text, value)
-        # 设置当前值
-        current_replay_key = self.current_config.get('replay_hotkey', DEFAULT_HOTKEYS['replay_hotkey'])
-        # 兼容可能保存了中文名称的情况
-        if current_replay_key in chinese_to_code:
-            current_replay_key = chinese_to_code[current_replay_key]
-        # 只对F键进行大写转换，XButton保持原样
-        if current_replay_key.startswith('F') and len(current_replay_key) <= 3:
-            current_replay_key = current_replay_key.upper()
-        for i in range(self.replay_hotkey.count()):
-            if self.replay_hotkey.itemData(i) == current_replay_key:
-                self.replay_hotkey.setCurrentIndex(i)
-                break
-        self.replay_hotkey.setToolTip("设置回放操作的快捷键\n仅在录制回放卡片参数面板打开时生效\n支持: F1-F12功能键、导航键(Home/End/Insert/Delete等)、小键盘、鼠标侧键")
-        self.replay_hotkey.setFixedWidth(130)
-        replay_container.addWidget(replay_label)
-        replay_container.addWidget(self.replay_hotkey)
-        # 暂停工作流快捷键
-        pause_container = QVBoxLayout()
-        pause_label = QLabel("暂停工作流")
-        pause_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pause_label.setObjectName("hotkey_label")
-        # 使用下拉选择框
-        self.pause_workflow_hotkey = CustomDropdown(self)
-        for display_text, value in hotkey_display_map.items():
-            self.pause_workflow_hotkey.addItem(display_text, value)
-        # 设置当前值
-        current_pause_key = self.current_config.get('pause_workflow_hotkey', DEFAULT_HOTKEYS['pause_workflow_hotkey'])
-        # 兼容可能保存了中文名称的情况
-        if current_pause_key in chinese_to_code:
-            current_pause_key = chinese_to_code[current_pause_key]
-        # 只对F键进行大写转换，XButton保持原样
-        if current_pause_key.startswith('F') and len(current_pause_key) <= 3:
-            current_pause_key = current_pause_key.upper()
-        for i in range(self.pause_workflow_hotkey.count()):
-            if self.pause_workflow_hotkey.itemData(i) == current_pause_key:
-                self.pause_workflow_hotkey.setCurrentIndex(i)
-                break
-        self.pause_workflow_hotkey.setToolTip("设置暂停/恢复工作流的快捷键\n支持: F1-F12功能键、导航键(Home/End/Insert/Delete等)、小键盘、鼠标侧键")
-        self.pause_workflow_hotkey.setFixedWidth(130)
-        pause_container.addWidget(pause_label)
-        pause_container.addWidget(self.pause_workflow_hotkey)
-        # 第一行：启动任务、停止任务、暂停工作流、录制操作
-        hotkey_row1_layout.addLayout(start_task_container)
-        hotkey_row1_layout.addLayout(stop_task_container)
-        hotkey_row1_layout.addLayout(pause_container)
-        hotkey_row1_layout.addLayout(record_container)
-        hotkey_row1_layout.addStretch()  # 添加弹性空间
-        # 第二行：回放操作
-        hotkey_row2_layout.addLayout(replay_container)
-        hotkey_row2_layout.addStretch()  # 添加弹性空间
-        # 添加两行到主布局
-        hotkey_main_layout.addLayout(hotkey_row1_layout)
-        hotkey_main_layout.addLayout(hotkey_row2_layout)
+        hotkey_main_layout.setSpacing(12)
+        # 底边多留一点，避免说明文字贴着 GroupBox 圆角被裁
+        hotkey_main_layout.setContentsMargins(15, 15, 15, 18)
+
+        start_task_cell, self.start_task_hotkey = self._make_hotkey_field(
+            "启动任务",
+            "start_task_hotkey",
+            "点击后按下任意键或组合键，绑定启动任务快捷键",
+        )
+        stop_task_cell, self.stop_task_hotkey = self._make_hotkey_field(
+            "停止任务",
+            "stop_task_hotkey",
+            "点击后按下任意键或组合键，绑定停止任务快捷键",
+        )
+        pause_cell, self.pause_workflow_hotkey = self._make_hotkey_field(
+            "暂停工作流",
+            "pause_workflow_hotkey",
+            "点击后按下任意键或组合键，绑定暂停/恢复工作流快捷键",
+        )
+        record_cell, self.record_hotkey = self._make_hotkey_field(
+            "录制操作",
+            "record_hotkey",
+            "点击后按下任意键或组合键。仅在录制卡片参数面板打开时生效",
+        )
+        replay_cell, self.replay_hotkey = self._make_hotkey_field(
+            "回放操作",
+            "replay_hotkey",
+            "点击后按下任意键或组合键。仅在录制回放卡片参数面板打开时生效",
+        )
+        close_cell, self.close_listen_hotkey = self._make_hotkey_field(
+            "关闭监听",
+            "close_listen_hotkey",
+            "关闭全局快捷键监听。关闭后仅该快捷键仍有效，可再次开启",
+        )
+        self.close_listen_hotkey.changed.connect(lambda _value: self._sync_hotkey_except_key())
+        self._sync_hotkey_except_key()
+
+        hotkey_grid = QGridLayout()
+        hotkey_grid.setHorizontalSpacing(16)
+        hotkey_grid.setVerticalSpacing(12)
+        hotkey_grid.addWidget(start_task_cell, 0, 0)
+        hotkey_grid.addWidget(stop_task_cell, 0, 1)
+        hotkey_grid.addWidget(pause_cell, 0, 2)
+        hotkey_grid.addWidget(record_cell, 0, 3)
+        hotkey_grid.addWidget(replay_cell, 1, 0)
+        hotkey_grid.addWidget(close_cell, 1, 1)
+        for column in range(4):
+            hotkey_grid.setColumnStretch(column, 1)
+
+        hint = QLabel("点击按键框后按下任意键或组合键即可绑定。Esc 关闭本次监听，且不能作为快捷键。关闭监听后仅该快捷键仍有效。")
+        hint.setWordWrap(True)
+        hint.setObjectName("hotkey_hint")
+
+        hotkey_main_layout.addLayout(hotkey_grid)
+        hotkey_main_layout.addWidget(hint)
         hotkey_layout.addWidget(self.hotkey_group)
         hotkey_layout.addStretch()
         self.tab_widget.addTab(hotkey_tab, "快捷键设置")
@@ -742,7 +778,7 @@ class GlobalSettingsDialogTabsMixin:
         other_layout.setSpacing(8)
         other_layout.setContentsMargins(10, 8, 10, 10)
         # --- Custom Resolution Group ---
-        resolution_group = QGroupBox("自定义分辨率 (0 = 禁用)")
+        resolution_group = QGroupBox("自定义绑定窗口分辨率（宽高都为 0 = 禁用）")
         resolution_layout = QFormLayout(resolution_group)
         resolution_layout.setSpacing(8)
         resolution_layout.setContentsMargins(15, 10, 15, 10)
@@ -756,6 +792,8 @@ class GlobalSettingsDialogTabsMixin:
         # 修复：允许保存和显示0值（禁用状态）
         default_height = self.current_config.get('custom_height', 0)
         self.height_spinbox.setValue(default_height)
+        self.width_spinbox.setToolTip("绑定窗口内容区域宽度（像素）。需与高度一起设置，单边为 0 无效。")
+        self.height_spinbox.setToolTip("绑定窗口内容区域高度（像素）。需与宽度一起设置，单边为 0 无效。")
         resolution_layout.addRow("宽度:", self.width_spinbox)
         resolution_layout.addRow("高度:", self.height_spinbox)
         other_layout.addWidget(resolution_group)
