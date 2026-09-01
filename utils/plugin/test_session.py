@@ -21,6 +21,29 @@ def test_capture_binds_normal_mouse_then_grabs():
     assert client.binds[0] == (10, 10, "gdi2", "normal", "normal", 0)
 
 
+class SplitRaiseClient:
+    def __init__(self):
+        self.binds = []
+        self.frames = {(10, "gdi2"): object()}
+
+    def bind(self, display_hwnd, input_hwnd, display, mouse, keypad, mode):
+        self.binds.append((display_hwnd, input_hwnd, display, mouse, keypad, mode))
+        if display_hwnd != input_hwnd:
+            raise RuntimeError("无法分离绑定: 大漠 BindWindowEx 不支持独立 input_hwnd")
+        return display == "gdi2"
+
+    def capture_bgr(self, hwnd, display, input_hwnd=0):
+        return self.frames.get((hwnd, display))
+
+
+def test_split_bind_rpc_error_retries_same_hwnd():
+    client = SplitRaiseClient()
+    session = PluginSession(client=client)
+    assert session.capture_bgr(10, "gdi2", input_hwnd=99) is client.frames[(10, "gdi2")]
+    assert (10, 99, "gdi2", "normal", "normal", 0) in client.binds
+    assert (10, 10, "gdi2", "normal", "normal", 0) in client.binds
+
+
 def test_dx_input_uses_non_hook_displays():
     assert INPUT_BIND_DISPLAYS == ("normal", "gdi", "gdi2")
     assert all(not item.startswith("dx") and not item.startswith("opengl") for item in INPUT_BIND_DISPLAYS)

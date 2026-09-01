@@ -54,6 +54,49 @@ def test_rpc_init_and_capture(monkeypatch, tmp_path):
     assert int(frame[0, 0, 0]) == 7
 
 
+def test_concurrent_captures_keep_own_frames():
+    import threading
+    import time
+
+    frames = {
+        11: np.full((2, 2, 3), 11, dtype=np.uint8),
+        22: np.full((2, 2, 3), 22, dtype=np.uint8),
+    }
+    buf = bytearray(FRAME_MAP_SIZE)
+
+    def handler(payload):
+        if payload["method"] == "capture":
+            hwnd = int(payload["args"]["hwnd"])
+            write_bgr_frame(memoryview(buf), frames[hwnd])
+            return {"id": payload["id"], "ok": True, "result": {}}
+        return {"id": payload["id"], "ok": True, "result": {}}
+
+    rpc = PluginRpc(LoopbackTransport(handler), frame_buf=memoryview(buf))
+    original_call = rpc.call
+
+    def delayed_call(method, **args):
+        result = original_call(method, **args)
+        if method == "capture":
+            time.sleep(0.05)
+        return result
+
+    rpc.call = delayed_call
+    client = PluginClient(rpc=rpc)
+    got = {}
+
+    def worker(hwnd):
+        got[hwnd] = client.capture_bgr(hwnd, "gdi2", hwnd)
+
+    threads = [threading.Thread(target=worker, args=(hwnd,)) for hwnd in (11, 22)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert int(got[11][0, 0, 0]) == 11
+    assert int(got[22][0, 0, 0]) == 22
+
+
 def test_rpc_error_raises():
     def handler(payload):
         return {"id": payload["id"], "ok": False, "error": "未填写插件注册码"}

@@ -185,7 +185,7 @@ class PluginRpc:
         self._transport = transport
         self._frame_buf = frame_buf
         self._next_id = 1
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def call(self, method: str, **args: Any) -> Any:
         with self._lock:
@@ -200,6 +200,12 @@ class PluginRpc:
         if self._frame_buf is None:
             return None
         return read_bgr_frame(self._frame_buf)
+
+    def capture_bgr(self, hwnd: int, display: str, input_hwnd: int = 0):
+        with self._lock:
+            self.call("capture", hwnd=int(hwnd), display=str(display), input_hwnd=int(input_hwnd or hwnd))
+            frame = self.read_frame()
+            return None if frame is None else frame.copy()
 
 
 class PluginClient:
@@ -234,8 +240,7 @@ class PluginClient:
             logger.debug("plugin unbind failed", exc_info=True)
 
     def capture_bgr(self, hwnd: int, display: str, input_hwnd: int = 0):
-        self._rpc.call("capture", hwnd=int(hwnd), display=str(display), input_hwnd=int(input_hwnd or hwnd))
-        return self._rpc.read_frame()
+        return self._rpc.capture_bgr(hwnd, display, input_hwnd)
 
     def move_to(self, x: int, y: int) -> bool:
         return bool(self._rpc.call("move_to", x=int(x), y=int(y)))

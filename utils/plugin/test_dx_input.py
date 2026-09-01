@@ -84,7 +84,12 @@ def test_plugin_dx_input_binds_dx_and_clicks_client_coords():
 
 
 def test_plugin_dx_input_retries_split_hwnds_as_equal():
-    handler = _FakeHandler(bind_ok=lambda rec: rec[0] == rec[1])
+    def bind_ok(rec):
+        if rec[0] != rec[1]:
+            raise RuntimeError("无法分离绑定: 大漠 BindWindowEx 不支持独立 input_hwnd")
+        return True
+
+    handler = _FakeHandler(bind_ok=bind_ok)
     client = _make_client(handler)
     dx = PluginDxInput(9, display="normal", client=client, input_hwnd=99)
     assert dx.click(3, 4, button="left", clicks=1, duration=0)

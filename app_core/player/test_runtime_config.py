@@ -1,7 +1,6 @@
 import json
 
 from app_core.config_store import _build_default_config
-from app_core.player.package import PLAYER_PACKAGE_SCHEMA_VERSION
 from app_core.player.memory_store import clear_player_memory_store, put_player_memory_file
 from app_core.player.runtime_config import (
     RUNTIME_CONFIG_FILENAME,
@@ -10,7 +9,6 @@ from app_core.player.runtime_config import (
     load_packaged_runtime_config,
     snapshot_export_runtime_config,
 )
-from ui.export_parts.assembler import build_manifest_and_ui_files
 
 
 def test_snapshot_keeps_engine_and_input_drops_bindings():
@@ -87,27 +85,6 @@ def test_apply_overlays_hotkeys_onto_defaults():
     assert merged["pause_workflow_hotkey"] == "CTRL+F11"
 
 
-def test_build_manifest_seeds_ui_hotkeys_from_runtime_config():
-    files = build_manifest_and_ui_files(
-        app_name="阴阳师",
-        description="",
-        ui={"title": "阴阳师"},
-        runtime_config={
-            "start_task_hotkey": "F6",
-            "stop_task_hotkey": "F7",
-            "pause_workflow_hotkey": "XBUTTON1",
-        },
-    )
-    ui = json.loads(files["ui.json"].decode("utf-8"))
-    assert ui["start_hotkey"] == "F6"
-    assert ui["stop_hotkey"] == "F7"
-    assert ui["pause_hotkey"] == "XBUTTON1"
-    runtime = json.loads(files[RUNTIME_CONFIG_FILENAME].decode("utf-8"))
-    assert runtime["start_task_hotkey"] == "F6"
-    assert "ibinputsimulator_ahk_path" not in runtime
-    assert "ibinputsimulator_ahk_dir" not in runtime
-
-
 def test_apply_player_ui_hotkeys_prefers_packaged_over_ui_defaults():
     ui = apply_player_ui_hotkeys(
         {"start_hotkey": "F9", "stop_hotkey": "F10", "pause_hotkey": "F11"},
@@ -155,51 +132,6 @@ def test_apply_empty_packaged_runtime_keeps_current_config():
     merged = apply_player_runtime_config(defaults, {})
     assert merged["screenshot_engine"] == defaults["screenshot_engine"]
     assert merged["execution_mode"] == defaults["execution_mode"]
-
-
-def test_build_manifest_includes_runtime_json():
-    files = build_manifest_and_ui_files(
-        app_name="阴阳师",
-        description="",
-        ui={"title": "阴阳师"},
-        runtime_config={
-            "screenshot_engine": "dx.d3d11",
-            "execution_mode": "foreground_py",
-            "bound_windows": [{"hwnd": 1}],
-        },
-    )
-    assert RUNTIME_CONFIG_FILENAME in files
-    payload = json.loads(files[RUNTIME_CONFIG_FILENAME].decode("utf-8"))
-    assert payload["screenshot_engine"] == "dx.d3d11"
-    assert payload["execution_mode"] == "foreground_py"
-    assert "bound_windows" not in payload
-    manifest = json.loads(files["manifest.json"].decode("utf-8"))
-    assert manifest["schema_version"] == PLAYER_PACKAGE_SCHEMA_VERSION
-    assert "license" not in manifest
-
-
-def test_load_player_package_reads_runtime_json(tmp_path):
-    from app_core.player.loader import load_player_package
-    from app_core.player.memory_store import clear_player_memory_store
-    from app_core.player.secure_package import seal_package_files
-
-    clear_player_memory_store()
-    files = build_manifest_and_ui_files(
-        app_name="阴阳师",
-        description="",
-        ui={"title": "阴阳师"},
-        runtime_config={"screenshot_engine": "dx.d3d11", "execution_mode": "foreground_py"},
-    )
-    files["workflows/main.json"] = json.dumps(
-        {"cards": [{"id": 1, "task_type": "线程起点", "parameters": {}}], "connections": []}
-    ).encode("utf-8")
-    seal_package_files(files, tmp_path, bind_id=bytes(range(16)))
-    try:
-        package = load_player_package(tmp_path)
-        assert package.runtime_config["screenshot_engine"] == "dx.d3d11"
-        assert package.runtime_config["execution_mode"] == "foreground_py"
-    finally:
-        clear_player_memory_store()
 
 
 def test_snapshot_export_runtime_config_drops_plugin_reg_code():

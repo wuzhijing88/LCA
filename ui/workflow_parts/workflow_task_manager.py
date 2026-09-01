@@ -169,31 +169,13 @@ class WorkflowTaskManager(QObject):
             task_names = f"{task_names} 等{len(yolo_tasks)}个任务"
 
         screenshot_engine = str(self.config.get("screenshot_engine", "") or "").strip().lower()
-        from utils.capture.engine_ids import (
-            is_native_screenshot_engine,
-            is_supported_screenshot_engine,
-        )
-        from task_workflow.yolo_backend import (
-            YOLO_BACKEND_NATIVE,
-            collect_yolo_backends,
-        )
+        from utils.capture.engine_ids import is_supported_screenshot_engine
 
         if screenshot_engine and not is_supported_screenshot_engine(screenshot_engine):
             return False, (
                 f"任务“{task_names}”包含YOLO，当前截图引擎为"
                 f"{self._format_screenshot_engine_label(screenshot_engine)}。"
                 "YOLO可用当前支持的截图引擎，请到全局设置切换后重试。"
-            )
-
-        backends = []
-        for task in yolo_tasks:
-            backends.extend(collect_yolo_backends((getattr(task, "workflow_data", None) or {}).get("cards")))
-        unique = set(backends)
-        if YOLO_BACKEND_NATIVE in unique and screenshot_engine and not is_native_screenshot_engine(screenshot_engine):
-            return False, (
-                f"任务“{task_names}”使用原生YOLO，当前截图引擎为"
-                f"{self._format_screenshot_engine_label(screenshot_engine)}。"
-                "请到全局设置改成 DXGI / GDI / WGC / PrintWindow。"
             )
 
         return True, ""

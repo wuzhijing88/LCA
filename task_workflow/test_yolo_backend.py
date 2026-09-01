@@ -60,3 +60,45 @@ def test_detect_requires_model_when_card_has_none():
 def test_native_detect_still_requires_onnx():
     with pytest.raises(ValueError, match="onnx"):
         resolve_yolo_model("", {"yolo_backend": "原生"})
+
+
+def _yolo_task(name="yolo"):
+    return type(
+        "Task",
+        (),
+        {
+            "name": name,
+            "workflow_data": {
+                "cards": [
+                    {
+                        "task_type": "YOLO目标检测",
+                        "parameters": {"yolo_backend": "原生"},
+                    }
+                ]
+            },
+        },
+    )()
+
+
+def _yolo_manager(engine: str):
+    from ui.workflow_parts.workflow_task_manager import WorkflowTaskManager
+
+    manager = WorkflowTaskManager.__new__(WorkflowTaskManager)
+    manager.config = {"screenshot_engine": engine}
+    return manager
+
+
+def test_native_yolo_allows_plugin_screenshot_engines():
+    task = _yolo_task()
+    for engine in ("gdi2", "dx.d3d11"):
+        ok, message = _yolo_manager(engine)._validate_yolo_runtime_for_tasks([task])
+        assert ok is True
+        assert message == ""
+
+
+def test_native_yolo_rejects_unknown_screenshot_engine():
+    ok, message = _yolo_manager("not-a-real-engine")._validate_yolo_runtime_for_tasks(
+        [_yolo_task()]
+    )
+    assert ok is False
+    assert "YOLO" in message

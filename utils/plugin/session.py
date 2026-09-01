@@ -110,9 +110,12 @@ class PluginSession:
             input_target = display_target
         client = self._ensure_client()
         if display_target != input_target:
-            if client.bind(display_target, input_target, display, mouse, keypad, mode):
-                self._last_input_hwnd = input_target
-                return True
+            try:
+                if client.bind(display_target, input_target, display, mouse, keypad, mode):
+                    self._last_input_hwnd = input_target
+                    return True
+            except Exception:
+                pass
             logger.warning(
                 "插件分离绑定失败，改用同一句柄重试: display_hwnd=%s input_hwnd=%s display=%s",
                 display_target,

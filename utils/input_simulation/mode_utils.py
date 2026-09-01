@@ -27,7 +27,13 @@ SUPPORTED_FOREGROUND_BACKENDS = {
     "ibinputsimulator",
 }
 
+SUPPORTED_FOREGROUND_PY_BACKENDS = {
+    "pyautogui",
+    "normal.hd",
+}
+
 _DEFAULT_FOREGROUND_BACKEND = "interception"
+_DEFAULT_FOREGROUND_PY_BACKEND = "pyautogui"
 _DEFAULT_IB_DRIVER = "Logitech"
 
 
@@ -44,10 +50,31 @@ def normalize_ib_driver_name(driver: Optional[str]) -> str:
     return mapped
 
 
+def _normalize_backend_token(value: object) -> str:
+    raw = str(value or "").strip().lower().replace("_", ".")
+    if raw in {"normal.hd", "normalhd", "normal.hd."}:
+        return "normal.hd"
+    return str(value or "").strip().lower()
+
+
 def require_foreground_backend(value: object) -> str:
-    backend = str(value or "").strip().lower()
+    backend = _normalize_backend_token(value)
+    # 旧配置可能把 normal.hd 写在驱动字段里；驱动下拉已移除，回落到默认驱动。
+    if backend == "normal.hd":
+        return _DEFAULT_FOREGROUND_BACKEND
     if backend not in SUPPORTED_FOREGROUND_BACKENDS:
         raise ValueError(f"不支持的前台驱动: {value!r}")
+    return backend
+
+
+def require_foreground_py_backend(value: object) -> str:
+    backend = _normalize_backend_token(value)
+    if backend in {"", "pyautogui", "py", "python"}:
+        return "pyautogui"
+    if backend == "normal.hd":
+        return "normal.hd"
+    if backend not in SUPPORTED_FOREGROUND_PY_BACKENDS:
+        raise ValueError(f"不支持的前台二输入方式: {value!r}")
     return backend
 
 
@@ -63,6 +90,38 @@ def parse_foreground_backends(config: Optional[Mapping] = None) -> Tuple[str, st
         require_foreground_backend(mouse_raw),
         require_foreground_backend(keyboard_raw),
     )
+
+
+def parse_foreground_py_backend(config: Optional[Mapping] = None) -> str:
+    values = dict(config or {})
+    raw = values.get("foreground_py_backend")
+    if raw is None or str(raw).strip() == "":
+        # 兼容：曾把 normal.hd 配在前台一驱动字段
+        mouse = str(values.get("foreground_mouse_driver_backend") or "").strip().lower()
+        keyboard = str(values.get("foreground_keyboard_driver_backend") or "").strip().lower()
+        if mouse in {"normal.hd", "normal_hd"} or keyboard in {"normal.hd", "normal_hd"}:
+            return "normal.hd"
+        return _DEFAULT_FOREGROUND_PY_BACKEND
+    return require_foreground_py_backend(raw)
+
+
+def migrate_legacy_normal_hd_config(config: Optional[Mapping] = None) -> dict:
+    """把误放在前台一驱动里的 normal.hd 迁到前台二输入方式。"""
+    result = dict(config or {})
+    mouse = _normalize_backend_token(result.get("foreground_mouse_driver_backend"))
+    keyboard = _normalize_backend_token(result.get("foreground_keyboard_driver_backend"))
+    had_hd = mouse == "normal.hd" or keyboard == "normal.hd"
+    if had_hd:
+        if not str(result.get("foreground_py_backend") or "").strip():
+            result["foreground_py_backend"] = "normal.hd"
+        if mouse == "normal.hd":
+            result["foreground_mouse_driver_backend"] = _DEFAULT_FOREGROUND_BACKEND
+        if keyboard == "normal.hd":
+            result["foreground_keyboard_driver_backend"] = _DEFAULT_FOREGROUND_BACKEND
+        if str(result.get("execution_mode") or "").strip().lower() == "foreground_driver":
+            result["execution_mode"] = "foreground_py"
+    result.setdefault("foreground_py_backend", _DEFAULT_FOREGROUND_PY_BACKEND)
+    return result
 
 
 def _read_main_config() -> dict:
@@ -109,6 +168,10 @@ def is_background_mode(execution_mode: Optional[str]) -> bool:
     return normalize_execution_mode(execution_mode) == "background"
 
 
+def is_dx_input_mode(execution_mode: Optional[str]) -> bool:
+    return str(execution_mode or "").strip().lower() in {"background_dx", "background_op_dx"}
+
+
 def get_ibinputsimulator_config() -> Tuple[str, str, str, str]:
     config = _read_main_config()
     driver = normalize_ib_driver_name(config.get("ibinputsimulator_driver", _DEFAULT_IB_DRIVER))
@@ -128,7 +191,8 @@ def get_foreground_driver(execution_mode: Optional[str]) -> str:
 def get_foreground_driver_backends(execution_mode: Optional[str]) -> Tuple[str, str]:
     mode = (execution_mode or "").strip().lower()
     if mode == "foreground_py":
-        return "pyautogui", "pyautogui"
+        backend = parse_foreground_py_backend(_read_main_config())
+        return backend, backend
     return parse_foreground_backends(_read_main_config())
 
 
