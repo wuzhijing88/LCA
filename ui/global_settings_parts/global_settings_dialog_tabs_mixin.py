@@ -563,14 +563,6 @@ class GlobalSettingsDialogTabsMixin:
         scroll.setWidget(page)
         self.tab_widget.addTab(scroll, "插件模式")
 
-    def _browse_plugin_dir(self):
-        start = ""
-        if hasattr(self, "plugin_dir_edit"):
-            start = self.plugin_dir_edit.text().strip()
-        chosen = QFileDialog.getExistingDirectory(self, "选择插件目录", start)
-        if chosen:
-            self.plugin_dir_edit.setText(chosen)
-
     def _on_plugin_advanced_toggled(self, checked: bool) -> None:
         if hasattr(self, "plugin_bind_mode_combo"):
             self.plugin_bind_mode_combo.setVisible(bool(checked))
@@ -916,10 +908,13 @@ class GlobalSettingsDialogTabsMixin:
         auth_layout = QVBoxLayout(auth_group)
         auth_layout.setSpacing(6)
         auth_layout.setContentsMargins(12, 8, 12, 8)
-        plugin_hint = "需 PluginHost.exe / dm.dll / RegDll.dll；注册码仅本机保存。"
+        plugin_hint = (
+            "插件运行库使用安装目录内 tools/plugin（PluginHost.exe / dm.dll / RegDll.dll）。"
+            "注册码仅本机保存。"
+        )
         auth_hint = QLabel(plugin_hint)
         auth_hint.setWordWrap(True)
-        auth_hint.setToolTip("默认目录 tools/plugin。注册码不会进入导出包。")
+        auth_hint.setToolTip("目录固定为安装内 tools/plugin。注册码不会进入导出包。")
         auth_layout.addWidget(auth_hint)
         reg_row = QHBoxLayout()
         reg_label = QLabel("注册码:")
@@ -932,19 +927,6 @@ class GlobalSettingsDialogTabsMixin:
         reg_row.addWidget(reg_label)
         reg_row.addWidget(self.plugin_reg_code_edit, 1)
         auth_layout.addLayout(reg_row)
-        dir_row = QHBoxLayout()
-        dir_label = QLabel("目录:")
-        dir_label.setFixedWidth(72)
-        self.plugin_dir_edit = QLineEdit(self)
-        self.plugin_dir_edit.setObjectName("plugin_dir_edit")
-        self.plugin_dir_edit.setText(str(self.current_config.get("plugin_dir", "") or "").strip())
-        self.plugin_dir_edit.setToolTip(plugin_hint)
-        browse_btn = QPushButton("浏览")
-        browse_btn.clicked.connect(self._browse_plugin_dir)
-        dir_row.addWidget(dir_label)
-        dir_row.addWidget(self.plugin_dir_edit, 1)
-        dir_row.addWidget(browse_btn)
-        auth_layout.addLayout(dir_row)
         other_layout.addWidget(auth_group)
 
         other_layout.addStretch()

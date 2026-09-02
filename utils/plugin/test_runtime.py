@@ -106,15 +106,51 @@ def test_rpc_error_raises():
         rpc.call("init", plugin_dir="x", reg_code="")
 
 
-def test_find_plugin_dir_prefers_config(monkeypatch, tmp_path):
-    chosen = tmp_path / "chosen"
-    chosen.mkdir()
+def _touch_runtime(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in ("PluginHost.exe", "dm.dll", "RegDll.dll"):
+        (directory / name).write_bytes(b"x")
+    return directory
+
+
+def test_find_plugin_dir_uses_app_root_tools_plugin(monkeypatch, tmp_path):
+    root = tmp_path / "install"
+    plugin = _touch_runtime(root / "tools" / "plugin")
+    other = _touch_runtime(tmp_path / "other")
+    monkeypatch.setenv("LCA_PLUGIN_DIR", str(other))
+    monkeypatch.setattr(
+        "utils.plugin.runtime._read_plugin_config",
+        lambda: {"plugin_dir": str(other), "plugin_reg_code": ""},
+    )
+    monkeypatch.setattr("utils.plugin.runtime.get_app_root", lambda: str(root))
+    assert find_plugin_dir() == plugin.resolve()
+
+
+def test_find_plugin_dir_ignores_config_and_env_when_install_missing(monkeypatch, tmp_path):
+    root = tmp_path / "install"
+    root.mkdir()
+    other = _touch_runtime(tmp_path / "other")
+    monkeypatch.setenv("LCA_PLUGIN_DIR", str(other))
+    monkeypatch.setattr(
+        "utils.plugin.runtime._read_plugin_config",
+        lambda: {"plugin_dir": str(other), "plugin_reg_code": ""},
+    )
+    monkeypatch.setattr("utils.plugin.runtime.get_app_root", lambda: str(root))
+    assert find_plugin_dir() is None
+
+
+def test_find_plugin_dir_rejects_incomplete_install_dir(monkeypatch, tmp_path):
+    root = tmp_path / "install"
+    incomplete = root / "tools" / "plugin"
+    incomplete.mkdir(parents=True)
+    (incomplete / "PluginHost.exe").write_bytes(b"x")
     monkeypatch.delenv("LCA_PLUGIN_DIR", raising=False)
     monkeypatch.setattr(
         "utils.plugin.runtime._read_plugin_config",
-        lambda: {"plugin_dir": str(chosen), "plugin_reg_code": ""},
+        lambda: {"plugin_dir": "", "plugin_reg_code": ""},
     )
-    assert find_plugin_dir() == chosen.resolve()
+    monkeypatch.setattr("utils.plugin.runtime.get_app_root", lambda: str(root))
+    assert find_plugin_dir() is None
 
 
 def test_ensure_plugin_rpc_rejects_empty_reg_code_before_launch(monkeypatch):

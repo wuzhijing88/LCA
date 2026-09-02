@@ -114,38 +114,30 @@ def _read_plugin_config() -> dict:
     }
 
 
+_PLUGIN_RUNTIME_FILES = ("PluginHost.exe", "dm.dll", "RegDll.dll")
+
+
+def _is_plugin_runtime_dir(directory: Path) -> bool:
+    return directory.is_dir() and all((directory / name).is_file() for name in _PLUGIN_RUNTIME_FILES)
+
+
 def find_plugin_dir() -> Optional[Path]:
-    candidates: list[Path] = []
-    configured = _read_plugin_config()["plugin_dir"]
-    if configured:
-        candidates.append(Path(configured))
-    env_dir = str(os.environ.get("LCA_PLUGIN_DIR") or "").strip()
-    if env_dir:
-        candidates.append(Path(env_dir))
     try:
         root = Path(get_app_root())
     except Exception:
         root = Path(__file__).resolve().parents[2]
-    candidates.append(root / "tools" / "plugin")
-    seen = set()
-    for item in candidates:
-        try:
-            resolved = item.resolve()
-        except OSError:
-            continue
-        key = os.path.normcase(str(resolved))
-        if key in seen or not resolved.is_dir():
-            continue
-        seen.add(key)
+    candidate = root / "tools" / "plugin"
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    if _is_plugin_runtime_dir(resolved):
         return resolved
     return None
 
 
 def is_plugin_runtime_available() -> bool:
-    directory = find_plugin_dir()
-    if directory is None:
-        return False
-    return all((directory / name).is_file() for name in ("PluginHost.exe", "dm.dll", "RegDll.dll"))
+    return find_plugin_dir() is not None
 
 
 def launch_host_command(exe: Path, pipe: str) -> list[str]:

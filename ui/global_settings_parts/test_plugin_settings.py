@@ -20,6 +20,8 @@ def test_plugin_tooltip_mentions_plugin_dir_not_op():
     assert "RegDll.dll" in source
     assert ("tools/" + "op") not in source
     assert ("op_" + "c_api") not in source
+    assert "plugin_dir_edit" not in source
+    assert "_browse_plugin_dir" not in source
     _ = GlobalSettingsDialogTabsMixin
 
 
@@ -36,10 +38,10 @@ def test_get_settings_includes_plugin_fields():
     )
     assert dialog.plugin_reg_code_edit.echoMode() == QLineEdit.EchoMode.Password
     assert dialog.plugin_reg_code_edit.text() == "secret-code"
-    assert dialog.plugin_dir_edit.text() == r"C:\tools\plugin"
+    assert not hasattr(dialog, "plugin_dir_edit")
     settings = dialog.get_settings()
     assert settings["plugin_reg_code"] == "secret-code"
-    assert settings["plugin_dir"] == r"C:\tools\plugin"
+    assert "plugin_dir" not in settings
     dialog.close()
 
 
@@ -60,7 +62,7 @@ def test_plugin_auth_lives_on_other_tab_not_plugin_mode_tab():
     other_tab = dialog.tab_widget.widget(other_index)
     plugin_tab = dialog.tab_widget.widget(plugin_index)
     assert other_tab.isAncestorOf(dialog.plugin_reg_code_edit)
-    assert other_tab.isAncestorOf(dialog.plugin_dir_edit)
+    assert not hasattr(dialog, "plugin_dir_edit")
     assert not plugin_tab.isAncestorOf(dialog.plugin_reg_code_edit)
     assert plugin_tab.isAncestorOf(dialog.plugin_mouse_combo)
     dialog.plugin_input_enable_check.setChecked(True)

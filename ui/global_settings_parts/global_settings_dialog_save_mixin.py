@@ -194,7 +194,6 @@ class GlobalSettingsDialogSaveMixin:
             "plugin_input_display_follow": follow_display,
             "plugin_bind_mode": plugin_bind_mode,
             "plugin_reg_code": self.plugin_reg_code_edit.text() if hasattr(self, "plugin_reg_code_edit") else self.current_config.get("plugin_reg_code", ""),
-            "plugin_dir": self.plugin_dir_edit.text().strip() if hasattr(self, "plugin_dir_edit") else self.current_config.get("plugin_dir", ""),
             'foreground_mouse_driver_backend': require_foreground_backend(
                 (self.foreground_driver_combo.currentData() if hasattr(self, 'foreground_driver_combo') else None)
                 or self.current_config.get('foreground_mouse_driver_backend', 'interception')
