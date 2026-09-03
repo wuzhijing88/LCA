@@ -32,94 +32,75 @@ except ImportError:
 
 class MainWindowWindowBindingMixin:
 
-    def _apply_multi_window_resize(self):
-        """应用多窗口分辨率调整（使用通用窗口管理器）"""
+    def _show_resolution_status(self, message: str, timeout_ms: int = 8000) -> None:
         try:
-            logger.debug("开始多窗口分辨率调整")
-            target_client_width = self.custom_width
-            target_client_height = self.custom_height
+            bar = self.statusBar() if hasattr(self, "statusBar") else None
+            if bar is not None:
+                bar.showMessage(str(message or ""), int(timeout_ms))
+        except Exception as exc:
+            logger.debug("显示分辨率状态失败: %s", exc)
+
+    def _apply_multi_window_resize(self):
+        """应用多窗口分辨率调整（后台线程，避免卡住界面）。"""
+        try:
+            target_client_width = int(getattr(self, "custom_width", 0) or 0)
+            target_client_height = int(getattr(self, "custom_height", 0) or 0)
             if target_client_width <= 0 or target_client_height <= 0:
                 logging.info("未配置自定义分辨率，跳过多窗口大小调整。")
                 return
-            # 工具 修复：安全检查绑定窗口
-            if not hasattr(self, 'bound_windows') or not self.bound_windows:
+            windows = list(getattr(self, "bound_windows", None) or [])
+            if not windows:
                 logging.warning("没有绑定窗口，跳过多窗口大小调整。")
                 return
-            # 获取所有启用的绑定窗口
-            enabled_windows = [w for w in self.bound_windows if w.get('enabled', True)]
-            if not enabled_windows:
-                logging.warning("没有启用的绑定窗口，跳过多窗口大小调整。")
-                return
-            logger.debug(f"准备调整 {len(enabled_windows)} 个窗口的分辨率")
         except Exception as init_error:
             logger.error(f"多窗口分辨率调整初始化失败: {init_error}", exc_info=True)
             return
-        try:
-            # 工具 修复：安全导入和初始化通用分辨率适配器
-            logger.debug("导入通用分辨率适配器")
-            from utils.universal_resolution_adapter import get_universal_adapter
-            logger.debug("获取适配器实例")
-            adapter = get_universal_adapter()
-            # 调试：打印窗口信息和检查句柄重复
-            logging.info("调试：多窗口调整前的窗口状态:")
-            # 检查句柄重复
-            hwnd_count = {}
-            for i, window_info in enumerate(enabled_windows):
-                hwnd = window_info.get('hwnd')
-                title = window_info.get('title', '未知窗口')
-                if hwnd:
-                    hwnd_count[hwnd] = hwnd_count.get(hwnd, 0) + 1
-                    debug_info = adapter.debug_window_info(hwnd)
-                    logging.info(f"  窗口 {i+1}: {title}")
-                    logging.info(f"    HWND: {hwnd}")
-                    logging.info(f"    类名: {debug_info.get('class_name', 'N/A')}")
-                    logging.info(f"    客户区尺寸: {debug_info.get('client_size', 'N/A')}")
-                    logging.info(f"    窗口尺寸: {debug_info.get('window_size', 'N/A')}")
-                    logging.info(f"    可见: {debug_info.get('is_visible', 'N/A')}")
-                    logging.info(f"    启用: {debug_info.get('is_enabled', 'N/A')}")
-                else:
-                    logging.warning(f"  窗口 {i+1}: {title} - 无有效句柄")
-            # 报告句柄重复情况
-            duplicate_hwnds = [hwnd for hwnd, count in hwnd_count.items() if count > 1]
-            if duplicate_hwnds:
-                logging.error(f"发现重复的窗口句柄: {duplicate_hwnds}")
-                for hwnd in duplicate_hwnds:
-                    logging.error(f"  句柄 {hwnd} 被 {hwnd_count[hwnd]} 个窗口使用")
-            else:
-                logging.info("所有窗口句柄都是唯一的")
-            # 使用通用窗口管理器批量调整窗口（异步模式）
-            from utils.window.universal_window_manager import get_universal_window_manager
-            window_manager = get_universal_window_manager()
-            results = []
-            for window_info in enabled_windows:
-                hwnd = window_info.get('hwnd')
-                if hwnd:
-                    # 每个窗口使用异步调整
-                    result = window_manager.adjust_single_window(
-                        hwnd, target_client_width, target_client_height, async_mode=True
+
+        def worker():
+            try:
+                from PySide6.QtCore import QTimer
+                from utils.window.universal_window_manager import get_universal_window_manager
+
+                window_manager = get_universal_window_manager()
+                results = window_manager.resize_bound_windows(
+                    windows, target_client_width, target_client_height
+                )
+                report = window_manager.create_adjustment_report(results)
+                summary = report.get("summary") or {}
+                success_count = int(summary.get("successful") or 0)
+                fail_count = int(summary.get("failed") or 0)
+                logging.info(
+                    "多窗口分辨率调整完成: 成功 %s, 失败 %s, 成功率 %s",
+                    success_count,
+                    fail_count,
+                    summary.get("success_rate"),
+                )
+                for failed_window in report.get("failed_windows") or ():
+                    logging.error(
+                        "失败窗口: %s - %s",
+                        failed_window.get("title"),
+                        failed_window.get("reason"),
                     )
-                    results.append(result)
-            # 生成调整报告
-            report = window_manager.create_adjustment_report(results)
-            logging.info("多窗口分辨率调整完成:")
-            logging.info(f"  总窗口数: {report['summary']['total_windows']}")
-            logging.info(f"  成功: {report['summary']['successful']}")
-            logging.info(f"  失败: {report['summary']['failed']}")
-            logging.info(f"  成功率: {report['summary']['success_rate']}")
-            # 记录失败的窗口
-            for failed_window in report['failed_windows']:
-                logging.error(f"  失败窗口: {failed_window['title']} - {failed_window['reason']}")
-            # 调试：打印调整后的窗口状态
-            logging.info("调试：多窗口调整后的窗口状态:")
-            for i, window_info in enumerate(enabled_windows):
-                hwnd = window_info.get('hwnd')
-                title = window_info.get('title', '未知窗口')
-                if hwnd:
-                    debug_info = adapter.debug_window_info(hwnd)
-                    logging.info(f"  窗口 {i+1}: {title}")
-                    logging.info(f"    调整后客户区尺寸: {debug_info.get('client_size', 'N/A')}")
-        except Exception as e:
-            logging.error(f"使用通用窗口管理器调整失败: {e}")
+                if fail_count:
+                    message = f"窗口分辨率调整完成：成功 {success_count}，失败 {fail_count}"
+                else:
+                    message = (
+                        f"窗口分辨率已调整：{success_count} 个窗口 -> "
+                        f"{target_client_width}x{target_client_height}"
+                    )
+                QTimer.singleShot(0, lambda: self._show_resolution_status(message))
+            except Exception as exc:
+                logging.error(f"使用通用窗口管理器调整失败: {exc}")
+                from PySide6.QtCore import QTimer
+
+                QTimer.singleShot(
+                    0,
+                    lambda: self._show_resolution_status(f"窗口分辨率调整失败: {exc}"),
+                )
+
+        import threading
+
+        threading.Thread(target=worker, daemon=True, name="MainMultiWindowResize").start()
 
     def _get_bound_hwnds_for_title(self, title):
         """获取当前绑定列表中与标题匹配的 HWND 集合。"""
@@ -460,6 +441,12 @@ class MainWindowWindowBindingMixin:
                 should_activate = False
                 reason = f"未识别的执行模式: {execution_mode}"
             logger.info(f"激活决策: {should_activate} - {reason}")
+            from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+            if should_activate and skip_cross_desktop_activation(target_hwnd, log_prefix="窗口绑定"):
+                should_activate = False
+                reason = "目标窗口不在当前虚拟桌面，跳过激活以免切换桌面"
+                logger.info(f"激活决策: {should_activate} - {reason}")
             if should_activate:
                 logger.info(f"开始激活窗口: {window_title}")
                 # 如果窗口最小化，先恢复窗口（恢复父窗口或顶级窗口）

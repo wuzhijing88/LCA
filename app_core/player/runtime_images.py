@@ -19,18 +19,6 @@ def _sound_relative_key(key: str) -> str:
     return ""
 
 
-def _map_relative_key(key: str) -> str:
-    text = str(key or "").replace("\\", "/").lstrip("/")
-    if text.startswith("memory://"):
-        text = text[len("memory://") :]
-    lowered = text.lower()
-    if lowered.startswith("assets/maps/"):
-        return text[len("assets/maps/") :]
-    if lowered.startswith("maps/"):
-        return text[len("maps/") :]
-    return ""
-
-
 def materialize_player_sounds(userdata_dir: str) -> int:
     """把密封包里的音效落到 userdata/sounds，供播放任务按文件名查找。"""
     from app_core.player.memory_store import list_player_memory_files
@@ -52,39 +40,6 @@ def materialize_player_sounds(userdata_dir: str) -> int:
             continue
         seen.add(rel)
         destination = sounds_dir / rel
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_file():
-            continue
-        destination.write_bytes(data)
-        count += 1
-    return count
-
-
-def materialize_player_maps(userdata_dir: str) -> int:
-    """把密封包里的地图落到 userdata/maps，保留每张地图的目录结构。"""
-    from app_core.player.memory_store import list_player_memory_files
-
-    root_text = str(userdata_dir or "").strip()
-    if not root_text:
-        return 0
-    maps_dir = Path(root_text) / "maps"
-    maps_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
-    seen: set[str] = set()
-    for key, data in list_player_memory_files().items():
-        rel = _map_relative_key(key)
-        rel_path = Path(rel)
-        if (
-            not rel
-            or rel in seen
-            or not data
-            or ".." in rel_path.parts
-            or rel_path.is_absolute()
-            or rel_path.drive
-        ):
-            continue
-        seen.add(rel)
-        destination = maps_dir / rel_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_file():
             continue

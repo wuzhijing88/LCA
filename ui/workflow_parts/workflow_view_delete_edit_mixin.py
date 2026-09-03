@@ -686,10 +686,10 @@ class WorkflowViewDeleteEditMixin:
             logger.error(f"安全清理卡片 {card_id} 状态失败: {e}")
 
     def edit_card_settings(self, card_id: int):
-        """Opens the parameter dialog for the specified card."""
+        """Show the parameter panel for the specified card."""
         card = self.cards.get(card_id)
-        if card and hasattr(card, 'open_parameter_dialog'):
-            card.open_parameter_dialog()
+        if card and hasattr(card, 'open_parameter_panel'):
+            card.open_parameter_panel()
 
     def _handle_jump_target_change(self, param_name: str, old_target_id: Optional[int], new_target_id: Optional[int]):
         """Handles changes in jump target parameters to update connections."""

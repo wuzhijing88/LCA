@@ -159,3 +159,23 @@ def deactivate() -> None:
 def get_current_session() -> Optional[LcaPackageSession]:
     """兼容旧名称；返回当前激活的工程会话。"""
     return get_active()
+
+
+def _resolve_active_package_asset(logical_path: str) -> Optional[str]:
+    session = get_active()
+    if session is None:
+        return None
+    return session.resolve_asset(logical_path)
+
+
+def _register_image_path_hook() -> None:
+    """把当前工程会话接到通用图片路径解析器上，避免 utils 层反向依赖本模块。"""
+    try:
+        from utils.image_paths import set_package_asset_resolver
+
+        set_package_asset_resolver(_resolve_active_package_asset)
+    except Exception:
+        pass
+
+
+_register_image_path_hook()

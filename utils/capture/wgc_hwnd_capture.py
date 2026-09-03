@@ -10,6 +10,12 @@ import os
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
+from utils.capture.wgc_capture_policy import (
+    detach_wgc_owned_resources,
+    resolve_wgc_capture_hwnd,
+    should_crop_wgc_as_child,
+    should_force_static_window_rebuild,
+)
 from utils.window.hwnd_utils import as_hwnd
 
 logger = logging.getLogger(__name__)
@@ -90,7 +96,7 @@ _WGC_STATIC_REBUILD_RETRY_INTERVAL_MS = _read_env_int(
 
 _WGC_STATIC_REBUILD_COOLDOWN_MS = _read_env_int(
     "SCREENSHOT_WGC_STATIC_REBUILD_COOLDOWN_MS",
-    default=0,
+    default=250,
     min_value=0,
     max_value=2000,
 )
@@ -157,34 +163,6 @@ _WGC_RECREATE_EVERY_N_FRAMES = _read_env_int(
     max_value=10000,
 )
 
-_WGC_MAIN_MEMORY_CHECK_INTERVAL_SEC = _read_env_int(
-    "SCREENSHOT_WGC_MEMORY_CHECK_INTERVAL_SEC",
-    default=1,
-    min_value=1,
-    max_value=30,
-)
-
-_WGC_MAIN_MEMORY_THRESHOLD_MB = _read_env_int(
-    "SCREENSHOT_WGC_MAIN_MEMORY_THRESHOLD_MB",
-    default=500,
-    min_value=200,
-    max_value=8192,
-)
-
-_WGC_NO_RESOURCE_RECLAIM_COOLDOWN_SEC = _read_env_int(
-    "SCREENSHOT_WGC_NO_RESOURCE_RECLAIM_COOLDOWN_SEC",
-    default=45,
-    min_value=5,
-    max_value=1800,
-)
-
-_WGC_NO_RESOURCE_HIGH_MEM_LOG_INTERVAL_SEC = _read_env_int(
-    "SCREENSHOT_WGC_NO_RESOURCE_HIGH_MEM_LOG_INTERVAL_SEC",
-    default=30,
-    min_value=5,
-    max_value=600,
-)
-
 # 尝试导入WGC相关库
 try:
     from winrt.windows.graphics.capture.interop import create_for_window
@@ -218,6 +196,15 @@ except ImportError:
     logger.warning("[ERROR] pywin32未安装: pip install pywin32")
 
 
+def _get_win32_root_hwnd(hwnd: int) -> int:
+    if not WIN32_AVAILABLE:
+        return as_hwnd(hwnd)
+    try:
+        return as_hwnd(win32gui.GetAncestor(hwnd, 2))
+    except Exception:
+        return as_hwnd(hwnd)
+
+
 def _resolve_relative_axis_bounds(
     start: int,
     end: int,
@@ -242,6 +229,77 @@ def _resolve_relative_axis_bounds(
         end_value = int(end_value * scale)
 
     return start_value, max(0, end_value - start_value)
+
+
+def resolve_wgc_client_crop_box(
+    surface_width: int,
+    surface_height: int,
+    *,
+    client_origin: Tuple[int, int],
+    client_size: Tuple[int, int],
+    dwm_rect: Tuple[int, int, int, int],
+    window_rect: Tuple[int, int, int, int],
+    surface_tolerance: int = 8,
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    从 WGC 整窗 surface 精确裁出客户区 box。
+
+    对齐 OP WgcCapture::getClientBox：多候选（已是客户区 / DWM 外框 / WindowRect），
+    若会裁掉像素则返回 None，禁止静默缩小宽度。
+    """
+    try:
+        surface_w = int(surface_width)
+        surface_h = int(surface_height)
+        expected_w = int(client_size[0])
+        expected_h = int(client_size[1])
+        origin_x = int(client_origin[0])
+        origin_y = int(client_origin[1])
+        tol = max(0, int(surface_tolerance))
+    except Exception:
+        return None
+    if surface_w <= 0 or surface_h <= 0 or expected_w <= 0 or expected_h <= 0:
+        return None
+
+    candidates: list[Tuple[int, int, int, int, int, int]] = []
+    # (x, y, w, h, clipped_pixels, frame_mismatch)
+
+    extra_w = surface_w - expected_w
+    extra_h = surface_h - expected_h
+    if 0 <= extra_w <= tol and 0 <= extra_h <= tol:
+        candidates.append((0, 0, expected_w, expected_h, 0, extra_w + extra_h))
+
+    for base_rect in (dwm_rect, window_rect):
+        try:
+            base_left, base_top, base_right, base_bottom = [int(v) for v in base_rect]
+        except Exception:
+            continue
+        left = max(0, origin_x - base_left)
+        top = max(0, origin_y - base_top)
+        if left >= surface_w or top >= surface_h:
+            continue
+        width = min(expected_w, surface_w - left)
+        height = min(expected_h, surface_h - top)
+        if width <= 0 or height <= 0:
+            continue
+        clipped = (expected_w - width) + (expected_h - height)
+        mismatch = abs((base_right - base_left) - surface_w) + abs((base_bottom - base_top) - surface_h)
+        candidates.append((left, top, width, height, clipped, mismatch))
+
+    best = None
+    for item in candidates:
+        if best is None:
+            best = item
+            continue
+        if item[4] < best[4]:
+            best = item
+        elif item[4] == best[4] and item[5] < best[5]:
+            best = item
+        elif item[4] == best[4] and item[5] == best[5] and item[0] < best[0]:
+            best = item
+
+    if best is None or best[4] > 0:
+        return None
+    return best[0], best[1], best[2], best[3]
 
 
 @dataclass
@@ -436,173 +494,6 @@ class D3D11DeviceManager:
                 self._learning_model_device = None
         except Exception as e:
             logger.debug(f"清理D3D11设备失败: {e}")
-class COMResourceTracker:
-    """
-    【完善的COM资源清理】追踪和清理WinRT/COM对象
-
-    """
-
-    _instance = None
-    _lock = threading.Lock()
-
-    # 【内存泄漏修复】限制待清理列表最大大小
-    MAX_PENDING_CLEANUP = 50
-
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._initialized = False
-        return cls._instance
-
-    def __init__(self):
-        if self._initialized:
-            return
-
-        self._pending_cleanup = []  # 待清理的对象列表 [(weak_ref, close_callback, name)]
-        self._cleanup_lock = threading.Lock()
-        self._cleanup_count = 0
-        self._last_cleanup_time = 0
-        self._initialized = True
-        logger.debug("[COMResourceTracker] 初始化完成")
-
-    def track(self, obj, name: str = "unknown"):
-        """
-        追踪一个COM对象，当它变得不可达时会被清理
-
-        Args:
-            obj: WinRT/COM对象（必须有close()方法）
-            name: 对象名称（用于日志）
-        """
-        if obj is None:
-            return
-
-        import weakref
-
-        def cleanup_callback(weak_ref):
-            """弱引用回调 - 当对象被GC时调用"""
-            logger.debug(f"[COMResourceTracker] 对象已被GC回收: {name}")
-
-        try:
-            # 创建弱引用，当对象被GC时会调用cleanup_callback
-            weak_ref = weakref.ref(obj, cleanup_callback)
-
-            with self._cleanup_lock:
-                self._pending_cleanup.append((weak_ref, name, time.time()))
-
-            logger.debug(f"[COMResourceTracker] 追踪对象: {name}")
-        except TypeError:
-            # 某些COM对象不支持弱引用，直接忽略
-            logger.debug(f"[COMResourceTracker] 对象不支持弱引用: {name}")
-
-    def schedule_cleanup(self, obj, name: str = "unknown"):
-        """
-        Args:
-            obj: WinRT/COM对象
-            name: 对象名称
-        """
-        if obj is None:
-            return
-
-        import weakref
-
-        # 【关键修复】先立即关闭对象，释放底层COM资源
-        try:
-            if hasattr(obj, 'close'):
-                obj.close()
-                logger.debug(f"[COMResourceTracker] 立即关闭: {name}")
-        except Exception as e:
-            logger.debug(f"[COMResourceTracker] 关闭失败: {name}: {e}")
-
-        # 【内存泄漏修复】使用弱引用而非强引用，不阻止GC
-        try:
-            weak_ref = weakref.ref(obj)
-            with self._cleanup_lock:
-                # 限制待清理列表大小，超过时强制清理最老的
-                if len(self._pending_cleanup) >= self.MAX_PENDING_CLEANUP:
-                    # 强制清理前一半
-                    half = len(self._pending_cleanup) // 2
-                    self._pending_cleanup = self._pending_cleanup[half:]
-                    logger.debug(f"[COMResourceTracker] 待清理列表过大，清理了{half}个旧条目")
-
-                self._pending_cleanup.append((weak_ref, name, time.time()))
-                self._cleanup_count += 1
-        except TypeError:
-            # 对象不支持弱引用，直接忽略（已经关闭了）
-            pass
-
-        logger.debug(f"[COMResourceTracker] 安排延迟清理: {name}")
-
-    def do_cleanup(self, max_age_seconds: float = 0.5, force: bool = False):
-        """
-        Args:
-            max_age_seconds: 只清理超过这个年龄的对象（秒）
-            force: 强制清理所有对象，忽略年龄
-
-        Returns:
-            int: 清理的对象数量
-        """
-        import weakref
-        current_time = time.time()
-        cleaned_count = 0
-        still_pending = []
-
-        with self._cleanup_lock:
-            for item in self._pending_cleanup:
-                obj_or_ref, name, create_time = item
-                age = current_time - create_time
-
-                # 检查年龄
-                if not force and age < max_age_seconds:
-                    still_pending.append(item)
-                    continue
-
-                # 现在存储的都是弱引用（schedule_cleanup改进后）
-                if isinstance(obj_or_ref, weakref.ref):
-                    # 弱引用：检查对象是否还存在
-                    obj = obj_or_ref()
-                    if obj is None:
-                        # 对象已被GC，清理成功
-                        cleaned_count += 1
-                        continue
-                    else:
-                        # 对象仍存在（可能还有其他引用），再次尝试关闭
-                        try:
-                            if hasattr(obj, 'close'):
-                                obj.close()
-                        except Exception:
-                            pass
-                        cleaned_count += 1
-                else:
-                    # 兼容旧的强引用模式（不应该再出现）
-                    obj = obj_or_ref
-                    try:
-                        if hasattr(obj, 'close'):
-                            obj.close()
-                            logger.debug(f"[COMResourceTracker] 已关闭: {name} (年龄: {age:.2f}s)")
-                    except Exception as e:
-                        logger.debug(f"[COMResourceTracker] 关闭失败: {name}: {e}")
-                    cleaned_count += 1
-
-            self._pending_cleanup = still_pending
-            self._last_cleanup_time = current_time
-
-        # 清理完成
-        if cleaned_count > 0:
-            logger.debug(f"[COMResourceTracker] 清理完成: {cleaned_count}个条目, 剩余: {len(still_pending)}个")
-
-        return cleaned_count
-
-    def get_pending_count(self) -> int:
-        """获取待清理对象数量"""
-        with self._cleanup_lock:
-            return len(self._pending_cleanup)
-
-
-def get_com_tracker() -> COMResourceTracker:
-    """获取全局COM资源追踪器"""
-    return COMResourceTracker()
 
 
 class WGC_HWND_Capturer:
@@ -827,22 +718,7 @@ class WGC_HWND_Capturer:
         return frame, frame_pool, session
 
     def _get_top_level_window(self, hwnd: int) -> int:
-        """
-        获取顶层窗口句柄
-        如果hwnd是子窗口，返回其根窗口；否则返回hwnd本身
-        """
-        try:
-            if not WIN32_AVAILABLE:
-                return hwnd
-            import win32gui
-            hwnd = as_hwnd(hwnd)
-            root_hwnd = as_hwnd(win32gui.GetAncestor(hwnd, 2))  # GA_ROOT = 2
-            if root_hwnd and root_hwnd != hwnd:
-                return root_hwnd
-            return hwnd
-        except Exception as e:
-            logger.warning(f"获取顶层窗口失败: {e}，使用原始句柄")
-            return hwnd
+        return resolve_wgc_capture_hwnd(hwnd, get_root_hwnd=_get_win32_root_hwnd)
 
     def _create_capture_item(self):
         """通过HWND创建GraphicsCaptureItem"""
@@ -1134,18 +1010,12 @@ class WGC_HWND_Capturer:
 
                         if frame is None and has_request:
                             now_ts = time.time()
-                            remaining = self._static_rebuild_cooldown_sec - (
-                                now_ts - self._last_static_rebuild_ts
-                            )
-                            if remaining > 0:
-                                self._native_frame_arrived.wait(timeout=remaining)
-                                self._native_frame_arrived.clear()
-                                try:
-                                    frame = frame_pool.try_get_next_frame()
-                                except Exception:
-                                    frame = None
-                            if frame is None:
-                                self._last_static_rebuild_ts = time.time()
+                            if should_force_static_window_rebuild(
+                                now_ts=now_ts,
+                                last_rebuild_ts=self._last_static_rebuild_ts,
+                                cooldown_sec=self._static_rebuild_cooldown_sec,
+                            ):
+                                self._last_static_rebuild_ts = now_ts
                                 self._rebuild_count = getattr(self, "_rebuild_count", 0) + 1
                                 logger.debug("[后台捕获] 静态窗口，强制出帧")
                                 try:
@@ -1169,6 +1039,17 @@ class WGC_HWND_Capturer:
                                         except Exception:
                                             pass
                                         break
+                            else:
+                                remaining = self._static_rebuild_cooldown_sec - (
+                                    now_ts - self._last_static_rebuild_ts
+                                )
+                                if remaining > 0:
+                                    self._native_frame_arrived.wait(timeout=remaining)
+                                    self._native_frame_arrived.clear()
+                                    try:
+                                        frame = frame_pool.try_get_next_frame()
+                                    except Exception:
+                                        frame = None
 
                         if frame is not None:
                             while True:
@@ -1278,6 +1159,36 @@ class WGC_HWND_Capturer:
         WGC_HWND_Capturer._inc_stat('capturers_destroyed')
         return True
 
+    def _close_detached_resources(self, taken) -> None:
+        if taken is None:
+            return
+        self._close_capture_session(taken.session)
+        self._close_frame_pool(taken.frame_pool)
+        if taken.item is not None:
+            try:
+                taken.item.close()
+            except Exception:
+                pass
+
+    def _force_release_owned_resources(self) -> None:
+        acquired = False
+        try:
+            acquired = self.lock.acquire(timeout=0.5)
+            taken = detach_wgc_owned_resources(self)
+        except Exception:
+            taken = detach_wgc_owned_resources(self)
+        finally:
+            if acquired:
+                try:
+                    self.lock.release()
+                except Exception:
+                    pass
+        self._close_detached_resources(taken)
+        try:
+            self._detach_frame_arrived_handler()
+        except Exception:
+            pass
+
     def _start_async_finalize(self, capture_thread: threading.Thread):
         """后台等待捕获线程退出后做最终收尾，避免状态悬挂。"""
         with self._destroy_lock:
@@ -1289,8 +1200,8 @@ class WGC_HWND_Capturer:
                 try:
                     capture_thread.join(timeout=8.0)
                     if capture_thread.is_alive():
-                        logger.error(f"[WGC-Stop] 捕获线程长时间未退出 (HWND: {self.hwnd})")
-                        return
+                        logger.error(f"[WGC-Stop] 捕获线程长时间未退出，强制释放资源 (HWND: {self.hwnd})")
+                        self._force_release_owned_resources()
                     self.capture_thread = None
                     if self._mark_destroyed_once():
                         logger.debug(f"[WGC-Stop] 捕获器延迟销毁完成 (HWND: {self.hwnd})")
@@ -1350,56 +1261,27 @@ class WGC_HWND_Capturer:
             except Exception as e:
                 logger.debug(f"[WGC-Stop] 线程join失败: {e}")
 
-        # 3. 线程已结束或超时，现在清理残留资源（以防finally未执行或执行失败）
+        # 3. 线程已结束或超时，都要拆掉残留 session/pool/item，避免悬挂泄漏
         try:
             lock_timeout = 0.5 if thread_still_alive else 2.0
-            if self.lock.acquire(timeout=lock_timeout):
-                try:
-                    # 【安全检查】如果session/frame_pool仍存在，说明finally未成功清理，这里补救
-                    # 注意：正常情况下这些应该已被finally清理，这只是保险措施
-                    if self.session is not None:
-                        logger.warning("[WGC-Stop] session未被finally清理，补救清理")
-                        try:
-                            self.session.close()
-                            WGC_HWND_Capturer._inc_stat('sessions_closed')
-                        except Exception:
-                            pass
-                        self.session = None
-
-                    if self.frame_pool is not None:
-                        logger.warning("[WGC-Stop] frame_pool未被finally清理，补救清理")
-                        try:
-                            self._detach_frame_arrived_handler(frame_pool=self.frame_pool)
-                            self.frame_pool.close()
-                            WGC_HWND_Capturer._inc_stat('frame_pools_closed')
-                        except Exception:
-                            pass
-                        self.frame_pool = None
-
-                    # 【显存优化】强制GPU完成所有操作并释放显存
-                    if self._flush_gpu():
-                        logger.debug("[WGC-Stop] GPU已Flush")
-
-                    # 清理GraphicsCaptureItem（这个是在构造函数创建的，由stop负责清理）
-                    if self.item:
-                        try:
-                            self.item.close()
-                        except Exception:
-                            pass
-                        self.item = None
-
-                    # 清理帧引用
-                    if self.latest_frame is not None:
-                        del self.latest_frame
-                        self.latest_frame = None
-
-                finally:
+            acquired = self.lock.acquire(timeout=lock_timeout)
+            if not acquired:
+                logger.warning(f"[WGC-Stop] 获取锁超时，改为无锁强制释放 (HWND: {self.hwnd})")
+            try:
+                taken = detach_wgc_owned_resources(self)
+            finally:
+                if acquired:
                     self.lock.release()
-            else:
-                logger.warning(f"[WGC-Stop] 获取锁超时，跳过同步兜底清理 (HWND: {self.hwnd})")
-
+            self._close_detached_resources(taken)
+            try:
+                self._detach_frame_arrived_handler()
+            except Exception:
+                pass
+            if self._flush_gpu():
+                logger.debug("[WGC-Stop] GPU已Flush")
         except Exception as e:
             logger.error(f"[WGC-Stop] 清理资源异常: {e}")
+            self._force_release_owned_resources()
 
         # 4. 清理线程引用和销毁统计
         if thread_still_alive:
@@ -1443,15 +1325,25 @@ class OptimizedWGCCapture:
         self._cleanup_thread = threading.Thread(target=self._periodic_cleanup, daemon=True, name="WGC-Cleanup")
         self._cleanup_thread.start()
         logger.debug("[WGC] 定期清理线程已启动")
-        self._high_mem_no_resource_hits = 0
-        self._high_mem_persistent_hits_to_reclaim = 2
-        self._full_reclaim_lock = threading.Lock()
-        self._no_resource_last_reclaim_ts = 0.0
-        self._no_resource_high_mem_last_log_ts = 0.0
-        self._no_resource_reclaim_cooldown_sec = float(_WGC_NO_RESOURCE_RECLAIM_COOLDOWN_SEC)
-        self._no_resource_high_mem_log_interval_sec = float(_WGC_NO_RESOURCE_HIGH_MEM_LOG_INTERVAL_SEC)
         self._last_capture_failure_reason = ""
         self._last_capture_failure_lock = threading.Lock()
+
+    def _capturer_key(self, hwnd: int) -> int:
+        return resolve_wgc_capture_hwnd(hwnd, get_root_hwnd=_get_win32_root_hwnd)
+
+    def _pop_capturer(self, key: int):
+        capturer = self.capturers.pop(key, None)
+        self.capturer_last_used.pop(key, None)
+        return capturer
+
+    @staticmethod
+    def _stop_detached_capturer(capturer) -> None:
+        if capturer is None:
+            return
+        try:
+            capturer.stop()
+        except Exception:
+            pass
 
     def _set_last_capture_failure_reason(self, reason: str) -> None:
         try:
@@ -1518,128 +1410,6 @@ class OptimizedWGCCapture:
         except Exception:
             pass
 
-    def _hard_reclaim_no_active_resources(self):
-        """无活跃捕获资源但内存持续偏高时执行硬回收。"""
-        try:
-            self.cache.clear()
-        except Exception:
-            pass
-
-        try:
-            get_com_tracker().do_cleanup(max_age_seconds=0.0, force=True)
-        except Exception:
-            pass
-
-        try:
-            D3D11DeviceManager().cleanup()
-        except Exception:
-            pass
-
-        self._run_process_trim()
-
-    def _get_main_and_children_rss_mb(self) -> Tuple[float, float]:
-        """获取主进程RSS和子进程RSS（MB）。"""
-        try:
-            import psutil
-            process = psutil.Process()
-            main_rss_mb = float(process.memory_info().rss) / 1024 / 1024
-            children_rss_mb = 0.0
-            try:
-                for child in process.children(recursive=True):
-                    try:
-                        children_rss_mb += float(child.memory_info().rss) / 1024 / 1024
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            return main_rss_mb, children_rss_mb
-        except Exception:
-            return 0.0, 0.0
-
-    def _full_reclaim_on_high_memory(
-        self,
-        memory_before_mb: float,
-        force_reclaim: bool = False,
-        recreate_device: bool = True
-    ) -> Tuple[float, float, int]:
-        """
-        高内存时执行完整回收闭环：
-        1. 停止并移除所有捕获器
-        2. 清理帧缓存
-        3. 强制清理COM延迟队列
-        4. 释放D3D设备
-        5. 执行进程级trim
-        """
-        _enter_wgc_rebuild()
-        try:
-            active_requests, _ = self._get_capture_activity_snapshot()
-            if active_requests > 0:
-                if not force_reclaim:
-                    # 正在执行截图请求时禁止做“完整回收”，避免关闭中的对象被并发访问
-                    self._run_process_trim()
-                    return memory_before_mb, 0.0, 0
-
-                # 强制回收路径：不使用硬编码超时，等待在途请求全部完成后再执行销毁重建
-                while active_requests > 0:
-                    if self._cleanup_stop_event.is_set():
-                        break
-                    time.sleep(0.01)
-                    active_requests, _ = self._get_capture_activity_snapshot()
-                if active_requests > 0:
-                    self._run_process_trim()
-                    return memory_before_mb, 0.0, 0
-
-            snapshot = []
-            if self.lock.acquire(timeout=2.0):
-                try:
-                    snapshot = list(self.capturers.items())
-                    self.capturers.clear()
-                    self.capturer_last_used.clear()
-                finally:
-                    self.lock.release()
-
-            stopped = 0
-            for _, capturer in snapshot:
-                try:
-                    capturer.stop()
-                    stopped += 1
-                except Exception:
-                    pass
-
-            try:
-                self.cache.clear()
-            except Exception:
-                pass
-
-            try:
-                get_com_tracker().do_cleanup(max_age_seconds=0.0, force=True)
-            except Exception:
-                pass
-
-            try:
-                D3D11DeviceManager().cleanup()
-            except Exception:
-                pass
-            if recreate_device:
-                try:
-                    # 立即重建设备链，确保“完整销毁重建”闭环在本次清理内完成
-                    D3D11DeviceManager().get_device()
-                except Exception:
-                    pass
-
-            self._run_process_trim()
-            time.sleep(0.05)
-            self._run_process_trim()
-
-            memory_after_mb, _ = self._get_main_and_children_rss_mb()
-            if memory_after_mb <= 0:
-                memory_after_mb = memory_before_mb
-
-            freed_mb = memory_before_mb - memory_after_mb
-            return memory_after_mb, freed_mb, stopped
-        finally:
-            _leave_wgc_rebuild()
-
     def _check_capturer_health(self, capturer: Optional[WGC_HWND_Capturer]) -> Tuple[bool, str]:
         """统一的捕获器健康检查，避免多处判定不一致。"""
         if capturer is None:
@@ -1666,14 +1436,11 @@ class OptimizedWGCCapture:
         import time
         # 【高频OCR优化】调整清理参数，更积极地检测和清理内存
         IDLE_TIMEOUT = 30  # 【优化】从60秒降到30秒，更快释放闲置捕获器
-        CHECK_INTERVAL = 1  # 每秒检查，保证高内存即时触发
+        CHECK_INTERVAL = 1  # 每秒检查闲置与不健康捕获器
         HEALTH_CHECK_INTERVAL = 3  # 【优化】健康检查间隔从5秒改为3秒
         FORCE_GC_INTERVAL = 30  # 【优化】从60秒改为30秒，更频繁GC
-        MEMORY_CHECK_INTERVAL = int(_WGC_MAIN_MEMORY_CHECK_INTERVAL_SEC)
-        MEMORY_THRESHOLD_MB = int(_WGC_MAIN_MEMORY_THRESHOLD_MB)
         last_health_check = 0
         last_force_gc = time.time()
-        last_memory_check = 0
 
         while not self._cleanup_stop_event.is_set():
             try:
@@ -1706,152 +1473,33 @@ class OptimizedWGCCapture:
                         elif len(self.capturers) > 0 or any(resource_stats.values()):
                             logger.debug(f"[资源平衡检查] 活跃捕获器: {len(self.capturers)}, 统计: {resource_stats}")
 
-                # 在锁外清理闲置的捕获器
+                # 在锁外停止，避免 stop() join 卡住清理线程
                 for hwnd, reason in to_cleanup:
                     try:
+                        pending = None
                         with self.lock:
-                            if hwnd in self.capturers:
-                                self.capturers[hwnd].stop()
-                                del self.capturers[hwnd]
-                            if hwnd in self.capturer_last_used:
-                                del self.capturer_last_used[hwnd]
-                        logger.info(f"[WGC自动清理] 清理捕获器 HWND={hwnd} ({reason})")
+                            pending = self._pop_capturer(hwnd)
+                        self._stop_detached_capturer(pending)
+                        if pending is not None:
+                            logger.info(f"[WGC自动清理] 清理捕获器 HWND={hwnd} ({reason})")
                     except Exception as e:
                         logger.debug(f"[WGC自动清理] 清理失败: {e}")
 
-                # 清理不健康的捕获器（让下次capture_window时重新创建）
                 for hwnd, reason in unhealthy_capturers:
                     try:
+                        pending = None
                         with self.lock:
-                            if hwnd in self.capturers:
-                                try:
-                                    self.capturers[hwnd].stop()
-                                except Exception:
-                                    pass
-                                del self.capturers[hwnd]
-                            if hwnd in self.capturer_last_used:
-                                del self.capturer_last_used[hwnd]
-                        logger.warning(f"[WGC健康检查] 清理不健康捕获器 HWND={hwnd} ({reason})")
+                            pending = self._pop_capturer(hwnd)
+                        self._stop_detached_capturer(pending)
+                        if pending is not None:
+                            logger.warning(f"[WGC健康检查] 清理不健康捕获器 HWND={hwnd} ({reason})")
                     except Exception as e:
                         logger.debug(f"[WGC健康检查] 清理失败: {e}")
-
-                # 3. 清理完成
-
-                # 【完善的清理】定期执行COM资源追踪器的延迟清理
-                try:
-                    com_tracker = get_com_tracker()
-                    pending_count = com_tracker.get_pending_count()
-                    if pending_count > 0:
-                        cleaned = com_tracker.do_cleanup(max_age_seconds=1.0)
-                        if cleaned > 0:
-                            logger.debug(f"[WGC定期清理] COM资源追踪器清理了{cleaned}个对象，剩余{com_tracker.get_pending_count()}个")
-                except Exception as e:
-                    logger.debug(f"[WGC定期清理] COM资源清理异常: {e}")
 
                 # 更新GC时间记录
                 if current_time - last_force_gc > FORCE_GC_INTERVAL:
                     last_force_gc = current_time
                     self._run_process_trim()
-
-                # 【长期运行优化】内存监控和自动清理
-                if current_time - last_memory_check > MEMORY_CHECK_INTERVAL:
-                    try:
-                        main_rss_mb, children_rss_mb = self._get_main_and_children_rss_mb()
-
-                        if main_rss_mb > MEMORY_THRESHOLD_MB:
-                            active_capturers = 0
-                            if self.lock.acquire(timeout=0.5):
-                                try:
-                                    active_capturers = len(self.capturers)
-                                finally:
-                                    self.lock.release()
-                            stats = WGC_HWND_Capturer.get_resource_stats()
-                            active_requests, _ = self._get_capture_activity_snapshot()
-                            has_active_wgc_resources = bool(
-                                active_requests > 0
-                                or active_capturers > 0
-                                or int(stats.get('frame_pools_active', 0) or 0) > 0
-                                or int(stats.get('sessions_active', 0) or 0) > 0
-                            )
-
-                            # 无活跃WGC资源时，不执行完整销毁重建；仅做低频轻量回收，避免误触发循环重建。
-                            if not has_active_wgc_resources:
-                                self._high_mem_no_resource_hits += 1
-                            else:
-                                self._high_mem_no_resource_hits = 0
-
-                            if not has_active_wgc_resources:
-                                now_ts = current_time
-                                reached_hits = self._high_mem_no_resource_hits >= self._high_mem_persistent_hits_to_reclaim
-                                cooldown_elapsed = (
-                                    (now_ts - self._no_resource_last_reclaim_ts)
-                                    >= self._no_resource_reclaim_cooldown_sec
-                                )
-                                if reached_hits and cooldown_elapsed:
-                                    self._hard_reclaim_no_active_resources()
-                                    self._high_mem_no_resource_hits = 0
-                                    self._no_resource_last_reclaim_ts = now_ts
-                                    try:
-                                        main_rss_mb, children_rss_mb = self._get_main_and_children_rss_mb()
-                                    except Exception:
-                                        pass
-
-                                if (
-                                    (now_ts - self._no_resource_high_mem_last_log_ts)
-                                    >= self._no_resource_high_mem_log_interval_sec
-                                ):
-                                    self._no_resource_high_mem_last_log_ts = now_ts
-                                    logger.info(
-                                        f"[WGC内存告警] 主进程内存{main_rss_mb:.1f}MB超过阈值{MEMORY_THRESHOLD_MB}MB，"
-                                        f"但当前无WGC活跃资源，跳过完整销毁重建 | 子进程RSS={children_rss_mb:.1f}MB(不计入阈值), "
-                                        f"active_requests={active_requests}, capturers={active_capturers}, "
-                                        f"frame_pools_active={stats.get('frame_pools_active', 0)}, "
-                                        f"sessions_active={stats.get('sessions_active', 0)}"
-                                    )
-                                continue
-
-                            logger.warning(
-                                f"[WGC内存告警] 主进程内存{main_rss_mb:.1f}MB超过阈值{MEMORY_THRESHOLD_MB}MB，"
-                                f"立即触发完整销毁重建 | 子进程RSS={children_rss_mb:.1f}MB(不计入阈值), "
-                                f"active_requests={active_requests}, capturers={active_capturers}, "
-                                f"frame_pools_active={stats.get('frame_pools_active', 0)}, "
-                                f"sessions_active={stats.get('sessions_active', 0)}"
-                            )
-                            if self._full_reclaim_lock.acquire(blocking=False):
-                                try:
-                                    memory_after_mb, freed_mb, stopped = self._full_reclaim_on_high_memory(
-                                        main_rss_mb,
-                                        force_reclaim=True,
-                                        recreate_device=True,
-                                    )
-                                    active_capturers_after = 0
-                                    if self.lock.acquire(timeout=0.5):
-                                        try:
-                                            active_capturers_after = len(self.capturers)
-                                        finally:
-                                            self.lock.release()
-                                    stats_after = WGC_HWND_Capturer.get_resource_stats()
-                                    logger.info(
-                                        f"[WGC内存告警] 完整清理完成，释放{freed_mb:.1f}MB，当前{memory_after_mb:.1f}MB，"
-                                        f"回收捕获器={stopped}，"
-                                        f"capturers={active_capturers_after}，frame_pools_active={stats_after.get('frame_pools_active', 0)}，"
-                                        f"sessions_active={stats_after.get('sessions_active', 0)}"
-                                    )
-                                except Exception as cleanup_err:
-                                    logger.error(f"[WGC内存告警] 完整清理失败: {cleanup_err}")
-                                finally:
-                                    self._full_reclaim_lock.release()
-                            else:
-                                logger.debug("[WGC内存告警] 完整清理正在进行，跳过本次触发")
-
-                        else:
-                            pass
-                    except ImportError:
-                        pass  # psutil未安装，跳过内存监控
-                    except Exception as e:
-                        logger.debug(f"内存监控失败: {e}")
-
-                    last_memory_check = current_time
 
             except Exception as e:
                 logger.error(f"[WGC自动清理] 异常: {e}")
@@ -1911,22 +1559,13 @@ class OptimizedWGCCapture:
             )
             return None
         self._begin_capture_request()
+        capture_key = self._capturer_key(hwnd)
 
         try:
-            # 验证窗口
+            # 验证窗口。子窗口失效时不要拆掉共享的顶层捕获器。
             if not WIN32_AVAILABLE or not win32gui.IsWindow(hwnd):
                 self._set_last_capture_failure_reason("invalid_hwnd")
                 logger.error(f"无效的窗口句柄: {hwnd}")
-                # 【修复闪退】如果窗口已失效，清理对应的捕获器
-                with self.lock:
-                    if hwnd in self.capturers:
-                        try:
-                            self.capturers[hwnd].stop()
-                        except Exception:
-                            pass
-                        del self.capturers[hwnd]
-                    if hwnd in self.capturer_last_used:
-                        del self.capturer_last_used[hwnd]
                 return None
 
             # 缓存key
@@ -1940,51 +1579,41 @@ class OptimizedWGCCapture:
                     self._set_last_capture_failure_reason("")
                     return cached_frame
 
-            # 【关键修复】复用捕获器，不要每次都销毁重建
-            # 只有在捕获器不存在或已失效时才创建新的
-            with self.lock:
-                capturer = None
-                if hwnd in self.capturers:
-                    # 检查已有捕获器是否仍在运行
-                    existing_capturer = self.capturers[hwnd]
-                    is_healthy, unhealthy_reason = self._check_capturer_health(existing_capturer)
-                    if is_healthy:
-                        # 复用已有的捕获器
-                        capturer = existing_capturer
-                        logger.debug(f"[WGC] 复用现有捕获器 (HWND: {hwnd})")
-                    else:
-                        # 捕获器已失效，清理并重建
-                        logger.warning(f"[WGC] 捕获器已失效({unhealthy_reason})，重新创建 (HWND: {hwnd})")
-                        try:
-                            existing_capturer.stop()  # 确保清理资源
-                        except Exception:
-                            pass
-                        del self.capturers[hwnd]
-                        if hwnd in self.capturer_last_used:
-                            del self.capturer_last_used[hwnd]
-
-                # 如果没有可用的捕获器，创建新的
-                if capturer is None:
-                    # 【内存管理】检查捕获器数量，如果超过最大限制则清理最久未使用的
-                    if len(self.capturers) >= self.max_capturers:
-                        self._cleanup_least_recently_used()
-
-                    if not WGC_AVAILABLE:
-                        self._set_last_capture_failure_reason("wgc_unavailable")
-                        raise RuntimeError("WGC库未安装，请安装: pip install winrt-Windows.Graphics winrt-Windows.Graphics.Capture winrt-Windows.Graphics.DirectX winrt-Windows.Foundation winrt-Windows.AI.MachineLearning")
-
-                    logger.debug(f"[WGC] 创建新捕获器 (HWND: {hwnd})")
-                    try:
-                        capturer = WGC_HWND_Capturer(hwnd)
-                    except Exception as create_error:
-                        self._set_last_capture_failure_reason(
-                            f"capturer_create_failed:{type(create_error).__name__}"
+            capturer = None
+            while capturer is None:
+                pending_stop = None
+                with self.lock:
+                    existing_capturer = self.capturers.get(capture_key)
+                    if existing_capturer is not None:
+                        is_healthy, unhealthy_reason = self._check_capturer_health(existing_capturer)
+                        if is_healthy:
+                            capturer = existing_capturer
+                            self.capturer_last_used[capture_key] = time.time()
+                            logger.debug(f"[WGC] 复用现有捕获器 (HWND: {hwnd}, key={capture_key})")
+                            break
+                        logger.warning(
+                            f"[WGC] 捕获器已失效({unhealthy_reason})，重新创建 (HWND: {hwnd}, key={capture_key})"
                         )
-                        raise
-                    self.capturers[hwnd] = capturer
-
-                # 【并发一致性】在同一把锁内更新使用时间戳
-                self.capturer_last_used[hwnd] = time.time()
+                        pending_stop = self._pop_capturer(capture_key)
+                    elif self.capturer_last_used and len(self.capturers) >= self.max_capturers:
+                        lru_key = min(self.capturer_last_used, key=self.capturer_last_used.get)
+                        pending_stop = self._pop_capturer(lru_key)
+                    else:
+                        if not WGC_AVAILABLE:
+                            self._set_last_capture_failure_reason("wgc_unavailable")
+                            raise RuntimeError("WGC库未安装，请安装: pip install winrt-Windows.Graphics winrt-Windows.Graphics.Capture winrt-Windows.Graphics.DirectX winrt-Windows.Foundation winrt-Windows.AI.MachineLearning")
+                        logger.debug(f"[WGC] 创建新捕获器 (HWND: {hwnd}, key={capture_key})")
+                        try:
+                            capturer = WGC_HWND_Capturer(hwnd)
+                        except Exception as create_error:
+                            self._set_last_capture_failure_reason(
+                                f"capturer_create_failed:{type(create_error).__name__}"
+                            )
+                            raise
+                        self.capturers[capture_key] = capturer
+                        self.capturer_last_used[capture_key] = time.time()
+                        break
+                self._stop_detached_capturer(pending_stop)
 
             # 根据use_cache决定是请求新帧还是使用已有帧
             first_request_timeout_ms = int(_WGC_REQUEST_FRAME_TIMEOUT_MS)
@@ -2044,21 +1673,15 @@ class OptimizedWGCCapture:
                     return None
                 logger.warning(f"[WGC] 捕获失败，尝试重建捕获器 (HWND: {hwnd})")
                 try:
+                    pending_stop = None
                     with self.lock:
-                        if hwnd in self.capturers:
-                            try:
-                                self.capturers[hwnd].stop()
-                            except Exception:
-                                pass
-                            del self.capturers[hwnd]
-                        if hwnd in self.capturer_last_used:
-                            del self.capturer_last_used[hwnd]
-
-                        # 重新创建捕获器
-                        logger.info(f"[WGC] 重建捕获器 (HWND: {hwnd})")
+                        pending_stop = self._pop_capturer(capture_key)
+                    self._stop_detached_capturer(pending_stop)
+                    with self.lock:
+                        logger.info(f"[WGC] 重建捕获器 (HWND: {hwnd}, key={capture_key})")
                         capturer = WGC_HWND_Capturer(hwnd)
-                        self.capturers[hwnd] = capturer
-                        self.capturer_last_used[hwnd] = time.time()
+                        self.capturers[capture_key] = capturer
+                        self.capturer_last_used[capture_key] = time.time()
 
                     if not use_cache:
                         frame = capturer.request_new_frame(timeout_ms=float(rebuild_request_timeout_ms))
@@ -2123,49 +1746,33 @@ class OptimizedWGCCapture:
             self._end_capture_request()
 
     def _cleanup_capturer(self, hwnd: int):
-        """
-        清理指定窗口的捕获器
-
-        Args:
-            hwnd: 窗口句柄
-        """
+        """清理指定窗口对应的顶层捕获器。"""
         try:
+            pending = None
+            key = self._capturer_key(hwnd)
             with self.lock:
-                if hwnd in self.capturers:
-                    cleanup_capturer = self.capturers[hwnd]
-                    # 调用stop方法完整清理所有资源
-                    cleanup_capturer.stop()
-                    del self.capturers[hwnd]
-                    # 同时清理使用时间戳
-                    if hwnd in self.capturer_last_used:
-                        del self.capturer_last_used[hwnd]
-                    logger.debug(f"[WGC清理] 已完全销毁捕获器并释放所有资源 (HWND: {hwnd})")
+                pending = self._pop_capturer(key)
+            self._stop_detached_capturer(pending)
+            if pending is not None:
+                logger.debug(f"[WGC清理] 已完全销毁捕获器并释放所有资源 (HWND: {hwnd}, key={key})")
         except Exception as e:
             logger.debug(f"清理捕获器失败: {e}")
 
     def _cleanup_least_recently_used(self):
-        """
-        清理最久未使用的捕获器（LRU策略）
-        当捕获器数量超过最大限制时调用
-        """
-        if not self.capturer_last_used:
+        """清理最久未使用的捕获器（LRU）。stop 在锁外执行。"""
+        pending = None
+        lru_hwnd = None
+        idle_time = 0.0
+        with self.lock:
+            if not self.capturer_last_used:
+                return
+            lru_hwnd = min(self.capturer_last_used, key=self.capturer_last_used.get)
+            idle_time = time.time() - self.capturer_last_used[lru_hwnd]
+            pending = self._pop_capturer(lru_hwnd)
+        if pending is None:
             return
-
-        # 找出最久未使用的hwnd
-        lru_hwnd = min(self.capturer_last_used, key=self.capturer_last_used.get)
-        lru_time = self.capturer_last_used[lru_hwnd]
-        idle_time = time.time() - lru_time
-
         logger.info(f"[内存管理-LRU] 清理最久未使用的捕获器 (HWND: {lru_hwnd}, 闲置时间: {idle_time:.1f}秒)")
-
-        # 清理该捕获器
-        try:
-            if lru_hwnd in self.capturers:
-                self.capturers[lru_hwnd].stop()
-                del self.capturers[lru_hwnd]
-            del self.capturer_last_used[lru_hwnd]
-        except Exception as e:
-            logger.debug(f"LRU清理失败: {e}")
+        self._stop_detached_capturer(pending)
 
     def _crop_to_client_area(self, hwnd: int, frame: np.ndarray, capturer: WGC_HWND_Capturer = None) -> Optional[np.ndarray]:
         """
@@ -2177,15 +1784,10 @@ class OptimizedWGCCapture:
         try:
             pass
 
-            # 【关键修复】从capturer获取target_hwnd和capture_hwnd
-            # 如果hwnd是原始目标窗口（可能是子窗口），则需要特殊处理
-            if capturer is not None and hasattr(capturer, 'target_hwnd') and hasattr(capturer, 'capture_hwnd'):
-                target_hwnd = capturer.target_hwnd
-                capture_hwnd = capturer.capture_hwnd
-                if target_hwnd != capture_hwnd:
-                    # 子窗口情况：需要将子窗口的客户区映射到父窗口捕获的坐标系
-                    logger.debug(f"【子窗口裁剪模式】目标窗口: {target_hwnd}, 捕获窗口: {capture_hwnd}")
-                    return self._crop_child_window(hwnd, frame, capture_hwnd)
+            capture_hwnd = getattr(capturer, "capture_hwnd", 0) if capturer is not None else 0
+            if should_crop_wgc_as_child(hwnd, capture_hwnd):
+                logger.debug(f"【子窗口裁剪模式】请求窗口: {hwnd}, 捕获窗口: {capture_hwnd}")
+                return self._crop_child_window(hwnd, frame, capture_hwnd)
 
             # 正常情况：裁剪到指定窗口的客户区
             return self._crop_normal_window(hwnd, frame)
@@ -2401,225 +2003,120 @@ class OptimizedWGCCapture:
             else:
                 logger.debug(f"  WGC使用物理像素，目标裁剪尺寸: {target_w}x{target_h}")
 
-            # 确保裁剪边界不超出帧尺寸
-            crop_x = max(0, min(offset_x_physical, frame_w - 1))
-            crop_y = max(0, min(offset_y_physical, frame_h - 1))
-            crop_w = min(target_w, frame_w - crop_x)
-            crop_h = min(target_h, frame_h - crop_y)
+            # 禁止静默缩小：算不出完整子窗口客户区则失败
+            crop_x = int(offset_x_physical)
+            crop_y = int(offset_y_physical)
+            crop_w = int(target_w)
+            crop_h = int(target_h)
+            if (
+                crop_x < 0
+                or crop_y < 0
+                or crop_w <= 0
+                or crop_h <= 0
+                or crop_x + crop_w > frame_w
+                or crop_y + crop_h > frame_h
+            ):
+                logger.error(
+                    "子窗口裁剪会丢失像素，拒绝缩小输出: offset=(%s,%s) target=%sx%s frame=%sx%s",
+                    crop_x,
+                    crop_y,
+                    crop_w,
+                    crop_h,
+                    frame_w,
+                    frame_h,
+                )
+                return None
 
             logger.debug(f"  实际裁剪区域: 起点=({crop_x}, {crop_y}), 尺寸={crop_w}x{crop_h}")
-            logger.debug(f"  裁剪范围: frame[{crop_y}:{crop_y + crop_h}, {crop_x}:{crop_x + crop_w}]")
-
-            if crop_x != offset_x_physical or crop_y != offset_y_physical or crop_w != target_w or crop_h != target_h:
-                logger.warning("  [WARNING] 子窗口边界修正发生:")
-                logger.warning(f"    期望裁剪区域: ({offset_x_physical}, {offset_y_physical}) {target_w}x{target_h}")
-                logger.warning(f"    实际裁剪区域: ({crop_x}, {crop_y}) {crop_w}x{crop_h}")
-                logger.warning(f"    丢失: 左={offset_x_physical - crop_x}px, 上={offset_y_physical - crop_y}px, 右={(offset_x_physical + target_w) - (crop_x + crop_w)}px, 下={(offset_y_physical + target_h) - (crop_y + crop_h)}px")
-                if (offset_y_physical + target_h) > frame_h:
-                    logger.error(f"    [ERROR] 底部被截断！期望高度={offset_y_physical + target_h}, 但帧高度只有{frame_h}, 少了{(offset_y_physical + target_h) - frame_h}像素")
-
-            # 裁剪子窗口区域
-            # 必须复制切片，避免返回视图导致整帧内存被上层长期引用
-            cropped = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w].copy()
-            logger.debug(f"  [OK] 裁剪完成，输出尺寸: {cropped.shape[1]}x{cropped.shape[0]}")
-
-            return cropped
+            return frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w].copy()
 
         except Exception as e:
             logger.error(f"子窗口裁剪失败: {e}", exc_info=True)
-            return frame
+            return None
 
     def _crop_normal_window(self, hwnd: int, frame: np.ndarray) -> Optional[np.ndarray]:
         """
-        正常窗口裁剪：裁剪到窗口的客户区
+        正常窗口裁剪：裁剪到窗口的客户区。
+
+        禁止静默缩小：算不出完整客户区时返回 None（由上层记 crop_failed）。
         """
         try:
             import ctypes
             from ctypes import wintypes
 
-            # 获取窗口DPI和进程DPI感知状态
-            dpi_scale = 1.0
-            is_dpi_aware = False
-            try:
-                user32 = ctypes.windll.user32
-                # 检查进程DPI感知状态
-                if hasattr(user32, 'GetAwarenessFromDpiAwarenessContext') and hasattr(user32, 'GetThreadDpiAwarenessContext'):
-                    try:
-                        context = user32.GetThreadDpiAwarenessContext()
-                        awareness = user32.GetAwarenessFromDpiAwarenessContext(context)
-                        # 0=Unaware, 1=System, 2=PerMonitor
-                        is_dpi_aware = awareness >= 2
-                    except Exception:
-                        pass
-
-                if hasattr(user32, 'GetDpiForWindow'):
-                    dpi = user32.GetDpiForWindow(hwnd)
-                    if dpi > 0:
-                        dpi_scale = dpi / 96.0
-            except Exception:
-                pass
-
-            # 获取客户区矩形
             client_rect = win32gui.GetClientRect(hwnd)
-            client_w = client_rect[2]
-            client_h = client_rect[3]
-
-            # 如果进程是Per-Monitor DPI感知，GetClientRect返回的已经是物理像素
-            # 否则需要转换
-            if is_dpi_aware:
-                client_w_physical = client_w
-                client_h_physical = client_h
-            else:
-                client_w_physical = int(client_w * dpi_scale)
-                client_h_physical = int(client_h * dpi_scale)
-
-            # 获取客户区在屏幕上的位置与右下角端点
             client_screen_pos = win32gui.ClientToScreen(hwnd, (0, 0))
             client_screen_end = win32gui.ClientToScreen(hwnd, (client_rect[2], client_rect[3]))
             client_w_screen = max(0, int(client_screen_end[0]) - int(client_screen_pos[0]))
             client_h_screen = max(0, int(client_screen_end[1]) - int(client_screen_pos[1]))
+            if client_w_screen <= 0 or client_h_screen <= 0:
+                client_w_screen = max(0, int(client_rect[2]))
+                client_h_screen = max(0, int(client_rect[3]))
 
-            # 尝试使用DwmGetWindowAttribute获取扩展frame边界
+            window_rect = win32gui.GetWindowRect(hwnd)
+            dwm_rect = (
+                int(window_rect[0]),
+                int(window_rect[1]),
+                int(window_rect[2]),
+                int(window_rect[3]),
+            )
             try:
                 dwmapi = ctypes.windll.dwmapi
-                DWMWA_EXTENDED_FRAME_BOUNDS = 9
-
                 rect = wintypes.RECT()
                 result = dwmapi.DwmGetWindowAttribute(
                     wintypes.HWND(hwnd),
-                    wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
+                    wintypes.DWORD(9),
                     ctypes.byref(rect),
-                    ctypes.sizeof(rect)
+                    ctypes.sizeof(rect),
                 )
-
                 if result == 0:
-                    # DWM返回窗口的实际可见边界（不含Windows 10的不可见阴影边框）
-                    # 在Per-Monitor DPI感知模式下，DWM返回的坐标已经是物理像素
-                    # 在非DPI感知模式下，返回的是逻辑像素
-                    dwm_rect = (rect.left, rect.top, rect.right, rect.bottom)
+                    dwm_rect = (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+            except Exception as exc:
+                logger.debug("DWM 边界获取失败，改用 WindowRect: %s", exc)
 
-                    # 客户区相对于DWM frame的偏移
-                    # 两者都是相同的坐标空间（都是物理或都是逻辑）
-                    border_left = client_screen_pos[0] - dwm_rect[0]
-                    border_top = client_screen_pos[1] - dwm_rect[1]
-
-                    logger.debug("【WGC客户区裁剪 - 使用DWM】")
-                    logger.debug(f"  DWM扩展frame边界: {dwm_rect}")
-                    logger.debug(f"  ClientToScreen: {client_screen_pos}")
-                    logger.debug(f"  边框偏移: left={border_left}, top={border_top}")
-                else:
-                    raise Exception(f"DwmGetWindowAttribute 调用失败，错误码：{result}")
-
-            except Exception as e:
-                logger.error(f"DWM API 调用失败: {e}")
-                raise
-
-            # 【修复】边界检查：确保不会超出WGC捕获的帧尺寸
             frame_h, frame_w = frame.shape[:2]
-
-            logger.debug(f"  WGC捕获尺寸: {frame_w}x{frame_h}")
-            logger.debug(f"  GetClientRect: {client_w}x{client_h}, 屏幕跨度: {client_w_screen}x{client_h_screen}, DPI缩放: {dpi_scale:.2f}, DPI感知: {is_dpi_aware}")
-            logger.debug(f"  客户区物理尺寸: {client_w_physical}x{client_h_physical}")
-            logger.debug(f"  边框偏移(逻辑): left={border_left}, top={border_top}")
-
-            # 判断WGC返回的坐标空间（逻辑像素 vs 物理像素）
-            # 先与逻辑尺寸比较
-            wgc_is_logical = True  # 默认假设逻辑像素
-            if abs(frame_w - client_w_screen) <= 4 and abs(frame_h - client_h_screen) <= 4:
-                wgc_is_logical = True
-                logger.debug(f"  [OK] WGC捕获尺寸≈客户区逻辑尺寸({client_w_screen}x{client_h_screen})，WGC使用逻辑像素")
-            elif abs(frame_w - client_w_physical) <= 4 and abs(frame_h - client_h_physical) <= 4:
-                wgc_is_logical = False
-                logger.debug(f"  [OK] WGC捕获尺寸≈客户区物理尺寸({client_w_physical}x{client_h_physical})，WGC使用物理像素")
-            else:
-                # 尝试比较DWM边界
-                try:
-                    dwm_w = dwm_rect[2] - dwm_rect[0]
-                    dwm_h = dwm_rect[3] - dwm_rect[1]
-                    dwm_w_physical = int(dwm_w * dpi_scale) if not is_dpi_aware else dwm_w
-                    dwm_h_physical = int(dwm_h * dpi_scale) if not is_dpi_aware else dwm_h
-                    if abs(frame_w - dwm_w) <= 4 and abs(frame_h - dwm_h) <= 4:
-                        wgc_is_logical = True
-                        logger.debug(f"  [OK] WGC捕获尺寸≈DWM逻辑尺寸({dwm_w}x{dwm_h})，WGC使用逻辑像素")
-                    elif abs(frame_w - dwm_w_physical) <= 4 and abs(frame_h - dwm_h_physical) <= 4:
-                        wgc_is_logical = False
-                        logger.debug(f"  [OK] WGC捕获尺寸≈DWM物理尺寸({dwm_w_physical}x{dwm_h_physical})，WGC使用物理像素")
-                    else:
-                        wgc_is_logical = True
-                        logger.warning("  [WARNING] WGC尺寸不匹配，默认使用逻辑像素坐标系")
-                except Exception:
-                    wgc_is_logical = True
-                    logger.warning("  [WARNING] 无法确定WGC坐标系，默认使用逻辑像素")
-
-            convert_to_physical = (not wgc_is_logical) and (not is_dpi_aware)
-            border_left_final, target_w = _resolve_relative_axis_bounds(
-                client_screen_pos[0],
-                client_screen_end[0],
-                dwm_rect[0],
-                dpi_scale=dpi_scale,
-                apply_scale=convert_to_physical,
+            box = resolve_wgc_client_crop_box(
+                frame_w,
+                frame_h,
+                client_origin=(int(client_screen_pos[0]), int(client_screen_pos[1])),
+                client_size=(client_w_screen, client_h_screen),
+                dwm_rect=dwm_rect,
+                window_rect=(
+                    int(window_rect[0]),
+                    int(window_rect[1]),
+                    int(window_rect[2]),
+                    int(window_rect[3]),
+                ),
             )
-            border_top_final, target_h = _resolve_relative_axis_bounds(
-                client_screen_pos[1],
-                client_screen_end[1],
-                dwm_rect[1],
-                dpi_scale=dpi_scale,
-                apply_scale=convert_to_physical,
+            if box is None:
+                logger.error(
+                    "WGC 客户区裁剪会丢失像素，拒绝缩小输出: hwnd=%s frame=%sx%s client=%sx%s",
+                    hwnd,
+                    frame_w,
+                    frame_h,
+                    client_w_screen,
+                    client_h_screen,
+                )
+                return None
+
+            crop_x, crop_y, crop_w, crop_h = box
+            logger.debug(
+                "WGC 客户区裁剪: hwnd=%s frame=%sx%s crop=(%s,%s) %sx%s",
+                hwnd,
+                frame_w,
+                frame_h,
+                crop_x,
+                crop_y,
+                crop_w,
+                crop_h,
             )
-            if wgc_is_logical:
-                logger.debug(f"  WGC逻辑模式: 边框=({border_left_final}, {border_top_final}), 目标={target_w}x{target_h}")
-            else:
-                logger.debug(f"  WGC物理模式: 边框=({border_left_final}, {border_top_final}), 目标={target_w}x{target_h}")
-
-            # 如果WGC已经返回了客户区内容（无边框），直接返回
-            if abs(frame_w - target_w) <= 4 and abs(frame_h - target_h) <= 4:
-                logger.debug("  [OK] WGC捕获尺寸≈目标尺寸，WGC已返回客户区，直接返回")
+            if crop_x == 0 and crop_y == 0 and crop_w == frame_w and crop_h == frame_h:
                 return frame
-
-            # 如果WGC捕获尺寸<=客户区且无边框，说明WGC已返回正确内容
-            if (frame_w <= target_w and frame_h <= target_h and
-                border_left_final <= 0 and border_top_final <= 0):
-                logger.debug("  [OK] WGC捕获尺寸≤目标尺寸且无边框，直接返回")
-                return frame
-
-            # WGC捕获了整个窗口（包含边框），需要裁剪到客户区
-            crop_x = max(0, min(border_left_final, frame_w - 1))
-            crop_y = max(0, min(border_top_final, frame_h - 1))
-            crop_w = min(target_w, frame_w - crop_x)
-            crop_h = min(target_h, frame_h - crop_y)
-
-            # 验证裁剪区域是否合理
-            can_crop_safely = (crop_x + crop_w <= frame_w and crop_y + crop_h <= frame_h and
-                             crop_w > 0 and crop_h > 0)
-
-            if not can_crop_safely:
-                logger.warning("  [WARNING] 无法安全裁剪：")
-                logger.warning(f"    WGC捕获尺寸: {frame_w}x{frame_h}")
-                logger.warning(f"    计算的裁剪区域: ({crop_x}, {crop_y}) {crop_w}x{crop_h}")
-                logger.warning(f"    边框偏移: left={border_left_final}, top={border_top_final}")
-                logger.warning("    返回完整帧由上层处理")
-                return frame
-
-            logger.debug(f"  需要裁剪边框: 起点=({crop_x}, {crop_y}), 尺寸={crop_w}x{crop_h}")
-
-            if crop_x != border_left_final or crop_y != border_top_final or crop_w != target_w or crop_h != target_h:
-                logger.warning("  [WARNING] 边界修正发生:")
-                logger.warning(f"    期望裁剪区域: ({border_left_final}, {border_top_final}) {target_w}x{target_h}")
-                logger.warning(f"    实际裁剪区域: ({crop_x}, {crop_y}) {crop_w}x{crop_h}")
-                if (crop_y + crop_h) < (border_top_final + target_h):
-                    logger.error("    [ERROR] 底部被截断！")
-
-            # 裁剪（从WGC捕获中提取客户区）
-            # 必须复制切片，避免返回视图导致整帧内存被上层长期引用
-            cropped = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w].copy()
-
-            logger.debug(f"  [OK] 裁剪完成，输出尺寸: {cropped.shape[1]}x{cropped.shape[0]}")
-
-            return cropped
+            return frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w].copy()
 
         except Exception as e:
             logger.error(f"正常窗口裁剪失败: {e}", exc_info=True)
-            return frame
+            return None
 
     def cleanup(self, hwnd: int = None):
         """
@@ -2629,18 +2126,13 @@ class OptimizedWGCCapture:
             hwnd: 指定窗口句柄只清理该窗口的capturer，None则清理所有
         """
         if hwnd is not None:
-            # 只清理指定窗口
+            pending = None
+            key = self._capturer_key(hwnd)
             with self.lock:
-                if hwnd in self.capturers:
-                    try:
-                        self.capturers[hwnd].stop()
-                        del self.capturers[hwnd]
-                        # 【内存泄漏修复】同时清理使用时间戳
-                        if hwnd in self.capturer_last_used:
-                            del self.capturer_last_used[hwnd]
-                        logger.debug(f"[清理] 已清理窗口{hwnd}的WGC捕获器")
-                    except Exception as e:
-                        logger.debug(f"清理窗口{hwnd}的捕获器失败: {e}")
+                pending = self._pop_capturer(key)
+            self._stop_detached_capturer(pending)
+            if pending is not None:
+                logger.debug(f"[清理] 已清理窗口{hwnd}的WGC捕获器 (key={key})")
         else:
             # 【内存泄漏修复】先停止定期清理线程
             if hasattr(self, "_cleanup_stop_event"):
@@ -2658,16 +2150,12 @@ class OptimizedWGCCapture:
                     logger.debug(f"[清理] 清理线程join失败: {e}")
             self._cleanup_thread = None
 
-            # 清理所有
             with self.lock:
-                for hwnd_key, capturer in list(self.capturers.items()):
-                    try:
-                        capturer.stop()
-                    except Exception:
-                        pass
+                pending_all = list(self.capturers.values())
                 self.capturers.clear()
-                # 【内存泄漏修复】清理所有使用时间戳
                 self.capturer_last_used.clear()
+            for capturer in pending_all:
+                self._stop_detached_capturer(capturer)
 
             self.cache.clear()
             try:

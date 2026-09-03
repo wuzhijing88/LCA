@@ -130,6 +130,9 @@ class WorkflowExecutor(QObject):
         self.task_modules = task_modules if task_modules is not None else {}
         self.target_hwnd = target_hwnd  # 目标窗口句柄（主要使用）
         self.target_window_title = target_window_title  # 窗口标题（仅用于日志显示）
+        self.bound_windows = []
+        self.custom_width = 0
+        self.custom_height = 0
         self.execution_mode = execution_mode or 'foreground'  # 【修复闪退】确保执行模式不为 None
         self.window_adapter = get_window_adapter(
             str(os.getenv("LCA_WINDOW_ADAPTER", "default") or "default")
@@ -177,7 +180,6 @@ class WorkflowExecutor(QObject):
             logger.error(f"connections_data 格式错误: {type(self.connections_data)}")
             self.connections_data = []
 
-        self._stop_requested = False
         self._is_running = False
         self._current_card_id = None
         self._last_execution_success = False
@@ -190,9 +192,7 @@ class WorkflowExecutor(QObject):
         self._current_card_issue_logs: List[Dict[str, Any]] = []
         self._error_capture_handler = None
         self._capture_card_issue_logs = False
-        self._paused = False  # 暂停标志
         self._is_retrying = False  # 重试进行中标志，防止并发重试
-        self._force_stop = False  # 强制停止标志（不等待当前任务完成）
         self._start_gate_event = None
 
         # 工具 修复：添加持久计数器字典
@@ -217,6 +217,41 @@ class WorkflowExecutor(QObject):
         # 【新架构】构建附加条件映射
         self._build_monitor_card_map()
         logger.info(f"WorkflowExecutor 初始化完成，起始卡片ID: {start_card_id}, test_mode: {test_mode}")
+
+    # 停止 / 强制停止 / 暂停 的唯一真相源是 run_context；下面的属性只是执行器内部的读写别名，
+    # 让 WorkflowContext、任务模块与执行器看到的永远是同一份状态。
+    @property
+    def _stop_requested(self) -> bool:
+        return self.run_context.is_stop_requested()
+
+    @_stop_requested.setter
+    def _stop_requested(self, value: bool) -> None:
+        if value:
+            self.run_context.request_stop("stop_requested")
+        else:
+            self.run_context.clear_stop()
+
+    @property
+    def _force_stop(self) -> bool:
+        return self.run_context.is_force_stop_requested()
+
+    @_force_stop.setter
+    def _force_stop(self, value: bool) -> None:
+        if value:
+            self.run_context.request_stop("force_stop", force=True)
+        else:
+            self.run_context.force_stop = False
+
+    @property
+    def _paused(self) -> bool:
+        return self.run_context.is_paused()
+
+    @_paused.setter
+    def _paused(self, value: bool) -> None:
+        if value:
+            self.run_context.pause()
+        else:
+            self.run_context.resume()
 
     @staticmethod
     def _normalize_workflow_id(workflow_id: Optional[str]) -> str:
@@ -380,10 +415,10 @@ class WorkflowExecutor(QObject):
 
                 # 执行附加条件卡片
                 task_module = get_task_module(task_type)
-                if task_module is None or not hasattr(task_module, 'execute_card'):
-                    raise RuntimeError(f"附加条件卡片 {card_id} 缺少执行模块")
+                if task_module is None or not hasattr(task_module, 'register_monitor'):
+                    raise RuntimeError(f"附加条件卡片 {card_id} 缺少监控登记模块")
                 try:
-                    result = task_module.execute_card(
+                    result = task_module.register_monitor(
                         card_id=card_id,
                         parameters=card_params,
                         context=self._workflow_context,
@@ -1241,8 +1276,8 @@ class WorkflowExecutor(QObject):
             return
 
         self._is_running = True
-        self._stop_requested = False
-        self._paused = False  # 重置暂停标志
+        # 只清暂停：启动前已登记的停止请求应当生效，而不是被新一轮 run() 抹掉。
+        self.run_context.resume()
         self._wait_for_start_gate()
         if self._stop_requested or self._force_stop:
             self._is_running = False
@@ -1400,7 +1435,7 @@ class WorkflowExecutor(QObject):
             # 统一清理图片相关缓存（覆盖异常/停止等路径）
             if self._cleanup_runtime_image_on_finish:
                 try:
-                    from utils.runtime_image_cleanup import cleanup_runtime_image_memory
+                    from app_core.runtime.runtime_image_cleanup import cleanup_runtime_image_memory
                     cleanup_runtime_image_memory(
                         reason="workflow_run_finally",
                         cleanup_screenshot_engines=False,
@@ -1434,22 +1469,18 @@ class WorkflowExecutor(QObject):
         Args:
             force: 是否强制停止（不等待当前任务完成）
         """
-        logger.warning("======================================")
-        logger.warning(f"=== request_stop() 被调用 (force={force}) ===")
-        logger.warning(f"=== 当前 _stop_requested = {self._stop_requested} ===")
-        logger.warning("======================================")
-
-        self._stop_requested = True
-        self.run_context.request_stop("force_stop" if force else "stop_requested")
+        logger.warning(
+            "request_stop(force=%s) 被调用，当前 stop_requested=%s",
+            force,
+            self.run_context.is_stop_requested(),
+        )
+        self.run_context.request_stop("force_stop" if force else "stop_requested", force=bool(force))
         if force:
-            self._force_stop = True
-            logger.warning("=== 强制停止模式已启用 ===")
-
-        logger.warning(f"=== 设置后 _stop_requested = {self._stop_requested} ===")
+            logger.warning("强制停止模式已启用")
 
         # 停止请求时先清理YOLO运行态，避免残留。
         try:
-            from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+            from app_core.runtime.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
             cleanup_yolo_runtime_on_stop(
                 release_engine=True,
                 compact_memory=True,
@@ -1467,16 +1498,16 @@ class WorkflowExecutor(QObject):
     def pause(self):
         """暂停执行"""
         logger.info("暂停工作流执行")
-        self._paused = True
+        self.run_context.pause()
 
     def resume(self):
         """恢复执行"""
         logger.info("恢复工作流执行")
-        self._paused = False
+        self.run_context.resume()
 
     def _is_pause_requested(self) -> bool:
         """统一读取本地/外部暂停状态，避免任务模块与执行器判断不一致。"""
-        if self._paused:
+        if self.run_context.is_paused():
             return True
         if self._external_pause_checker is not None:
             try:
@@ -1489,21 +1520,24 @@ class WorkflowExecutor(QObject):
         """供任务模块使用的控制检查：暂停时阻塞，停止时返回 True。"""
         return self._check_pause_and_stop()
 
+    def _external_stop_signalled(self) -> bool:
+        """外部（会话 / 代理）停止信号一旦出现，就登记到 run_context，之后无需再询问外部。"""
+        if self._external_stop_checker is None:
+            return False
+        try:
+            if self._external_stop_checker():
+                self.run_context.request_stop("external_stop")
+                return True
+        except Exception as exc:
+            logger.debug(f"外部停止检查失败: {exc}")
+        return False
+
     def _check_pause_and_stop(self):
         """检查暂停和停止请求，实现无延迟响应"""
-        if self.run_context.is_stop_requested():
-            self._stop_requested = True
-            return True
-        if self._external_stop_checker is not None:
-            try:
-                if self._external_stop_checker():
-                    self._stop_requested = True
-                    return True
-            except Exception as exc:
-                logger.debug(f"外部停止检查失败: {exc}")
-        # 检查强制停止 - 立即返回
-        if self._force_stop:
+        if self.run_context.is_force_stop_requested():
             logger.warning("[_check_pause_and_stop] 检测到强制停止请求，立即中断")
+            return True
+        if self.run_context.is_stop_requested() or self._external_stop_signalled():
             return True
 
         # WGC完整销毁重建期间，阻塞任务执行，直到重建完成
@@ -1514,30 +1548,22 @@ class WorkflowExecutor(QObject):
             )
             if is_wgc_rebuilding():
                 while is_wgc_rebuilding():
-                    if self._force_stop or self._stop_requested:
+                    if self.run_context.is_stop_requested():
                         return True
                     wait_wgc_rebuild_complete(timeout=0.05)
         except Exception:
             pass
 
-        # 检查暂停 - 快速响应
-        pause_requested = self._is_pause_requested()
-        while pause_requested and not self._stop_requested and not self._force_stop:
-            if self._external_stop_checker is not None:
-                try:
-                    if self._external_stop_checker():
-                        self._stop_requested = True
-                        return True
-                except Exception as exc:
-                    logger.debug(f"外部停止检查失败: {exc}")
+        # 暂停期间原地等待，但停止请求（本地或外部）随时可以打断等待
+        while self._is_pause_requested():
+            if self.run_context.is_stop_requested() or self._external_stop_signalled():
+                return True
             time.sleep(0.01)
-            pause_requested = self._is_pause_requested()
 
-        # 检查停止
-        if self._stop_requested:
-            logger.debug(f"[_check_pause_and_stop] 检测到停止请求，_stop_requested={self._stop_requested}")
-            return True  # 需要停止
-        return False  # 继续执行
+        if self.run_context.is_stop_requested():
+            logger.debug("[_check_pause_and_stop] 检测到停止请求")
+            return True
+        return False
 
     def _release_all_keys(self):
         """释放所有可能正在按下的按键"""
@@ -1711,6 +1737,10 @@ class WorkflowExecutor(QObject):
             if not win32gui.IsWindow(self.target_hwnd):
                 logger.warning(f"目标窗口句柄无效: {self.target_hwnd}")
                 return False
+            from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+            if skip_cross_desktop_activation(self.target_hwnd, log_prefix="Executor"):
+                return True
             if self.window_adapter.activate_foreground(self.target_hwnd):
                 logger.info("WindowAdapter 已激活目标窗口: HWND=%s", self.target_hwnd)
                 return True
@@ -1776,6 +1806,10 @@ class WorkflowExecutor(QObject):
             if not win32gui.IsWindow(self.target_hwnd):
                 logger.warning(f"目标窗口句柄无效: {self.target_hwnd}")
                 return False
+            from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+            if skip_cross_desktop_activation(self.target_hwnd, log_prefix="后台激活"):
+                return True
 
             logger.info(f"[后台激活] 发送点击激活消息 (HWND: {self.target_hwnd})")
 
@@ -2275,7 +2309,7 @@ class WorkflowExecutor(QObject):
             # 2. 清理图片相关缓存
             if self._cleanup_runtime_image_on_finish:
                 try:
-                    from utils.runtime_image_cleanup import cleanup_runtime_image_memory
+                    from app_core.runtime.runtime_image_cleanup import cleanup_runtime_image_memory
                     cleanup_runtime_image_memory(
                         reason="workflow_natural_finish",
                         cleanup_screenshot_engines=False,
@@ -2409,7 +2443,10 @@ class WorkflowExecutor(QObject):
                             get_image_data=self.get_image_data,
                             stop_checker=self._task_runtime_stop_checker,
                             pause_checker=self._is_pause_requested,
-                            executor=self  # 传递executor自身，用于发射信号
+                            executor=self,  # 传递executor自身，用于发射信号
+                            bound_windows=getattr(self, "bound_windows", None),
+                            custom_width=getattr(self, "custom_width", 0),
+                            custom_height=getattr(self, "custom_height", 0),
                         )
 
                     # 工具 修复：检查返回值是否为None，防止解包错误

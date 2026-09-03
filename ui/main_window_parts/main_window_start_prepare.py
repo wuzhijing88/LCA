@@ -37,28 +37,45 @@ def prepare_main_window_start(
         favorites_config_path = get_favorites_path()
         if os.path.exists(favorites_config_path):
             try:
-                import json
+                from task_workflow.workspace import (
+                    load_workspace_favorites_snapshot,
+                    resolve_existing_workflow_path,
+                    save_workspace_favorites_snapshot,
+                )
 
-                with open(favorites_config_path, 'r', encoding='utf-8') as handle:
-                    favorites_data = json.load(handle)
+                workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(favorites_config_path)
+                if changed:
+                    save_workspace_favorites_snapshot(
+                        favorites_config_path,
+                        workspaces,
+                        favorites,
+                        excluded_paths=excluded_paths,
+                        extra_paths=extra_paths,
+                    )
 
-                checked_favorites = [item for item in favorites_data.get('favorites', []) if item.get('checked', True)]
+                checked_favorites = [item for item in favorites if item.get('checked', False)]
                 if checked_favorites:
                     logger.info('start checked favorites because canvas has no task: count=%s', len(checked_favorites))
-                    filepaths = [item['filepath'] for item in checked_favorites]
+                    filepaths = []
+                    for item in checked_favorites:
+                        resolved = resolve_existing_workflow_path(item.get('filepath'))
+                        if resolved and os.path.exists(resolved):
+                            filepaths.append(resolved)
+                    if not filepaths:
+                        logger.warning('checked favorites exist but no workflow files were found')
+                    else:
+                        if not claim_task_start_state():
+                            return {'should_return': True}
 
-                    if not claim_task_start_state():
+                        if task_state_manager:
+                            try:
+                                task_state_manager.confirm_started()
+                                start_state['workflow_started'] = True
+                            except Exception as state_err:
+                                logger.warning('failed to confirm running state for batch start: %s', state_err)
+
+                        self._on_batch_workflow_execute(filepaths)
                         return {'should_return': True}
-
-                    if task_state_manager:
-                        try:
-                            task_state_manager.confirm_started()
-                            start_state['workflow_started'] = True
-                        except Exception as state_err:
-                            logger.warning('failed to confirm running state for batch start: %s', state_err)
-
-                    self._on_batch_workflow_execute(filepaths)
-                    return {'should_return': True}
             except Exception as exc:
                 logger.error('failed to load favorites and batch start: %s', exc, exc_info=True)
 
@@ -118,8 +135,10 @@ def save_main_window_tasks_before_start(ctx, all_tasks, resolve_current_canvas_t
         else:
             logger.warning("workflow view missing for task '%s'; keep existing workflow data", task.name)
 
+        old_filepath = task.filepath
         if task.save_and_backup(workflow_data=latest_workflow_data):
             saved_count += 1
+            self._sync_favorite_path_after_save(old_filepath, task)
             self.workflow_tab_widget._update_tab_status(task.task_id)
         else:
             backup_failed_tasks.append(task.name)

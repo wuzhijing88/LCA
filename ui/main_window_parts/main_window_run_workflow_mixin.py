@@ -9,8 +9,11 @@ from app_core.runtime.execution_coordinator import (
     ExecutionSource,
     create_coordinated_workflow_runtime,
 )
-from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
-from task_workflow.workflow_payload import save_workflow_file
+from task_workflow.thread_start import THREAD_START_TASK_TYPE
+from task_workflow.workflow_payload import (
+    cards_dict_from_workflow,
+    require_start_card_ids,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,27 +33,18 @@ class MainWindowRunWorkflowMixin:
 
         self._active_execution_task_id = None
 
-        # 【互斥检查】检查中控是否有任务正在运行，如果有则拒绝启动
+        from ui.control_center_parts.control_center_shutdown import (
+            control_center_blocks_main_window_start,
+        )
 
-        if hasattr(self, 'control_center') and self.control_center:
-
-            if self.control_center.is_any_task_running():
-
-                logger.warning("中控有任务正在运行，主窗口拒绝启动新任务")
-
-                QMessageBox.warning(
-
-                    self,
-
-                    "无法启动",
-
-                    "中控正在执行任务，请等待中控任务完成或停止后再从主窗口启动。\n\n"
-
-                    "中控和主窗口的执行器不能同时运行，否则可能导致程序卡死。"
-
-                )
-
-                return
+        block_reason = control_center_blocks_main_window_start(
+            getattr(self, "control_center", None),
+            getattr(self, "_control_center_shutdown", None),
+        )
+        if block_reason:
+            logger.warning("主窗口拒绝启动: %s", block_reason.splitlines()[0])
+            QMessageBox.warning(self, "无法启动", block_reason)
+            return
 
         # 提取测试模式参数
 
@@ -228,9 +222,13 @@ class MainWindowRunWorkflowMixin:
 
             # 保存和备份（传入最新数据，避免覆盖跳转配置）
 
+            old_filepath = task_item.filepath
+
             if task_item.save_and_backup(workflow_data=latest_workflow_data):
 
                 saved_count += 1
+
+                self._sync_favorite_path_after_save(old_filepath, task_item)
 
                 logger.info(f"任务 '{task_item.name}' 保存和备份成功")
 
@@ -379,27 +377,23 @@ class MainWindowRunWorkflowMixin:
 
                 if filepath:
 
-                    # 保存任务
+                    if not filepath.lower().endswith(".lca"):
+                        filepath += ".lca"
 
                     workflow_data = task_workflow_view.serialize_workflow()
+                    old_filepath = task.filepath
+                    task.filepath = filepath
+                    task.name = os.path.basename(filepath)
 
-                    try:
-                        saved_path = save_workflow_file(filepath, workflow_data)
-                        task.filepath = str(saved_path)
-                        task.name = os.path.basename(task.filepath)
-
+                    if task.save_and_backup(workflow_data=workflow_data):
+                        self._sync_favorite_path_after_save(old_filepath, task)
                         task.modified = False
-
                         save_successful = True
-
-                        logger.info(f"任务保存成功: {saved_path}")
-
-                    except Exception as e:
-
-                        logger.error(f"保存任务失败: {e}")
-
-                        QMessageBox.warning(self, "保存失败", f"保存失败: {e}")
-
+                        logger.info(f"任务保存成功: {task.filepath}")
+                    else:
+                        task.filepath = old_filepath
+                        logger.error("保存任务失败: %s", filepath)
+                        QMessageBox.warning(self, "保存失败", f"保存失败: {filepath}")
                         return
 
                 else:
@@ -505,37 +499,7 @@ class MainWindowRunWorkflowMixin:
 
             # --------------------------------------------------
 
-            # 【关键修复】使用序列化数据（深拷贝）而不是TaskCard对象引用
-
-            # 这样可以确保参数在工作流开始时被固定，避免执行过程中被UI修改
-
-            # 将 workflow_data["cards"] 列表转换为 {card_id: card_data} 字典格式
-
-            cards_dict = {}
-
-            for card_data in workflow_data.get("cards", []):
-
-                card_id = card_data.get("id")
-
-                if card_id is not None:
-
-                    # 深拷贝参数，确保完全隔离
-
-                    cards_dict[card_id] = {
-
-                        'id': card_id,
-
-                        'task_type': card_data.get('task_type', '未知'),
-
-                        'parameters': copy.deepcopy(card_data.get('parameters', {})),
-
-                        'custom_name': card_data.get('custom_name'),
-
-                        'pos_x': card_data.get('pos_x', 0),
-
-                        'pos_y': card_data.get('pos_y', 0)
-
-                    }
+            cards_dict = cards_dict_from_workflow(workflow_data)
 
             logger.info(f"[工作流启动] 已将 {len(cards_dict)} 个卡片转换为序列化字典格式（参数已深拷贝）")
 
@@ -619,37 +583,11 @@ class MainWindowRunWorkflowMixin:
 
                 if not test_mode:
 
-                    # 正常模式：查找类型为“线程起点”的卡片
+                    try:
 
-                    # 【修复闪退】检查workflow_view和cards是否存在
+                        start_card_ids, thread_labels = require_start_card_ids(cards_dict)
 
-                    if not workflow_view or not hasattr(workflow_view, 'cards'):
-
-                        logging.error("workflow_view 或 cards 不存在，无法执行工作流")
-
-                        QMessageBox.critical(self, "错误", "工作流视图异常，无法执行")
-
-                        self._reset_run_button()
-
-                        self.executor = None
-
-                        self.executor_thread = None
-
-                        return
-
-                    for card in workflow_view.cards.values():
-
-                        if is_thread_start_task_type(getattr(card, "task_type", "")):
-
-                            start_card_ids.append(card.card_id)
-
-                    start_card_ids = sorted(set(start_card_ids))
-
-                    start_card_count = len(start_card_ids)
-
-                    # Validate the start card
-
-                    if start_card_count == 0:
+                    except ValueError:
 
                         logging.error(f"未能找到{THREAD_START_TASK_TYPE}卡片。执行中止。")
 
@@ -657,59 +595,39 @@ class MainWindowRunWorkflowMixin:
 
                         self._reset_run_button()
 
-                        # --- ADDED: Explicit cleanup on start card error ---
-
                         self.executor = None
 
                         self.executor_thread = None
 
-                        # -------------------------------------------------
-
                         return
 
-                    else:
+                    start_card_count = len(start_card_ids)
 
-                        start_card_id = start_card_ids[0]
+                    start_card_id = start_card_ids[0]
+
+                    start_card_obj = None
+
+                    if workflow_view and hasattr(workflow_view, "cards"):
 
                         start_card_obj = workflow_view.cards.get(start_card_id)
 
-                        for sid in start_card_ids:
+                    if start_card_count == 1:
 
-                            card_data = cards_dict.get(sid) if isinstance(cards_dict, dict) else None
+                        card_type = getattr(start_card_obj, "task_type", None) or cards_dict.get(start_card_id, {}).get("task_type", THREAD_START_TASK_TYPE)
 
-                            label_text = ""
+                        logging.info(f"找到唯一的线程起点卡片: Card ID={start_card_id}, Type={card_type}")
 
-                            if isinstance(card_data, dict):
+                    else:
 
-                                label_text = str(card_data.get("custom_name") or "").strip()
+                        logging.info(
 
-                            if not label_text:
+                            "找到 %d 个线程起点卡片，将以多线程模式并发执行: %s",
 
-                                card_obj = workflow_view.cards.get(sid)
+                            start_card_count,
 
-                                label_text = str(getattr(card_obj, "custom_name", "") or "").strip()
+                            start_card_ids,
 
-                            if label_text:
-
-                                thread_labels[sid] = label_text
-
-                        if start_card_count == 1:
-
-                            card_type = getattr(start_card_obj, "task_type", THREAD_START_TASK_TYPE)
-
-                            logging.info(f"找到唯一的线程起点卡片: Card ID={start_card_id}, Type={card_type}")
-
-                        else:
-
-                            logging.info(
-
-                                "找到 %d 个线程起点卡片，将以多线程模式并发执行: %s",
-
-                                start_card_count,
-
-                                start_card_ids,
-
-                            )
+                        )
 
                 # --- END MODIFICATION ---
 
@@ -798,6 +716,17 @@ class MainWindowRunWorkflowMixin:
                     target_window_title = getattr(self, '_forced_target_title', None) or target_window_title
 
                 logger.info(f"单窗口模式: 最终目标窗口句柄 = {target_hwnd}")
+
+                from utils.window.virtual_desktop import should_block_execution_start
+
+                block_message = should_block_execution_start(
+                    getattr(self, "current_execution_mode", None),
+                    hwnds=[target_hwnd],
+                )
+                if block_message:
+                    logger.warning("前台执行被虚拟桌面策略取消")
+                    QMessageBox.warning(self, "无法执行", block_message)
+                    return
 
                 # --- 测试模式：创建虚拟起点并修改工作流 ---
 
@@ -1031,6 +960,8 @@ class MainWindowRunWorkflowMixin:
                     target_hwnd=target_hwnd,
                     thread_labels=thread_labels,
                     bound_windows=self.bound_windows,
+                    custom_width=getattr(self, "custom_width", None) or self.config.get("custom_width"),
+                    custom_height=getattr(self, "custom_height", None) or self.config.get("custom_height"),
                     test_mode=test_mode,
                     parent=self,
                 )

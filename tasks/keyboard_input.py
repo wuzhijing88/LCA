@@ -34,6 +34,10 @@ from utils.input.input_timing import (
 
 logger = logging.getLogger(__name__)
 
+# 任务类型标识
+TASK_TYPE = "模拟键盘操作"
+TASK_NAME = "模拟键盘操作"
+
 _VAR_PATTERN = re.compile(r"\$\{([^{}]+)\}|\{\{([^{}]+)\}\}")
 _MISSING = object()
 _COMPLETE_PRESS_HOLD_SECONDS = DEFAULT_KEY_HOLD_SECONDS
@@ -105,12 +109,24 @@ _COMBO_KEY_ALIASES = {
     "control": "ctrl",
     "ctrl": "ctrl",
     "ctl": "ctrl",
+    "lctrl": "ctrl",
+    "rctrl": "ctrl",
+    "leftctrl": "ctrl",
+    "rightctrl": "ctrl",
     "控制": "ctrl",
     "控制键": "ctrl",
     "option": "alt",
     "alt": "alt",
+    "lalt": "alt",
+    "ralt": "alt",
+    "leftalt": "alt",
+    "rightalt": "alt",
     "菜单": "alt",
     "shift": "shift",
+    "lshift": "shift",
+    "rshift": "shift",
+    "leftshift": "shift",
+    "rightshift": "shift",
     "win": "win",
     "windows": "win",
     "command": "win",
@@ -145,10 +161,22 @@ _COMBO_KEY_ALIASES = {
 _RECORDED_KEY_ALIASES = {
     "left ctrl": "ctrl",
     "right ctrl": "ctrl",
+    "lctrl": "ctrl",
+    "rctrl": "ctrl",
+    "leftctrl": "ctrl",
+    "rightctrl": "ctrl",
     "left shift": "shift",
     "right shift": "shift",
+    "lshift": "shift",
+    "rshift": "shift",
+    "leftshift": "shift",
+    "rightshift": "shift",
     "left alt": "alt",
     "right alt": "alt",
+    "lalt": "alt",
+    "ralt": "alt",
+    "leftalt": "alt",
+    "rightalt": "alt",
     "alt gr": "alt",
     "left windows": "win",
     "right windows": "win",
@@ -160,6 +188,15 @@ _RECORDED_KEY_ALIASES = {
     "num lock": "numlock",
     "scroll lock": "scrolllock",
     "print screen": "printscreen",
+}
+# keyboard 库偶发 name 为空时，用扫描码兜底（Windows 常见值）
+_RECORDED_SCAN_CODE_KEY_NAMES = {
+    29: "ctrl",
+    42: "shift",
+    54: "shift",
+    56: "alt",
+    91: "win",
+    92: "win",
 }
 _COMBO_MOUSE_PREFIX_ALIASES = {
     "mouse_left": "left",
@@ -1660,6 +1697,21 @@ def _normalize_recorded_combo_key_name(raw_key: Any) -> str:
     return _normalize_combo_key_name(key_text)
 
 
+def _resolve_recorded_combo_key_name(event: Any) -> str:
+    """从 keyboard 事件解析键名；name 为空时回退扫描码。"""
+    key_name = _normalize_recorded_combo_key_name(getattr(event, "name", ""))
+    if key_name:
+        return key_name
+
+    try:
+        scan_code = int(getattr(event, "scan_code", 0) or 0)
+    except Exception:
+        scan_code = 0
+    if scan_code <= 0:
+        return ""
+    return _normalize_recorded_combo_key_name(_RECORDED_SCAN_CODE_KEY_NAMES.get(scan_code, ""))
+
+
 def _format_recorded_mouse_token(event: Dict[str, Any]) -> str:
     """将录制到的鼠标事件转成文本步骤。"""
     button = str(event.get("button", "left") or "left").strip().lower()
@@ -1970,8 +2022,7 @@ def toggle_combo_key_sequence_record(params: Dict[str, Any], **kwargs) -> None:
             event_type = str(getattr(event, "event_type", "") or "").strip().lower()
             if event_type not in ("down", "up"):
                 return
-            key_name_raw = getattr(event, "name", "")
-            key_name = _normalize_recorded_combo_key_name(key_name_raw)
+            key_name = _resolve_recorded_combo_key_name(event)
             if not key_name:
                 return
             if event_type == "down":
@@ -2691,6 +2742,13 @@ def _execute_combo_expression_foreground(
                     if target_hwnd:
                         _activate_foreground_window(target_hwnd)
                         precise_sleep(0.08)
+                    # 鼠标步骤前重申修饰键，避免 shift(按下)+点击 时修饰状态被吞掉。
+                    for held_key in pressed_keys:
+                        if held_key in modifier_key_names:
+                            try:
+                                driver.key_down(held_key)
+                            except Exception:
+                                continue
                     if use_current_position:
                         screen_x, screen_y = _resolve_foreground_runtime_position(foreground_input_manager)
                         stored_x, stored_y = None, None
@@ -2923,6 +2981,13 @@ def _execute_combo_expression_background(simulator: Any, operations: List[Dict[s
                     runtime_x, runtime_y = x_value, y_value
                     if use_current_position:
                         runtime_x, runtime_y = _resolve_background_runtime_position(simulator)
+                    # 后台鼠标步骤前重申修饰键，与滚轮路径保持一致。
+                    for held_vk in pressed_vk_codes:
+                        if held_vk in modifier_vk_codes:
+                            try:
+                                simulator.send_key_down(int(held_vk))
+                            except Exception:
+                                continue
                     mouse_op = {
                         "button": button,
                         "action": normalized_action,
@@ -3369,9 +3434,6 @@ def _handle_multi_text_input(text_groups: List[str], card_id: int, window_index:
         logger.error(f"多组文本输入处理失败: {e}", exc_info=True)
         return "", None
 
-# 任务类型标识
-TASK_TYPE = "模拟键盘操作"
-
 # --- Constants for Typing Simulation ---
 RANDOM_DELAY_THRESHOLD = 0.05 # Apply random delay if base delay is >= 50ms
 RANDOM_DELAY_FACTOR = 0.3   # Randomize delay by +/- 30%
@@ -3493,6 +3555,10 @@ def _activate_foreground_window(target_hwnd: Optional[int]):
     try:
         if not win32gui.IsWindow(target_hwnd):
             logger.warning(f"目标窗口句柄 {target_hwnd} 无效或已销毁。将在当前活动窗口执行操作。")
+            return False
+        from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+        if skip_cross_desktop_activation(target_hwnd, log_prefix="键盘按键"):
             return False
 
         foreground_target = int(target_hwnd)
@@ -3723,8 +3789,12 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
                         logger.warning("[前台模式文本输入] 多组文本解析失败，使用单组模式")
 
                 # 执行前台文本输入
-                if text_to_type:
+                if str(text_to_type or "").strip():
                     text_to_type = _resolve_text_template(text_to_type)
+                    if not str(text_to_type or "").strip():
+                        detail = "[前台模式文本输入] 文本为空，无法执行"
+                        logger.error(detail)
+                        return False, failure_action, failure_jump_target, detail
                     _publish_typed_text(kwargs, text_to_type)
                     logger.info(f"[前台模式文本输入] 输入文本: '{text_to_type}' (长度: {len(text_to_type)})")
                     _raise_if_stopped(stop_checker, "前台文本输入")
@@ -3820,9 +3890,9 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
                         logger.error("[前台模式文本输入] 驱动初始化失败")
                         return False, failure_action, failure_jump_target
                 else:
-                    logger.info("[前台模式文本输入] 文本为空，跳过")
-                    # 即使文本为空，也返回成功，但前提是初始化成功
-                    return True, success_action, success_jump_target
+                    detail = "[前台模式文本输入] 文本为空，无法执行"
+                    logger.error(detail)
+                    return False, failure_action, failure_jump_target, detail
             except InterruptedError:
                 return False, "停止工作流", None
             except Exception as e:
@@ -3946,8 +4016,11 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
                             logger.warning("[后台模式] 多组文本解析失败，使用单组模式")
 
                     # 执行后台文本输入
-                    if text_to_type:
+                    if str(text_to_type or "").strip():
                         text_to_type = _resolve_text_template(text_to_type)
+                        if not str(text_to_type or "").strip():
+                            logger.error("[后台模式] 文本为空，无法执行")
+                            return False, failure_action, failure_jump_target
                         _publish_typed_text(kwargs, text_to_type)
                         logger.info(f"[后台模式] 输入文本: '{text_to_type}' (长度: {len(text_to_type)})")
                         _raise_if_stopped(stop_checker, "后台文本输入")
@@ -3987,8 +4060,8 @@ def execute_task(params, counters, execution_mode='foreground', target_hwnd=None
                             )
                             return False, failure_action, failure_jump_target
                     else:
-                        logger.info("[后台模式] 文本为空，跳过")
-                        return True, success_action, success_jump_target
+                        logger.error("[后台模式] 文本为空，无法执行")
+                        return False, failure_action, failure_jump_target
 
                 except InterruptedError:
                     return False, "停止工作流", None

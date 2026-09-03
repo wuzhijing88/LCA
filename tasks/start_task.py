@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, Tuple
 from task_workflow.thread_start import THREAD_START_TASK_TYPE
 
 TASK_TYPE = THREAD_START_TASK_TYPE
+TASK_NAME = THREAD_START_TASK_TYPE
 
 
 def get_params_definition() -> Dict[str, Dict[str, Any]]:

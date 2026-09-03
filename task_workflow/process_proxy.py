@@ -21,6 +21,13 @@ from services.ocr_socket_message_utils import recv_message, send_message
 from services.socket_message_utils import SocketMessageError
 from services.worker_process_cleanup import register_worker_process, unregister_worker_process
 from task_workflow.process_payload import build_process_workflow_payload
+from task_workflow.workflow_worker_pool import (
+    WarmWorkflowWorker,
+    acquire_warm_workflow_worker,
+    is_workflow_worker_prewarm_active,
+    release_warm_workflow_worker,
+    schedule_workflow_worker_prewarm,
+)
 from utils.app_paths import get_app_root
 from app_core.runtime.worker_entry import build_worker_launch_command, build_worker_process_env
 
@@ -38,7 +45,9 @@ def _resolve_payload_screenshot_engine(
     normalized = str(screenshot_engine or "").strip().lower()
     if not normalized:
         raise ValueError("创建工作流子进程必须显式指定 screenshot_engine")
-    if normalized not in {"wgc", "printwindow", "gdi", "dxgi"}:
+    from utils.capture.engine_ids import is_supported_screenshot_engine
+
+    if not is_supported_screenshot_engine(normalized):
         raise ValueError(f"不支持的工作流截图引擎: {normalized}")
     return normalized
 
@@ -160,6 +169,8 @@ class ProcessWorkflowExecutorProxy(QObject):
         self._reader_error_status: Optional[str] = None
         self._thread_handle: Optional[ProcessWorkflowThreadHandle] = None
         self._force_stop_timer: Optional[threading.Timer] = None
+        self._plugin_host_pid = ""
+        self._recycle_worker = False
 
         self._drain_timer = QTimer(self)
         self._drain_timer.setInterval(16)
@@ -267,6 +278,7 @@ class ProcessWorkflowExecutorProxy(QObject):
             self._exit_event.clear()
             self._received_execution_finished = False
             self._reader_error_status = None
+            self._recycle_worker = False
 
         if not self._drain_timer.isActive():
             self._drain_timer.start()
@@ -293,6 +305,59 @@ class ProcessWorkflowExecutorProxy(QObject):
         with self._state_lock:
             return generation != self._launch_generation or self._stop_event.is_set()
 
+    def _try_adopt_warm_worker(self, generation: int) -> bool:
+        scheduled = schedule_workflow_worker_prewarm()
+        if scheduled or is_workflow_worker_prewarm_active():
+            logger.info("等待预热工作流子进程就绪")
+        leased = acquire_warm_workflow_worker(wait_timeout=15.0)
+        if leased is None:
+            return False
+
+        process = leased.process
+        client_socket = leased.socket
+        try:
+            if self._launch_cancelled(generation):
+                raise _LaunchCancelled()
+            self._auth_token = str(leased.auth_token or "")
+            self._plugin_host_pid = str(getattr(leased, "plugin_host_pid", "") or "")
+            if not send_message(client_socket, {"command": "init", "payload": self._payload}, logger=logger):
+                raise RuntimeError("发送工作流初始化消息失败")
+            with self._state_lock:
+                if self._launch_cancelled(generation):
+                    raise _LaunchCancelled()
+                self._process = process
+                self._socket = client_socket
+                self._launch_client_socket = None
+                self._launching = False
+                self._running = True
+            try:
+                client_socket.settimeout(0.5)
+            except Exception:
+                pass
+            self._reader_thread = threading.Thread(
+                target=self._reader_loop,
+                daemon=True,
+                name="WorkflowProcessReader",
+            )
+            self._reader_thread.start()
+            logger.info("接管预热工作流子进程 pid=%s", getattr(process, "pid", "?"))
+            return True
+        except _LaunchCancelled:
+            _kill_process_tree(process)
+            try:
+                client_socket.close()
+            except Exception:
+                pass
+            raise
+        except Exception:
+            logger.warning("接管预热工作流子进程失败，回退冷启动", exc_info=True)
+            _kill_process_tree(process)
+            try:
+                client_socket.close()
+            except Exception:
+                pass
+            return False
+
     def _launch_worker(self, generation: int):
         server_socket: Optional[socket.socket] = None
         client_socket: Optional[socket.socket] = None
@@ -301,6 +366,10 @@ class ProcessWorkflowExecutorProxy(QObject):
         try:
             if self._launch_cancelled(generation):
                 raise _LaunchCancelled()
+            if self._try_adopt_warm_worker(generation):
+                launch_succeeded = True
+                return
+            logger.info("预热工作流子进程未就绪，冷启动")
 
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -314,6 +383,7 @@ class ProcessWorkflowExecutorProxy(QObject):
             child_env = build_worker_process_env(project_root=project_root)
             child_env["LCA_WORKFLOW_WORKER"] = "1"
             child_env["LCA_WORKFLOW_AUTH_TOKEN"] = self._auth_token
+            self._plugin_host_pid = str(child_env.get("LCA_PLUGIN_HOST_PID") or "")
 
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             cmd = self._build_worker_command(port)
@@ -432,6 +502,9 @@ class ProcessWorkflowExecutorProxy(QObject):
             while True:
                 message = recv_message(sock, timeout=0.5, logger=logger)
                 if message is not None:
+                    if str(message.get("type") or "").strip().lower() == "idle":
+                        self._recycle_worker = True
+                        break
                     self._enqueue_message(message)
                     continue
                 if process.poll() is not None:
@@ -448,12 +521,19 @@ class ProcessWorkflowExecutorProxy(QObject):
         except Exception as exc:
             logger.warning("工作流子进程读取失败: %s", exc)
         finally:
-            if process.poll() is None:
-                try:
+            if self._recycle_worker:
+                self._on_process_stopped()
+            else:
+                self._finalize_dead_worker(process)
+
+    def _finalize_dead_worker(self, process: Optional[subprocess.Popen]) -> None:
+        if process is not None:
+            try:
+                if process.poll() is None:
                     process.wait(timeout=1.0)
-                except Exception:
-                    pass
-            self._on_process_stopped()
+            except Exception:
+                pass
+        self._on_process_stopped()
 
     def _on_process_stopped(self):
         force_stop_timer = self._force_stop_timer
@@ -535,6 +615,21 @@ class ProcessWorkflowExecutorProxy(QObject):
             process = self._process
             self._socket = None
             self._process = None
+        alive = False
+        try:
+            alive = process is not None and process.poll() is None
+        except Exception:
+            alive = False
+        if alive and sock is not None and self._recycle_worker:
+            release_warm_workflow_worker(
+                WarmWorkflowWorker(
+                    process=process,
+                    socket=sock,
+                    auth_token=str(self._auth_token or ""),
+                    plugin_host_pid=str(self._plugin_host_pid or ""),
+                )
+            )
+            return
         if sock is not None:
             try:
                 sock.close()
@@ -550,6 +645,7 @@ class ProcessWorkflowExecutorProxy(QObject):
                     unregister_worker_process(process)
             except Exception:
                 pass
+        schedule_workflow_worker_prewarm()
 
     def _send_command(self, command: str, **kwargs) -> bool:
         with self._state_lock:
@@ -618,6 +714,7 @@ class ProcessWorkflowExecutorProxy(QObject):
         launch_client_socket = None
         launch_thread = None
         self._stop_event.set()
+        self._recycle_worker = False
         with self._state_lock:
             process = self._process
             sock = self._socket
@@ -677,8 +774,11 @@ def create_process_workflow_runtime(
     target_hwnd: Optional[int] = None,
     thread_labels: Optional[Dict[int, str]] = None,
     bound_windows: Optional[list[Dict[str, Any]]] = None,
+    custom_width: Any = 0,
+    custom_height: Any = 0,
     screenshot_engine: str,
     test_mode: Any = None,
+    prefer_memory_reference: bool = False,
     parent=None,
 ):
     payload = build_process_workflow_payload(
@@ -696,10 +796,13 @@ def create_process_workflow_runtime(
         target_hwnd=target_hwnd,
         thread_labels=thread_labels,
         bound_windows=bound_windows,
+        custom_width=custom_width,
+        custom_height=custom_height,
         test_mode=test_mode,
         prefer_file_reference=(
             str(os.getenv("LCA_WORKFLOW_PAYLOAD_MODE", "") or "").strip().lower()
             == "reference"
         ),
+        prefer_memory_reference=prefer_memory_reference,
     )
     return create_process_workflow_bundle(payload=payload, parent=parent)

@@ -1,4 +1,3 @@
-import datetime
 import logging
 import os
 
@@ -87,9 +86,11 @@ class MainWindowSaveMixin:
         saved_count = 0
         failed_tasks = []
         for task, workflow_data in tasks_to_save:
+            old_filepath = task.filepath
             # 使用 save_and_backup 同时保存和备份
             if task.save_and_backup(workflow_data=workflow_data):
                 saved_count += 1
+                self._sync_favorite_path_after_save(old_filepath, task)
                 self.workflow_tab_widget._update_tab_status(task.task_id)
                 logger.info(f"已保存并备份: {task.filepath}")
             else:
@@ -151,6 +152,10 @@ class MainWindowSaveMixin:
         sanitize_workflow_data(workflow_data)
         # --- END ADDED ---
         try:
+            if os.path.isfile(filepath):
+                from task_workflow.workspace import backup_workflow_file
+
+                backup_workflow_file(filepath)
             filepath = str(save_workflow_file(filepath, workflow_data))
         except Exception as e:
             logger.error(f"写入文件失败: {e}", exc_info=True)
@@ -163,33 +168,6 @@ class MainWindowSaveMixin:
         self.current_save_path = filepath # Update current save path
         self.unsaved_changes = False
         self._update_main_window_title()
-        # --- ADDED: Automatic Backup Logic --- 
-        try:
-            # --- MODIFIED: Determine backup directory --- 
-            # Assume app root is parent of images_dir
-            app_root = os.path.dirname(self.images_dir) 
-            backup_dir = os.path.join(app_root, "backups")
-            os.makedirs(backup_dir, exist_ok=True) # Ensure backup directory exists
-
-            # Keep original file info
-            original_dir, original_filename = os.path.split(filepath)
-            base, ext = os.path.splitext(original_filename)
-            # --- END MODIFICATION ---
-
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            # --- MODIFIED: Construct backup path in backup_dir --- 
-            # backup_filepath = f"{base}_backup_{timestamp}{ext}" # Old logic
-            backup_filename = f"{base}_backup_{timestamp}{ext}"
-            backup_filepath = os.path.join(backup_dir, backup_filename)
-            # --- END MODIFICATION ---
-
-            logger.info(f"尝试创建备份文件: {backup_filepath}")
-            save_workflow_file(backup_filepath, workflow_data)
-        except Exception as backup_e:
-            logger.error(f"创建备份文件时发生错误: {backup_e}", exc_info=True)
-            # Optionally show a warning to the user?
-            # self._show_error_message(\"备份警告\", f\"创建备份文件时出错: {backup_e}\")
-        # --- END ADDED ---
         return True
     def save_workflow_as(self):
         """Saves the current workflow to a new file chosen by the user."""

@@ -9,14 +9,11 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QFormLayout,
     QGroupBox,
-    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -26,7 +23,7 @@ from app_core.hotkey_spec import display_hotkey, normalize_hotkey
 from app_core.player.player_ui_state import extract_settings_from_ui
 
 PLUGIN_LOCAL_HINT = (
-    "插件：正常 / GDI2（无需挂钩）；DX / OpenGL（需注入）。"
+    "插件：通用 / GDI2（无需挂钩）；DX / OpenGL（需注入）。"
     "需要 tools/plugin 下 PluginHost.exe、dm.dll、RegDll.dll"
 )
 
@@ -112,31 +109,22 @@ class PlayerSettingsDialog(QDialog):
         self.plugin_reg_code_edit.setObjectName("plugin_reg_code_edit")
         self.plugin_reg_code_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.plugin_reg_code_edit.setToolTip(PLUGIN_LOCAL_HINT)
-        self.plugin_dir_edit = QLineEdit(str(local_cfg.get("plugin_dir", "") or "").strip())
-        self.plugin_dir_edit.setObjectName("plugin_dir_edit")
-        self.plugin_dir_edit.setToolTip(PLUGIN_LOCAL_HINT)
-        browse = QPushButton("浏览")
-        browse.clicked.connect(self._browse_plugin_dir)
-        dir_row = QWidget(group)
-        dir_layout = QHBoxLayout(dir_row)
-        dir_layout.setContentsMargins(0, 0, 0, 0)
-        dir_layout.addWidget(self.plugin_dir_edit)
-        dir_layout.addWidget(browse)
+        self.plugin_extra_code_edit = QLineEdit(str(local_cfg.get("plugin_extra_code", "") or ""))
+        self.plugin_extra_code_edit.setObjectName("plugin_extra_code_edit")
+        self.plugin_extra_code_edit.setPlaceholderText("大漠后台附加码，可空")
+        self.plugin_extra_code_edit.setMaxLength(20)
+        self.plugin_extra_code_edit.setToolTip(
+            "传给 dm.Reg(注册码, 附加码)。与后台「您的附加码」一致，或留空。"
+        )
         form.addRow("插件注册码:", self.plugin_reg_code_edit)
-        form.addRow("插件目录:", dir_row)
+        form.addRow("附加码:", self.plugin_extra_code_edit)
         return group
-
-    def _browse_plugin_dir(self):
-        start = self.plugin_dir_edit.text().strip() if hasattr(self, "plugin_dir_edit") else ""
-        chosen = QFileDialog.getExistingDirectory(self, "选择插件目录", start)
-        if chosen:
-            self.plugin_dir_edit.setText(chosen)
 
     def accept(self) -> None:
         try:
             config = dict(load_config() or {})
             config["plugin_reg_code"] = self.plugin_reg_code_edit.text()
-            config["plugin_dir"] = self.plugin_dir_edit.text().strip()
+            config["plugin_extra_code"] = self.plugin_extra_code_edit.text().strip()
             save_config(config)
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", f"插件本机设置没有保存：{exc}")

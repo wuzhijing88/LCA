@@ -33,7 +33,7 @@ class WindowTaskRunnerControlMixin:
                     # 断开所有信号连接
                     for signal_name in ['execution_started', 'execution_finished', 'step_details',
                                        'card_executing', 'card_finished', 'error_occurred',
-                                       'path_updated', 'path_resolution_failed',
+                                       'show_warning', 'path_updated', 'path_resolution_failed',
                                        ]:
                         if hasattr(self.executor, signal_name):
                             try:

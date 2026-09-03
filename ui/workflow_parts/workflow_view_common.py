@@ -24,22 +24,8 @@ from task_workflow.thread_start import is_thread_start_task_type
 
 logger = logging.getLogger(__name__) # <<< ADDED: Define module-level logger
 
+from ui.widgets.no_wheel_spinbox import NoWheelDoubleSpinBox, NoWheelSpinBox  # noqa: E402,F401
 
-# ===== 自定义 SpinBox 类，禁用滚轮修改数值 =====
-from PySide6.QtWidgets import QSpinBox, QDoubleSpinBox
-
-
-class NoWheelSpinBox(QSpinBox):
-    """禁用滚轮事件的 QSpinBox"""
-    def wheelEvent(self, event):
-        event.ignore()
-
-
-class NoWheelDoubleSpinBox(QDoubleSpinBox):
-    """禁用滚轮事件的 QDoubleSpinBox"""
-    def wheelEvent(self, event):
-        event.ignore()
-# ================================================
 
 class TempConnectionLine(QGraphicsLineItem):
     """Temporary drag line with local antialiasing to reduce jagged edges."""

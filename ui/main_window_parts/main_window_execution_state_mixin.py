@@ -46,7 +46,7 @@ class MainWindowExecutionStateMixin:
 
         self.run_action.setText("停止")
 
-        self.run_action.setIcon(create_media_control_icon('stop', 20))
+        self.run_action.setIcon(create_media_control_icon('stop', 22))
 
         self.run_action.setToolTip("停止所有任务执行 (F10)") # Add F10 hint
 
@@ -416,7 +416,7 @@ class MainWindowExecutionStateMixin:
 
             try:
 
-                from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+                from app_core.runtime.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
 
                 cleanup_yolo_runtime_on_stop(
 
@@ -789,7 +789,7 @@ class MainWindowExecutionStateMixin:
             # 重置运行按钮
             self._reset_run_button()
             try:
-                from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+                from app_core.runtime.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
                 cleanup_yolo_runtime_on_stop(
                     release_engine=True,
                     compact_memory=True,
@@ -904,7 +904,7 @@ class MainWindowExecutionStateMixin:
             except Exception as state_err:
                 logging.warning(f"_on_all_tasks_completed: confirm_stopped failed: {state_err}")
         try:
-            from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+            from app_core.runtime.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
             cleanup_yolo_runtime_on_stop(
                 release_engine=True,
                 compact_memory=True,
@@ -956,6 +956,9 @@ class MainWindowExecutionStateMixin:
             else:  # stopped
                 self.run_action.setEnabled(True)
                 self.run_action.setText("运行所有任务")
+        # 运行期间禁止改全局设置：执行模式/驱动切换会串进正在跑的任务
+        if hasattr(self, "_sync_global_settings_action_enabled"):
+            self._sync_global_settings_action_enabled()
         if new_state == "stopped":
             if hasattr(self, "_clear_runtime_line_animation_pauses"):
                 self._clear_runtime_line_animation_pauses()
@@ -1058,7 +1061,7 @@ class MainWindowExecutionStateMixin:
             logger.debug(f"断开 run_action 信号时出现可忽略异常: {e}")
         self.run_action.setEnabled(True)
         self.run_action.setText("停止多窗口执行")
-        self.run_action.setIcon(create_media_control_icon('stop', 20))
+        self.run_action.setIcon(create_media_control_icon('stop', 22))
         self.run_action.setToolTip("停止所有窗口的执行 (F10)")
         self.run_action.triggered.connect(self.safe_stop_tasks)
 
@@ -1068,7 +1071,7 @@ class MainWindowExecutionStateMixin:
         self.run_action.setEnabled(True)
         self.run_action.setText("恢复")
         self.run_action.setToolTip("恢复工作流执行")
-        self.run_action.setIcon(create_media_control_icon('pause', 20))
+        self.run_action.setIcon(create_media_control_icon('pause', 22))
 
     def _set_button_to_stopped_state(self):
         """设置按钮为停止状态：显示▶运行按钮"""
@@ -1076,7 +1079,7 @@ class MainWindowExecutionStateMixin:
         self.run_action.setEnabled(True)
         self.run_action.setText("运行所有任务")
         self.run_action.setToolTip("开始执行所有工作流 (F9)")
-        self.run_action.setIcon(create_media_control_icon('play', 20))
+        self.run_action.setIcon(create_media_control_icon('play', 22))
 
     def _set_button_to_running_state(self):
         """设置按钮为运行状态：显示■停止按钮"""
@@ -1084,7 +1087,7 @@ class MainWindowExecutionStateMixin:
         self.run_action.setEnabled(True)
         self.run_action.setText("停止")
         self.run_action.setToolTip("停止所有任务执行 (F10)")
-        self.run_action.setIcon(create_media_control_icon('stop', 20))
+        self.run_action.setIcon(create_media_control_icon('stop', 22))
 
     def _set_toolbar_to_stop_state(self):
         """兼容旧代码：设置为运行状态"""

@@ -45,6 +45,13 @@ def get_memory_image_provider() -> Optional[Callable[[str], Optional[bytes]]]:
     return _memory_image_provider
 
 
+def set_memory_image_provider(
+    provider: Optional[Callable[[str], Optional[bytes]]],
+) -> None:
+    global _memory_image_provider
+    _memory_image_provider = provider
+
+
 class TemplatePreloader:
     """
     模板图片预加载器。
@@ -136,9 +143,9 @@ class TemplatePreloader:
         if os.path.isfile(raw):
             return raw
 
-        from tasks.task_utils import correct_single_image_path
+        from utils.image_paths import get_image_path_resolver
 
-        resolved = correct_single_image_path(raw)
+        resolved = get_image_path_resolver().resolve(raw)
         if resolved:
             return str(resolved)
         return None

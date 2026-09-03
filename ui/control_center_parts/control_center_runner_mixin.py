@@ -162,6 +162,8 @@ class ControlCenterRunnerMixin:
             return 1
 
     def _enqueue_runner_start(self, runner: Optional[WindowTaskRunner]) -> bool:
+        if getattr(self, "_is_closing", False):
+            return False
         if runner is None:
             return False
         if getattr(runner, "_queued_for_start", False):
@@ -203,12 +205,16 @@ class ControlCenterRunnerMixin:
         started_count = 0
         dispatch_limit = self._get_runner_dispatch_limit()
         active_count = self._count_started_runner_threads()
+        from .control_center_dispatch import collect_busy_window_ids, partition_serial_dispatch
+
+        busy_window_ids = collect_busy_window_ids(self.window_runners)
         self._runner_dispatch_in_progress = True
         try:
             while active_count < dispatch_limit and self._runner_start_queue:
-                runner = self._runner_start_queue.popleft()
+                runner, leftover = partition_serial_dispatch(self._runner_start_queue, busy_window_ids)
+                self._runner_start_queue = leftover
                 if runner is None:
-                    continue
+                    break
 
                 runner._queued_for_start = False
 
@@ -230,6 +236,7 @@ class ControlCenterRunnerMixin:
                         logger.warning(f"设置线程优先级失败: {e}")
                     started_count += 1
                     active_count += 1
+                    busy_window_ids.add(str(getattr(runner, "window_id", "") or ""))
                     logger.info(
                         "中控调度启动runner: window_id=%s, workflow_index=%s, active=%s/%s",
                         runner.window_id,

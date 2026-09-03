@@ -22,7 +22,6 @@ class MainWindowInitStateMixin:
         images_dir: str,
         task_state_manager=None,
     ):
-        from .main_window_support import normalize_execution_mode_setting
         self.task_modules = task_modules # Store the task modules
         self.save_config_func = save_config_func # Store the save function
         self.images_dir = images_dir # <<< RE-ADDED: Store images directory
@@ -62,13 +61,20 @@ class MainWindowInitStateMixin:
         self._sync_runtime_window_binding_state()
         if self.window_binding_mode != 'multiple' and not self.current_target_window_title:
             self.current_target_window_title = self.config.get('target_window_title')
-        self.current_execution_mode = normalize_execution_mode_setting(
-            self.config.get('execution_mode', 'background_sendmessage')
-        ) # Load from config
+        self.current_execution_mode = str(self.config.get('execution_mode') or 'background_sendmessage')
         logger.info(f"从配置加载执行模式: {self.current_execution_mode}")
         try:
             from utils.input.foreground_input_manager import get_foreground_input_manager
-            from utils.input_simulation.mode_utils import parse_foreground_backends
+            from utils.input_simulation import global_input_simulator_manager
+            from utils.input_simulation.mode_utils import parse_foreground_backends, resolve_execution_mode
+            # 输入模拟器工厂的默认模式必须和配置一致，否则省略参数的调用方会
+            # 用工厂自带的出厂默认值创建模拟器。
+            global_input_simulator_manager.set_default_operation_mode(
+                str(self.config.get('operation_mode') or 'auto').strip().lower()
+            )
+            global_input_simulator_manager.set_default_execution_mode(
+                resolve_execution_mode(self.config) or self.current_execution_mode
+            )
             foreground_input = get_foreground_input_manager()
             mouse_backend, keyboard_backend = parse_foreground_backends(self.config)
             ib_driver = str(self.config.get('ibinputsimulator_driver', 'Logitech') or 'Logitech').strip()
@@ -86,14 +92,16 @@ class MainWindowInitStateMixin:
         # Store custom resolution from config
         self.custom_width = self.config.get('custom_width', 0)
         self.custom_height = self.config.get('custom_height', 0)
-        # 操作模式配置 - 默认使用自动检测
-        self.operation_mode = 'auto'
+        # 操作模式配置 - 保留全局配置中的默认值
+        self.operation_mode = self.config.get('operation_mode', 'auto')
         # 快捷键配置
         self.start_task_hotkey = self.config.get('start_task_hotkey', DEFAULT_HOTKEYS['start_task_hotkey'])
         self.stop_task_hotkey = self.config.get('stop_task_hotkey', DEFAULT_HOTKEYS['stop_task_hotkey'])
         self.pause_workflow_hotkey = self.config.get('pause_workflow_hotkey', DEFAULT_HOTKEYS['pause_workflow_hotkey'])
         self.record_hotkey = self.config.get('record_hotkey', DEFAULT_HOTKEYS['record_hotkey'])
         self.replay_hotkey = self.config.get('replay_hotkey', DEFAULT_HOTKEYS['replay_hotkey'])
+        self.close_listen_hotkey = self.config.get('close_listen_hotkey', DEFAULT_HOTKEYS['close_listen_hotkey'])
+        self._hotkey_listen_enabled = True
         # 应用截图引擎配置（异步初始化，避免主线程首屏阻塞）
         screenshot_engine = self.config.get('screenshot_engine', 'wgc')
         self._startup_engine_init_target = str(screenshot_engine or "").strip().lower()

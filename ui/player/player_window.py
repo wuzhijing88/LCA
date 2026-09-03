@@ -47,6 +47,7 @@ from app_core.player.player_ui_state import (
     extract_settings_from_ui,
     load_player_ui_state,
     merge_settings_into_ui,
+    player_ui_state_path,
     save_player_ui_state,
 )
 from app_core.player.runtime_config import apply_player_ui_hotkeys
@@ -278,6 +279,7 @@ class PlayerWindow(QMainWindow):
             list_order = merged
         state = {
             "group_loops": group_loops_from_refs(self._custom_refs) or self._group_loops_from_ui(),
+            "group_loops_by_list": self._group_loops_by_list_from_refs(),
             "loops_by_id": script_loops_from_refs(self._custom_refs) or self._loops_from_ui(),
             "settings": settings,
             "schedule_alarms": schedule_alarms_from_refs(self._custom_refs),
@@ -332,7 +334,7 @@ class PlayerWindow(QMainWindow):
         except Exception:
             disk = {}
         self._config["plugin_reg_code"] = str(disk.get("plugin_reg_code") or "")
-        self._config["plugin_dir"] = str(disk.get("plugin_dir") or "").strip()
+        self._config["plugin_extra_code"] = str(disk.get("plugin_extra_code") or "")
         self.config = self._config
         self._runtime.update_config(self._config)
         try:
@@ -446,10 +448,22 @@ class PlayerWindow(QMainWindow):
             initial_page=self._initial_page,
         )
         self._custom_refs = refs
+        # ``load_player_ui_state`` returns normalized defaults even when no
+        # userdata file exists.  Do not let that synthetic default (group
+        # loops=1) overwrite loop settings embedded in the exported package.
+        try:
+            has_saved_state = player_ui_state_path(
+                getattr(self._package, "userdata_dir", "") or ""
+            ).is_file()
+        except OSError:
+            has_saved_state = False
         apply_script_loops_to_refs(
             refs,
-            loops_by_id=self._ui_state.get("loops_by_id") or {},
-            group_loops=self._ui_state.get("group_loops"),
+            loops_by_id=(self._ui_state.get("loops_by_id") or {}) if has_saved_state else None,
+            group_loops=self._ui_state.get("group_loops") if has_saved_state else None,
+            group_loops_by_list=(self._ui_state.get("group_loops_by_list") or {})
+            if has_saved_state
+            else None,
         )
         saved_item_order = self._ui_state.get("list_item_order") or {}
         if saved_item_order:
@@ -835,6 +849,48 @@ class PlayerWindow(QMainWindow):
                 return normalize_script_loop_count(widget.get("group_loops"), 1)
         return 1
 
+    def _group_loops_by_list_from_refs(self) -> dict[str, int]:
+        """读取独立程序当前各脚本列表的整组循环值。
+
+        导出包里的 ``ui`` 是静态配置，而循环框可以在独立程序运行时修改。
+        队列展开必须使用控件当前值，否则修改后仍会按导出时的值执行。
+        """
+        from app_core.player.package import normalize_script_loop_count
+
+        refs = self._custom_refs or {}
+        mapping = refs.get("script_lists")
+        spins_by_id = refs.get("group_loop_spins_by_id")
+        if isinstance(spins_by_id, dict) and spins_by_id:
+            result: dict[str, int] = {}
+            for list_id, spin in spins_by_id.items():
+                try:
+                    result[str(list_id)] = normalize_script_loop_count(spin.value(), 1)
+                except RuntimeError:
+                    continue
+            if result:
+                return result
+        spins = refs.get("group_loop_spins") or []
+        if not isinstance(mapping, dict) or not mapping:
+            spin = refs.get("group_loop_spin")
+            if spin is not None:
+                try:
+                    return {"__main__": normalize_script_loop_count(spin.value(), 1)}
+                except RuntimeError:
+                    pass
+            return {}
+
+        order = [str(key) for key in (refs.get("script_list_order") or mapping.keys())]
+        result: dict[str, int] = {}
+        for index, list_id in enumerate(order):
+            if list_id not in mapping or index >= len(spins):
+                continue
+            spin = spins[index]
+            try:
+                result[list_id] = normalize_script_loop_count(spin.value(), 1)
+            except RuntimeError:
+                continue
+        return result
+
     def _waiting_script_ids(self) -> list[str]:
         ids: list[str] = []
         seen: set[str] = set()
@@ -884,6 +940,7 @@ class PlayerWindow(QMainWindow):
             scripts=available,
             state=state if isinstance(state, dict) else {},
             loops_by_id=loops_by_id,
+            group_loops_by_list=self._group_loops_by_list_from_refs(),
         )
 
     def _clear_script_queue(self):

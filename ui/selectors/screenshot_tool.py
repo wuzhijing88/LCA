@@ -322,11 +322,17 @@ class ScreenshotOverlay(QWidget):
 
             if screenshot is None:
                 logger.error("截图失败：无法获取屏幕截图")
-                QMessageBox.critical(
-                    None,
-                    "截图失败",
-                    "无法获取屏幕截图\n\n请在全局设置里更换适合当前系统的截图引擎。"
-                )
+                detail = ""
+                try:
+                    from utils.capture.screenshot_helper import get_last_screenshot_error
+
+                    detail = str(get_last_screenshot_error(current_engine) or "").strip()
+                except Exception:
+                    detail = ""
+                tip = "无法获取屏幕截图\n\n请在全局设置里更换适合当前窗口的截图引擎（如 WGC / PrintWindow）。"
+                if detail:
+                    tip = f"{tip}\n\n详情：{detail}"
+                QMessageBox.critical(None, "截图失败", tip)
                 return False
 
             # 保存截图数据（现在统一为numpy.ndarray BGR格式）
@@ -569,17 +575,18 @@ class ScreenshotOverlay(QWidget):
             # 与 image_match_click 执行路径统一：始终走 capture_window_smart。
             from tasks.task_utils import capture_window_smart
             try:
+                from utils.capture.engine_ids import screenshot_engine_log_label
                 from utils.capture.screenshot_helper import get_screenshot_engine
-                engine = get_screenshot_engine()
+                engine = screenshot_engine_log_label(get_screenshot_engine())
             except Exception:
-                engine = "unknown"
+                engine = "未知引擎"
             screenshot = capture_window_smart(self.target_hwnd, client_area_only=True)
 
             if screenshot is not None:
-                logger.info(f"{str(engine).upper()} 窗口截图成功（客户区），尺寸: {screenshot.shape}")
+                logger.info(f"{engine} 窗口截图成功（客户区），尺寸: {screenshot.shape}")
                 return screenshot
 
-            logger.warning(f"{str(engine).upper()} 窗口截图失败")
+            logger.warning(f"{engine} 窗口截图失败")
             return None
 
         except Exception as e:
@@ -1278,11 +1285,12 @@ class ScreenshotOverlay(QWidget):
                 # 边界检查
                 img_h, img_w = self.screenshot_image.shape[:2]
                 try:
+                    from utils.capture.engine_ids import screenshot_engine_log_label
                     from utils.capture.screenshot_helper import get_screenshot_engine
-                    engine = get_screenshot_engine()
+                    engine = screenshot_engine_log_label(get_screenshot_engine())
                 except Exception:
-                    engine = "unknown"
-                logger.info(f"{str(engine).upper()} 截图尺寸(物理像素): {img_w}x{img_h}")
+                    engine = "未知引擎"
+                logger.info(f"{engine} 截图尺寸(物理像素): {img_w}x{img_h}")
 
                 # 直接使用相对坐标裁剪，不再判断WGC返回内容
                 x = max(0, min(relative_physical_x, img_w - 1))

@@ -398,7 +398,7 @@ class ParameterPanelConditionalMixin:
     def _apply_condition_operator(self, current_value: Any, expected_value: Any, operator: str) -> bool:
         """应用条件操作符"""
         try:
-            if operator == '==' or operator == 'eq':
+            if operator == '==' or operator == 'eq' or operator == 'and':
                 return current_value == expected_value
             elif operator == '!=' or operator == 'ne':
                 return current_value != expected_value

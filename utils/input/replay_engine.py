@@ -16,6 +16,22 @@ import win32con
 logger = logging.getLogger(__name__)
 WIN32_AVAILABLE = True
 
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
+MAPVK_VK_TO_VSC = 0
+MAPVK_VK_TO_VSC_EX = 4
+
+# 录制侧会把左右修饰键存成 lshift/rshift 等；这些键以及方向/导航键需按硬件扫描码注入，
+# 仅填 VK_LSHIFT(0xA0) 等左右专用 VK 时，大量游戏/程序的 GetAsyncKeyState(VK_SHIFT) 读不到。
+_EXTENDED_KEY_NAMES = frozenset({
+    'left', 'right', 'up', 'down',
+    'home', 'end', 'pageup', 'pagedown',
+    'insert', 'delete',
+    'rctrl', 'ralt',
+    'numpad_divide',
+})
+
 
 def get_vk_code_from_char(char):
     """将单字符映射到虚拟键码，仅返回VK，不注入修饰键信息。"""
@@ -130,12 +146,49 @@ class ReplayEngine:
         return False
 
     def _get_scan_code(self, vk_code):
-        """将虚拟键码转换为扫描码（硬件扫描码）"""
-        # 使用MapVirtualKey获取扫描码
-        return ctypes.windll.user32.MapVirtualKeyW(vk_code, 0)
+        """将虚拟键码转换为硬件扫描码（优先区分左右键的 EX 映射）。"""
+        scan_ex = int(ctypes.windll.user32.MapVirtualKeyW(int(vk_code), MAPVK_VK_TO_VSC_EX))
+        if scan_ex:
+            return scan_ex
+        return int(ctypes.windll.user32.MapVirtualKeyW(int(vk_code), MAPVK_VK_TO_VSC))
 
-    def _send_key_with_sendinput(self, vk_code, key_up=False):
-        """使用SendInput发送按键（更可靠，支持扫描码）"""
+    def build_key_send_params(self, key_name: str, key_up: bool = False) -> Tuple[int, int, int]:
+        """构建 SendInput 键盘参数：(wVk, wScan, dwFlags)。
+
+        始终优先使用 KEYEVENTF_SCANCODE + wVk=0，与 normal.hd 驱动一致，
+        避免 lshift/rshift 等左右专用 VK 注入后目标程序读不到修饰键状态。
+        """
+        vk_code = self._get_vk_code(key_name)
+        if not vk_code:
+            raise ValueError(f"无法解析按键: {key_name}")
+
+        normalized = str(key_name or '').strip().lower()
+        scan_raw = self._get_scan_code(vk_code)
+        extended = normalized in _EXTENDED_KEY_NAMES
+        if scan_raw > 0xFF:
+            extended = True
+            scan_code = scan_raw & 0xFF
+        else:
+            scan_code = scan_raw & 0xFF
+
+        if scan_code:
+            flags = KEYEVENTF_SCANCODE
+            wvk = 0
+            wscan = scan_code
+        else:
+            # 扫描码不可用时回退到虚拟键码路径
+            flags = 0
+            wvk = int(vk_code)
+            wscan = 0
+
+        if extended:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        if key_up:
+            flags |= KEYEVENTF_KEYUP
+        return wvk, wscan, flags
+
+    def _send_key_with_sendinput(self, vk_code, key_up=False, key_name: str = ''):
+        """使用SendInput发送按键（扫描码优先，兼容游戏/DirectInput）。"""
         if not self._INPUT_KEYBOARD_defined:
             class KEYBDINPUT(ctypes.Structure):
                 _fields_ = [
@@ -181,20 +234,32 @@ class ReplayEngine:
             self._KEYBDINPUT = KEYBDINPUT
             self._INPUT_KEYBOARD_defined = True
 
-        # 获取扫描码
-        scan_code = self._get_scan_code(vk_code)
+        if key_name:
+            wvk, wscan, flags = self.build_key_send_params(key_name, key_up=key_up)
+        else:
+            # 兼容旧调用：仅有 vk_code 时仍尽量走扫描码
+            scan_raw = self._get_scan_code(vk_code)
+            extended = scan_raw > 0xFF
+            scan_code = scan_raw & 0xFF
+            if scan_code:
+                wvk, wscan = 0, scan_code
+                flags = KEYEVENTF_SCANCODE
+            else:
+                wvk, wscan = int(vk_code), 0
+                flags = 0
+            if extended:
+                flags |= KEYEVENTF_EXTENDEDKEY
+            if key_up:
+                flags |= KEYEVENTF_KEYUP
 
-        # 创建INPUT结构
-        extra = wintypes.ULONG(0)
         ii = self._INPUT()
         ii.type = 1  # INPUT_KEYBOARD
-        ii.ki.wVk = vk_code
-        ii.ki.wScan = scan_code
-        ii.ki.dwFlags = 0x0002 if key_up else 0  # KEYEVENTF_KEYUP = 0x0002
+        ii.ki.wVk = wvk
+        ii.ki.wScan = wscan
+        ii.ki.dwFlags = flags
         ii.ki.time = 0
-        ii.ki.dwExtraInfo = ctypes.pointer(extra)
+        ii.ki.dwExtraInfo = None
 
-        # 发送输入
         ctypes.windll.user32.SendInput(1, ctypes.byref(ii), ctypes.sizeof(ii))
 
     def _get_vk_code(self, key_name):
@@ -367,10 +432,9 @@ class ReplayEngine:
             elif action_type == 'key_press':
                 key = action.get('key', '')
                 if key:
-                    # 按键按下 - 使用 SendInput（支持扫描码，更可靠）
                     vk_code = self._get_vk_code(key)
                     if vk_code:
-                        self._send_key_with_sendinput(vk_code, key_up=False)
+                        self._send_key_with_sendinput(vk_code, key_up=False, key_name=key)
                         # 如果是修饰键，添加短延迟确保被目标应用识别
                         if key.lower() in ['shift', 'lshift', 'rshift', 'ctrl', 'lctrl', 'rctrl', 'alt', 'lalt', 'ralt']:
                             time.sleep(0.02)  # 20ms延迟，确保修饰键生效
@@ -380,10 +444,9 @@ class ReplayEngine:
             elif action_type == 'key_release':
                 key = action.get('key', '')
                 if key:
-                    # 按键释放 - 使用 SendInput
                     vk_code = self._get_vk_code(key)
                     if vk_code:
-                        self._send_key_with_sendinput(vk_code, key_up=True)
+                        self._send_key_with_sendinput(vk_code, key_up=True, key_name=key)
                     else:
                         logger.warning(f"[回放引擎] 无法获取按键虚拟码: {key}")
 

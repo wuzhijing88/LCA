@@ -145,12 +145,9 @@ def resolve_plugin_input_hwnd_for_display(
         return 0
     cfg = config
     if cfg is None:
-        try:
-            from app_core.config_store import load_config
+        from utils.runtime_config import get_runtime_config
 
-            cfg = load_config()
-        except Exception:
-            cfg = None
+        cfg = get_runtime_config() or None
     for window_info in get_active_bound_windows(cfg):
         if not isinstance(window_info, dict):
             continue

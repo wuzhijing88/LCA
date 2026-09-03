@@ -14,6 +14,7 @@ class ExecutionSource(str, Enum):
     CONTROL_CENTER = "control_center"
     WORKFLOW_TEST = "workflow_test"
     SCHEDULE = "schedule"
+    PLAYER = "player"
 
 
 @dataclass(frozen=True)

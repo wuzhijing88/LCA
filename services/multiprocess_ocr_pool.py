@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 import os
 from collections import deque
@@ -64,6 +64,109 @@ def _send_message(sock: socket.socket, data: dict) -> bool:
 def _recv_message(sock: socket.socket, timeout: float = 10.0) -> Optional[dict]:
     """通过 socket 接收消息（带长度前缀）"""
     return recv_ocr_socket_message(sock=sock, timeout=timeout, logger=logger)
+
+
+_OCR_SKIP_MESSAGE_TYPES = frozenset({"ready", "pong", "reset_engine"})
+
+# 资源通道解析器：由执行层（task_workflow）注册，服务层本身不感知工作流上下文。
+ResourceKeyResolver = Callable[[Optional[int]], Optional[str]]
+_resource_key_resolver: Optional[ResourceKeyResolver] = None
+
+
+def set_resource_key_resolver(resolver: Optional[ResourceKeyResolver]) -> None:
+    """注册“按窗口句柄推导当前资源通道 key”的回调（传 None 可取消）。"""
+    global _resource_key_resolver
+    _resource_key_resolver = resolver if callable(resolver) else None
+
+
+def _normalize_response_hwnd(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _recv_expected_ocr_response(
+    sock: socket.socket,
+    request_id: str,
+    window_hwnd: int,
+    timeout: float,
+    process_id: str,
+) -> dict:
+    """Read the OCR result for one request, skipping leftover control frames.
+
+    Worker startup/hot-reset may leave `ready` / `pong` / `reset_engine` on the
+    socket. Those dicts have no `window_hwnd`, which used to surface as
+    `OCR response window mismatch: requested=<hwnd>, received=0`.
+    """
+    deadline = time.monotonic() + max(0.01, float(timeout))
+    expected_hwnd = _normalize_response_hwnd(window_hwnd)
+    last_skipped = None
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            extra = f" last_skipped={last_skipped!r}" if last_skipped else ""
+            raise OCRPoolError(
+                f"timed out waiting for OCR response: {process_id}{extra}"
+            )
+
+        try:
+            response = _recv_message(sock, timeout=remaining)
+        except OCRPoolError:
+            raise
+        except Exception as exc:
+            raise OCRPoolError(
+                f"failed to receive OCR response: {process_id}"
+            ) from exc
+
+        if response is None:
+            extra = f" last_skipped={last_skipped!r}" if last_skipped else ""
+            raise OCRPoolError(
+                f"timed out waiting for OCR response: {process_id}{extra}"
+            )
+        if not isinstance(response, dict):
+            raise OCRPoolError(
+                f"invalid OCR response from {process_id}: {type(response).__name__}"
+            )
+
+        msg_type = str(response.get("type") or "").strip().lower()
+        if msg_type in _OCR_SKIP_MESSAGE_TYPES:
+            last_skipped = msg_type
+            logger.warning(
+                "skip stale OCR control message from %s: type=%s",
+                process_id,
+                msg_type,
+            )
+            continue
+        if msg_type == "error":
+            detail = (
+                response.get("message")
+                or response.get("detail")
+                or response.get("error")
+                or repr(response)
+            )
+            raise OCRPoolError(f"OCR worker error: {detail}")
+
+        got_id = response.get("request_id")
+        if got_id not in (None, "", request_id):
+            last_skipped = f"request_id={got_id!r}"
+            logger.warning(
+                "skip OCR response with unexpected request_id from %s: got=%r expected=%r",
+                process_id,
+                got_id,
+                request_id,
+            )
+            continue
+
+        response_hwnd = _normalize_response_hwnd(response.get("window_hwnd", 0))
+        if response_hwnd != expected_hwnd:
+            raise OCRPoolError(
+                "OCR response window mismatch: "
+                f"requested={expected_hwnd}, received={response_hwnd}, "
+                f"type={msg_type or 'ocr'}, request_id={got_id!r}"
+            )
+        return response
 
 
 def _is_process_alive(process: Optional[subprocess.Popen]) -> bool:
@@ -235,6 +338,7 @@ class MultiProcessOCRPool:
         self._is_shutdown = False  # 【修复闪退】标记是否正在关闭
         self._cleanup_in_progress = False
         self._cleanup_error: Optional[OCRPoolError] = None
+        self._keep_warm = False
 
         # 【画面变动修复】记录每个窗口的最后请求时间戳，用于防止请求堆积
         self._window_last_request_time: Dict[int, float] = {}  # hwnd -> timestamp
@@ -281,6 +385,62 @@ class MultiProcessOCRPool:
     def _generate_process_id(self) -> str:
         """生成进程ID"""
         return f"ocr_process_{time.time_ns()}"
+
+    def set_keep_warm(self, enabled: bool) -> None:
+        self._keep_warm = bool(enabled)
+
+    def _live_or_creating_count_locked(self) -> int:
+        count = 0
+        for process_info in self.processes.values():
+            if process_info.is_retiring:
+                continue
+            if process_info.is_creating:
+                count += 1
+                continue
+            if process_info.process is not None and _is_process_alive(process_info.process):
+                count += 1
+        return count
+
+    def ensure_warm_workers(self, count: Optional[int] = None) -> int:
+        """保证至少有 count 个保底 OCR 子进程（可无窗口）。禁止在主线程创建真实进程。"""
+        if self._is_shutdown or not self._running or self._cleanup_in_progress:
+            return 0
+        self._keep_warm = True
+        target = int(self._adaptive_min_processes if count is None else count)
+        target = max(1, min(target, self.max_processes))
+        created_ids: list[str] = []
+        with self._pool_lock:
+            have = self._live_or_creating_count_locked()
+            while have < target:
+                process_id = self._generate_process_id()
+                self.processes[process_id] = OCRProcessInfo(
+                    process_id=process_id,
+                    process=None,
+                    is_active=False,
+                    last_used=time.time(),
+                    max_windows=self.max_windows_per_process,
+                    is_creating=True,
+                )
+                created_ids.append(process_id)
+                have += 1
+            current = have
+        for process_id in created_ids:
+            self._start_async_create_for_process(process_id)
+        return current
+
+    def release_window_assignments(self) -> int:
+        """清掉窗口映射，保留已创建的 OCR 子进程。"""
+        released = 0
+        with self._pool_lock:
+            for process_info in self.processes.values():
+                if process_info.assigned_windows:
+                    released += len(process_info.assigned_windows)
+                    process_info.assigned_windows.clear()
+            self.window_process_mapping.clear()
+            self._window_last_request_time.clear()
+            self._resource_process_mapping.clear()
+            self._resource_last_used.clear()
+        return released
 
     def _generate_request_id(self) -> str:
         """生成请求ID"""
@@ -339,10 +499,10 @@ class MultiProcessOCRPool:
             return explicit_key
         if not self._route_by_thread_start:
             return None
-        from task_workflow.workflow_context import get_current_resource_lane_key
-        return self._normalize_resource_key(
-            get_current_resource_lane_key(window_hwnd=window_hwnd)
-        )
+        resolver = _resource_key_resolver
+        if resolver is None:
+            return None
+        return self._normalize_resource_key(resolver(window_hwnd))
 
     def _touch_resource_mapping_locked(self, resource_key: Optional[str], process_id: Optional[str], now: Optional[float] = None) -> None:
         normalized_key = self._normalize_resource_key(resource_key)
@@ -394,6 +554,7 @@ class MultiProcessOCRPool:
                         new_process_info.add_window(hwnd, title)
                     new_process_info.is_creating = False
                     self.processes[process_id] = new_process_info
+                    self._mark_ocr_activity_locked()
                 elif new_process_info is not None:
                     self._terminate_process_tree(new_process_info.process, wait_timeout=3.0)
                     if new_process_info.socket_conn is not None:
@@ -939,23 +1100,19 @@ class MultiProcessOCRPool:
             del request
 
             try:
-                response = _recv_message(process_info.socket_conn, timeout=timeout)
-                if response is None:
-                    force_recycle_process = request_sent_to_worker
-                    raise OCRPoolError(f"timed out waiting for OCR response: {process_id}")
+                response = _recv_expected_ocr_response(
+                    process_info.socket_conn,
+                    request_id=request_id,
+                    window_hwnd=window_hwnd,
+                    timeout=timeout,
+                    process_id=process_id,
+                )
             except OCRPoolError:
+                force_recycle_process = request_sent_to_worker
                 raise
             except Exception as exc:
                 force_recycle_process = request_sent_to_worker
                 raise OCRPoolError(f"failed to receive OCR response: {process_id}") from exc
-
-            # 验证响应窗口句柄
-            response_hwnd = response.get('window_hwnd', 0)
-            if response_hwnd != window_hwnd:
-                force_recycle_process = True
-                raise OCRPoolError(
-                    f"OCR response window mismatch: requested={window_hwnd}, received={response_hwnd}"
-                )
 
             # 处理响应
             worker_should_recycle = bool(response.get('worker_should_recycle', False))
@@ -1077,7 +1234,24 @@ class MultiProcessOCRPool:
             try:
                 if not _send_message(sock, {'command': 'RESET_ENGINE', 'force': bool(force)}):
                     raise OCRPoolError(f"failed to send reset command to {process_id}")
-                response = _recv_message(sock, timeout=2.0)
+                reset_deadline = time.monotonic() + 2.0
+                response = None
+                while True:
+                    remaining = reset_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise OCRPoolError(
+                            f"timed out waiting for reset response from {process_id}"
+                        )
+                    response = _recv_message(sock, timeout=remaining)
+                    msg_type = str((response or {}).get("type") or "").strip().lower()
+                    if msg_type in {"ready", "pong"}:
+                        logger.warning(
+                            "skip stale OCR control message during reset from %s: type=%s",
+                            process_id,
+                            msg_type,
+                        )
+                        continue
+                    break
                 if not isinstance(response, dict) or response.get('type') != 'reset_engine':
                     raise OCRPoolError(
                         f"invalid reset response from {process_id}: {response!r}"
@@ -1168,6 +1342,11 @@ class MultiProcessOCRPool:
                 # 【内存优化】使用配置的超时时间（从600秒优化为60秒）
                 elif current_time - process_info.last_used > self._process_timeout and process_info.is_empty():
                     should_terminate = True
+            if should_terminate and self._keep_warm and not process_info.is_retiring:
+                with self._pool_lock:
+                    live_count = self._live_or_creating_count_locked()
+                if live_count <= self._adaptive_min_processes:
+                    should_terminate = False
 
             if should_terminate:
                 processes_to_terminate.append(process_id)
@@ -1454,7 +1633,7 @@ def cleanup_registered_ocr_subprocesses() -> int:
 
 
 def cleanup_ocr_services_on_stop() -> None:
-    """Force-clean the existing OCR pool, propagating cleanup failures."""
-    pool = get_existing_multiprocess_ocr_pool()
-    if pool is not None:
-        pool.cleanup_all_processes()
+    """按截图引擎处理 OCR 池：插件注销，原生保留保底进程。"""
+    from services.ocr_pool_policy import apply_ocr_pool_stop_policy
+
+    apply_ocr_pool_stop_policy()

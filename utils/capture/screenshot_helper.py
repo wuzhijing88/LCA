@@ -31,6 +31,7 @@ from utils.capture.engine_ids import (
     canonicalize_screenshot_engine,
     is_plugin_screenshot_engine,
     is_supported_screenshot_engine,
+    screenshot_engine_log_label,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 def _shutdown_existing_async_pipeline() -> bool:
     """Stop the async pipeline without importing new modules during shutdown."""
-    async_module = sys.modules.get("utils.async_screenshot")
+    async_module = sys.modules.get("utils.capture.async_screenshot")
     shutdown_pipeline = getattr(async_module, "shutdown_global_pipeline", None)
     if not callable(shutdown_pipeline):
         return False
@@ -65,7 +66,7 @@ def set_window_manager(manager):
 
 # 截图引擎（主进程直连，不再走子进程）
 try:
-    import utils.wgc_hwnd_capture as _wgc_module
+    import utils.capture.wgc_hwnd_capture as _wgc_module
     from utils.capture.wgc_hwnd_capture import (
         capture_window_wgc as _capture_window_wgc_raw,
         clear_wgc_cache as _clear_wgc_cache_raw,
@@ -326,7 +327,13 @@ def is_plugin_available() -> bool:
     return False
 
 
-def capture_window_plugin(hwnd: int, display: str, client_area_only: bool = True, timeout: float = 4.0):
+def capture_window_plugin(
+    hwnd: int,
+    display: str,
+    client_area_only: bool = True,
+    timeout: float = 4.0,
+    fallback: bool = True,
+):
     if not callable(_capture_window_plugin_raw):
         return None
     try:
@@ -335,6 +342,7 @@ def capture_window_plugin(hwnd: int, display: str, client_area_only: bool = True
             display=display,
             client_area_only=client_area_only,
             timeout=timeout,
+            fallback=fallback,
         )
     except Exception:
         return None
@@ -710,7 +718,7 @@ def set_screenshot_engine(engine: str) -> bool:
         _current_engine = requested_engine
     if previous_engine and previous_engine != requested_engine:
         _cleanup_inactive_engines_after_switch(active_engine=requested_engine)
-    logger.info(f"截图引擎已切换到: {requested_engine}")
+    logger.info(f"截图引擎已切换到: {screenshot_engine_log_label(requested_engine)}")
     return True
 
 
@@ -787,6 +795,25 @@ def _capture_with_engine(
         raise
     except Exception as e:
         logger.error(f"引擎 {engine} 捕获失败: {e}")
+        return None
+
+
+def capture_window_frame(
+    hwnd: int,
+    client_area_only: bool = True,
+    timeout: float = 4.0,
+) -> Optional[np.ndarray]:
+    """使用当前配置的截图引擎捕获一帧窗口画面（BGR/BGRA ndarray，失败返回 None）。"""
+    try:
+        engine = get_screenshot_engine()
+        return _capture_with_engine(
+            int(hwnd),
+            bool(client_area_only),
+            engine,
+            timeout=max(0.1, float(timeout)),
+        )
+    except Exception as e:
+        logger.error(f"窗口截图失败: {e}")
         return None
 
 
@@ -907,7 +934,7 @@ def take_window_screenshot(hwnd, client_area_only=True, return_format="pil"):
     try:
         # 获取当前截图引擎（严格使用当前引擎，不自动降级）
         engine_to_use = get_screenshot_engine()
-        logger.debug(f"使用 {engine_to_use.upper()} 截图引擎捕获窗口: HWND={hwnd}, client_area_only={client_area_only}")
+        logger.debug(f"使用 {screenshot_engine_log_label(engine_to_use)} 截图引擎捕获窗口: HWND={hwnd}, client_area_only={client_area_only}")
 
         # 使用当前引擎截图
         img_bgr = _capture_with_engine(hwnd, client_area_only, engine_to_use)
@@ -963,10 +990,10 @@ def get_window_pixel_color(hwnd, x, y, client_coords=True):
     try:
         color = _get_pixel_color_with_engine(hwnd, x, y, client_coords, engine)
         if color is not None:
-            logger.debug(f"{engine.upper()} 取色成功: hwnd={hwnd}, pos=({x},{y}), color={color}")
+            logger.debug(f"{screenshot_engine_log_label(engine)} 取色成功: hwnd={hwnd}, pos=({x},{y}), color={color}")
             return color
 
-        logger.error(f"{engine.upper()} 取色失败: hwnd={hwnd}, pos=({x},{y})")
+        logger.error(f"{screenshot_engine_log_label(engine)} 取色失败: hwnd={hwnd}, pos=({x},{y})")
         return None
 
     except Exception as e:
@@ -1133,12 +1160,6 @@ def cleanup_screenshot_engines_on_stop(keep_current_engine: bool = True):
             _shutdown_existing_async_pipeline()
         except Exception as e:
             logger.error(f"停止时异步截图管道清理失败: {e}")
-
-        try:
-            from services.screenshot_pool import clear_screenshot_runtime_state
-            clear_screenshot_runtime_state(hwnd=None)
-        except Exception:
-            pass
 
         if not bool(keep_current_engine):
             cleanup_screenshot_runtime()

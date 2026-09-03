@@ -7,6 +7,7 @@ set "ERRMSG="
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 if not defined LCA_NONINTERACTIVE set "LCA_NONINTERACTIVE=0"
+if not defined LCA_INSTALLER_ONLY set "LCA_INSTALLER_ONLY=0"
 
 set "SCRIPT_DIR=%~dp0"
 set "SCRIPT_DIR_NOSLASH=%SCRIPT_DIR:~0,-1%"
@@ -14,7 +15,7 @@ for %%I in ("%SCRIPT_DIR%..\..") do set "PROJECT_ROOT=%%~fI"
 cd /d "%PROJECT_ROOT%"
 
 echo ========================================
-echo   LCA 离线版打包
+echo   LCA 测试版打包
 echo ========================================
 echo.
 
@@ -29,6 +30,21 @@ if errorlevel 1 (
     goto fail
 )
 
+set "BUILD_OUTPUT_DIR=%PROJECT_ROOT%\build_assets\packaging\build_output"
+set "RELEASE_OUTPUT_DIR=%PROJECT_ROOT%\build_assets\packaging\release_output"
+set "DIST=%BUILD_OUTPUT_DIR%\main.dist"
+set "BUILD_DIR=%BUILD_OUTPUT_DIR%\main.build"
+
+set "STEP=ENSURE_AV_EXCLUSIONS"
+echo [0.1/6] Ensure Windows Defender exclusions for packaging...
+venv\Scripts\python.exe build_assets\packaging\ensure_packaging_av_exclusions.py --project-root "%PROJECT_ROOT%"
+if errorlevel 1 (
+    set "ERRMSG=Windows Defender blocked packaging files; add exclusions or rerun as Administrator"
+    goto fail
+)
+
+if "%LCA_INSTALLER_ONLY%"=="1" goto installer_from_existing
+
 set "STEP=VERIFY_THIRD_PARTY_MANIFEST"
 venv\Scripts\python.exe build_assets\packaging\verify_third_party_manifest.py --require-all
 if errorlevel 1 (
@@ -38,16 +54,11 @@ if errorlevel 1 (
 
 set "STEP=CLEAN_PREVIOUS_BUILD_ARTIFACTS"
 echo [0.2/6] Clean previous build traces...
-if exist "%PROJECT_ROOT%\build_assets\packaging\build_output" rd /s /q "%PROJECT_ROOT%\build_assets\packaging\build_output"
-if exist "%PROJECT_ROOT%\build_assets\packaging\release_output" rd /s /q "%PROJECT_ROOT%\build_assets\packaging\release_output"
+if exist "%BUILD_OUTPUT_DIR%" rd /s /q "%BUILD_OUTPUT_DIR%"
+if exist "%RELEASE_OUTPUT_DIR%" rd /s /q "%RELEASE_OUTPUT_DIR%"
 if exist "%PROJECT_ROOT%\build_assets\packaging\map_navigation_worker_build_output" rd /s /q "%PROJECT_ROOT%\build_assets\packaging\map_navigation_worker_build_output"
 if exist "%PROJECT_ROOT%\build_assets\packaging\_tmp_probe_comtypes.py" del /f /q "%PROJECT_ROOT%\build_assets\packaging\_tmp_probe_comtypes.py" >nul 2>&1
 if exist "%PROJECT_ROOT%\nuitka-crash-report.xml" del /f /q "%PROJECT_ROOT%\nuitka-crash-report.xml" >nul 2>&1
-
-set "BUILD_OUTPUT_DIR=%PROJECT_ROOT%\build_assets\packaging\build_output"
-set "RELEASE_OUTPUT_DIR=%PROJECT_ROOT%\build_assets\packaging\release_output"
-set "DIST=%BUILD_OUTPUT_DIR%\main.dist"
-set "BUILD_DIR=%BUILD_OUTPUT_DIR%\main.build"
 
 set "STEP=PREPARE_OUTPUT"
 echo [1/6] Prepare build outputs...
@@ -82,6 +93,15 @@ echo [2.1/6] Inject Windows DPI manifest...
 venv\Scripts\python.exe build_assets\packaging\inject_windows_manifest.py --exe "%DIST%\main.exe" --manifest "%SCRIPT_DIR_NOSLASH%\lca_main.manifest"
 if errorlevel 1 (
     set "ERRMSG=Inject Windows DPI manifest failed"
+    goto fail
+)
+
+REM 离线双身份：清单注入之后再盖编辑器印记（避免被其它资源更新冲掉）
+set "STEP=STAMP_EDITOR_ENTRY"
+echo [2.15/6] Stamp editor entry identity into main.exe...
+venv\Scripts\python.exe -c "from pathlib import Path; from app_core.player.entry_stamp import ENTRY_EDITOR, apply_entry_stamp; p=Path(r'%DIST%\main.exe'); apply_entry_stamp(p, ENTRY_EDITOR); print('entry_stamp=editor path='+str(p))"
+if errorlevel 1 (
+    set "ERRMSG=Stamp editor entry identity failed"
     goto fail
 )
 
@@ -130,15 +150,18 @@ if not exist "%DIST%\Interception\library\x86\interception.dll" (
     set "ERRMSG=Missing Interception x86 DLL"
     goto fail
 )
-if not exist "tools\ibinputsimulator\ib_worker_core.ahk" (
-    set "ERRMSG=Missing source ib_worker_core.ahk"
-    goto fail
-)
-if not exist "%DIST%\tools\ibinputsimulator" mkdir "%DIST%\tools\ibinputsimulator"
-copy /y "tools\ibinputsimulator\ib_worker_core.ahk" "%DIST%\tools\ibinputsimulator\ib_worker_core.ahk" >nul 2>&1
-if not exist "%DIST%\tools\ibinputsimulator\ib_worker_core.ahk" (
-    set "ERRMSG=Missing ib_worker_core.ahk"
-    goto fail
+REM 以下四个文件由 run_nuitka_main_build.py 的 DATA_FILE_SPECS 打进 dist，
+REM 这里只校验产物，不再第二次拷贝，避免两份清单各改各的。
+for %%f in (
+    "tools\ibinputsimulator\ib_worker_core.ahk"
+    "tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.ahk"
+    "tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.dll"
+    "AutoHotkey\AutoHotkey64.exe"
+) do (
+    if not exist "%DIST%\%%~f" (
+        set "ERRMSG=Nuitka data file missing from dist: %%~f (check DATA_FILE_SPECS)"
+        goto fail
+    )
 )
 findstr /l /c:"UIntP" "%DIST%\tools\ibinputsimulator\ib_worker_core.ahk" >nul
 if errorlevel 1 (
@@ -148,37 +171,6 @@ if errorlevel 1 (
 findstr /l /c:"UInt*" "%DIST%\tools\ibinputsimulator\ib_worker_core.ahk" >nul
 if not errorlevel 1 (
     set "ERRMSG=ib_worker_core.ahk version check failed (legacy UInt* found)"
-    goto fail
-)
-
-if not exist "tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.ahk" (
-    set "ERRMSG=Missing source IbInputSimulator.ahk"
-    goto fail
-)
-if not exist "%DIST%\tools\ibinputsimulator\Binding.AHK2" mkdir "%DIST%\tools\ibinputsimulator\Binding.AHK2"
-copy /y "tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.ahk" "%DIST%\tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.ahk" >nul 2>&1
-if not exist "%DIST%\tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.ahk" (
-    set "ERRMSG=Missing IbInputSimulator.ahk"
-    goto fail
-)
-if not exist "tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.dll" (
-    set "ERRMSG=Missing source IbInputSimulator.dll"
-    goto fail
-)
-if not exist "%DIST%\tools\ibinputsimulator\Binding.AHK2" mkdir "%DIST%\tools\ibinputsimulator\Binding.AHK2"
-copy /y "tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.dll" "%DIST%\tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.dll" >nul 2>&1
-if not exist "%DIST%\tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.dll" (
-    set "ERRMSG=Missing IbInputSimulator.dll"
-    goto fail
-)
-if not exist "AutoHotkey\AutoHotkey64.exe" (
-    set "ERRMSG=Missing source AutoHotkey64.exe"
-    goto fail
-)
-if not exist "%DIST%\AutoHotkey" mkdir "%DIST%\AutoHotkey"
-copy /y "AutoHotkey\AutoHotkey64.exe" "%DIST%\AutoHotkey\AutoHotkey64.exe" >nul 2>&1
-if not exist "%DIST%\AutoHotkey\AutoHotkey64.exe" (
-    set "ERRMSG=Missing AutoHotkey64.exe"
     goto fail
 )
 set "STEP=COPY_VC_RUNTIME"
@@ -257,6 +249,26 @@ if defined SIZE (
 )
 
 set "STEP=CHECK_INNO_SETUP"
+goto build_installers
+
+:installer_from_existing
+echo.
+echo ========================================
+echo   Installer-only mode
+echo ========================================
+echo.
+if not exist "%DIST%\main.exe" (
+    set "ERRMSG=Installer-only mode requires existing %DIST%\main.exe"
+    goto fail
+)
+set "STEP=STAGE_PACKAGED_RUNTIME_ASSETS"
+venv\Scripts\python.exe build_assets\packaging\stage_packaged_runtime_assets.py --project-root "%PROJECT_ROOT%" --dist "%DIST%"
+if errorlevel 1 (
+    set "ERRMSG=Stage packaged runtime assets failed"
+    goto fail
+)
+
+:build_installers
 echo.
 echo ========================================
 echo   Build installers
@@ -278,6 +290,13 @@ if "%ISCC%"=="" (
     exit /b 0
 )
 
+set "STEP=VERIFY_STAGED_PLUGIN_RUNTIME"
+venv\Scripts\python.exe build_assets\packaging\ensure_packaging_av_exclusions.py --project-root "%PROJECT_ROOT%" --verify-dist "%DIST%" --skip-add
+if errorlevel 1 (
+    set "ERRMSG=Staged plugin runtime missing or quarantined before Inno Setup"
+    goto fail
+)
+
 set "STEP=BUILD_MAIN_INSTALLER"
 echo Build main installer...
 if "%LCA_NONINTERACTIVE%"=="1" (
@@ -293,7 +312,7 @@ if errorlevel 1 (
 echo.
 echo ========================================
 echo   Build complete
-echo   Installer: build_assets\packaging\release_output\LCA_离线版_Setup.exe
+echo   Installer: build_assets\packaging\release_output\LCA_测试版_Setup.exe
 echo ========================================
 echo.
 if not "%LCA_NONINTERACTIVE%"=="1" pause

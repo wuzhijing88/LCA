@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+TASK_TYPE = '延迟'
 TASK_NAME = '延迟'
 
 

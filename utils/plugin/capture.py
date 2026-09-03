@@ -39,7 +39,14 @@ def capture_window_plugin(
     display: str,
     client_area_only: bool = True,
     timeout: float = 4.0,
+    fallback: bool = False,
+    bind_extras=None,
+    bind_params=None,
 ) -> Optional[np.ndarray]:
+    """按配置的 display 绑定并取帧。默认不静默降级：绑不上就返回 None 并给出可读原因。
+
+    bind_extras=(public, fake_active) 可覆盖运行时配置里的可选绑定参数（设置页边改边试绑用）。
+    """
     target = int(hwnd or 0)
     mode = str(display or "").strip().lower()
     if target <= 0 or not is_plugin_screenshot_engine(mode):
@@ -56,23 +63,22 @@ def capture_window_plugin(
             input_hwnd = int(resolve_plugin_input_hwnd_for_display(target) or target)
         except Exception:
             input_hwnd = target
-        frame = get_shared_plugin_client(target).capture_bgr(
+        session = get_shared_plugin_client(target)
+        frame = session.capture_bgr(
             target,
             mode,
             input_hwnd=input_hwnd,
             timeout=timeout,
             client_area_only=client_area_only,
+            fallback=fallback,
+            bind_extras=bind_extras,
+            bind_params=bind_params,
         )
         if frame is None:
-            try:
-                last_error = int(get_shared_plugin_client(target).last_error() or 0)
-            except Exception:
-                last_error = 0
-            err_part = f", last_error={last_error}" if last_error else ""
+            reason = session.last_bind_failure_text() if session.last_bind_outcome is not None else "绑定成功但取帧为空"
             _set_failure(
-                f"BindWindow/取帧失败: hwnd={target}, display={mode}{err_part}；"
-                "挂钩模式需目标确为对应渲染；可改用插件里的 WGC / DXGI / GDI2，"
-                "或原生 WGC / PrintWindow"
+                f"插件截图失败 hwnd={target}：{reason}；"
+                "挂钩类 display（dx/opengl）要求目标确实用对应方式渲染，否则请改用 normal / gdi2 或原生 WGC / PrintWindow"
             )
             return None
         _set_failure("")

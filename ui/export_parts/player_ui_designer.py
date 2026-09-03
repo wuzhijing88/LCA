@@ -578,9 +578,12 @@ class DesignerItem(QWidget):
                 size = _panel_font_size(self.data)
                 self.setStyleSheet(designer_panel_item_qss("", "", panel_fg, size))
             elif kind == "script_list":
+                # 与运行窗一致：标题行右侧「全选」+ 条目 + 整组循环
                 title = str(self.data.get("title") or "脚本")
                 items = self.data.get("items") or []
                 names = []
+                checked_n = 0
+                total_n = 0
                 for entry in items:
                     if not isinstance(entry, dict):
                         continue
@@ -591,14 +594,21 @@ class DesignerItem(QWidget):
                         loops = max(1, int(entry.get("loops") or 1))
                     except (TypeError, ValueError):
                         loops = 1
-                    mark = "☑" if entry.get("checked", True) else "☐"
+                    is_on = bool(entry.get("checked", True))
+                    total_n += 1
+                    if is_on:
+                        checked_n += 1
+                    mark = "☑" if is_on else "☐"
                     names.append(f"{mark} {name}  ×{loops}")
                 try:
                     group = max(1, int(self.data.get("group_loops") or 1))
                 except (TypeError, ValueError):
                     group = 1
-                text = title + ("\n" + "\n".join(names[:5]) if names else "")
-                text += f"\n整组 ×{group}"
+                select_mark = "☑" if checked_n > 0 else "☐"
+                text = f"{title}  全选 {select_mark}"
+                if names:
+                    text += "\n" + "\n".join(names[:5])
+                text += f"\n整组循环 ×{group}"
                 panel_fg = _panel_text_color(self.data)
                 size = _panel_font_size(self.data)
                 self.setStyleSheet(designer_panel_item_qss("", "", panel_fg, size))
@@ -626,12 +636,15 @@ class DesignerItem(QWidget):
                 size = _panel_font_size(self.data)
                 self.setStyleSheet(designer_panel_item_qss("", "", panel_fg, size))
             elif kind == "rich_text":
+                from ui.player.player_chrome import PLAYER_PANEL_RADIUS
+
                 text = str(self.data.get("text") or "说明文字")
                 color = str(self.data.get("color") or text_c)
                 size = int(self.data.get("font_size") or 12)
                 self.setStyleSheet(
                     f"#DesignerItem {{ background:transparent; color:{color};"
-                    f" font-size:{size}px; border:none; }}"
+                    f" font-size:{size}px; border:1px solid {border};"
+                    f" border-radius:{PLAYER_PANEL_RADIUS}px; }}"
                 )
             elif kind == "status":
                 text = "状态：就绪"
@@ -762,14 +775,123 @@ class DesignerItem(QWidget):
                 int(Qt.AlignmentFlag.AlignCenter),
                 self._caption or "待命",
             )
-        elif kind in ("script_list", "schedule", "rich_text"):
-            if kind in ("script_list", "schedule"):
-                from ui.player.player_chrome import PLAYER_PANEL_RADIUS
+        elif kind == "script_list":
+            # 画布预览：标题左对齐，「全选 ☐/☑」画在标题行右侧，贴近运行窗布局
+            from ui.player.player_chrome import PLAYER_PANEL_RADIUS
 
-                path = _rounded_rect_path(self.rect(), PLAYER_PANEL_RADIUS)
-                painter.setPen(QPen(_theme_qcolor("border")))
+            path = _rounded_rect_path(self.rect(), PLAYER_PANEL_RADIUS)
+            painter.setPen(QPen(_theme_qcolor("border")))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+            size = _panel_font_size(self.data)
+            fg = QColor(_panel_text_color(self.data))
+            border = _theme_qcolor("border")
+            accent = _theme_qcolor("accent")
+            font = painter.font()
+            font.setPixelSize(max(8, size))
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            content = self.rect().adjusted(8, 6, -8, -6)
+            title = str(self.data.get("title") or "脚本")
+            items = self.data.get("items") or []
+            checked_n = 0
+            total_n = 0
+            row_lines: List[str] = []
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("title") or "")
+                if not name:
+                    continue
+                try:
+                    loops = max(1, int(entry.get("loops") or 1))
+                except (TypeError, ValueError):
+                    loops = 1
+                is_on = bool(entry.get("checked", True))
+                total_n += 1
+                if is_on:
+                    checked_n += 1
+                mark = "☑" if is_on else "☐"
+                row_lines.append(f"{mark} {name}  ×{loops}")
+            try:
+                group = max(1, int(self.data.get("group_loops") or 1))
+            except (TypeError, ValueError):
+                group = 1
+            line_h = max(16, metrics.height() + 2)
+            y = float(content.y())
+            painter.setPen(fg)
+            painter.drawText(
+                QRectF(content.x(), y, max(8.0, content.width() - 72.0), float(line_h)),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                title,
+            )
+            # 右侧：全选 + 指示器（透明底，勾选时用主题色填充）
+            box = 14.0
+            label = "全选"
+            gap = 4.0
+            block_w = float(metrics.horizontalAdvance(label)) + gap + box
+            bx = float(content.x() + content.width() - block_w)
+            painter.drawText(
+                QRectF(bx, y, float(metrics.horizontalAdvance(label)), float(line_h)),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                label,
+            )
+            ind = QRectF(
+                bx + float(metrics.horizontalAdvance(label)) + gap,
+                y + (float(line_h) - box) / 2.0,
+                box,
+                box,
+            )
+            if checked_n > 0:
+                painter.setPen(QPen(accent))
+                painter.setBrush(accent)
+                painter.drawRoundedRect(ind, 3.0, 3.0)
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(ind, int(Qt.AlignmentFlag.AlignCenter), "✓")
+            else:
+                painter.setPen(QPen(border))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawPath(path)
+                painter.drawRoundedRect(ind, 3.0, 3.0)
+            y += float(line_h) + 2.0
+            painter.setPen(fg)
+            for line in row_lines[:8]:
+                if y + line_h > content.y() + content.height() - line_h - 4:
+                    break
+                painter.drawText(
+                    QRectF(content.x(), y, float(content.width()), float(line_h)),
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    line,
+                )
+                y += float(line_h)
+            # 底部分隔 + 整组循环
+            sep_y = float(content.y() + content.height() - line_h - 6)
+            if sep_y > y:
+                painter.setPen(QPen(border))
+                painter.drawLine(
+                    int(content.x()),
+                    int(sep_y),
+                    int(content.x() + content.width()),
+                    int(sep_y),
+                )
+                painter.setPen(fg)
+                painter.drawText(
+                    QRectF(
+                        content.x(),
+                        sep_y + 4.0,
+                        float(content.width()),
+                        float(line_h),
+                    ),
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    f"整组循环 ×{group}",
+                )
+        elif kind in ("schedule", "rich_text"):
+            from ui.player.player_chrome import PLAYER_PANEL_RADIUS
+
+            path = _rounded_rect_path(self.rect(), PLAYER_PANEL_RADIUS)
+            painter.setPen(QPen(_theme_qcolor("border")))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+            if kind == "schedule":
                 size = _panel_font_size(self.data)
                 fg = _panel_text_color(self.data)
             else:
@@ -1434,12 +1556,21 @@ class PlayerUiDesignerDialog(QDialog):
         self._max_undo = 40
 
         seed = ensure_designer_ui(ui, app_name=self._app_name)
-        # 打开时互斥同步：新工作流进第一个列表，剔除项从所有列表移除
+        # 打开时互斥同步：剔除失效项；仅当尚无任何已分配项时，才把目录填进第一个列表
+        # （已有分配时不回填可分配池，保留用户「移出列表」的结果）
         if callable(self._script_catalog):
             try:
-                from ui.export_parts.export_scripts import apply_catalog_to_ui_exclusive
+                from ui.export_parts.export_scripts import (
+                    apply_catalog_to_ui_exclusive,
+                    assigned_script_ids,
+                )
 
-                seed = apply_catalog_to_ui_exclusive(seed, list(self._script_catalog() or []))
+                catalog = list(self._script_catalog() or [])
+                seed = apply_catalog_to_ui_exclusive(
+                    seed,
+                    catalog,
+                    append_missing=not bool(assigned_script_ids(seed)),
+                )
             except Exception:
                 pass
         # 把已有相对路径映射回本地预览
@@ -1549,7 +1680,16 @@ class PlayerUiDesignerDialog(QDialog):
             lab.setObjectName("SideTitle")
             return lab
 
-        right_layout.addWidget(_side_title("窗口"))
+        # 画布当前编辑页（点标签条切换）；不再在侧栏单独放「编辑页」下拉
+        self._edit_page_id = ""
+        self._force_bg_panel = False
+
+        self._window_group = QWidget()
+        self._window_group.setObjectName("DesignerWindowGroup")
+        window_layout = QVBoxLayout(self._window_group)
+        window_layout.setContentsMargins(0, 0, 0, 0)
+        window_layout.setSpacing(8)
+        window_layout.addWidget(_side_title("窗口"))
         size_row = QHBoxLayout()
         size_row.setSpacing(6)
         self._width_spin = QSpinBox()
@@ -1564,32 +1704,11 @@ class PlayerUiDesignerDialog(QDialog):
         self._height_spin.valueChanged.connect(self._on_window_size)
         size_row.addWidget(self._width_spin, 1)
         size_row.addWidget(self._height_spin, 1)
-        right_layout.addLayout(size_row)
-
-        edit_page_row = QHBoxLayout()
-        edit_page_row.setSpacing(6)
-        edit_page_lab = QLabel("编辑页")
-        edit_page_lab.setObjectName("PropFieldLabel")
-        self._edit_page = CustomDropdown(self)
-        self._edit_page.setToolTip(
-            "进入某一页进行编辑：画布只显示该页控件；新添加的控件会自动放进当前页。"
-            "也可直接点击画布上的标签切换。"
-        )
-        self._edit_page.currentIndexChanged.connect(self._on_edit_page_changed)
-        edit_page_row.addWidget(edit_page_lab)
-        edit_page_row.addWidget(self._edit_page, 1)
-        right_layout.addLayout(edit_page_row)
-        self._edit_page_hint = QLabel(
-            "只有标签页框内的控件随切换显隐；框外始终显示。框内用「所属页」决定在哪一页。"
-        )
-        self._edit_page_hint.setObjectName("PropFieldHint")
-        self._edit_page_hint.setWordWrap(True)
-        self._edit_page_hint.setStyleSheet("color: palette(mid); font-size: 11px;")
-        right_layout.addWidget(self._edit_page_hint)
+        window_layout.addLayout(size_row)
 
         self._title_edit = QLineEdit(str(seed.get("title") or self._app_name))
         self._title_edit.setPlaceholderText("窗口标题")
-        right_layout.addWidget(self._title_edit)
+        window_layout.addWidget(self._title_edit)
 
         self._layout_combo = CustomDropdown(self)
         self._theme_combo = CustomDropdown(self)
@@ -1603,14 +1722,24 @@ class PlayerUiDesignerDialog(QDialog):
         self._theme_combo.setToolTip("独立程序启动时的界面主题。设计器画布仍跟随编辑器主题。")
         self._layout_combo.currentIndexChanged.connect(self._on_shell_choice_changed)
         self._theme_combo.currentIndexChanged.connect(self._on_shell_choice_changed)
-        right_layout.addWidget(self._layout_combo)
-        right_layout.addWidget(self._theme_combo)
+        window_layout.addWidget(self._layout_combo)
+        window_layout.addWidget(self._theme_combo)
+        self._bg_entry_btn = QPushButton("编辑背景")
+        self._bg_entry_btn.setToolTip("设置窗口背景纯色或图片")
+        self._bg_entry_btn.clicked.connect(self._enter_bg_edit)
+        window_layout.addWidget(self._bg_entry_btn)
+        right_layout.addWidget(self._window_group)
 
-        right_layout.addWidget(_side_title("背景"))
+        self._bg_group = QWidget()
+        self._bg_group.setObjectName("DesignerBgGroup")
+        bg_layout = QVBoxLayout(self._bg_group)
+        bg_layout.setContentsMargins(0, 0, 0, 0)
+        bg_layout.setSpacing(8)
+        bg_layout.addWidget(_side_title("背景"))
         self._bg_mode = CustomDropdown(self)
         self._bg_mode.addItem("纯色", "color")
         self._bg_mode.addItem("图片", "image")
-        right_layout.addWidget(self._bg_mode)
+        bg_layout.addWidget(self._bg_mode)
         color_row = QHBoxLayout()
         color_row.setSpacing(6)
         self._bg_color = QLineEdit(str(seed["background"].get("color") or _tc("canvas")))
@@ -1618,7 +1747,7 @@ class PlayerUiDesignerDialog(QDialog):
         color_btn.clicked.connect(self._pick_bg_color)
         color_row.addWidget(self._bg_color, 1)
         color_row.addWidget(color_btn)
-        right_layout.addLayout(color_row)
+        bg_layout.addLayout(color_row)
         img_row = QHBoxLayout()
         img_row.setSpacing(6)
         self._bg_image = QLineEdit(str(seed["background"].get("image") or ""))
@@ -1632,24 +1761,36 @@ class PlayerUiDesignerDialog(QDialog):
         img_row.addWidget(self._bg_image, 1)
         img_row.addWidget(img_btn)
         img_row.addWidget(self._bg_clear_btn)
-        right_layout.addLayout(img_row)
+        bg_layout.addLayout(img_row)
         self._bg_fill_btn = QPushButton("铺满窗口")
         self._bg_fill_btn.setToolTip("把背景图重新铺满整个窗口")
         self._bg_fill_btn.clicked.connect(self._fill_bg_image)
-        right_layout.addWidget(self._bg_fill_btn)
-        self._bg_hint = QLabel("选中背景图后可拖动、缩放；Delete 或「清除」可去掉背景图")
+        bg_layout.addWidget(self._bg_fill_btn)
+        self._bg_hint = QLabel("可拖动、缩放背景图；Delete 或「清除」可去掉")
         self._bg_hint.setObjectName("PropFieldLabel")
         self._bg_hint.setWordWrap(True)
-        right_layout.addWidget(self._bg_hint)
+        bg_layout.addWidget(self._bg_hint)
+        self._bg_back_btn = QPushButton("返回窗口设置")
+        self._bg_back_btn.clicked.connect(self._leave_bg_edit)
+        bg_layout.addWidget(self._bg_back_btn)
         self._bg_mode.currentIndexChanged.connect(self._on_bg_mode_changed)
         self._bg_color.editingFinished.connect(self._on_bg_color_edited)
         mode = str(seed["background"].get("mode") or "color")
         self._bg_mode.setCurrentIndex(0 if mode != "image" else 1)
+        self._bg_group.hide()
+        right_layout.addWidget(self._bg_group)
 
-        right_layout.addWidget(_side_title("选中控件"))
+        # 未选中控件时整块隐藏，避免一排灰色无用项
+        self._prop_group = QWidget()
+        self._prop_group.setObjectName("DesignerPropGroup")
+        prop_layout = QVBoxLayout(self._prop_group)
+        prop_layout.setContentsMargins(0, 0, 0, 0)
+        prop_layout.setSpacing(8)
+
+        prop_layout.addWidget(_side_title("选中控件"))
         self._prop_type = QLabel("未选中")
         self._prop_type.setObjectName("PropTypeLabel")
-        right_layout.addWidget(self._prop_type)
+        prop_layout.addWidget(self._prop_type)
         self._prop_text = QLineEdit()
         self._prop_text.setPlaceholderText("文字")
         self._prop_text_multi = QTextEdit()
@@ -1658,9 +1799,9 @@ class PlayerUiDesignerDialog(QDialog):
         self._prop_text_multi.hide()
         self._prop_url = QLineEdit()
         self._prop_url.setPlaceholderText("链接 URL")
-        right_layout.addWidget(self._prop_text)
-        right_layout.addWidget(self._prop_text_multi)
-        right_layout.addWidget(self._prop_url)
+        prop_layout.addWidget(self._prop_text)
+        prop_layout.addWidget(self._prop_text_multi)
+        prop_layout.addWidget(self._prop_url)
 
         page_row = QHBoxLayout()
         page_row.setSpacing(6)
@@ -1673,7 +1814,7 @@ class PlayerUiDesignerDialog(QDialog):
         self._prop_page.currentIndexChanged.connect(self._on_prop_page_changed)
         page_row.addWidget(page_lab)
         page_row.addWidget(self._prop_page, 1)
-        right_layout.addLayout(page_row)
+        prop_layout.addLayout(page_row)
 
         align_row = QHBoxLayout()
         align_row.setSpacing(6)
@@ -1685,7 +1826,7 @@ class PlayerUiDesignerDialog(QDialog):
         self._prop_align.currentIndexChanged.connect(self._apply_props_to_item)
         align_row.addWidget(align_lab)
         align_row.addWidget(self._prop_align, 1)
-        right_layout.addLayout(align_row)
+        prop_layout.addLayout(align_row)
 
         font_row = QHBoxLayout()
         font_row.setSpacing(6)
@@ -1697,7 +1838,7 @@ class PlayerUiDesignerDialog(QDialog):
         self._prop_font.setToolTip("从列表选择字号")
         font_row.addWidget(font_lab)
         font_row.addWidget(self._prop_font, 1)
-        right_layout.addLayout(font_row)
+        prop_layout.addLayout(font_row)
 
         self._tabs_editor = QFrame()
         self._tabs_editor.setObjectName("TabsEditor")
@@ -1707,7 +1848,7 @@ class PlayerUiDesignerDialog(QDialog):
         tabs_layout.addWidget(QLabel("标签页（可多个）"))
         self._tabs_list = QListWidget()
         self._tabs_list.setFixedHeight(140)
-        self._tabs_list.setToolTip("选中一项后可在下方改名称；点「添加页」可自定义多个页面")
+        self._tabs_list.setToolTip("选中一项后可改名称，或用上移/下移调整顺序；点「添加页」可自定义多个页面")
         self._tabs_list.currentItemChanged.connect(self._on_tabs_list_current)
         self._tabs_list.itemDoubleClicked.connect(self._on_tabs_list_double_clicked)
         tabs_layout.addWidget(self._tabs_list)
@@ -1720,17 +1861,26 @@ class PlayerUiDesignerDialog(QDialog):
         self._tabs_title.editingFinished.connect(self._apply_tabs_editor)
         tabs_layout.addWidget(self._tabs_title)
         tabs_btns = QHBoxLayout()
+        tabs_btns.setSpacing(6)
+        tabs_up = QPushButton("上移")
+        tabs_down = QPushButton("下移")
         tabs_add = QPushButton("添加页")
         tabs_del = QPushButton("删除页")
+        tabs_up.setToolTip("将选中标签页上移（画布标签条同步）")
+        tabs_down.setToolTip("将选中标签页下移（画布标签条同步）")
         tabs_add.setToolTip("新增一个自定义标签页")
         tabs_del.setToolTip("删除当前选中的标签页（至少保留一页）")
+        tabs_up.clicked.connect(lambda: self._move_tab_page(-1))
+        tabs_down.clicked.connect(lambda: self._move_tab_page(1))
         tabs_add.clicked.connect(self._add_tab_page)
         tabs_del.clicked.connect(self._remove_tab_page)
-        tabs_btns.addWidget(tabs_add)
-        tabs_btns.addWidget(tabs_del)
+        tabs_btns.addWidget(tabs_up, 1)
+        tabs_btns.addWidget(tabs_down, 1)
+        tabs_btns.addWidget(tabs_add, 1)
+        tabs_btns.addWidget(tabs_del, 1)
         tabs_layout.addLayout(tabs_btns)
         self._tabs_editor.hide()
-        right_layout.addWidget(self._tabs_editor)
+        prop_layout.addWidget(self._tabs_editor)
 
         self._script_editor = QFrame()
         self._script_editor.setObjectName("ScriptEditor")
@@ -1790,7 +1940,7 @@ class PlayerUiDesignerDialog(QDialog):
         pool_add.clicked.connect(self._assign_pool_to_current_list)
         script_layout.addWidget(pool_add)
         self._script_editor.hide()
-        right_layout.addWidget(self._script_editor)
+        prop_layout.addWidget(self._script_editor)
 
         color_row2 = QHBoxLayout()
         color_row2.setSpacing(6)
@@ -1810,33 +1960,8 @@ class PlayerUiDesignerDialog(QDialog):
         color_row2.addWidget(self._prop_color_swatch)
         color_row2.addWidget(self._prop_color, 1)
         color_row2.addWidget(self._prop_color_btn)
-        right_layout.addLayout(color_row2)
+        prop_layout.addLayout(color_row2)
         self._refresh_prop_color_swatch()
-
-        # 脚本列表 / 日志：底色用上面「底色」，这里单独设文字色
-        self._prop_fg_wrap = QWidget()
-        fg_row = QHBoxLayout(self._prop_fg_wrap)
-        fg_row.setContentsMargins(0, 0, 0, 0)
-        fg_row.setSpacing(6)
-        self._prop_fg_lab = QLabel("文字")
-        self._prop_fg_lab.setObjectName("PropFieldLabel")
-        self._prop_fg_swatch = QFrame()
-        self._prop_fg_swatch.setObjectName("PropFgColorSwatch")
-        self._prop_fg_swatch.setFixedSize(28, 28)
-        self._prop_fg_swatch.setToolTip("框内文字颜色")
-        self._prop_fg = QLineEdit(_tc("text"))
-        self._prop_fg.setPlaceholderText("文字颜色")
-        self._prop_fg.setToolTip("标题与列表/日志正文的文字颜色，#RRGGBB")
-        self._prop_fg_btn = QPushButton("取色")
-        self._prop_fg_btn.setToolTip("选择文字颜色")
-        self._prop_fg_btn.clicked.connect(self._pick_prop_fg_color)
-        fg_row.addWidget(self._prop_fg_lab)
-        fg_row.addWidget(self._prop_fg_swatch)
-        fg_row.addWidget(self._prop_fg, 1)
-        fg_row.addWidget(self._prop_fg_btn)
-        self._prop_fg_wrap.hide()
-        right_layout.addWidget(self._prop_fg_wrap)
-        self._refresh_prop_fg_swatch()
 
         geo_row1 = QHBoxLayout()
         geo_row2 = QHBoxLayout()
@@ -1856,11 +1981,11 @@ class PlayerUiDesignerDialog(QDialog):
         geo_row1.addWidget(self._prop_y, 1)
         geo_row2.addWidget(self._prop_w, 1)
         geo_row2.addWidget(self._prop_h, 1)
-        right_layout.addLayout(geo_row1)
-        right_layout.addLayout(geo_row2)
+        prop_layout.addLayout(geo_row1)
+        prop_layout.addLayout(geo_row2)
         self._prop_visible = QCheckBox("显示")
         self._prop_visible.setChecked(True)
-        right_layout.addWidget(self._prop_visible)
+        prop_layout.addWidget(self._prop_visible)
 
         self._prop_text.editingFinished.connect(self._apply_props_to_item)
         self._prop_text_multi.textChanged.connect(self._on_prop_text_multi_changed)
@@ -1870,18 +1995,25 @@ class PlayerUiDesignerDialog(QDialog):
         self._prop_font.currentIndexChanged.connect(self._on_prop_font_changed)
         self._prop_color.editingFinished.connect(self._on_prop_color_edited)
         self._prop_color.textChanged.connect(self._refresh_prop_color_swatch)
-        self._prop_fg.editingFinished.connect(self._on_prop_fg_edited)
-        self._prop_fg.textChanged.connect(self._refresh_prop_fg_swatch)
         for spin in (self._prop_x, self._prop_y, self._prop_w, self._prop_h):
             spin.valueChanged.connect(self._apply_geo_to_item)
 
-        right_layout.addWidget(_side_title("运行"))
+        self._prop_group.hide()
+        right_layout.addWidget(self._prop_group)
+
+        self._run_group = QWidget()
+        self._run_group.setObjectName("DesignerRunGroup")
+        run_layout = QVBoxLayout(self._run_group)
+        run_layout.setContentsMargins(0, 0, 0, 0)
+        run_layout.setSpacing(8)
+        run_layout.addWidget(_side_title("运行"))
         self._auto_start = QCheckBox("打开后自动执行")
         self._auto_start.setChecked(bool(seed.get("auto_start")))
         self._exit_on_finish = QCheckBox("结束后退出")
         self._exit_on_finish.setChecked(bool(seed.get("exit_on_finish")))
-        right_layout.addWidget(self._auto_start)
-        right_layout.addWidget(self._exit_on_finish)
+        run_layout.addWidget(self._auto_start)
+        run_layout.addWidget(self._exit_on_finish)
+        right_layout.addWidget(self._run_group)
         right_layout.addStretch(1)
 
         side_scroll = QScrollArea()
@@ -2182,13 +2314,11 @@ class PlayerUiDesignerDialog(QDialog):
                     )
                 elif kind in ("script_list", "progress", "schedule", "log", "tabs"):
                     self._prop_color.setText(str(data.get("color") or tokens["text"]))
-                    self._prop_fg.setText(str(data.get("color") or tokens["text"]))
                 elif kind == "link":
                     self._prop_color.setText(str(data.get("color") or tokens["accent"]))
                 elif kind in ("label", "status"):
                     self._prop_color.setText(str(data.get("color") or tokens["text"]))
             self._refresh_prop_color_swatch()
-            self._refresh_prop_fg_swatch()
             self._theme_tokens = tokens
         finally:
             self._syncing_props = was_syncing
@@ -2461,28 +2591,11 @@ class PlayerUiDesignerDialog(QDialog):
         self._refresh_prop_color_swatch()
         self._apply_props_to_item()
 
-    def _pick_prop_fg_color(self):
-        current = QColor(self._prop_fg.text().strip() or _tc("text"))
-        color = QColorDialog.getColor(current, self, "文字颜色")
-        if not color.isValid():
-            return
-        self._checkpoint()
-        self._prop_fg.setText(color.name())
-        self._refresh_prop_fg_swatch()
-        self._apply_props_to_item()
-
     def _on_prop_color_edited(self):
         if getattr(self, "_syncing_props", True):
             return
         self._checkpoint()
         self._refresh_prop_color_swatch()
-        self._apply_props_to_item()
-
-    def _on_prop_fg_edited(self):
-        if getattr(self, "_syncing_props", True):
-            return
-        self._checkpoint()
-        self._refresh_prop_fg_swatch()
         self._apply_props_to_item()
 
     def _refresh_prop_color_swatch(self, *_args):
@@ -2495,19 +2608,6 @@ class PlayerUiDesignerDialog(QDialog):
         border = _tc("border")
         self._prop_color_swatch.setStyleSheet(
             f"QFrame#PropColorSwatch {{ background:{color.name()}; border:1px solid {border};"
-            f" border-radius:4px; }}"
-        )
-
-    def _refresh_prop_fg_swatch(self, *_args):
-        if not hasattr(self, "_prop_fg_swatch"):
-            return
-        raw = self._prop_fg.text().strip() if hasattr(self, "_prop_fg") else ""
-        color = QColor(raw) if raw else QColor(_tc("text"))
-        if not color.isValid():
-            color = QColor(_tc("text"))
-        border = _tc("border")
-        self._prop_fg_swatch.setStyleSheet(
-            f"QFrame#PropFgColorSwatch {{ background:{color.name()}; border:1px solid {border};"
             f" border-radius:4px; }}"
         )
 
@@ -2688,8 +2788,12 @@ class PlayerUiDesignerDialog(QDialog):
         )
 
     def _current_edit_page_id(self) -> str:
-        data = self._edit_page.currentData()
-        return str(data or "")
+        return str(getattr(self, "_edit_page_id", "") or "")
+
+    def _set_edit_page_id(self, page_id: str) -> None:
+        target = str(page_id or "")
+        self._edit_page_id = target
+        self.canvas.set_edit_page(target)
 
     def _default_page_for_new_item(self) -> str:
         """新控件默认归属当前编辑页；无标签页时为空（全局）。"""
@@ -2721,81 +2825,43 @@ class PlayerUiDesignerDialog(QDialog):
             prop_current = str(self._prop_page.currentData() or "")
         self._syncing_props = True
         try:
-            self._edit_page.blockSignals(True)
             self._prop_page.blockSignals(True)
-            self._edit_page.clear()
             self._prop_page.clear()
-            self._edit_page.addItem("全部页（始终显示）", "")
             self._prop_page.addItem("全部页（始终显示）", "")
             for page in pages:
                 page_id = str(page.get("id") or "")
                 title = str(page.get("title") or page_id)
-                self._edit_page.addItem(title, page_id)
                 self._prop_page.addItem(title, page_id)
             if pages:
                 valid_ids = {str(p.get("id") or "") for p in pages}
                 first_id = str(pages[0].get("id") or "")
                 if preserve and (edit_current == "" or edit_current in valid_ids):
-                    # 保留「全部页」预览或当前页
                     target = edit_current
                 elif edit_current in valid_ids:
                     target = edit_current
                 else:
                     # 打开设计器时默认进入第一页，否则停在「全部页」会看起来像切页无效
                     target = first_id
-                idx = self._edit_page.findData(target)
-                self._edit_page.setCurrentIndex(max(0, idx))
-                self.canvas.set_edit_page(str(self._edit_page.currentData() or ""))
+                self._set_edit_page_id(target)
             else:
-                self._edit_page.setCurrentIndex(0)
-                self.canvas.set_edit_page("")
+                self._set_edit_page_id("")
             prop_idx = self._prop_page.findData(prop_current)
             self._prop_page.setCurrentIndex(max(0, prop_idx))
-            self._refresh_edit_page_hint()
         finally:
-            self._edit_page.blockSignals(False)
             self._prop_page.blockSignals(False)
             self._syncing_props = False
 
-    def _refresh_edit_page_hint(self):
-        pages = self.canvas.tab_pages()
-        if not pages:
-            self._edit_page_hint.setText(
-                "未添加标签页时控件全局显示。添加「标签页」后：框内控件按所属页切换，框外始终显示。"
-            )
-            return
-        page_id = self._current_edit_page_id()
-        if not page_id:
-            self._edit_page_hint.setText(
-                "当前：全部页预览。框内控件按所属页切换；框外控件始终显示。"
-            )
-            return
-        title = page_id
-        for page in pages:
-            if str(page.get("id") or "") == page_id:
-                title = str(page.get("title") or page_id)
-                break
-        self._edit_page_hint.setText(
-            f"正在编辑「{title}」：框内只显示此页（或全部页）的控件；框外不受影响。"
-        )
-
-    def _on_edit_page_changed(self, *_args):
-        if self._syncing_props:
-            return
-        self.canvas.set_edit_page(self._current_edit_page_id())
-        self._refresh_edit_page_hint()
-
     def _on_canvas_page_activated(self, page_id: str):
-        """画布标签条点击 → 同步侧栏「编辑页」与标签页列表选中项。"""
+        """画布标签条点击 → 同步编辑页与标签页列表选中项。"""
         if self._syncing_props:
             return
         target = str(page_id or "")
-        idx = self._edit_page.findData(target)
-        if idx < 0:
+        pages = self.canvas.tab_pages()
+        valid_ids = {str(p.get("id") or "") for p in pages}
+        if target and target not in valid_ids:
             return
         self._syncing_props = True
         try:
-            self._edit_page.setCurrentIndex(idx)
             # 侧栏页列表必须跟着标签条走，否则再次点选标签页控件时会跳回旧页
             self._tabs_list.blockSignals(True)
             try:
@@ -2810,8 +2876,7 @@ class PlayerUiDesignerDialog(QDialog):
                 self._tabs_list.blockSignals(False)
         finally:
             self._syncing_props = False
-        self.canvas.set_edit_page(target)
-        self._refresh_edit_page_hint()
+        self._set_edit_page_id(target)
 
     def _migrate_unpaged_widgets_if_needed(self):
         """修复页归属：分区外清 page；分区内无效 page 清空；分区内全无归属则归到第一页。"""
@@ -2908,17 +2973,11 @@ class PlayerUiDesignerDialog(QDialog):
         self._syncing_props = True
         try:
             self._tabs_title.setText(str(data.get("title") or ""))
-            page_id = str(data.get("id") or "")
-            if page_id:
-                idx = self._edit_page.findData(page_id)
-                if idx >= 0:
-                    self._edit_page.setCurrentIndex(idx)
         finally:
             self._syncing_props = False
         page_id = str(data.get("id") or "")
         if page_id:
-            self.canvas.set_edit_page(page_id)
-            self._refresh_edit_page_hint()
+            self._set_edit_page_id(page_id)
 
     def _on_tabs_list_double_clicked(self, _item: QListWidgetItem):
         self._tabs_title.setFocus()
@@ -2979,9 +3038,8 @@ class PlayerUiDesignerDialog(QDialog):
         self._tabs_list.blockSignals(False)
         self._tabs_title.setText(title)
         self._apply_tabs_editor()
-        self.canvas.set_edit_page(page_id)
+        self._set_edit_page_id(page_id)
         self._refresh_page_combos(preserve=True)
-        self._refresh_edit_page_hint()
         self._tabs_title.setFocus()
         self._tabs_title.selectAll()
 
@@ -3001,9 +3059,40 @@ class PlayerUiDesignerDialog(QDialog):
         if cur is not None:
             page_id = str((cur.data(Qt.ItemDataRole.UserRole) or {}).get("id") or "")
             if page_id:
-                self.canvas.set_edit_page(page_id)
+                self._set_edit_page_id(page_id)
                 self._refresh_page_combos(preserve=True)
-                self._refresh_edit_page_hint()
+
+    def _move_tab_page(self, delta: int):
+        """将侧栏选中的标签页上移/下移一格；到顶/到底静默忽略。"""
+        if self._syncing_props or self._undoing:
+            return
+        item = self.canvas.selected_item()
+        if item is None or item.data.get("type") != "tabs":
+            return
+        row = self._tabs_list.currentRow()
+        if row < 0:
+            return
+        target = row + int(delta)
+        if target < 0 or target >= self._tabs_list.count():
+            return
+        # 先把名称编辑框写回当前行，避免移动时丢未失焦的改名
+        current = self._tabs_list.currentItem()
+        if current is not None:
+            data = dict(current.data(Qt.ItemDataRole.UserRole) or {})
+            new_title = self._tabs_title.text().strip() or data.get("title") or "页"
+            data["title"] = new_title
+            current.setData(Qt.ItemDataRole.UserRole, data)
+            current.setText(str(data["title"]))
+        self._tabs_list.blockSignals(True)
+        moved = self._tabs_list.takeItem(row)
+        self._tabs_list.insertItem(target, moved)
+        self._tabs_list.setCurrentRow(target)
+        self._tabs_list.blockSignals(False)
+        self._apply_tabs_editor()
+        page_id = str((moved.data(Qt.ItemDataRole.UserRole) or {}).get("id") or "")
+        if page_id:
+            self._set_edit_page_id(page_id)
+            self._refresh_page_combos(preserve=True)
 
     def _designer_ui_snapshot(self) -> dict:
         widgets = []
@@ -3194,6 +3283,14 @@ class PlayerUiDesignerDialog(QDialog):
         self._script_list.blockSignals(True)
         self._script_list.takeItem(row)
         self._script_list.blockSignals(False)
+        # takeItem 时屏蔽了 currentItemChanged，显示名仍是已移出项的；
+        # 若不先同步，_apply_script_editor 会把旧标题写到留下的行上，看起来像移错了项。
+        current = self._script_list.currentItem()
+        if current is None:
+            self._script_title.setText("")
+        else:
+            data = current.data(Qt.ItemDataRole.UserRole) or {}
+            self._script_title.setText(str(data.get("title") or ""))
         self._apply_script_editor()
         self._fill_script_pool()
 
@@ -3262,10 +3359,7 @@ class PlayerUiDesignerDialog(QDialog):
         # 已有控件若未归属页面，全部归到第一页，否则切换标签看不出变化
         self.canvas.assign_unpaged_widgets_to("page_1")
         self._refresh_page_combos(preserve=False)
-        idx = self._edit_page.findData("page_1")
-        if idx >= 0:
-            self._edit_page.setCurrentIndex(idx)
-        self.canvas.set_edit_page("page_1")
+        self._set_edit_page_id("page_1")
 
     def _add_script_list(self):
         from ui.export_parts.export_scripts import sync_script_list_items
@@ -3562,11 +3656,66 @@ class PlayerUiDesignerDialog(QDialog):
         finally:
             self._syncing_props = False
 
+    def _enter_bg_edit(self) -> None:
+        """从窗口设置进入背景编辑（纯色或选中背景图）。"""
+        if self._bg_mode_value() == "image" and self._bg_image.text().strip():
+            self._force_bg_panel = False
+            self.canvas.select(DesignerCanvas.BG_ITEM_ID)
+            return
+        self._force_bg_panel = True
+        if self.canvas.selected_item() is not None:
+            self.canvas.select("")
+        self._update_side_context(None)
+        self._refresh_bg_controls()
+
+    def _leave_bg_edit(self) -> None:
+        self._force_bg_panel = False
+        if (
+            self.canvas.selected_item() is not None
+            and self.canvas.selected_item().widget_id == DesignerCanvas.BG_ITEM_ID
+        ):
+            self.canvas.select("")
+        self._update_side_context(self.canvas.selected_item())
+
+    def _update_side_context(self, item) -> None:
+        """按选中对象互斥显示：空白=窗口+运行；背景=背景；控件=控件属性。"""
+        is_bg = (
+            item is not None
+            and (
+                item.widget_id == DesignerCanvas.BG_ITEM_ID
+                or str(item.data.get("type") or "") == "_background"
+            )
+        )
+        is_control = item is not None and not is_bg
+        if is_bg or is_control:
+            self._force_bg_panel = False
+        show_bg = bool(is_bg or (item is None and self._force_bg_panel))
+        show_window = item is None and not self._force_bg_panel
+        self._window_group.setVisible(show_window)
+        self._run_group.setVisible(show_window)
+        self._bg_group.setVisible(show_bg)
+        self._prop_group.setVisible(is_control)
+
     def _on_selection(self, widget_id: str):
         self._syncing_props = True
         try:
             item = self.canvas.selected_item()
-            enabled = item is not None
+            self._tabs_editor.hide()
+            self._script_editor.hide()
+            self._prop_text.show()
+            self._prop_text_multi.hide()
+            self._update_side_context(item)
+            if item is None:
+                self._prop_type.setText("未选中")
+                return
+            data = item.export_data()
+            kind = str(data.get("type") or "")
+            if (
+                item.widget_id == DesignerCanvas.BG_ITEM_ID
+                or kind == "_background"
+            ):
+                self._refresh_bg_controls()
+                return
             for w in (
                 self._prop_text,
                 self._prop_text_multi,
@@ -3576,9 +3725,6 @@ class PlayerUiDesignerDialog(QDialog):
                 self._prop_color,
                 self._prop_color_btn,
                 self._prop_color_swatch,
-                self._prop_fg,
-                self._prop_fg_btn,
-                self._prop_fg_swatch,
                 self._prop_page,
                 self._prop_align,
                 self._prop_x,
@@ -3586,18 +3732,7 @@ class PlayerUiDesignerDialog(QDialog):
                 self._prop_w,
                 self._prop_h,
             ):
-                w.setEnabled(enabled)
-            self._tabs_editor.hide()
-            self._script_editor.hide()
-            self._prop_fg_wrap.hide()
-            self._prop_text.show()
-            self._prop_text_multi.hide()
-            if item is None:
-                self._prop_type.setText("未选中")
-                self._refresh_prop_color_swatch()
-                self._refresh_prop_fg_swatch()
-                return
-            data = item.export_data()
+                w.setEnabled(True)
             type_names = {
                 "button": "按钮",
                 "label": "文本",
@@ -3610,9 +3745,7 @@ class PlayerUiDesignerDialog(QDialog):
                 "log": "日志",
                 "status": "状态",
                 "image": "图片",
-                "_background": "背景图",
             }
-            kind = str(data.get("type") or "")
             extra = f" · {data.get('action')}" if kind == "button" else ""
             self._prop_type.setText(f"{type_names.get(kind, kind)}{extra}")
             if kind in ("script_list", "progress", "schedule"):
@@ -3656,15 +3789,12 @@ class PlayerUiDesignerDialog(QDialog):
                 self._prop_color.setText(
                     custom_bg or _default_button_bg(str(data.get("action") or ""))
                 )
-                self._prop_fg_wrap.hide()
             elif kind in panel_kinds:
                 self._prop_color_lab.setText("颜色")
                 self._prop_color_swatch.setToolTip("文字颜色")
                 self._prop_color.setToolTip("面板文字颜色，可输入 #RRGGBB")
                 self._prop_color_btn.setToolTip("选择文字颜色")
                 self._prop_color.setText(str(data.get("color") or _tc("text")))
-                self._prop_fg.setText(str(data.get("color") or _tc("text")))
-                self._prop_fg_wrap.hide()
             else:
                 self._prop_color_lab.setText("颜色")
                 self._prop_color_swatch.setToolTip("当前文字颜色")
@@ -3673,9 +3803,7 @@ class PlayerUiDesignerDialog(QDialog):
                 default_color = _tc("accent") if kind == "link" else _tc("text")
                 self._prop_color.setText(str(data.get("color") or default_color))
                 self._prop_url.setPlaceholderText("链接 URL")
-                self._prop_fg_wrap.hide()
             self._refresh_prop_color_swatch()
-            self._refresh_prop_fg_swatch()
             self._prop_text.setEnabled(
                 kind in ("button", "label", "link", "script_list", "progress", "schedule")
             )
@@ -3687,9 +3815,6 @@ class PlayerUiDesignerDialog(QDialog):
             self._prop_color.setEnabled(color_ok)
             self._prop_color_btn.setEnabled(color_ok)
             self._prop_color_swatch.setEnabled(color_ok)
-            self._prop_fg.setEnabled(False)
-            self._prop_fg_btn.setEnabled(False)
-            self._prop_fg_swatch.setEnabled(False)
             has_tabs = self.canvas.tabs_item() is not None
             in_zone = has_tabs and self.canvas.item_in_tabs_zone(item)
             page_ok = kind not in ("tabs", "_background") and in_zone
@@ -3702,7 +3827,7 @@ class PlayerUiDesignerDialog(QDialog):
                 self._prop_page.setToolTip(
                     "框内控件：切换标签时只显示所属页匹配的；选「全部页」则每一页都显示。"
                 )
-            self._prop_visible.setEnabled(kind != "_background")
+            self._prop_visible.setEnabled(True)
             if kind == "tabs":
                 self._tabs_editor.show()
                 self._fill_tabs_editor(list(data.get("pages") or []))
@@ -3829,7 +3954,10 @@ class PlayerUiDesignerDialog(QDialog):
                 )
 
                 catalog = list(self._script_catalog() or [])
-                payload = apply_catalog_to_ui_exclusive(payload, catalog)
+                # 不回填可分配池：移出列表的项应在运行/完成时保持未分配
+                payload = apply_catalog_to_ui_exclusive(
+                    payload, catalog, append_missing=False
+                )
                 payload = ensure_list_order(payload)
             except Exception:
                 pass

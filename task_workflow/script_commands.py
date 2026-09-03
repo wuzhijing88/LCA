@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -286,6 +288,7 @@ ALLOWED_TASK_TYPES = frozenset(
         "OCR文字识别",
         "点阵字库OCR",
         "YOLO目标检测",
+        "录制回放",
     }
 )
 _KIND_BY_TASK = {
@@ -643,12 +646,55 @@ def build_key_params(
     return params
 
 
-def build_type_params(文本: Any, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def build_type_params(
+    文本: Any,
+    defaults: Optional[Dict[str, Any]] = None,
+    方式: Any = None,
+) -> Dict[str, Any]:
     params = dict(defaults or {})
     params["input_type"] = "文本输入"
     params["text_input_mode"] = "单组文本"
     params["text_to_type"] = str(文本 or "")
+    method = str(方式 or params.get("foreground_text_method") or "仿真输入").strip()
+    if method in {"粘贴", "复制粘贴", "clipboard", "paste"}:
+        params["foreground_text_method"] = "复制粘贴"
+    else:
+        params["foreground_text_method"] = "仿真输入"
     return params
+
+
+_KEY_CN_ALIASES = {
+    "空格": "space",
+    "回车": "enter",
+    "换行": "enter",
+    "退出": "esc",
+    "逃脱": "esc",
+    "删除": "delete",
+    "退格": "backspace",
+    "上": "up",
+    "下": "down",
+    "左": "left",
+    "右": "right",
+}
+
+
+def _script_key_vks(name: Any) -> list:
+    from utils.input.normal_hd_driver import resolve_virtual_key
+
+    text = str(name or "").strip()
+    if not text:
+        raise ValueError('等按键要写按键，例如 等按键("F1")')
+    parts = [part.strip() for part in text.replace("＋", "+").split("+") if part.strip()]
+    vks = []
+    for part in parts:
+        mapped = _KEY_CN_ALIASES.get(part) or _KEY_CN_ALIASES.get(part.lower()) or part
+        vk = resolve_virtual_key(mapped)
+        if vk is None:
+            vk = resolve_virtual_key(str(mapped).lower())
+        if vk is None:
+            raise ValueError(f"不认识这个按键: {part}")
+        vks.append(int(vk))
+    return vks
 
 
 def build_delay_params(秒: Any, defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -749,38 +795,24 @@ def build_yolo_params(
     类别: Any = None,
     阈值: Any = 0.5,
     defaults: Optional[Dict[str, Any]] = None,
-    点击: Any = False,
-    双击: Any = False,
-    偏移横坐标: Any = 0,
-    偏移纵坐标: Any = 0,
-    随机: Any = None,
-    随机横坐标: Any = None,
-    随机纵坐标: Any = None,
     区域: Any = None,
     策略: Any = None,
     模型: Any = None,
+    后端: Any = None,
 ) -> Dict[str, Any]:
+    from task_workflow.yolo_backend import normalize_yolo_backend
+
     params = dict(defaults or {})
+    backend = normalize_yolo_backend(后端 if 后端 is not None else params.get("yolo_backend"))
+    params["yolo_backend"] = backend
     model = str(模型 or params.get("model_path") or "").strip()
     if model:
         params["model_path"] = model
     params["confidence_threshold"] = float(阈值)
     params["target_classes"] = str(类别) if 类别 else "全部类别"
-    params["action_type"] = "点击" if _as_bool(点击) else "无"
-    params["approach_mode"] = "否"
     strategy = _as_yolo_strategy(策略)
     if strategy:
         params["target_selection"] = strategy
-    params.update(
-        build_click_style_params(
-            双击=双击,
-            偏移横坐标=偏移横坐标,
-            偏移纵坐标=偏移纵坐标,
-            随机=随机,
-            随机横坐标=随机横坐标,
-            随机纵坐标=随机纵坐标,
-        )
-    )
     region = _as_region(区域)
     if region:
         left, top, width, height = region
@@ -997,18 +1029,9 @@ def _read_pixel_color(hwnd: Any, x: int, y: int) -> Optional[Tuple[int, int, int
     if handle <= 0:
         return None
     try:
-        from utils.capture.screenshot_helper import get_screenshot_engine
+        from utils.capture.screenshot_helper import get_window_pixel_color
 
-        engine = str(get_screenshot_engine() or "wgc").strip().lower()
-        from utils import screenshot_helper
-
-        reader = {
-            "wgc": screenshot_helper.get_pixel_color_wgc,
-            "printwindow": screenshot_helper.get_pixel_color_printwindow,
-            "gdi": screenshot_helper.get_pixel_color_gdi,
-            "dxgi": screenshot_helper.get_pixel_color_dxgi,
-        }.get(engine, screenshot_helper.get_pixel_color_wgc)
-        rgb = reader(handle, int(x), int(y), True)
+        rgb = get_window_pixel_color(handle, int(x), int(y), True)
         if rgb and len(rgb) >= 3:
             return int(rgb[0]), int(rgb[1]), int(rgb[2])
     except Exception:
@@ -1038,17 +1061,9 @@ def _capture_window_frame(hwnd: Any):
     if handle <= 0:
         return None
     try:
-        from utils.capture.screenshot_helper import get_screenshot_engine
-        from utils import screenshot_helper
+        from utils.capture.screenshot_helper import capture_window_frame
 
-        engine = str(get_screenshot_engine() or "wgc").strip().lower()
-        capture = {
-            "wgc": screenshot_helper.capture_window_wgc,
-            "printwindow": screenshot_helper.capture_window_printwindow,
-            "gdi": screenshot_helper.capture_window_gdi,
-            "dxgi": screenshot_helper.capture_window_dxgi,
-        }.get(engine, screenshot_helper.capture_window_wgc)
-        return capture(handle, client_area_only=True)
+        return capture_window_frame(handle, client_area_only=True)
     except Exception:
         return None
 
@@ -1091,6 +1106,19 @@ class CommandHost:
         self._user_idents: Dict[int, threading.Event] = {}
         self._thread_lock = threading.Lock()
         self._outer_stop = self.context.get("stop_checker")
+        self._user_thread_errors: list[str] = []
+
+    def _resource_dirs(self) -> Tuple[str, str]:
+        executor = self.context.get("executor")
+        images = str(self.context.get("images_dir") or getattr(executor, "images_dir", "") or "")
+        sounds = str(self.context.get("sounds_dir") or getattr(executor, "sounds_dir", "") or "")
+        return images, sounds
+
+    def _constrain_path(self, path: Any) -> str:
+        from task_workflow.script_resources import constrain_script_path
+
+        images, sounds = self._resource_dirs()
+        return constrain_script_path(str(path or ""), images_dir=images, sounds_dir=sounds)
 
     def 找图(
         self,
@@ -1128,7 +1156,7 @@ class CommandHost:
             images = [str(图片 or "")]
         last = ScriptResult(ok=False)
         for image in images:
-            params["image_path"] = str(image)
+            params["image_path"] = self._constrain_path(image)
             last = self._run("图片点击", dict(params))
             if last:
                 return last
@@ -1217,8 +1245,8 @@ class CommandHost:
             return self._run("模拟键盘操作", build_key_params(按键内容, self._defaults("模拟键盘操作"), 动作="只释放"))
         return self._run("模拟键盘操作", build_key_params(按键内容, self._defaults("模拟键盘操作"), 动作=动作))
 
-    def 输入(self, 文本: Any) -> bool:
-        return self._run("模拟键盘操作", build_type_params(文本, self._defaults("模拟键盘操作")))
+    def 输入(self, 文本: Any, 方式: Any = None) -> bool:
+        return self._run("模拟键盘操作", build_type_params(文本, self._defaults("模拟键盘操作"), 方式=方式))
 
     def 延时(self, 秒: Any) -> bool:
         if self._invoke is not None:
@@ -1226,6 +1254,7 @@ class CommandHost:
         return self._sleep_interruptible(float(秒))
 
     def _sleep_interruptible(self, seconds: float) -> ScriptResult:
+        self._extend_deadline(seconds)
         deadline = time.monotonic() + max(0.0, float(seconds))
         stop = self.context.get("stop_checker")
         pause = self.context.get("pause_checker")
@@ -1263,6 +1292,8 @@ class CommandHost:
         相似度: Any = None,
         区域: Any = None,
     ) -> bool:
+        if 字库:
+            字库 = self._constrain_path(字库)
         return self._run(
             "点阵字库OCR",
             build_dict_ocr_params(目标, 字库, 颜色, 相似度, 区域, self._defaults("点阵字库OCR")),
@@ -1273,36 +1304,25 @@ class CommandHost:
         模型: Any = None,
         类别: Any = None,
         阈值: Any = 0.5,
-        点击: Any = False,
-        双击: Any = False,
-        偏移横坐标: Any = 0,
-        偏移纵坐标: Any = 0,
-        偏移x: Any = None,
-        偏移y: Any = None,
-        随机: Any = None,
-        随机横坐标: Any = None,
-        随机纵坐标: Any = None,
         区域: Any = None,
         策略: Any = None,
     ) -> bool:
-        defaults = self._defaults("YOLO目标检测")
-        偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
+        from task_workflow.yolo_backend import first_yolo_card_parameters, resolve_workflow_yolo_backend
+
+        defaults = dict(self._defaults("YOLO目标检测"))
+        defaults.update(first_yolo_card_parameters(self._workflow_cards()))
+        backend = resolve_workflow_yolo_backend(self._workflow_cards())
+        model = self._constrain_path(resolve_yolo_model(模型, defaults))
         return self._run(
             "YOLO目标检测",
             build_yolo_params(
                 类别,
                 阈值,
                 defaults,
-                点击=点击,
-                双击=双击,
-                偏移横坐标=偏移横坐标,
-                偏移纵坐标=偏移纵坐标,
-                随机=随机,
-                随机横坐标=随机横坐标,
-                随机纵坐标=随机纵坐标,
                 区域=区域,
                 策略=策略,
-                模型=resolve_yolo_model(模型, defaults),
+                模型=model,
+                后端=backend,
             ),
         )
 
@@ -1360,13 +1380,16 @@ class CommandHost:
             return dict(payload) if payload is not None else None
 
     def 持续检测(self, 模型: Any = None, 类别: Any = None, 间隔: Any = 0.3, **kwargs: Any) -> ScriptResult:
-        kwargs.pop("点击", None)
-        kwargs.pop("双击", None)
-        resolve_yolo_model(模型, self._defaults("YOLO目标检测"))
+        from task_workflow.yolo_backend import first_yolo_card_parameters, resolve_workflow_yolo_backend
+
+        resolve_workflow_yolo_backend(self._workflow_cards())
+        defaults = dict(self._defaults("YOLO目标检测"))
+        defaults.update(first_yolo_card_parameters(self._workflow_cards()))
+        resolve_yolo_model(模型, defaults)
         self._start_watch(
             "yolo",
             间隔,
-            lambda: self.检测(模型, 类别, 点击=False, **kwargs),
+            lambda: self.检测(模型, 类别, **kwargs),
         )
         return ScriptResult({"ok": True, "kind": "watch"})
 
@@ -1410,6 +1433,8 @@ class CommandHost:
                     if _is_stop_error(exc) or type(exc).__name__ == "ScriptOutcome":
                         return
                     self.logger.warning("[自定义脚本] 线程%s失败: %s", name, exc)
+                    with self._thread_lock:
+                        self._user_thread_errors.append(f"{name}: {exc}")
 
             thread = threading.Thread(target=runner, name=f"lca-script-fn-{name}", daemon=True)
             self._user_threads[name] = thread
@@ -1438,6 +1463,10 @@ class CommandHost:
         for thread in list(self._watch_threads.values()) + list(self._user_threads.values()):
             if thread is not None and thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=2.0)
+
+    def thread_failure(self) -> str:
+        with self._thread_lock:
+            return str(self._user_thread_errors[0]) if self._user_thread_errors else ""
 
     def _remember(self, kind: str, payload: Dict[str, Any]) -> None:
         if not kind:
@@ -2009,7 +2038,7 @@ class CommandHost:
         region = _as_region(区域)
         items = []
         for image in images:
-            items = self._collect_image_matches(image, threshold, region, _as_int(最多, 20))
+            items = self._collect_image_matches(self._constrain_path(image), threshold, region, _as_int(最多, 20))
             if items:
                 break
         first = items[0] if items else {}
@@ -2140,7 +2169,10 @@ class CommandHost:
     def 播放(self, 文件: Any, 等待: Any = True) -> ScriptResult:
         from task_workflow.media_player import play_audio
 
-        path = str(文件 or "").strip()
+        # 先判空再做路径约束，否则用户看到的是笼统的“缺少资源路径”而不是这条命令的用法
+        if not str(文件 or "").strip():
+            raise ValueError('播放要写音频文件，例如 播放("提示.wav")')
+        path = self._constrain_path(文件)
         if not path:
             raise ValueError('播放要写音频文件，例如 播放("提示.wav")')
         try:
@@ -2159,6 +2191,92 @@ class CommandHost:
         stop_audio()
         return ScriptResult({"ok": True, "kind": "audio"})
 
+    def 回放(self, 文件: Any, 速度: Any = 1.0, 次数: Any = 1) -> ScriptResult:
+        from task_workflow.script_resources import resolve_resource_path
+
+        raw = str(文件 or "").strip()
+        if not raw:
+            raise ValueError('回放要写文件，例如 回放("replays/过图.replay.json")')
+        images, sounds = self._resource_dirs()
+        relative = self._constrain_path(raw)
+        absolute = resolve_resource_path(relative, images, sounds, enforce_jail=True)
+        if not absolute or not os.path.isfile(absolute):
+            raise ValueError(f"回放文件不存在: {raw}")
+        try:
+            with open(absolute, encoding="utf-8") as handle:
+                payload = json.loads(handle.read())
+        except Exception as exc:
+            raise ValueError(f"回放文件读不出来: {exc}") from exc
+        if isinstance(payload, dict) and "actions" in payload:
+            data = payload
+        elif isinstance(payload, list):
+            data = {"actions": payload}
+        else:
+            raise ValueError("回放文件格式不对，需要含 actions")
+        return self._run(
+            "录制回放",
+            {
+                "recorded_actions": json.dumps(data, ensure_ascii=False),
+                "speed": float(速度 if 速度 is not None else 1.0),
+                "loop_count": max(1, int(次数 or 1)),
+            },
+        )
+
+    def 截图(self, 文件: Any = None) -> ScriptResult:
+        from task_workflow.script_resources import constrain_script_path, script_path_for_file
+        from utils.app_paths import get_images_dir
+
+        frame = _capture_window_frame(self.context.get("target_hwnd"))
+        if frame is None:
+            return ScriptResult({"ok": False, "kind": "image"})
+        images, _sounds = self._resource_dirs()
+        root = str(images or "").strip() or get_images_dir("LCA")
+        name = str(文件 or "").strip().replace("\\", "/")
+        if not name:
+            name = time.strftime("shot_%Y%m%d_%H%M%S.png")
+        if not os.path.splitext(os.path.basename(name))[1]:
+            name = f"{name}.png"
+        if os.path.isabs(name):
+            dest = constrain_script_path(name, images_dir=root)
+        else:
+            dest = constrain_script_path(os.path.join(root, os.path.basename(name)), images_dir=root)
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        try:
+            import cv2
+
+            image = frame
+            if getattr(image, "ndim", 0) == 3 and image.shape[2] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+            wrote = bool(cv2.imwrite(dest, image))
+        except Exception as exc:
+            raise ValueError(f"截图保存失败: {exc}") from exc
+        if not wrote:
+            return ScriptResult({"ok": False, "kind": "image"})
+        relative = script_path_for_file(dest, "image", root)
+        payload = {"ok": True, "kind": "image", "path": relative}
+        try:
+            self.store.publish(self.context.get("card_id"), **payload)
+        except Exception:
+            pass
+        self._remember("image", payload)
+        return ScriptResult(payload)
+
+    def 等按键(self, 按键: Any, 超时: Any = 8, 间隔: Any = 0.05) -> ScriptResult:
+        vks = _script_key_vks(按键)
+        checker = self.context.get("key_down_checker")
+
+        def _pressed() -> ScriptResult:
+            if callable(checker):
+                down = all(bool(checker(vk)) for vk in vks)
+            else:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                down = all(int(user32.GetAsyncKeyState(int(vk))) & 0x8000 for vk in vks)
+            return ScriptResult({"ok": down, "kind": "key"})
+
+        return self._wait_found(_pressed, 超时, 间隔)
+
     def 激活(self) -> ScriptResult:
         hwnd = int(self.context.get("target_hwnd") or 0)
         if hwnd <= 0:
@@ -2170,6 +2288,35 @@ class CommandHost:
         except Exception as exc:
             raise ValueError(f"激活窗口失败: {exc}") from exc
         return ScriptResult({"ok": True, "kind": "window"})
+
+    def 设置分辨率(self, *args: Any, 报错: Any = True) -> ScriptResult:
+        from task_workflow.script_window_resolution import (
+            ResolutionError,
+            apply_window_resolution,
+            default_adjust_window,
+            parse_resolution_args,
+        )
+
+        try:
+            call = parse_resolution_args(*args, 报错=报错)
+            adjust = self.context.get("adjust_window_resolution") or default_adjust_window
+            payload = apply_window_resolution(
+                call=call,
+                windows=self.context.get("bound_windows"),
+                current_hwnd=self.context.get("target_hwnd"),
+                global_size=(
+                    int(self.context.get("custom_width") or 0),
+                    int(self.context.get("custom_height") or 0),
+                ),
+                adjust=adjust,
+            )
+        except ResolutionError as exc:
+            raise ValueError(str(exc)) from exc
+        return ScriptResult(payload, ok=bool(payload.get("ok")))
+
+    def _workflow_cards(self) -> Any:
+        executor = self.context.get("executor")
+        return getattr(executor, "cards_data", None) or {}
 
     def _defaults(self, task_type: str) -> Dict[str, Any]:
         return {}

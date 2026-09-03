@@ -422,9 +422,9 @@ def numpy_screenshot_to_qpixmap(screenshot) -> Optional[QPixmap]:
 
 def capture_window_client_pixmap(hwnd: int) -> Optional[QPixmap]:
     try:
-        from tasks.task_utils import capture_window_smart
+        from utils.capture.screenshot_helper import capture_window_frame
 
-        frame = capture_window_smart(int(hwnd), client_area_only=True)
+        frame = capture_window_frame(int(hwnd), client_area_only=True)
     except Exception:
         return None
     return numpy_screenshot_to_qpixmap(frame)

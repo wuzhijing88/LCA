@@ -1,9 +1,9 @@
-"""应用程序标识。离线版不维护数字版本号。"""
+"""应用程序标识。测试版不维护数字版本号。"""
 
 from urllib.parse import urlunsplit
 
 APP_NAME = "LCA"
-APP_EDITION = "离线版"
+APP_EDITION = "测试版"
 APP_VERSION = APP_EDITION
 APP_SUMMARY = "本地、视觉驱动的 Windows 桌面工作流自动化程序。"
 APP_LICENSE_NAME = "GNU Affero General Public License v3.0"

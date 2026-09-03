@@ -87,8 +87,6 @@ class WorkflowTask(QObject):
 
             self.lca_session = get_active()
             self.lca_session_path = get_active_path()
-        self.read_only_mode = False
-        self.read_only_reason = ""
         self.task_modules = task_modules
         self.images_dir = images_dir
         self.config = config
@@ -159,7 +157,7 @@ class WorkflowTask(QObject):
 
         action = str(payload.get("action") or "update").strip().lower()
         try:
-            from tasks.yolo_detection import draw_detections_on_window, hide_detections_overlay
+            from tasks.yolo_overlay_runtime import draw_detections_on_window, hide_detections_overlay
         except Exception as exc:
             logger.debug(f"任务 '{self.name}' 加载YOLO画框模块失败: {exc}")
             return
@@ -193,7 +191,7 @@ class WorkflowTask(QObject):
         if int(request_token) != int(self._overlay_hide_request_token):
             return
         try:
-            from tasks.yolo_detection import hide_detections_overlay
+            from tasks.yolo_overlay_runtime import hide_detections_overlay
 
             hide_detections_overlay()
         except Exception as exc:
@@ -758,6 +756,8 @@ class WorkflowTask(QObject):
             target_hwnd=target_hwnd,
             thread_labels=thread_labels,
             bound_windows=effective_bound_windows,
+            custom_width=self.config.get("custom_width"),
+            custom_height=self.config.get("custom_height"),
             parent=None,
         )
 
@@ -902,11 +902,6 @@ class WorkflowTask(QObject):
             workflow_data: 可选的工作流数据，如果提供则使用此数据，否则使用self.workflow_data
         """
         # 如果没有文件路径（新建的空白工作流），返回False
-        if self.read_only_mode:
-            logger.info(f"任务 '{self.name}' 为只读运行态，跳过保存")
-            self.modified = False
-            return True
-
         if not self.filepath:
             logger.warning(f"任务 '{self.name}' 没有保存路径，需要先另存为")
             return False
@@ -936,6 +931,8 @@ class WorkflowTask(QObject):
                 # 只更新 cards 和 connections，保留其他配置
                 self.workflow_data['cards'] = workflow_data.get('cards', [])
                 self.workflow_data['connections'] = workflow_data.get('connections', [])
+                if isinstance(workflow_data.get('metadata'), dict):
+                    self.workflow_data['metadata'] = workflow_data.get('metadata')
                 logger.info(f"任务 '{self.name}' 内存中的 workflow_data 已同步更新")
 
             # 添加跳转配置到保存数据
@@ -972,8 +969,15 @@ class WorkflowTask(QObject):
                     temporarily_activated = True
 
             logger.debug(f"写入文件: {abs_filepath}")
+            old_filepath = self.filepath
             saved_path = save_workflow_file(abs_filepath, save_data)
             self.filepath = str(saved_path)
+            from task_workflow.workspace import favorite_path_key, workflow_path_keys
+
+            if not self.source_ref or favorite_path_key(str(self.source_ref)) in set(
+                workflow_path_keys(old_filepath)
+            ):
+                self.source_ref = self.filepath
             from app_core.lca_format.project_io import load_lca_project
             from app_core.lca_format.session import deactivate, get_active
 
@@ -1025,46 +1029,16 @@ class WorkflowTask(QObject):
         Returns:
             是否备份成功
         """
-        if self.read_only_mode:
-            logger.info(f"任务 '{self.name}' 为只读运行态，跳过保存")
-            return True
-
         try:
-            import shutil
-            from datetime import datetime
-
-            # 检查文件路径是否存在
             if not self.filepath:
                 logger.warning(f"任务 '{self.name}' 没有文件路径，无法备份")
                 return False
 
-            # 确保文件路径是绝对路径
+            from task_workflow.workspace import backup_workflow_file
+
             abs_filepath = os.path.abspath(self.filepath)
             logger.debug(f"备份任务 '{self.name}': 原始路径={self.filepath}, 绝对路径={abs_filepath}")
-
-            # 检查文件是否存在
-            if not os.path.exists(abs_filepath):
-                logger.warning(f"任务 '{self.name}' 文件不存在: {abs_filepath}，跳过备份")
-                return False
-
-            # 创建 backups 目录（如果不存在）
-            base_dir = os.path.dirname(abs_filepath)
-            backups_dir = os.path.join(base_dir, 'backups')
-
-            logger.debug(f"创建备份目录: {backups_dir}")
-            os.makedirs(backups_dir, exist_ok=True)
-
-            # 备份保持原文件格式；JSON 转换时保留旧 JSON，LCA 则备份 LCA。
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = os.path.basename(abs_filepath)
-            name_without_ext, extension = os.path.splitext(filename)
-            backup_filename = f"{name_without_ext}_backup_{timestamp}{extension or '.lca'}"
-            backup_filepath = os.path.join(backups_dir, backup_filename)
-
-            # 复制文件到备份目录
-            logger.debug(f"复制文件: {abs_filepath} -> {backup_filepath}")
-            shutil.copy2(abs_filepath, backup_filepath)
-
+            backup_filepath = backup_workflow_file(abs_filepath)
             logger.info(f"✓ 任务 '{self.name}' 已备份到: {backup_filepath}")
             return True
 
@@ -1085,11 +1059,6 @@ class WorkflowTask(QObject):
             是否全部成功
         """
         # 如果没有文件路径（新建的空白工作流），创建临时备份
-        if self.read_only_mode:
-            logger.info(f"任务 '{self.name}' 为只读运行态，跳过保存和备份")
-            self.modified = False
-            return True
-
         if not self.filepath:
             logger.info(f"任务 '{self.name}' 未保存，创建临时备份")
             try:
@@ -1138,17 +1107,17 @@ class WorkflowTask(QObject):
                 logger.error(f"任务 '{self.name}' 临时备份失败: {e}")
                 return False
 
-        # JSON 转换为 LCA 前先备份旧 JSON；其余情况保持“保存后备份”。
-        converting_json = (
-            os.path.splitext(str(self.filepath))[1].lower() == '.json'
-            and os.path.isfile(os.path.abspath(self.filepath))
-        )
-        if converting_json:
-            backup_success = self.backup()
+        # 已有文件先备份旧内容再覆盖；新文件则保存后再归档一份。
+        existing_filepath = os.path.abspath(self.filepath)
+        if os.path.isfile(existing_filepath):
+            if not self.backup():
+                logger.error(f"任务 '{self.name}' 备份失败，已取消保存以免覆盖上一版")
+                return False
             save_success = self.save(workflow_data=workflow_data)
+            backup_success = True
         else:
             save_success = self.save(workflow_data=workflow_data)
-            backup_success = self.backup()
+            backup_success = self.backup() if os.path.isfile(os.path.abspath(self.filepath)) else save_success
 
         if save_success and backup_success:
             logger.info(f"任务 '{self.name}' 保存和备份成功")

@@ -57,7 +57,10 @@ class ControlCenterBatchOpsMixin:
         self._cc_active_stop_window_filter = active_filter
         self.log_message(f"批量停止：{scope_desc}")
         try:
-            return control_center_stop_all_tasks(self)
+            result = control_center_stop_all_tasks(self)
+            if getattr(self, "_stability_test_active", False) and not resolved_ids:
+                self._restore_stability_test_assignments()
+            return result
         finally:
             self._cc_active_stop_window_filter = None
 

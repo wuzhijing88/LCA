@@ -124,6 +124,16 @@ class MainWindowMultiWindowRuntimeMixin:
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+        from utils.window.virtual_desktop import should_block_execution_start
+
+        block_message = should_block_execution_start(
+            getattr(self, "current_execution_mode", None),
+            hwnds=[window.get("hwnd") for window in enabled_windows],
+        )
+        if block_message:
+            logger.warning("前台执行被虚拟桌面策略取消")
+            QMessageBox.warning(self, "无法执行", block_message)
+            return
         # 工具 关键修复：先清理旧的多窗口执行器
         if hasattr(self, 'multi_executor') and self.multi_executor:
             logger.info("清理旧的多窗口执行器...")

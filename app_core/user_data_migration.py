@@ -18,12 +18,19 @@ _DIRECTORY_NAMES = ("images", "workflows", "logs", "runtime", "runtime_data")
 
 @dataclass(frozen=True)
 class UserDataMigrationReport:
+    """一次 ensure_user_data_migrated() 调用的结果。
+
+    ``copied`` / ``skipped`` 只描述本次调用实际做了什么；已经迁移过再调用时两者都为空，
+    ``performed`` 为 False，历史迁移时间保留在 ``completed_at``。
+    """
+
     version: int
     source: str
     destination: str
     copied: tuple[str, ...]
     skipped: tuple[str, ...]
     completed_at: float
+    performed: bool = True
 
 
 def _copy_file_atomic(source: Path, destination: Path) -> None:
@@ -53,13 +60,15 @@ def ensure_user_data_migrated(
         try:
             payload = json.loads(marker.read_text(encoding="utf-8"))
             if int(payload.get("version", 0)) >= MIGRATION_VERSION:
+                # 已迁移过：本次什么都不做，不要把历史 copied 清单当成本次结果返回。
                 return UserDataMigrationReport(
                     version=int(payload["version"]),
                     source=str(payload.get("source", source_root)),
                     destination=str(payload.get("destination", destination_root)),
-                    copied=tuple(payload.get("copied", [])),
-                    skipped=tuple(payload.get("skipped", [])),
+                    copied=(),
+                    skipped=(),
                     completed_at=float(payload.get("completed_at", 0.0)),
+                    performed=False,
                 )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass

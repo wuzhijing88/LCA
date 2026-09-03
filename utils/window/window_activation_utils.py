@@ -72,6 +72,10 @@ def activate_window(hwnd: int, log_prefix: str = '') -> Optional[int]:
         return hwnd
 
     activation_hwnd = resolve_window_activation_hwnd(hwnd, log_prefix=log_prefix)
+    from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+    if skip_cross_desktop_activation(activation_hwnd, log_prefix=log_prefix):
+        return activation_hwnd
     if win32gui.IsIconic(activation_hwnd):
         win32gui.ShowWindow(activation_hwnd, win32con.SW_RESTORE)
         time.sleep(0.1)
@@ -183,6 +187,10 @@ def force_window_top(hwnd: int, log_prefix: str = '窗口') -> bool:
 
     if not hwnd:
         logger.warning(f'[{log_prefix}] 目标窗口句柄无效，无法置顶')
+        return False
+    from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+    if skip_cross_desktop_activation(hwnd, log_prefix=log_prefix):
         return False
 
     try:

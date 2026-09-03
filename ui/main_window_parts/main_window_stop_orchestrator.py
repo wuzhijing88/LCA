@@ -152,7 +152,7 @@ def main_window_safe_stop_tasks(ctx):
 
         try:
 
-            from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+            from app_core.runtime.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
 
             cleanup_yolo_runtime_on_stop(
 
@@ -170,7 +170,7 @@ def main_window_safe_stop_tasks(ctx):
 
         try:
 
-            from utils.capture.screenshot_helper import cleanup_screenshot_engines_on_stop
+            from services.screenshot_pool import cleanup_screenshot_engines_on_stop
 
             cleanup_screenshot_engines_on_stop(keep_current_engine=True)
 
@@ -194,7 +194,7 @@ def main_window_safe_stop_tasks(ctx):
 
         try:
 
-            from utils.runtime_image_cleanup import cleanup_runtime_image_memory
+            from app_core.runtime.runtime_image_cleanup import cleanup_runtime_image_memory
 
             cleanup_runtime_image_memory(
 

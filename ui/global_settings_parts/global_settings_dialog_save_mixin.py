@@ -5,10 +5,12 @@ from PySide6.QtWidgets import QMessageBox
 from app_core.config_sections import DEFAULT_HOTKEYS
 from app_core.hotkey_spec import normalize_hotkey
 from utils.input_simulation.mode_utils import (
+    PLUGIN_EXECUTION_MODE,
     require_foreground_backend,
     require_foreground_py_backend,
 )
 from utils.plugin.bind_modes import (
+    normalize_plugin_bind_kind,
     normalize_plugin_bind_mode,
     normalize_plugin_keypad,
     normalize_plugin_mouse,
@@ -38,6 +40,8 @@ class GlobalSettingsDialogSaveMixin:
                     "绑定窗口分辨率的宽高需要同时大于 0 才会启用；若要禁用请把宽和高都设为 0。",
                 )
                 return
+            if hasattr(self, "_finish_live_plugin_probe_for_accept"):
+                self._finish_live_plugin_probe_for_accept()
             settings = self.get_settings()
             self._warn_plugin_display_mismatch_if_needed(settings)
             self.current_config.update(settings)
@@ -84,7 +88,7 @@ class GlobalSettingsDialogSaveMixin:
         if internal_mode:
             return internal_mode
         selected_display_mode = self.mode_combo.currentText()
-        return self.MODE_INTERNAL_MAP.get(selected_display_mode, 'foreground_driver')
+        return self.MODE_INTERNAL_MAP.get(selected_display_mode, 'background_sendmessage')
     def get_custom_width(self):
         """获取自定义宽度"""
         return self.width_spinbox.value()
@@ -125,18 +129,24 @@ class GlobalSettingsDialogSaveMixin:
         internal_mode = self.mode_combo.currentData()
         if not internal_mode:
             selected_display_mode = self.mode_combo.currentText()
-            internal_mode = self.MODE_INTERNAL_MAP.get(selected_display_mode, 'foreground_driver')
+            internal_mode = self.MODE_INTERNAL_MAP.get(selected_display_mode, 'background_sendmessage')
         # 根据绑定窗口数量决定窗口绑定模式
         bound_windows = self.get_bound_windows()
         window_count = len(bound_windows)
         window_binding_mode = 'multiple' if window_count > 1 else 'single'
         active_bound_windows = bound_windows
         active_window_binding_mode = window_binding_mode
-        use_plugin_screenshot = bool(
-            getattr(self, "plugin_screenshot_enable_check", None)
-            and self.plugin_screenshot_enable_check.isChecked()
+        input_backend = (
+            self._selected_input_backend()
+            if hasattr(self, "_selected_input_backend")
+            else "native"
         )
-        if use_plugin_screenshot and hasattr(self, "plugin_screenshot_engine_combo"):
+        # 插件后端只能按后台消息执行，但不要覆盖原生模式的持久化值。
+        # 这样在“原生 -> 插件 -> 原生”之间切换时，原生面板仍恢复用户上次选择。
+        effective_execution_mode = (
+            PLUGIN_EXECUTION_MODE if input_backend == "plugin" else internal_mode
+        )
+        if input_backend == "plugin" and hasattr(self, "plugin_screenshot_engine_combo"):
             screenshot_engine = self.plugin_screenshot_engine_combo.currentData()
             if not screenshot_engine:
                 raise ValueError(
@@ -151,9 +161,6 @@ class GlobalSettingsDialogSaveMixin:
                 raise ValueError(
                     f"未知的截图引擎选项: {self.screenshot_engine_combo.currentText()!r}"
                 )
-        input_backend = "native"
-        if hasattr(self, "plugin_input_enable_check") and self.plugin_input_enable_check.isChecked():
-            input_backend = "plugin"
         plugin_mouse = normalize_plugin_mouse(
             (self.plugin_mouse_combo.currentData() if hasattr(self, "plugin_mouse_combo") else None)
             or self.current_config.get("plugin_mouse", "normal")
@@ -180,9 +187,20 @@ class GlobalSettingsDialogSaveMixin:
         else:
             bind_raw = self.current_config.get("plugin_bind_mode", 0)
         plugin_bind_mode = normalize_plugin_bind_mode(bind_raw)
+        if hasattr(self, "plugin_bind_kind_combo"):
+            kind_raw = self.plugin_bind_kind_combo.currentData()
+        else:
+            kind_raw = self.current_config.get("plugin_bind_kind", "basic")
+        try:
+            plugin_bind_kind = normalize_plugin_bind_kind(kind_raw)
+        except ValueError:
+            plugin_bind_kind = "basic"
         settings = {
-            'execution_mode': internal_mode,
-            'operation_mode': 'auto',  # 默认使用自动检测
+            'execution_mode': effective_execution_mode,
+            'native_execution_mode': internal_mode,
+            # operation_mode 属于输入模拟器的独立默认值；设置页没有该控件时
+            # 必须保留已有配置，不能因保存任意其它参数而重置。
+            'operation_mode': self.current_config.get('operation_mode', 'auto'),
             'custom_width': self.width_spinbox.value(),
             'custom_height': self.height_spinbox.value(),
             'screenshot_format': self.screenshot_format_combo.currentData() if hasattr(self, 'screenshot_format_combo') else self.current_config.get('screenshot_format', 'bmp'),
@@ -192,8 +210,24 @@ class GlobalSettingsDialogSaveMixin:
             "plugin_keypad": plugin_keypad,
             "plugin_input_display": plugin_input_display,
             "plugin_input_display_follow": follow_display,
+            "plugin_bind_kind": plugin_bind_kind,
             "plugin_bind_mode": plugin_bind_mode,
+            "plugin_text_ime": (
+                bool(self.plugin_text_ime_check.isChecked())
+                if hasattr(self, "plugin_text_ime_check")
+                else bool(self.current_config.get("plugin_text_ime", False))
+            ),
+            "plugin_fake_active": (
+                bool(self.plugin_fake_active_check.isChecked())
+                if hasattr(self, "plugin_fake_active_check")
+                else bool(self.current_config.get("plugin_fake_active", False))
+            ),
             "plugin_reg_code": self.plugin_reg_code_edit.text() if hasattr(self, "plugin_reg_code_edit") else self.current_config.get("plugin_reg_code", ""),
+            "plugin_extra_code": (
+                self.plugin_extra_code_edit.text().strip()
+                if hasattr(self, "plugin_extra_code_edit")
+                else self.current_config.get("plugin_extra_code", "")
+            ),
             'foreground_mouse_driver_backend': require_foreground_backend(
                 (self.foreground_driver_combo.currentData() if hasattr(self, 'foreground_driver_combo') else None)
                 or self.current_config.get('foreground_mouse_driver_backend', 'interception')

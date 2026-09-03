@@ -80,6 +80,9 @@ class WorkflowMultiThreadSession(QObject):
         self.thread_window_configs = self._normalize_thread_window_configs(thread_window_configs)
         self.get_image_data = get_image_data
         self.test_mode = None
+        self.bound_windows = []
+        self.custom_width = 0
+        self.custom_height = 0
 
         self._lock = threading.RLock()
         self._done_event = threading.Event()
@@ -679,6 +682,9 @@ class WorkflowMultiThreadSession(QObject):
             workflow_filepath=self.workflow_filepath,
             get_image_data=self.get_image_data,
         )
+        executor.bound_windows = list(getattr(self, "bound_windows", None) or [])
+        executor.custom_width = int(getattr(self, "custom_width", 0) or 0)
+        executor.custom_height = int(getattr(self, "custom_height", 0) or 0)
 
         thread = QThread()
         thread_id = entry["thread_id"]

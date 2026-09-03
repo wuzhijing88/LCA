@@ -100,6 +100,7 @@ def build_run_queue_parts(
     scripts: Mapping[str, Any],
     state: Optional[Mapping[str, Any]] = None,
     loops_by_id: Optional[Mapping[str, int]] = None,
+    group_loops_by_list: Optional[Mapping[str, int]] = None,
     rng: Optional[random.Random] = None,
 ) -> List[tuple]:
     """按列表顺序展开多段队列。
@@ -137,7 +138,19 @@ def build_run_queue_parts(
                 pairs.append((sid, data))
         if not pairs:
             continue
-        group_loops = normalize_script_loop_count(widget.get("group_loops"), 1)
+        # The standalone player lets users change loop counts at runtime.  Those
+        # values live in the widgets, not in the immutable exported UI payload;
+        # callers pass them explicitly so a run uses the current controls.
+        runtime_group_loops = None
+        if isinstance(group_loops_by_list, Mapping):
+            if list_id in group_loops_by_list:
+                runtime_group_loops = group_loops_by_list.get(list_id)
+            elif "__main__" in group_loops_by_list and len(list_ids) == 1:
+                runtime_group_loops = group_loops_by_list.get("__main__")
+        group_loops = normalize_script_loop_count(
+            runtime_group_loops if runtime_group_loops is not None else widget.get("group_loops"),
+            1,
+        )
         queue.extend(
             expand_script_run_queue(
                 pairs,

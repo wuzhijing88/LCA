@@ -25,16 +25,9 @@ def script_id_for_task(task: Any) -> str:
     return _safe_script_id(name, fallback)
 
 
-def workspace_dirs_from_main(main: Any) -> List[str]:
-    """侧栏已配置的工作区根目录（导出扫描范围）。"""
+def _normalize_workspace_dir_list(raw: Any) -> List[str]:
     from task_workflow.workspace import normalize_workspace_dir
 
-    panel = getattr(main, "parameter_panel", None) if main is not None else None
-    raw = None
-    if panel is not None:
-        raw = getattr(panel, "_favorite_workspaces", None)
-    if raw is None and main is not None:
-        raw = getattr(main, "_favorite_workspaces", None)
     if not isinstance(raw, (list, tuple)):
         return []
     out: List[str] = []
@@ -49,6 +42,46 @@ def workspace_dirs_from_main(main: Any) -> List[str]:
         seen.add(key)
         out.append(root)
     return out
+
+
+def workspace_dirs_from_main(main: Any) -> List[str]:
+    """侧栏已配置的全部工作区根目录（导出扫描范围）。
+
+    冷启动时收藏面板可能尚未打开，内存里的 ``_favorite_workspaces`` 仍为空；
+    此时回退读取收藏配置文件，避免必须先打开一次工作区才能导出。
+    """
+    panel = getattr(main, "parameter_panel", None) if main is not None else None
+    raw = None
+    if panel is not None:
+        raw = getattr(panel, "_favorite_workspaces", None)
+        # 面板已创建但从未 show_favorites：主动从磁盘同步一次
+        if (not raw) and hasattr(panel, "_sync_workspace_favorites_snapshot"):
+            try:
+                workspaces, _favorites, _changed = panel._sync_workspace_favorites_snapshot()
+                raw = workspaces
+            except Exception:
+                raw = getattr(panel, "_favorite_workspaces", None)
+    if raw is None and main is not None:
+        raw = getattr(main, "_favorite_workspaces", None)
+    dirs = _normalize_workspace_dir_list(raw)
+    if dirs:
+        return dirs
+    # 无面板或同步失败：直接读收藏配置
+    try:
+        from task_workflow.workspace import load_workspace_favorites_snapshot
+        from utils.app_paths import get_favorites_path
+
+        config_path = ""
+        if panel is not None:
+            config_path = str(getattr(panel, "_favorites_config_path", "") or "")
+        if not config_path:
+            config_path = str(get_favorites_path() or "")
+        if config_path and os.path.exists(config_path):
+            workspaces, *_rest = load_workspace_favorites_snapshot(config_path)
+            return _normalize_workspace_dir_list(workspaces)
+    except Exception:
+        pass
+    return []
 
 
 def list_workspace_export_scripts(main: Any) -> List[Dict[str, Any]]:
@@ -372,8 +405,17 @@ def apply_catalog_to_ui(ui: Mapping[str, Any], catalog: List[Mapping[str, Any]])
     return payload
 
 
-def apply_catalog_to_ui_exclusive(ui: Mapping[str, Any], catalog: List[Mapping[str, Any]]) -> dict:
-    """互斥同步：剔除不在 catalog 的项；新项只追加到第一个脚本列表。"""
+def apply_catalog_to_ui_exclusive(
+    ui: Mapping[str, Any],
+    catalog: List[Mapping[str, Any]],
+    *,
+    append_missing: bool = True,
+) -> dict:
+    """互斥同步：剔除不在 catalog 的项；可选把未分配新项追加到第一个脚本列表。
+
+    append_missing=False 时只清理无效/重复项，不把可分配池里的工作流塞回列表
+    （用于运行/完成导出，避免「移出列表」被回填）。
+    """
     payload = copy.deepcopy(dict(ui or {}))
     catalog_ids = {
         str(entry.get("id") or "").strip()
@@ -413,9 +455,9 @@ def apply_catalog_to_ui_exclusive(ui: Mapping[str, Any], catalog: List[Mapping[s
             item["order_mode"] = mode if mode in ("fixed", "random") else "fixed"
         widgets.append(item)
     payload["widgets"] = widgets
-    # 新项进第一个列表
+    # 新项进第一个列表（可选；False 时保留可分配池）
     missing = [sid for sid in catalog_by_id if sid not in claimed]
-    if missing:
+    if append_missing and missing:
         if not list_indices:
             # 无脚本列表：不自动造控件（由设计器添加）；打包回退用全 catalog
             pass

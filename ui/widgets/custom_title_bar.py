@@ -5,11 +5,68 @@ from PySide6.QtWidgets import (
     QSpacerItem # Import QSpacerItem
 )
 # Import QIcon explicitly if needed for size setting
-from PySide6.QtCore import Qt, QPoint 
-from PySide6.QtGui import QMouseEvent, QAction, QFontMetrics
+from PySide6.QtCore import Qt, QPoint, QSize, QRect
+from PySide6.QtGui import QMouseEvent, QAction, QFontMetrics, QColor, QIcon, QPainter, QPaintEvent
 from utils.window.window_activation_utils import show_and_raise_widget
 
 class MainWindow: pass
+
+
+class TitleCloseButton(QToolButton):
+    """标题栏关闭按钮：自绘红底白叉，不走 QToolButton 原生边框/灰底。"""
+
+    _HOVER = QColor("#e81123")
+    _PRESSED = QColor("#b00000")
+
+    def __init__(self, normal_icon: QIcon, hover_icon: QIcon, parent=None):
+        super().__init__(parent)
+        self._normal_icon = normal_icon
+        self._hover_icon = hover_icon
+        self.setObjectName("closeButton")
+        self.setToolTip("关闭")
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.setAutoRaise(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFixedSize(36, 30)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        # 清空样式，避免主题给工具按钮描边
+        self.setStyleSheet(
+            "QToolButton#closeButton { background: transparent; border: none; padding: 0; margin: 0; }"
+        )
+
+    def paintEvent(self, event: QPaintEvent):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+
+        hovered = self.underMouse()
+        if self.isDown():
+            painter.setBrush(self._PRESSED)
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 4, 4)
+            icon = self._hover_icon
+        elif hovered:
+            painter.setBrush(self._HOVER)
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 4, 4)
+            icon = self._hover_icon
+        else:
+            icon = self._normal_icon
+
+        size = self.iconSize()
+        if size.width() <= 0 or size.height() <= 0:
+            size = QSize(16, 16)
+        x = (self.width() - size.width()) // 2
+        y = (self.height() - size.height()) // 2
+        icon.paint(painter, QRect(x, y, size.width(), size.height()))
+
+    def enterEvent(self, event):
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.update()
+        super().leaveEvent(event)
+
 
 class CustomTitleBar(QWidget):
     """A custom title bar where title is manually centered."""
@@ -49,6 +106,8 @@ class CustomTitleBar(QWidget):
             toggle_button = QToolButton(self)
             toggle_button.setDefaultAction(toggle_action)
             toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            toggle_button.setAutoRaise(True)
+            toggle_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             toggle_button.setFixedSize(28, 28)
             main_layout.addWidget(toggle_button)
             self.action_buttons[toggle_action] = toggle_button
@@ -57,6 +116,8 @@ class CustomTitleBar(QWidget):
                 button = QToolButton(self.file_actions_container)
                 button.setDefaultAction(action)
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+                button.setAutoRaise(True)
+                button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
                 button.setFixedSize(28, 28)
                 container_layout.addWidget(button)
                 self.action_buttons[action] = button 
@@ -78,28 +139,57 @@ class CustomTitleBar(QWidget):
         # --- Window Buttons (Right) ---
         self.window_button_container = QWidget(self) # Store container reference
         window_button_layout = QHBoxLayout(self.window_button_container)
-        window_button_layout.setContentsMargins(0,0,4,0)
-        style = self.style()
-        def create_window_button(text, tooltip):
-            button = QPushButton(text, self.window_button_container)
+        window_button_layout.setContentsMargins(0, 0, 4, 0)
+        window_button_layout.setSpacing(2)
+
+        from ui.main_window_parts.main_window_support import (
+            create_window_close_icon,
+            create_window_maximize_icon,
+            create_window_minimize_icon,
+            create_window_restore_icon,
+            create_window_topmost_icon,
+        )
+
+        icon_size = 16
+        self._maximize_icon = create_window_maximize_icon(icon_size)
+        self._restore_icon = create_window_restore_icon(icon_size)
+        self._close_icon = create_window_close_icon(icon_size)
+        self._close_hover_icon = create_window_close_icon(icon_size, QColor("#ffffff"))
+
+        def create_window_button(icon: QIcon, tooltip: str) -> QToolButton:
+            button = QToolButton(self.window_button_container)
             button.setObjectName("windowButton")
+            button.setIcon(icon)
+            button.setIconSize(QSize(icon_size, icon_size))
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            button.setAutoRaise(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setFixedSize(36, 30)
             button.setToolTip(tooltip)
             return button
-        # 置顶按钮
+
         self._window_topmost = False
-        self.topmost_button = create_window_button("⊼", "窗口置顶")
+        self.topmost_button = create_window_button(create_window_topmost_icon(icon_size), "窗口置顶")
         self.topmost_button.setCheckable(True)
         self.topmost_button.clicked.connect(self._toggle_topmost)
         window_button_layout.addWidget(self.topmost_button)
-        self.minimize_button = create_window_button("−", "最小化")
+
+        self.minimize_button = create_window_button(create_window_minimize_icon(icon_size), "最小化")
         self.minimize_button.clicked.connect(self._on_minimize_clicked)
         window_button_layout.addWidget(self.minimize_button)
-        self.maximize_char = "□"; self.restore_char = "❐"
-        self.maximize_button = create_window_button(self.maximize_char, "最大化")
-        self.maximize_button.setCheckable(True); self.maximize_button.clicked.connect(self._toggle_maximize)
+
+        self.maximize_button = create_window_button(self._maximize_icon, "最大化")
+        self.maximize_button.setCheckable(True)
+        self.maximize_button.clicked.connect(self._toggle_maximize)
         window_button_layout.addWidget(self.maximize_button)
-        self.close_button = create_window_button("✕", "关闭")
-        self.close_button.setObjectName("closeButton"); self.close_button.clicked.connect(self.parent_window.close)
+
+        self.close_button = TitleCloseButton(
+            self._close_icon,
+            self._close_hover_icon,
+            self.window_button_container,
+        )
+        self.close_button.setIconSize(QSize(icon_size, icon_size))
+        self.close_button.clicked.connect(self.parent_window.close)
         window_button_layout.addWidget(self.close_button)
 
         main_layout.addWidget(self.window_button_container)
@@ -302,10 +392,10 @@ class CustomTitleBar(QWidget):
         is_maximized = self.parent_window.isMaximized()
 
         if is_maximized:
-            self.maximize_button.setText(self.restore_char)
+            self.maximize_button.setIcon(self._restore_icon)
             self.maximize_button.setToolTip("向下还原")
         else:
-            self.maximize_button.setText(self.maximize_char)
+            self.maximize_button.setIcon(self._maximize_icon)
             self.maximize_button.setToolTip("最大化")
 
         # 强制刷新按钮显示
@@ -327,6 +417,8 @@ class CustomTitleBar(QWidget):
         button = QToolButton(self)
         button.setDefaultAction(action)
         button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        button.setAutoRaise(True)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         button.setFixedSize(28, 28)
         return button
 

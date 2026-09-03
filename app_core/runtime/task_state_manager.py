@@ -10,6 +10,8 @@ import time
 
 from PySide6.QtCore import QObject, Signal
 
+from app_core.runtime.resource_cleanup import cleanup_yolo_runtime_resources
+
 
 def _trim_main_process_memory() -> float:
     """尽量回收主进程工作集，返回估算释放量（MB）。"""
@@ -64,35 +66,12 @@ def _trim_main_process_memory() -> float:
 
 def _shutdown_existing_async_screenshot_pipeline() -> bool:
     """Stop the async screenshot pipeline without importing it during cleanup."""
-    async_module = sys.modules.get("utils.async_screenshot")
+    async_module = sys.modules.get("utils.capture.async_screenshot")
     shutdown_pipeline = getattr(async_module, "shutdown_global_pipeline", None)
     if not callable(shutdown_pipeline):
         return False
     shutdown_pipeline()
     return True
-
-
-def cleanup_yolo_runtime_resources(
-    release_process: bool = True,
-    compact_memory: bool = True,
-) -> bool:
-    """清理YOLO运行时资源（仅清理已存在实例，不创建新实例）。"""
-    cleaned = False
-    try:
-        from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
-
-        cleanup_result = cleanup_yolo_runtime_on_stop(
-            release_engine=bool(release_process),
-            compact_memory=bool(compact_memory),
-        )
-        cleaned = bool(
-            cleanup_result.get("runtime")
-            or cleanup_result.get("overlay_only")
-            or cleanup_result.get("engine")
-        )
-    except Exception as e:
-        logging.debug(f"清理YOLO运行时资源时出错: {e}")
-    return cleaned
 
 
 class TaskStateManager(QObject):
@@ -487,23 +466,19 @@ class TaskStateManager(QObject):
                         return
 
                     from services.multiprocess_ocr_pool import (
-                        cleanup_registered_ocr_subprocesses,
+                        cleanup_ocr_services_on_stop,
                         get_existing_multiprocess_ocr_pool,
                     )
-                    logging.debug("[后台清理] 开始强制清理所有OCR子进程...")
+                    logging.debug("[后台清理] 按截图引擎处理 OCR 子进程...")
                     pool = get_existing_multiprocess_ocr_pool()
                     if pool is not None:
                         stats = pool.get_stats()
                         logging.debug(f"[后台清理] 当前OCR进程数: {stats.get('total_processes', 0)}")
-                        pool.cleanup_all_processes()
+                    cleanup_ocr_services_on_stop()
+                    pool = get_existing_multiprocess_ocr_pool()
+                    if pool is not None:
                         stats = pool.get_stats()
-                        logging.debug(f"[后台清理] 清理后OCR进程数: {stats.get('total_processes', 0)}")
-
-                    cleaned_count = int(cleanup_registered_ocr_subprocesses() or 0)
-                    if cleaned_count > 0:
-                        logging.info(f"[后台清理] OCR登记子进程已清理: {cleaned_count}")
-                    else:
-                        logging.debug("[后台清理] 未发现需要清理的OCR登记子进程")
+                        logging.debug(f"[后台清理] 处理后OCR进程数: {stats.get('total_processes', 0)}")
                 except Exception as e:
                     logging.error(f"[后台清理] OCR进程清理失败: {e}")
                     import traceback

@@ -191,7 +191,7 @@ class _ProjectCollector:
         images_dir: Path,
         sounds_dir: Path,
     ) -> None:
-        from ui.dialogs.script_resources import list_script_resources
+        from task_workflow.script_resources import list_script_resources, rewrite_resource_literal
 
         source = str(parameters.get("script_source") or "")
         if not source.strip():
@@ -215,7 +215,7 @@ class _ProjectCollector:
                 sounds_dir=sounds_dir,
             )
             if packaged_path != raw_path:
-                rewritten = rewritten.replace(raw_path, packaged_path)
+                rewritten = rewrite_resource_literal(rewritten, raw_path, packaged_path)
         parameters["script_source"] = rewritten
 
     def _collect_asset(

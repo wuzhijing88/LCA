@@ -85,7 +85,7 @@ class WorkflowViewIoMixin:
 
         selected_action = menu.exec(self.mapToGlobal(pos))
         if selected_action == settings_action:
-            card.open_parameter_dialog()
+            card.open_parameter_panel()
         elif selected_action == rename_action:
             self.handle_rename_card(card)
         elif selected_action == change_id_action:
@@ -216,7 +216,10 @@ class WorkflowViewIoMixin:
             try:
                 from task_workflow.workflow_sanitize import sanitize_card_parameters
 
-                parameters = sanitize_card_parameters(copy.deepcopy(card.parameters))
+                parameters = sanitize_card_parameters(
+                    copy.deepcopy(card.parameters),
+                    card.task_type,
+                )
             except Exception as exc:
                 raise TypeError(f"卡片 {card_id} 的 parameters 无法复制: {exc}") from exc
 
@@ -389,7 +392,9 @@ class WorkflowViewIoMixin:
             )
             if card is None:
                 raise RuntimeError(f"卡片创建失败: {card_data['id']}")
-            card.parameters.update(sanitize_card_parameters(copy.deepcopy(card_data['parameters'])))
+            card.parameters.update(
+                sanitize_card_parameters(copy.deepcopy(card_data['parameters']), task_type)
+            )
             custom_name = card_data.get('custom_name')
             if custom_name:
                 card.set_custom_name(custom_name.strip())

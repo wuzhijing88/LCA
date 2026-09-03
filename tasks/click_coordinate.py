@@ -125,6 +125,10 @@ def _activate_window_foreground(target_hwnd: Optional[int]) -> None:
     """前台点击前激活当前绑定窗口。"""
     if not target_hwnd or not PYWIN32_AVAILABLE:
         return
+    from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+    if skip_cross_desktop_activation(target_hwnd, log_prefix="坐标点击"):
+        return
     try:
         hwnd = int(target_hwnd)
     except Exception:
@@ -723,7 +727,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "type": "select",
             "options": ["完整点击", "双击", "仅按下", "仅松开"],
             "default": "完整点击",
-            "tooltip": "完整点击=按下+松开，双击=连续两次完整点击，仅按下=只按下不松开，仅松开=只松开不按下"
+            "tooltip": "完整点击=按下+松开，双击=发送标准双击消息序列，仅按下=只按下不松开，仅松开=只松开不按下"
         },
         "hold_duration": {
             "label": "按下持续时间(秒)",

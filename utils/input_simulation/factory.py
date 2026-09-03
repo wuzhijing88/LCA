@@ -9,8 +9,14 @@ import threading
 import time
 import os
 from typing import Optional, Dict, Tuple, List
+from utils.runtime_config import get_runtime_config
 from .base import BaseInputSimulator, InputSimulatorType
-from .mode_utils import get_foreground_driver, is_foreground_mode
+from .mode_utils import (
+    PLUGIN_EXECUTION_MODE,
+    get_foreground_driver,
+    is_foreground_mode,
+    is_plugin_input_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +102,9 @@ class InputSimulatorFactory:
         """
         from .standard_window import StandardWindowInputSimulator
 
-        # 始终使用标准窗口模式
+        # 始终使用标准窗口模式；键鼠走插件时任何前台模式都按后台执行
+        if is_plugin_input_backend(get_runtime_config()):
+            execution_mode = PLUGIN_EXECUTION_MODE
         use_foreground = is_foreground_mode(execution_mode)
         foreground_driver = get_foreground_driver(execution_mode)
         return StandardWindowInputSimulator(

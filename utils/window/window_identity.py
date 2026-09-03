@@ -6,10 +6,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from utils.window.hwnd_utils import as_hwnd
+from utils.window.hwnd_utils import as_hwnd, get_window_text
 from utils.window.window_finder import sanitize_window_lookup_title
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ def is_desktop_window(hwnd: Any) -> bool:
             return True
 
         class_name = win32gui.GetClassName(handle)
-        title = win32gui.GetWindowText(handle)
+        title = get_window_text(handle)
         parent = as_hwnd(win32gui.GetParent(handle))
         parent_class = win32gui.GetClassName(parent) if parent else ""
         if _is_desktop_identity(class_name, title, parent_class):
@@ -105,6 +106,42 @@ def is_desktop_window(hwnd: Any) -> bool:
         return False
     except Exception:
         return False
+
+
+def find_desktop_icon_layer() -> Tuple[int, int, int]:
+    """定位桌面图标层 (Progman/WorkerW, SHELLDLL_DefView, SysListView32)，找不到的环节返回 0。
+
+    绑定「桌面」时后台消息应送到图标层，而不是屏幕上该点最上层的随便哪个窗口
+    （任务栏、透明覆盖层、别的程序）。开启壁纸幻灯片等情况下 DefView 会被挂到某个 WorkerW 下。
+    """
+    try:
+        import win32gui
+    except Exception:
+        return 0, 0, 0
+    try:
+        progman = as_hwnd(win32gui.FindWindow("Progman", None))
+        host = progman
+        defview = as_hwnd(win32gui.FindWindowEx(progman, 0, "SHELLDLL_DefView", None)) if progman else 0
+        if not defview:
+            candidates: List[Tuple[int, int]] = []
+
+            def _collect(hwnd, acc):
+                try:
+                    if win32gui.GetClassName(hwnd) == "WorkerW":
+                        found = as_hwnd(win32gui.FindWindowEx(hwnd, 0, "SHELLDLL_DefView", None))
+                        if found:
+                            acc.append((as_hwnd(hwnd), found))
+                except Exception:
+                    pass
+                return True
+
+            win32gui.EnumWindows(_collect, candidates)
+            if candidates:
+                host, defview = candidates[0]
+        listview = as_hwnd(win32gui.FindWindowEx(defview, 0, "SysListView32", None)) if defview else 0
+        return host, defview, listview
+    except Exception:
+        return 0, 0, 0
 
 
 WGC_DESKTOP_ENGINE_MESSAGE = (
@@ -163,9 +200,26 @@ def _build_instance_key(cmdline: Optional[Sequence[str]]) -> str:
     return key
 
 
+def _cmdline_instance_key(process: Any, timeout_sec: float = 0.15) -> str:
+    """cmdline() 可能在受保护进程上挂起，必须限时。"""
+    result = [""]
+
+    def worker() -> None:
+        try:
+            result[0] = _build_instance_key(process.cmdline())
+        except Exception:
+            result[0] = ""
+
+    thread = threading.Thread(target=worker, daemon=True, name="WindowCmdlineProbe")
+    thread.start()
+    thread.join(max(0.05, float(timeout_sec)))
+    return result[0]
+
+
 def _get_window_process_info(
     hwnd: int,
     pid_cache: Optional[Dict[int, Dict[str, str]]] = None,
+    include_instance_key: bool = True,
 ) -> Tuple[str, str]:
     try:
         import win32process
@@ -185,10 +239,8 @@ def _get_window_process_info(
 
             process = psutil.Process(pid)
             process_name = _normalize_text(process.name())
-            try:
-                instance_key = _build_instance_key(process.cmdline())
-            except Exception:
-                instance_key = ""
+            if include_instance_key:
+                instance_key = _cmdline_instance_key(process)
         except Exception:
             process_name = ""
 
@@ -216,7 +268,11 @@ def _get_window_process_info(
         return "", ""
 
 
-def capture_window_identity(hwnd: Any, pid_cache: Optional[Dict[int, Dict[str, str]]] = None) -> Dict[str, str]:
+def capture_window_identity(
+    hwnd: Any,
+    pid_cache: Optional[Dict[int, Dict[str, str]]] = None,
+    include_instance_key: bool = True,
+) -> Dict[str, str]:
     """采集窗口的稳定特征。HWND / PID 都不是稳定身份。"""
     identity = {
         "title": "",
@@ -233,12 +289,16 @@ def capture_window_identity(hwnd: Any, pid_cache: Optional[Dict[int, Dict[str, s
 
         if not win32gui.IsWindow(handle):
             return identity
-        identity["title"] = _normalize_text(win32gui.GetWindowText(handle))
+        identity["title"] = _normalize_text(get_window_text(handle))
         try:
             identity["class_name"] = _normalize_text(win32gui.GetClassName(handle))
         except Exception:
             identity["class_name"] = ""
-        process_name, instance_key = _get_window_process_info(handle, pid_cache)
+        process_name, instance_key = _get_window_process_info(
+            handle,
+            pid_cache,
+            include_instance_key=include_instance_key,
+        )
         identity["process_name"] = process_name
         identity["instance_key"] = instance_key
     except Exception:
@@ -250,7 +310,7 @@ def _snapshot_from_hwnd(hwnd: int, pid_cache: Optional[Dict[int, Dict[str, str]]
     handle = as_hwnd(hwnd)
     if handle == 0:
         return None
-    identity = capture_window_identity(handle, pid_cache)
+    identity = capture_window_identity(handle, pid_cache, include_instance_key=False)
     title = _normalize_text(identity.get("title"))
     if not title and is_desktop_window(handle):
         title = "桌面"
@@ -510,12 +570,12 @@ def apply_window_identity(
         window_info["bind_id"] = str(uuid.uuid4())
 
     identity = _identity_from_window_info(window_info)
-    peer_snapshots = list(snapshots) if snapshots is not None else enumerate_window_snapshots(False)
-    peers = _select_candidates(peer_snapshots, identity)
-    for index, peer in enumerate(peers):
-        if as_hwnd(peer.get("hwnd")) == handle:
-            window_info["instance_index"] = index
-            break
+    if snapshots is not None:
+        peers = _select_candidates(list(snapshots), identity)
+        for index, peer in enumerate(peers):
+            if as_hwnd(peer.get("hwnd")) == handle:
+                window_info["instance_index"] = index
+                break
     return window_info
 
 

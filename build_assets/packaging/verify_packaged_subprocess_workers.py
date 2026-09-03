@@ -321,10 +321,9 @@ def _verify_build_modules(build_dir: Path) -> tuple[bool, list[str]]:
         "module.services.multiprocess_ocr_pool.c",
         "module.services.multiprocess_ocr_worker.c",
         "module.services.rapidocr_ocr_service.c",
-        "module.services.multiprocess_match_worker.c",
         "module.services.screenshot_pool.c",
         "module.task_workflow.process_worker.c",
-        "module.utils.dxgi_capture.c",
+        "module.utils.capture.dxgi_capture.c",
         "module.dxcam.c",
     ]
     missing = [name for name in required if not (build_dir / name).exists()]
@@ -347,7 +346,6 @@ def main() -> int:
     failures = []
     workers = [
         ("ocr", lambda: _run_worker_smoke(exe_path, "ocr", "--ocr-worker", timeout_sec=float(args.timeout))),
-        ("match", lambda: _run_worker_smoke(exe_path, "match", "--match-worker", timeout_sec=float(args.timeout))),
         ("workflow", lambda: _run_workflow_worker_smoke(exe_path, timeout_sec=float(args.timeout))),
     ]
 

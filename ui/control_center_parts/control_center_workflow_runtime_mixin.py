@@ -267,7 +267,7 @@ class ControlCenterWorkflowRuntimeMixin:
 
     def _cleanup_yolo_runtime_after_global_stop(self):
         try:
-            from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+            from app_core.runtime.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
 
             cleanup_yolo_runtime_on_stop(release_engine=True, compact_memory=True)
         except Exception as e:
@@ -275,7 +275,7 @@ class ControlCenterWorkflowRuntimeMixin:
 
     def _cleanup_screenshot_runtime_after_global_stop(self):
         try:
-            from utils.capture.screenshot_helper import cleanup_screenshot_engines_on_stop
+            from services.screenshot_pool import cleanup_screenshot_engines_on_stop
 
             cleanup_screenshot_engines_on_stop(keep_current_engine=True)
         except Exception as e:
@@ -291,7 +291,7 @@ class ControlCenterWorkflowRuntimeMixin:
 
     def _cleanup_runtime_image_after_global_stop(self):
         try:
-            from utils.runtime_image_cleanup import cleanup_runtime_image_memory
+            from app_core.runtime.runtime_image_cleanup import cleanup_runtime_image_memory
 
             cleanup_runtime_image_memory(
                 reason="control_center_stop_all_tasks",

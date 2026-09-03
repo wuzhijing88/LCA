@@ -19,7 +19,6 @@ from typing import List, Optional, Tuple
 import ctypes
 from ctypes import wintypes
 
-import cv2
 import numpy as np
 import win32gui
 
@@ -107,6 +106,7 @@ def get_screen_rect(hwnd: int, client_area_only: bool) -> Optional[Tuple[int, in
 
     try:
         if client_area_only:
+            # 客户区以系统 GetClientRect 为准；不按标题栏/边框二次“恢复”，否则自绘标题栏的无边框窗口会被裁小
             rect = win32gui.GetClientRect(hwnd)
             width = int(rect[2] - rect[0])
             height = int(rect[3] - rect[1])
@@ -249,7 +249,5 @@ def crop_frame_by_hwnd(
         )
         return None
 
-    if crop_w != target_w or crop_h != target_h:
-        cropped = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-
+    # 只做像素裁剪，禁止 resize 到目标尺寸；否则宽高差 1~2px 时会非等比拉伸。
     return cropped

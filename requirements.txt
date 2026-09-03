@@ -3,6 +3,7 @@
 
 # 运行时
 cffi==2.0.0
+cryptography==44.0.0
 coloredlogs==15.0.1
 comtypes==1.4.15
 dxcam==0.0.5

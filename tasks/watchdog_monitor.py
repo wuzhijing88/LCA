@@ -10,8 +10,9 @@ from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 任务类型标识
+# 任务类型标识（监控类节点：不参与顺序执行，见 tasks.contract.MonitorModule）
 TASK_TYPE = "附加条件"
+TASK_NAME = "附加条件"
 
 # 全局监控状态存储
 # 格式: {workflow_id: {condition_card_id: {target_card_id: {count, first_time, last_check_time, monitoring_type, triggered_count}}}}
@@ -138,7 +139,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "tooltip": "将计数器重置到的数值（通常为0）",
             "condition": [
                 {"param": "target_supports_counter", "value": True},
-                {"param": "enable_counter_reset", "value": True, "operator": "and"}
+                {"param": "enable_counter_reset", "value": True}
             ]
         },
 
@@ -270,9 +271,9 @@ def check_trigger_condition(state: Dict[str, Any], monitor_mode: str,
     return False, ""
 
 
-def execute_card(card_id: int, parameters: Dict[str, Any], context: Any, **kwargs) -> Tuple[bool, str]:
+def register_monitor(card_id: int, parameters: Dict[str, Any], context: Any, **kwargs) -> Tuple[bool, str]:
     """
-    执行附加条件逻辑 - 返回监控配置（附加条件模式）
+    登记附加条件 - 把本卡片注册为被监控卡片的监控器（附加条件模式）
 
     新架构：附加条件作为被监控卡片的modifier
     - 附加条件不再独立执行循环，而是将自己注册为被监控卡片的监控器
@@ -523,8 +524,3 @@ def check_monitor_trigger(monitor_config: Dict[str, Any], target_card_result: bo
     except Exception as e:
         logger.error(f"检查附加条件触发时失败: {e}", exc_info=True)
         return None
-
-
-# 向后兼容
-execute_task = execute_card
-run = execute_card

@@ -28,19 +28,33 @@ class MainWindowScreenshotEngineMixin:
                         break
                     try:
                         actual_engine = str(get_screenshot_engine() or "").strip().lower()
-                        if target_engine and target_engine == actual_engine:
+                        engine_changed = bool(target_engine) and target_engine != actual_engine
+                        if not engine_changed:
                             logger.info(f"截图引擎未变更，跳过切换: {actual_engine}")
-                            continue
-                        switch_ok = bool(set_screenshot_engine(target_engine))
-                        actual_engine = str(get_screenshot_engine() or "").strip().lower()
-                        if switch_ok and actual_engine == target_engine:
-                            logger.info(f"截图引擎已切换到: {actual_engine}")
                         else:
-                            logger.warning(
-                                "截图引擎切换请求=%s, 实际=%s（目标引擎不可用或受限）",
-                                target_engine,
-                                actual_engine,
-                            )
+                            switch_ok = bool(set_screenshot_engine(target_engine))
+                            actual_engine = str(get_screenshot_engine() or "").strip().lower()
+                            if switch_ok and actual_engine == target_engine:
+                                logger.info(f"截图引擎已切换到: {actual_engine}")
+                            else:
+                                logger.warning(
+                                    "截图引擎切换请求=%s, 实际=%s（目标引擎不可用或受限）",
+                                    target_engine,
+                                    actual_engine,
+                                )
+                        try:
+                            from services.ocr_pool_policy import sync_ocr_pool_to_screenshot_engine
+
+                            sync_ocr_pool_to_screenshot_engine(target_engine)
+                        except Exception:
+                            logger.debug("按截图引擎同步 OCR 池失败", exc_info=True)
+                        if engine_changed:
+                            try:
+                                from task_workflow.workflow_worker_pool import recycle_warm_workflow_workers
+
+                                recycle_warm_workflow_workers()
+                            except Exception:
+                                logger.debug("按截图引擎回收预热工作流子进程失败", exc_info=True)
                     except Exception as exc:
                         logger.error(f"切换截图引擎失败: {exc}")
             finally:

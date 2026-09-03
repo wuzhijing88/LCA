@@ -256,23 +256,17 @@ class ParameterPanelActionsMixin:
             if result is False:
                 logger.warning(f"执行action失败: {action}")
                 return
-            if action == 'open_map_stitcher' and isinstance(result, str) and result.strip():
-                map_option = result.strip()
-                map_combo = self._get_value_widget('map_option')
-                list_map_options = self._resolve_dynamic_options_func('list_map_options')
-                if isinstance(map_combo, QComboBox) and callable(list_map_options):
-                    self._refresh_dynamic_combo_box(map_combo, list_map_options(None))
-                    map_index = map_combo.findText(map_option)
-                    if map_index < 0:
-                        map_combo.addItem(map_option)
-                        map_index = map_combo.findText(map_option)
-                    map_combo.setCurrentIndex(map_index)
-                self.current_parameters['map_option'] = map_option
             logger.info(f"成功执行action: {action}")
         except Exception as e:
             logger.error(f"执行action失败: {action}, 错误: {e}", exc_info=True)
 
     def _resolve_button_action(self, action: str):
+        from ui.panels.actions.ui_button_actions import resolve_ui_button_action
+
+        ui_action = resolve_ui_button_action(action)
+        if ui_action is not None:
+            return ui_action
+
         if hasattr(self, 'task_module') and self.task_module and hasattr(self.task_module, action):
             return getattr(self.task_module, action)
 

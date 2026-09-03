@@ -1,9 +1,9 @@
-﻿; Inno Setup Script - Chinese Version
+; Inno Setup Script - Chinese Version
 ; Encoding: UTF-8 with BOM
 
 #define MyAppName "LCA"
-#define MyAppEdition "离线版"
-#define MyAppDisplayName "LCA 离线版"
+#define MyAppEdition "测试版"
+#define MyAppDisplayName "LCA 测试版"
 #define MyAppPublisher "LCA"
 #define MyAppExeName "main.exe"
 #define MyAppIcon "..\..\resources\icon.ico"
@@ -29,7 +29,7 @@ DefaultGroupName={#MyAppDisplayName}
 DisableDirPage=no
 AllowNoIcons=yes
 OutputDir={#MyOutputDir}
-OutputBaseFilename=LCA_离线版_Setup
+OutputBaseFilename=LCA_测试版_Setup
 
 ; 压缩优化
 Compression=lzma2/ultra64
@@ -435,36 +435,61 @@ end;
 
 function GetProgramRuntimeDirNames(): TArrayOfString;
 begin
-  SetArrayLength(Result, 29);
+  SetArrayLength(Result, 54);
   Result[0] := 'AutoHotkey';
-  Result[1] := 'certs';
-  Result[2] := 'charset_normalizer';
-  Result[3] := 'comtypes';
+  Result[1] := 'Interception';
+  Result[2] := 'tools';
+  Result[3] := 'certs';
   Result[4] := 'config';
-  Result[5] := 'cryptography';
-  Result[6] := 'cv2';
-  Result[7] := 'Interception';
-  Result[8] := 'numpy';
-  Result[9] := 'numpy.libs';
-  Result[10] := 'PIL';
-  Result[11] := 'psutil';
-  Result[12] := 'PySide6';
-  Result[13] := 'resources';
-  Result[14] := 'shiboken6';
-  Result[15] := 'themes';
-  Result[16] := 'uiautomation';
-  Result[17] := 'winrt';
-  Result[18] := 'tools';
-  Result[19] := 'rapidocr';
+  Result[5] := 'resources';
+  Result[6] := 'themes';
+  Result[7] := 'PySide6';
+  Result[8] := 'shiboken6';
+  Result[9] := 'numpy';
+  Result[10] := 'numpy.libs';
+  Result[11] := 'cv2';
+  Result[12] := 'PIL';
+  Result[13] := 'onnxruntime';
+  Result[14] := 'rapidocr';
+  Result[15] := 'shapely';
+  Result[16] := 'shapely.libs';
+  Result[17] := 'pyclipper';
+  Result[18] := 'omegaconf';
+  Result[19] := 'antlr4';
   Result[20] := 'yaml';
-  Result[21] := 'keyboard';
-  Result[22] := 'mouse';
-  Result[23] := 'qtmonaco';
-  Result[24] := 'onnxruntime';
-  Result[25] := 'win32com';
-  Result[26] := '_tufup_data';
-  Result[27] := 'export_runtime';
-  Result[28] := 'runtime_templates';
+  Result[21] := 'requests';
+  Result[22] := 'urllib3';
+  Result[23] := 'idna';
+  Result[24] := 'certifi';
+  Result[25] := 'charset_normalizer';
+  Result[26] := 'colorlog';
+  Result[27] := 'tqdm';
+  Result[28] := 'comtypes';
+  Result[29] := 'uiautomation';
+  Result[30] := 'winrt';
+  Result[31] := 'psutil';
+  Result[32] := 'keyboard';
+  Result[33] := 'mouse';
+  Result[34] := 'pynput';
+  Result[35] := 'mss';
+  Result[36] := 'dxcam';
+  Result[37] := 'pyperclip';
+  Result[38] := 'pyautogui';
+  Result[39] := 'pyscreeze';
+  Result[40] := 'pygetwindow';
+  Result[41] := 'pymsgbox';
+  Result[42] := 'pyrect';
+  Result[43] := 'pytweening';
+  Result[44] := 'win32';
+  Result[45] := 'win32com';
+  Result[46] := 'win32comext';
+  Result[47] := 'pythonwin';
+  Result[48] := 'pywin32_system32';
+  Result[49] := 'cffi';
+  Result[50] := 'pycparser';
+  Result[51] := 'coloredlogs';
+  Result[52] := 'humanfriendly';
+  Result[53] := 'packaging';
 end;
 
 procedure DeleteFilesByMask(const DirPath, Mask: String);

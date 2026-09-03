@@ -39,13 +39,13 @@ def main() -> int:
     args = parser.parse_args()
     dist = Path(args.dist).resolve()
     files = {}
-    for relative in ("main.exe", "DirectML.dll", "onnxruntime.dll"):
+    for relative in ("main.exe", "DirectML.dll", "onnxruntime/capi/onnxruntime.dll"):
         path = dist / relative
         if path.is_file():
             files[relative] = {"size": path.stat().st_size, "sha256": _sha256(path)}
     metadata = {
         "schema_version": 1,
-        "edition": "离线版",
+        "edition": "测试版",
         "git_commit": _git_commit(),
         "built_at": time.time(),
         "files": files,

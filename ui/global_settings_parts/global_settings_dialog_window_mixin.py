@@ -9,7 +9,7 @@ except ImportError:
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QMessageBox
-from utils.window.hwnd_utils import as_hwnd
+from utils.window.hwnd_utils import as_hwnd, get_window_text
 from utils.window.window_binding_utils import sync_runtime_window_binding_state
 from utils.window.window_identity import is_window_alive, refresh_bound_windows
 from utils.window.window_activation_utils import (
@@ -86,6 +86,10 @@ class GlobalSettingsDialogWindowMixin:
             return
         self.bound_windows_combo.setEnabled(True)
         self.remove_window_button.setEnabled(True)
+        show_plugin_probe = (
+            hasattr(self, "_selected_input_backend")
+            and self._selected_input_backend() == "plugin"
+        )
         title_counts = {}
         for window_info in self.bound_windows:
             raw_title = str(window_info.get('title') or '')
@@ -104,9 +108,22 @@ class GlobalSettingsDialogWindowMixin:
                 display_text = f"✗ {label} (待确认重连)"
             else:
                 display_text = f"✗ {label} (未连接)"
+            plugin_ok = window_info.get('plugin_bind_ok') if show_plugin_probe else None
+            plugin_error = (
+                str(window_info.get('plugin_bind_error') or '').strip()
+                if show_plugin_probe
+                else ""
+            )
+            if show_plugin_probe:
+                if plugin_ok is True:
+                    display_text += " · 插件试绑通过"
+                elif plugin_ok is False:
+                    display_text += " · 插件试绑失败"
             self.bound_windows_combo.addItem(display_text)
             # 保存窗口信息到item data
             self.bound_windows_combo.setItemData(i, window_info)
+            if plugin_ok is False and plugin_error:
+                self.bound_windows_combo.setItemToolTip(i, plugin_error)
     def _on_window_selected(self, index):
         """当用户从下拉框选择窗口时，自动绑定该单个窗口"""
         if not WIN32_AVAILABLE_FOR_LIST:
@@ -244,11 +261,7 @@ class GlobalSettingsDialogWindowMixin:
             hwnd = as_hwnd(hwnd)
             safe_title = title.strip() if isinstance(title, str) else ""
             if not safe_title and hwnd:
-                try:
-                    import win32gui
-                    safe_title = win32gui.GetWindowText(hwnd).strip()
-                except Exception as e:
-                    logger.debug(f"获取窗口标题失败: {e}")
+                safe_title = get_window_text(hwnd)
             if not safe_title:
                 safe_title = f"窗口_{hwnd}" if hwnd else "未知窗口"
             title = safe_title
@@ -349,8 +362,7 @@ class GlobalSettingsDialogWindowMixin:
                 elif isinstance(item, int):
                     # 如果是句柄，尝试获取窗口标题
                     try:
-                        import win32gui
-                        title = win32gui.GetWindowText(item)
+                        title = get_window_text(item)
                         if not title:
                             title = f"窗口_{item}"
                         window_list_items.append(f"• {title}")
@@ -380,14 +392,8 @@ class GlobalSettingsDialogWindowMixin:
                             window_title, window_hwnd = item[0], item[1]
                         elif isinstance(item, int):
                             # 如果是单个整数（句柄），尝试获取窗口标题
-                            import win32gui
                             window_hwnd = item
-                            try:
-                                window_title = win32gui.GetWindowText(window_hwnd)
-                                if not window_title:
-                                    window_title = f"窗口_{window_hwnd}"
-                            except Exception:
-                                window_title = f"窗口_{window_hwnd}"
+                            window_title = get_window_text(window_hwnd) or f"窗口_{window_hwnd}"
                         else:
                             logger.warning(f"跳过格式错误的项目 {i}: {type(item)} = {item}")
                             continue
@@ -469,7 +475,7 @@ class GlobalSettingsDialogWindowMixin:
             def enum_windows_callback(hwnd, _):
                 try:
                     if win32gui.IsWindowVisible(hwnd):
-                        title = win32gui.GetWindowText(hwnd)
+                        title = get_window_text(hwnd)
                         if title and len(title.strip()) > 0:
                             # 排除启动器窗口
                             if ("启动器" not in title and
@@ -488,7 +494,7 @@ class GlobalSettingsDialogWindowMixin:
                 if not desktop_hwnd:
                     desktop_hwnd = as_hwnd(win32gui.GetDesktopWindow())
                 if desktop_hwnd and is_desktop_window(desktop_hwnd):
-                    desktop_title = (win32gui.GetWindowText(desktop_hwnd) or "").strip() or "桌面"
+                    desktop_title = get_window_text(desktop_hwnd) or "桌面"
                     if not any(as_hwnd(hwnd) == desktop_hwnd for _, hwnd in pc_windows):
                         pc_windows.insert(0, (desktop_title, desktop_hwnd))
             except Exception as e:
@@ -555,27 +561,18 @@ class GlobalSettingsDialogWindowMixin:
                 return True
         return False
     def _save_bound_windows_config(self):
-        """保存绑定窗口配置到文件"""
-        try:
-            self.current_config['bound_windows'] = self.bound_windows
-            self.current_config['window_binding_mode'] = self.window_binding_mode
-            sync_runtime_window_binding_state(self.current_config)
-            # 确保自定义分辨率也被保存
-            if hasattr(self, 'width_spinbox') and hasattr(self, 'height_spinbox'):
-                self.current_config['custom_width'] = self.width_spinbox.value()
-                self.current_config['custom_height'] = self.height_spinbox.value()
-            # 通过父窗口保存配置
-            parent_window = self.parent()
-            if parent_window and hasattr(parent_window, 'save_config_func'):
-                parent_window.save_config_func(self.current_config)
-                logger.info(f"已通过父窗口保存配置，共 {len(self.bound_windows)} 个窗口")
-            else:
-                # 备用方案：直接调用main模块的save_config
-                from app_core.config_store import save_config
-                save_config(self.current_config)
-                logger.info(f"已直接保存配置，共 {len(self.bound_windows)} 个窗口")
-        except Exception as e:
-            logger.error(f"保存配置失败: {e}")
+        """把绑定窗口状态同步到对话框自己的配置副本。
+
+        不落盘：对话框在“确定”前的任何编辑都只存在于副本里，
+        真正写回主窗口配置并保存由 MainWindow._apply_global_settings 完成。
+        """
+        self.current_config['bound_windows'] = self.bound_windows
+        self.current_config['window_binding_mode'] = self.window_binding_mode
+        sync_runtime_window_binding_state(self.current_config)
+        if hasattr(self, 'width_spinbox') and hasattr(self, 'height_spinbox'):
+            self.current_config['custom_width'] = self.width_spinbox.value()
+            self.current_config['custom_height'] = self.height_spinbox.value()
+        logger.debug("对话框配置副本已同步，共 %d 个绑定窗口", len(self.bound_windows))
     def _cleanup_invalid_windows(self):
         """刷新失效句柄。窗口重启后按特征重连，不再删除绑定记录。"""
         try:

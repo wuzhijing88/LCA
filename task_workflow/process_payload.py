@@ -8,6 +8,7 @@ import os
 from typing import Any, Dict, Iterable, Optional
 
 from task_workflow.thread_window_binding import resolve_thread_window_configs
+from utils.capture.engine_ids import is_supported_screenshot_engine
 
 
 def _normalize_start_card_ids(
@@ -52,7 +53,7 @@ def _validate_payload_inputs(
 
     if not str(execution_mode or "").strip():
         raise ValueError("execution_mode 不能为空")
-    if str(screenshot_engine or "").strip().lower() not in {"wgc", "printwindow", "gdi", "dxgi"}:
+    if not is_supported_screenshot_engine(screenshot_engine):
         raise ValueError(f"不支持的 screenshot_engine: {screenshot_engine!r}")
     if not str(workflow_id or "").strip():
         raise ValueError("workflow_id 不能为空")
@@ -81,8 +82,11 @@ def build_process_workflow_payload(
     target_hwnd: Optional[int] = None,
     thread_labels: Optional[Dict[int, str]] = None,
     bound_windows: Optional[list[Dict[str, Any]]] = None,
+    custom_width: Any = 0,
+    custom_height: Any = 0,
     test_mode: Any = None,
     prefer_file_reference: bool = False,
+    prefer_memory_reference: bool = False,
 ) -> Dict[str, Any]:
     normalized_start_ids = _normalize_start_card_ids(start_card_ids)
     _validate_payload_inputs(
@@ -112,6 +116,15 @@ def build_process_workflow_payload(
             single_thread_target_hwnd = single_thread_window_config["target_hwnd"]
             single_thread_target_window_title = single_thread_window_config["target_window_title"]
 
+    try:
+        required_width = int(custom_width or 0)
+    except (TypeError, ValueError):
+        required_width = 0
+    try:
+        required_height = int(custom_height or 0)
+    except (TypeError, ValueError):
+        required_height = 0
+
     payload: Dict[str, Any] = {
         "payload_version": 2,
         "cards_data": cards_data,
@@ -121,8 +134,16 @@ def build_process_workflow_payload(
         "images_dir": images_dir,
         "workflow_id": str(workflow_id).strip(),
         "workflow_filepath": workflow_filepath,
+        "bound_windows": safe_bound_windows,
+        "custom_width": required_width,
+        "custom_height": required_height,
     }
-    if prefer_file_reference and workflow_filepath:
+    memory_uri = str(workflow_filepath or "").strip()
+    if prefer_memory_reference and memory_uri.startswith("memory://"):
+        payload["workflow_reference"] = {"memory_uri": memory_uri}
+        payload.pop("cards_data", None)
+        payload.pop("connections_data", None)
+    elif prefer_file_reference and workflow_filepath:
         workflow_path = os.path.abspath(str(workflow_filepath))
         if os.path.isfile(workflow_path):
             payload["workflow_reference"] = {

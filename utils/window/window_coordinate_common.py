@@ -1736,6 +1736,10 @@ def build_window_info(
 
     When include_system_metrics=True, also include:
     system_dpi/window_scale_factor/system_scale_factor/qt_dpi
+
+    客户区一律以系统 GetClientRect / ClientToScreen 为准，与 WGC 等引擎裁出的帧完全对应。
+    不再按标题栏/边框“恢复”客户区：无边框自绘标题栏的窗口（QQ、Chrome、Electron）客户区本来就等于整窗，
+    扣一块下去会让整幅截图被缩进更小的矩形里。
     """
     try:
         import win32gui
@@ -1758,6 +1762,8 @@ def build_window_info(
         else:
             client_width = int(client_rect[2] - client_rect[0])
             client_height = int(client_rect[3] - client_rect[1])
+            client_screen_pos = (int(client_screen_pos[0]), int(client_screen_pos[1]))
+            client_rect = (0, 0, int(client_width), int(client_height))
 
         window_dpi = get_window_dpi(hwnd_int)
         qt_device_pixel_ratio = max(1.0, float(window_dpi) / 96.0)

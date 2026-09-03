@@ -59,6 +59,8 @@ class ParameterPanelInitializationMixin:
         self._favorites_mode: bool = False
         self._favorites: List[Dict] = []
         self._favorite_workspaces: List[str] = []
+        self._favorite_excluded: List[str] = []
+        self._favorite_extras: List[str] = []
         self._favorites_pending_close_paths: Dict[str, str] = {}
         self._favorites_active_view: str = "favorites"
         self._favorites_config_path = get_favorites_path()

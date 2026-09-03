@@ -25,6 +25,7 @@ class WindowTaskRunner(
     status_updated = Signal(str, str)
     step_updated = Signal(str, str)
     task_completed = Signal(str, bool)
+    runtime_alert = Signal(str, str)
 
     def __init__(
         self,

@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from utils.input.input_timing import DEFAULT_CLICK_HOLD_SECONDS
+from utils.input.input_timing import DEFAULT_CLICK_HOLD_SECONDS, DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
 from utils.plugin.runtime import is_plugin_runtime_available
 from utils.plugin.session import PluginSession, get_shared_plugin_client, resolve_plugin_display_mode
 from utils.precise_sleep import precise_sleep
@@ -53,12 +53,9 @@ class PluginDxInput:
         return PluginSession(client=self._injected_client)
 
     def _load_bind_params(self) -> tuple[str, str, str, int]:
-        try:
-            from app_core.config_store import load_config
+        from utils.runtime_config import get_runtime_config
 
-            cfg = load_config() or {}
-        except Exception:
-            cfg = {}
+        cfg = get_runtime_config()
         mouse = str(cfg.get("plugin_mouse") or "dx").strip() or "dx"
         keypad = str(cfg.get("plugin_keypad") or "dx").strip() or "dx"
         try:
@@ -73,7 +70,7 @@ class PluginDxInput:
         if self.hwnd <= 0:
             return False
         if self._injected_client is None and not is_plugin_runtime_available():
-            logger.error("DX 模式需要插件运行库（tools/plugin 或 LCA_PLUGIN_DIR）")
+            logger.error("插件键鼠需要安装目录内的 tools/plugin 运行库（PluginHost.exe / dm.dll / RegDll.dll）")
             return False
         session = self._session()
         display, mouse, keypad, mode = self._load_bind_params()
@@ -86,44 +83,65 @@ class PluginDxInput:
             mode=mode,
             input_hwnd=input_hwnd,
             timeout=8.0,
+            fallback=False,
         ):
             logger.error(
-                "插件 DX 键鼠绑定失败: display_hwnd=%s input_hwnd=%s preferred_display=%s；"
-                "32 位游戏若一直卡住/超时，多半是注入被拦或句柄不对。"
-                "可试：管理员运行 LCA、核对 PluginHost.exe，或改后台一/二",
+                "插件键鼠绑定失败: display_hwnd=%s input_hwnd=%s %s；"
+                "若一直超时多半是注入被安全软件拦截或句柄不对，可试管理员运行、换绑定模式或改用原生后台",
                 self.hwnd,
                 input_hwnd,
-                display,
+                session.last_bind_failure_text(),
             )
             self._client = None
             return False
         self._client = session._client
         return True
 
+    def _text_ime_enabled(self) -> bool:
+        from utils.runtime_config import get_runtime_config
+
+        try:
+            return bool(get_runtime_config().get("plugin_text_ime", False))
+        except Exception:
+            return False
+
+    def send_text(self, text: str) -> bool:
+        """ASCII 走 KeyPressStr（按键序列）；含中文等非 ASCII 字符时走 SendString（消息注入），
+        开启「插件文本走输入法」时优先 SendStringIme（游戏类窗口通常只认这条路）。"""
+        value = str(text or "")
+        if not value:
+            return True
+        if not self._ready():
+            return False
+        if value.isascii():
+            return bool(self._client.key_press_str(value, hwnd=self.hwnd))
+        target = as_hwnd(self._resolved_input_hwnd()) or self.hwnd
+        return bool(self._client.send_string(self.hwnd, value, ime=self._text_ime_enabled(), target=target))
+
     def move_to(self, x: int, y: int) -> bool:
         if not self._ready():
             return False
-        return bool(self._client.move_to(int(x), int(y)))
+        return bool(self._client.move_to(int(x), int(y), hwnd=self.hwnd))
 
     def mouse_down(self, button: str = "left") -> bool:
         if not self._ready():
             return False
-        return bool(self._client.mouse_down(button))
+        return bool(self._client.mouse_down(button, hwnd=self.hwnd))
 
     def mouse_up(self, button: str = "left") -> bool:
         if not self._ready():
             return False
-        return bool(self._client.mouse_up(button))
+        return bool(self._client.mouse_up(button, hwnd=self.hwnd))
 
     def mouse_click(self, button: str = "left") -> bool:
         if not self._ready():
             return False
-        return bool(self._client.mouse_click(button))
+        return bool(self._client.mouse_click(button, hwnd=self.hwnd))
 
     def mouse_double_click(self, button: str = "left") -> bool:
         if not self._ready():
             return False
-        return bool(self._client.mouse_double_click(button))
+        return bool(self._client.mouse_double_click(button, hwnd=self.hwnd))
 
     def click(
         self,
@@ -161,32 +179,67 @@ class PluginDxInput:
                 return False
         return True
 
-    def double_click(self, x: int, y: int, button: str = "left") -> bool:
+    def double_click(
+        self,
+        x: int,
+        y: int,
+        button: str = "left",
+        interval: Optional[float] = None,
+        hold_duration: Optional[float] = None,
+    ) -> bool:
+        """左键走大漠 LeftDoubleClick（消息注入模式下两次单击不会被识别为双击）；
+        大漠没有 Right/MiddleDoubleClick，非左键用两次按下/松开凑出双击时序。"""
         if not self.move_to(x, y):
             return False
-        return self.mouse_double_click(button)
+        normalized = str(button or "left").strip().lower()
+        if normalized == "left":
+            return self.mouse_double_click("left")
+        try:
+            gap = DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS if interval is None else max(0.0, float(interval))
+        except Exception:
+            gap = DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
+        try:
+            hold = DEFAULT_CLICK_HOLD_SECONDS if hold_duration is None else max(0.0, float(hold_duration))
+        except Exception:
+            hold = DEFAULT_CLICK_HOLD_SECONDS
+        for index in range(2):
+            if index > 0 and gap > 0:
+                precise_sleep(gap)
+            if not self.mouse_down(normalized):
+                return False
+            if hold > 0:
+                precise_sleep(hold)
+            if not self.mouse_up(normalized):
+                return False
+        return True
 
     def wheel(self, x: int, y: int, delta: int) -> bool:
+        """delta 既可能是格数（±3）也可能是 WHEEL_DELTA 单位（±120 的倍数），统一换算成格数交给宿主。"""
         if not self.move_to(x, y):
             return False
-        return bool(self._client.wheel(int(delta)))
+        raw = int(delta)
+        if raw == 0:
+            return False
+        magnitude = abs(raw)
+        notches = max(1, magnitude // 120) if magnitude >= 120 else magnitude
+        return bool(self._client.wheel(notches if raw > 0 else -notches, hwnd=self.hwnd))
 
     def key_down(self, vk_code: int) -> bool:
         if not self._ready():
             return False
-        return bool(self._client.key_down(int(vk_code)))
+        return bool(self._client.key_down(int(vk_code), hwnd=self.hwnd))
 
     def key_up(self, vk_code: int) -> bool:
         if not self._ready():
             return False
-        return bool(self._client.key_up(int(vk_code)))
+        return bool(self._client.key_up(int(vk_code), hwnd=self.hwnd))
 
     def key_press(self, vk_code: int) -> bool:
         if not self._ready():
             return False
-        return bool(self._client.key_press(int(vk_code)))
+        return bool(self._client.key_press(int(vk_code), hwnd=self.hwnd))
 
     def key_press_str(self, text: str, delay: int = 30) -> bool:
         if not self._ready():
             return False
-        return bool(self._client.key_press_str(str(text or ""), int(delay)))
+        return bool(self._client.key_press_str(str(text or ""), int(delay), hwnd=self.hwnd))

@@ -70,14 +70,23 @@ class BaseInputSimulator(ABC):
         """
 
     @abstractmethod
-    def double_click(self, x: int, y: int, button: str = 'left') -> bool:
+    def double_click(
+        self,
+        x: int,
+        y: int,
+        button: str = 'left',
+        interval: Optional[float] = None,
+        hold_duration: Optional[float] = None,
+    ) -> bool:
         """
-        鼠标双击
+        鼠标双击（必须是目标能识别为“双击”的序列，而不是两次单击）
 
         Args:
             x: X坐标
             y: Y坐标
             button: 鼠标按钮
+            interval: 两次按下之间的间隔秒数，None 用默认
+            hold_duration: 每次按住秒数，None 用默认
 
         Returns:
             bool: 操作是否成功

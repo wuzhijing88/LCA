@@ -1,7 +1,6 @@
 import logging
 import os
 from PySide6.QtWidgets import QMessageBox
-from .main_window_support import normalize_execution_mode_setting
 from ..main_window_parts.main_window_pause_orchestrator import (
     main_window_pause_workflow,
     main_window_resume_workflow,
@@ -698,11 +697,7 @@ class MainWindowExecutionFlowMixin:
 
         if not configured_mode:
 
-            configured_mode = normalize_execution_mode_setting(
-
-                self.config.get('execution_mode', 'background_sendmessage')
-
-            )
+            configured_mode = str(self.config.get('execution_mode') or 'background_sendmessage')
 
         # 检查是否选择了前台模式
 
@@ -808,7 +803,7 @@ class MainWindowExecutionFlowMixin:
 
                 try:
 
-                    from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+                    from app_core.runtime.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
 
                     cleanup_yolo_runtime_on_stop(
 

@@ -25,11 +25,7 @@ class MainWindowFavoritesBatchMixin:
             task_id = self._open_workflow_reference(filepath, switch_to_tab=False)
             if task_id is not None:
                 task = self.task_manager.get_task(task_id)
-                if (
-                    getattr(self, '_favorites_open_first_task_id', None) is None
-                    and task is not None
-                    and not getattr(task, 'read_only_mode', False)
-                ):
+                if getattr(self, '_favorites_open_first_task_id', None) is None and task is not None:
                     self._favorites_open_first_task_id = task_id
                 self._favorites_open_success = getattr(self, '_favorites_open_success', 0) + 1
             else:
@@ -50,8 +46,6 @@ class MainWindowFavoritesBatchMixin:
             all_tasks = self.task_manager.get_all_tasks()
             saved_count = 0
             for task in all_tasks:
-                if getattr(task, 'read_only_mode', False):
-                    continue
                 workflow_view = self.workflow_tab_widget.task_views.get(task.task_id)
                 latest_workflow_data = None
                 if workflow_view:
@@ -60,11 +54,20 @@ class MainWindowFavoritesBatchMixin:
                     if latest_workflow_data:
                         task.workflow_data = latest_workflow_data
                         logger.info(f"  Task '{task.name}' workflow_data refreshed")
+                old_filepath = task.filepath
                 if task.save_and_backup(workflow_data=latest_workflow_data):
                     saved_count += 1
+                    self._sync_favorite_path_after_save(old_filepath, task)
                     self.workflow_tab_widget._update_tab_status(task.task_id)
             logger.info(f"Saved and backed up {saved_count}/{len(all_tasks)} tasks before batch execute")
-            resolved_queue = list(filepaths)
+            resolved_queue = []
+            for filepath in filepaths:
+                task_id = self._open_workflow_reference(filepath, switch_to_tab=False)
+                task = self.task_manager.get_task(task_id) if task_id is not None else None
+                if task is not None and task.filepath:
+                    resolved_queue.append(task.filepath)
+                else:
+                    resolved_queue.append(filepath)
             self._batch_execute_queue = list(resolved_queue)
             self._batch_execute_index = 0
             self._is_jumping = False
@@ -126,6 +129,6 @@ class MainWindowFavoritesBatchMixin:
             QTimer.singleShot(500, self._execute_next_batch_workflow)
         task.execution_finished.connect(on_finished)
         tab_index = self.workflow_tab_widget.task_to_tab.get(task.task_id)
-        if tab_index is not None and not getattr(task, 'read_only_mode', False):
+        if tab_index is not None:
             self.workflow_tab_widget.setCurrentIndex(tab_index)
         QTimer.singleShot(100, lambda: task.execute_async())

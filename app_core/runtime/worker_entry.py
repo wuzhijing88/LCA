@@ -157,6 +157,12 @@ def build_worker_process_env(
         env["VIRTUAL_ENV"] = venv_root
         env["PATH"] = _prepend_path_once(env.get("PATH"), scripts_dir)
 
+    try:
+        from utils.plugin.runtime import plugin_attach_env
+
+        env.update(plugin_attach_env())
+    except Exception:
+        pass
     return env
 
 

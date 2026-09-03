@@ -86,9 +86,9 @@ SCRIPT_INSERT_GROUPS = (
             },
             {
                 "name": "输入",
-                "signature": '输入("文本")',
-                "params": ("文本",),
-                "note": "往当前焦点输入文字。",
+                "signature": '输入("文本")  /  输入("文本", 方式="粘贴")',
+                "params": (("文本",), ("文本", '方式="粘贴"')),
+                "note": "往当前焦点输入文字。方式=粘贴 走剪贴板 Ctrl+V，适合长文本；默认仿真逐字输入。",
                 "snippet": "输入(文本)",
             },
             {
@@ -153,7 +153,7 @@ SCRIPT_INSERT_GROUPS = (
                     ("模型", '类别="敌人"', "阈值=0.5", '策略="最近"'),
                     ("模型", '类别="敌人"', "阈值=0.5", '策略="最近"', "区域=(x, y, 宽, 高)"),
                 ),
-                "note": "模型写 onnx 路径，例如 \"yolo/xxx.onnx\"。不写类别就认模型里全部类。只检出这一帧，默认不点。要一直认用 持续检测，然后读 检测，不要再写 检测()。",
+                "note": "跟画布 YOLO 卡的「原生/插件」。模型和类别跟卡片一样，也可写成 检测(\"yolo/xxx.onnx\", 类别=\"敌人\")。只识别，不点；要点写 点击(结果)。",
                 "kind": "expr",
                 "snippet": "检测(模型)",
             },
@@ -442,6 +442,23 @@ SCRIPT_INSERT_GROUPS = (
                 "snippet": "激活()",
             },
             {
+                "name": "窗口.设置分辨率",
+                "signature": (
+                    "窗口.设置分辨率(宽, 高)\n"
+                    "窗口.设置分辨率(宽, 高, 目标)\n"
+                    "窗口.设置分辨率(目标)\n"
+                    "窗口.设置分辨率(宽, 高, 报错=假)"
+                ),
+                "params": (
+                    ("宽", "高"),
+                    ("宽", "高", "目标"),
+                    ("目标",),
+                    ("宽", "高", "报错=假"),
+                ),
+                "note": "改绑定窗口客户区尺寸。不写宽高就用全局自定义分辨率。目标可省略（当前）、写「当前」「全部」、标题、序号（从 1 起）或列表。单独一个数字不行。默认失败会打断脚本，报错=假 时只返回假。",
+                "snippet": "窗口.设置分辨率(1280, 720)",
+            },
+            {
                 "name": "播放",
                 "signature": '播放(文件)  /  播放(文件, 等待=真)',
                 "params": (("文件",), ("文件", "等待=真")),
@@ -453,6 +470,29 @@ SCRIPT_INSERT_GROUPS = (
                 "signature": "停止播放()",
                 "note": "停掉当前正在播的音频。",
                 "snippet": "停止播放()",
+            },
+            {
+                "name": "回放",
+                "signature": '回放("replays/过图.replay.json")  /  回放(文件, 速度=1, 次数=1)',
+                "params": (("文件",), ("文件", "速度=1", "次数=1")),
+                "note": "回放录制轨迹。文件用 .replay.json，放在 replays/ 或资源栏导入。只回放，不在脚本里开录制。",
+                "snippet": '回放("replays/过图.replay.json", 速度=1, 次数=1)',
+            },
+            {
+                "name": "截图",
+                "signature": "截图()  /  截图(\"shot.png\")",
+                "params": ((), ("文件",)),
+                "note": "把当前绑定窗口存成项目图片。不写文件名就自动起名。返回路径，可接着 找图(图.路径)。",
+                "kind": "expr",
+                "snippet": '截图("shot.png")',
+            },
+            {
+                "name": "等按键",
+                "signature": '等按键("F1", 超时=8)  /  等按键("Ctrl+C", 超时=8)',
+                "params": (("按键", "超时=8"),),
+                "note": "等到这些键都按下。超时没按到就返回假，不会抛错。可写 空格、回车、F1 或组合键。",
+                "kind": "expr",
+                "snippet": '等按键("F1", 超时=8)',
             },
         ),
     },
@@ -892,6 +932,7 @@ def script_completion_names() -> List[str]:
             "时间",
             "窗口.宽",
             "窗口.高",
+            "窗口.设置分辨率",
             "剪贴板.获取",
             "剪贴板.设置",
         )
@@ -921,6 +962,8 @@ _PLACEHOLDER_TOKENS = (
     "点击=真",
     "点击=False",
     "点击=True",
+    "报错=假",
+    "报错=真",
     "双击=假",
     "双击=真",
     "偏移x=0",
@@ -1216,8 +1259,10 @@ _STMT_COMMANDS = frozenset(
         "按住",
         "连点",
         "激活",
+        "窗口.设置分辨率",
         "播放",
         "停止播放",
+        "回放",
         "剪贴板.设置",
         "记录",
         "成功",
@@ -1262,6 +1307,8 @@ _RESULT_ASSIGN_PREFIXES = (
     "比色(",
     "点文字(",
     "点元素(",
+    "截图(",
+    "等按键(",
 )
 _HEADER_PREFIXES = (
     ("否则如果 ", "条件"),
@@ -1280,6 +1327,7 @@ _PARAM_CHOICES = {
     "键": ('"左键"', '"右键"'),
     "方向": ('"向下"', '"向上"'),
     "动作": ('"按下"', '"松开"'),
+    "方式": ('"粘贴"', '"仿真"'),
     "策略": ('"最近"', '"最大"', '"置信度最高"'),
 }
 
@@ -2211,6 +2259,11 @@ _COMMAND_EXAMPLES = {
     ),
     "相对移动": "相对移动(10, 0)",
     "激活": "激活()",
+    "窗口.设置分辨率": (
+        "窗口.设置分辨率(1280, 720)\n"
+        '窗口.设置分辨率(1280, 720, "全部")\n'
+        '窗口.设置分辨率("阴阳师", 报错=假)'
+    ),
     "播放": (
         '播放("提示.wav")\n'
         '播放("提示.mp3", 等待=假)\n'
@@ -2218,6 +2271,15 @@ _COMMAND_EXAMPLES = {
         "停止播放()"
     ),
     "停止播放": "停止播放()",
+    "回放": '回放("replays/过图.replay.json", 速度=1)',
+    "截图": (
+        '图 = 截图("shot.png")\n'
+        "记录(图.路径)"
+    ),
+    "等按键": (
+        '如果 等按键("F1", 超时=8):\n'
+        "    点击()"
+    ),
     "记录": '记录("已点确定")',
     "成功": "成功()",
     "失败": '失败("没找到确定")',
@@ -2430,6 +2492,10 @@ _COMMAND_RETURNS = {
     "卡片": "卡片[编号].内容  卡片[编号].分数  卡片[编号].通过",
     "窗口.宽": "当前绑定窗口客户区宽度",
     "窗口.高": "当前绑定窗口客户区高度",
+    "窗口.设置分辨率": "可读 结果.宽  结果.高  结果.通过。报错=假 时失败返回假",
+    "回放": "无。按录制轨迹前台回放",
+    "截图": "可读 图.路径  图.通过",
+    "等按键": "按时为真。超时为假",
     "变量.获取": "返回这个名字的值",
     "变量.设置": "无",
     "变量.增加": "返回增加后的值",
@@ -2615,16 +2681,34 @@ def execute_task(
         store = get_runtime_store()
         store.bind_counters(counters if isinstance(counters, dict) else {})
         store.set_current_card_id(card_id)
+        executor = kwargs.get("executor")
         context = {
             "counters": counters if isinstance(counters, dict) else {},
             "execution_mode": execution_mode,
             "target_hwnd": target_hwnd,
+            "bound_windows": kwargs.get("bound_windows")
+            if kwargs.get("bound_windows") is not None
+            else getattr(executor, "bound_windows", None),
+            "custom_width": kwargs.get("custom_width")
+            if kwargs.get("custom_width") is not None
+            else getattr(executor, "custom_width", 0),
+            "custom_height": kwargs.get("custom_height")
+            if kwargs.get("custom_height") is not None
+            else getattr(executor, "custom_height", 0),
+            "adjust_window_resolution": kwargs.get("adjust_window_resolution")
+            or getattr(executor, "adjust_window_resolution", None),
             "window_region": window_region,
             "card_id": card_id,
             "get_image_data": kwargs.get("get_image_data"),
             "stop_checker": kwargs.get("stop_checker"),
             "pause_checker": kwargs.get("pause_checker"),
             "executor": kwargs.get("executor"),
+            "images_dir": kwargs.get("images_dir")
+            if kwargs.get("images_dir") is not None
+            else getattr(executor, "images_dir", None),
+            "sounds_dir": kwargs.get("sounds_dir")
+            if kwargs.get("sounds_dir") is not None
+            else getattr(executor, "sounds_dir", None),
         }
         success, detail = run_script(source, store, logger, context=context)
         if success:

@@ -51,6 +51,7 @@ except ImportError:
     logging.warning("性能优化器不可用")
 
 logger = logging.getLogger(__name__)
+TASK_TYPE = '录制回放'
 TASK_NAME = '录制回放'
 
 
@@ -197,8 +198,8 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
             recorded_actions_json = counters.get(f'__recorded_actions_{card_id}', '')
 
     if not recorded_actions_json:
-        logger.warning("没有可回放的录制数据，跳过当前回放步骤")
-        return True, '执行下一步', None
+        logger.warning("没有可回放的录制数据")
+        return False, '执行下一步', None
 
     try:
         if isinstance(recorded_actions_json, str):
@@ -226,8 +227,8 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
         return False, '停止工作流', None
 
     if not actions:
-        logger.warning("录制数据为空，跳过当前回放步骤")
-        return True, '执行下一步', None
+        logger.warning("录制数据为空，没有可回放的动作")
+        return False, '执行下一步', None
 
     logger.info(f"录制数据解析完成: 区域={recording_area}, 模式={recording_mode}, 动作数={len(actions)}")
 
@@ -304,99 +305,103 @@ def _execute_replay(params: Dict[str, Any], counters: Dict[str, int],
 
                     # 使用找到的顶级窗口进行激活
                     activation_hwnd = target_hwnd
+                    from utils.window.virtual_desktop import skip_cross_desktop_activation
 
-                    # 步骤1: 恢复最小化的窗口
-                    logger.info("[录制回放] 步骤1: 检查窗口是否最小化...")
-                    if win32gui.IsIconic(activation_hwnd):
-                        logger.info(f"[录制回放] 窗口已最小化，正在恢复: {activation_hwnd}")
-                        win32gui.ShowWindow(activation_hwnd, win32con.SW_RESTORE)
-                        time.sleep(0.1)
-                    else:
-                        logger.info("[录制回放] 窗口未最小化")
-
-                    # 步骤2: 确保窗口可见并在顶层
-                    logger.info("[录制回放] 步骤2: 显示窗口...")
-                    win32gui.ShowWindow(activation_hwnd, win32con.SW_SHOW)
-                    time.sleep(0.05)
-
-                    # 步骤3: 将窗口置于最顶层（临时）
-                    logger.info("[录制回放] 步骤3: 设置窗口为TOPMOST...")
-                    HWND_TOPMOST = -1
-                    HWND_NOTOPMOST = -2
-                    SWP_NOMOVE = 0x0002
-                    SWP_NOSIZE = 0x0001
-                    SWP_SHOWWINDOW = 0x0040
-
-                    # 设置为topmost
-                    ctypes.windll.user32.SetWindowPos(
-                        activation_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
-                    )
-                    time.sleep(0.1)
-                    logger.info("[录制回放] 已设置为TOPMOST")
-
-                    # 步骤4: 获取线程ID并附加输入
-                    logger.info("[录制回放] 步骤4: 附加线程输入...")
-                    foreground_hwnd = win32gui.GetForegroundWindow()
-                    foreground_thread_id = None  # 在外层定义，避免作用域问题
-                    target_thread_id = None
-
-                    if foreground_hwnd != 0:
-                        foreground_thread_id = win32process.GetWindowThreadProcessId(foreground_hwnd)[0]
-                        target_thread_id = win32process.GetWindowThreadProcessId(activation_hwnd)[0]
-                        logger.info(f"[录制回放] 前台窗口: {foreground_hwnd}, 前台线程: {foreground_thread_id}, 目标线程: {target_thread_id}")
-
-                        # 附加线程输入
-                        if foreground_thread_id != target_thread_id:
-                            ctypes.windll.user32.AttachThreadInput(foreground_thread_id, target_thread_id, True)
-                            logger.info("[录制回放] 已附加线程输入")
+                    if not skip_cross_desktop_activation(activation_hwnd, log_prefix="录制回放"):
+                        # 步骤1: 恢复最小化的窗口
+                        logger.info("[录制回放] 步骤1: 检查窗口是否最小化...")
+                        if win32gui.IsIconic(activation_hwnd):
+                            logger.info(f"[录制回放] 窗口已最小化，正在恢复: {activation_hwnd}")
+                            win32gui.ShowWindow(activation_hwnd, win32con.SW_RESTORE)
+                            time.sleep(0.1)
                         else:
-                            logger.info("[录制回放] 前台线程与目标线程相同，无需附加")
-                    else:
-                        logger.warning("[录制回放] 无法获取前台窗口")
+                            logger.info("[录制回放] 窗口未最小化")
 
-                    # 步骤5: 设置为前台窗口
-                    logger.info("[录制回放] 步骤5: 设置为前台窗口...")
-                    win32gui.SetForegroundWindow(activation_hwnd)
-                    time.sleep(0.1)
-                    current_fg = win32gui.GetForegroundWindow()
-                    logger.info(f"[录制回放] SetForegroundWindow后，当前前台窗口: {current_fg}")
+                        # 步骤2: 确保窗口可见并在顶层
+                        logger.info("[录制回放] 步骤2: 显示窗口...")
+                        win32gui.ShowWindow(activation_hwnd, win32con.SW_SHOW)
+                        time.sleep(0.05)
 
-                    # 步骤6: 取消topmost，恢复为普通窗口
-                    logger.info("[录制回放] 步骤6: 取消TOPMOST...")
-                    ctypes.windll.user32.SetWindowPos(
-                        activation_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
-                    )
+                        # 步骤3: 将窗口置于最顶层（临时）
+                        logger.info("[录制回放] 步骤3: 设置窗口为TOPMOST...")
+                        HWND_TOPMOST = -1
+                        HWND_NOTOPMOST = -2
+                        SWP_NOMOVE = 0x0002
+                        SWP_NOSIZE = 0x0001
+                        SWP_SHOWWINDOW = 0x0040
 
-                    # 步骤7: 分离线程输入
-                    logger.info("[录制回放] 步骤7: 分离线程输入...")
-                    if foreground_hwnd != 0 and foreground_thread_id is not None and target_thread_id is not None:
-                        if foreground_thread_id != target_thread_id:
-                            ctypes.windll.user32.AttachThreadInput(foreground_thread_id, target_thread_id, False)
-                            logger.info("[录制回放] 已分离线程输入")
+                        ctypes.windll.user32.SetWindowPos(
+                            activation_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                        )
+                        time.sleep(0.1)
+                        logger.info("[录制回放] 已设置为TOPMOST")
 
-                    # 步骤8: 再次确认窗口在前台
-                    logger.info("[录制回放] 步骤8: 再次确认窗口在前台...")
-                    win32gui.BringWindowToTop(activation_hwnd)
-                    time.sleep(0.2)
+                        # 步骤4: 获取线程ID并附加输入
+                        logger.info("[录制回放] 步骤4: 附加线程输入...")
+                        foreground_hwnd = win32gui.GetForegroundWindow()
+                        foreground_thread_id = None
+                        target_thread_id = None
 
-                    final_fg = win32gui.GetForegroundWindow()
-                    window_title = win32gui.GetWindowText(activation_hwnd)
-                    logger.info(f"[录制回放] 激活完成! 目标窗口: {activation_hwnd} ({window_title}), 当前前台: {final_fg}")
+                        if foreground_hwnd != 0:
+                            foreground_thread_id = win32process.GetWindowThreadProcessId(foreground_hwnd)[0]
+                            target_thread_id = win32process.GetWindowThreadProcessId(activation_hwnd)[0]
+                            logger.info(f"[录制回放] 前台窗口: {foreground_hwnd}, 前台线程: {foreground_thread_id}, 目标线程: {target_thread_id}")
 
-                    if final_fg == activation_hwnd:
-                        logger.info("[录制回放] ✓ 窗口激活成功!")
-                    else:
-                        logger.warning("[录制回放] ✗ 窗口可能未激活成功，前台窗口不匹配")
+                            if foreground_thread_id != target_thread_id:
+                                ctypes.windll.user32.AttachThreadInput(foreground_thread_id, target_thread_id, True)
+                                logger.info("[录制回放] 已附加线程输入")
+                            else:
+                                logger.info("[录制回放] 前台线程与目标线程相同，无需附加")
+                        else:
+                            logger.warning("[录制回放] 无法获取前台窗口")
+
+                        # 步骤5: 设置为前台窗口
+                        logger.info("[录制回放] 步骤5: 设置为前台窗口...")
+                        win32gui.SetForegroundWindow(activation_hwnd)
+                        time.sleep(0.1)
+                        current_fg = win32gui.GetForegroundWindow()
+                        logger.info(f"[录制回放] SetForegroundWindow后，当前前台窗口: {current_fg}")
+
+                        # 步骤6: 取消topmost，恢复为普通窗口
+                        logger.info("[录制回放] 步骤6: 取消TOPMOST...")
+                        ctypes.windll.user32.SetWindowPos(
+                            activation_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                        )
+
+                        # 步骤7: 分离线程输入
+                        logger.info("[录制回放] 步骤7: 分离线程输入...")
+                        if foreground_hwnd != 0 and foreground_thread_id is not None and target_thread_id is not None:
+                            if foreground_thread_id != target_thread_id:
+                                ctypes.windll.user32.AttachThreadInput(foreground_thread_id, target_thread_id, False)
+                                logger.info("[录制回放] 已分离线程输入")
+
+                        # 步骤8: 再次确认窗口在前台
+                        logger.info("[录制回放] 步骤8: 再次确认窗口在前台...")
+                        win32gui.BringWindowToTop(activation_hwnd)
+                        time.sleep(0.2)
+
+                        final_fg = win32gui.GetForegroundWindow()
+                        window_title = win32gui.GetWindowText(activation_hwnd)
+                        logger.info(f"[录制回放] 激活完成! 目标窗口: {activation_hwnd} ({window_title}), 当前前台: {final_fg}")
+
+                        if final_fg == activation_hwnd:
+                            logger.info("[录制回放] ✓ 窗口激活成功!")
+                        else:
+                            logger.warning("[录制回放] ✗ 窗口可能未激活成功，前台窗口不匹配")
 
                 except Exception as e:
                     logger.error(f"[录制回放] ✗ 激活窗口过程发生异常: {e}", exc_info=True)
-                    # 尝试备用方法：简单激活
                     try:
-                        logger.info("[录制回放] 尝试备用激活方法...")
-                        win32gui.ShowWindow(hwnd, 5)  # SW_SHOW
-                        win32gui.SetForegroundWindow(hwnd)
+                        from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+                        if skip_cross_desktop_activation(hwnd, log_prefix="录制回放"):
+                            pass
+                        else:
+                            logger.info("[录制回放] 尝试备用激活方法...")
+                            win32gui.ShowWindow(hwnd, 5)  # SW_SHOW
+                            win32gui.SetForegroundWindow(hwnd)
                     except Exception:
                         pass
 

@@ -515,6 +515,11 @@ class UniversalResolutionAdapter:
             SW_RESTORE = 9
             restored = False
 
+            from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+            if skip_cross_desktop_activation(hwnd, log_prefix="分辨率适配"):
+                return
+
             if self.user32.IsIconic(hwnd):
                 logger.info(f"[HWND:{hwnd}] 窗口处于最小化状态，先恢复并强制激活")
                 self.user32.ShowWindow(hwnd, SW_RESTORE)

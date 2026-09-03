@@ -3,8 +3,10 @@ import os
 from typing import List
 
 from task_workflow.workspace import (
+    favorite_path_key,
     get_effective_workflow_images_dir,
     load_workspace_favorites_snapshot,
+    resolve_existing_workflow_path,
     save_workspace_favorites_snapshot,
 )
 
@@ -12,8 +14,23 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindowFavoritesMixin:
+    def _sync_favorite_path_after_save(self, old_filepath: str, task) -> None:
+        """JSON 转 LCA 后同步工作区收藏路径。"""
+        new_filepath = str(getattr(task, "filepath", "") or "")
+        if not old_filepath or not new_filepath:
+            return
+        if favorite_path_key(old_filepath) == favorite_path_key(new_filepath):
+            return
+        panel = getattr(self, "parameter_panel", None)
+        if panel is not None and hasattr(panel, "update_favorite_entry"):
+            panel.update_favorite_entry(old_filepath, new_filepath, getattr(task, "name", None))
+
     def _on_favorite_workflow_check_changed(self, filepath: str, checked: bool):
-        """处理收藏勾选状态变化。"""
+        """处理收藏勾选状态变化。
+
+        取消勾选等于关闭该工作流标签：有未保存更改时同样要问用户（保存 / 放弃 / 取消），
+        不能因为是从收藏列表关的就静默丢掉正在编辑的步骤。用户取消时标签保留，勾选状态恢复。
+        """
         try:
             if checked:
                 self._open_workflow_reference(filepath)
@@ -22,10 +39,18 @@ class MainWindowFavoritesMixin:
             if task is None:
                 return
             tab_index = self.workflow_tab_widget.task_to_tab.get(task.task_id)
-            if tab_index is not None:
-                self.workflow_tab_widget.close_tab_silent(tab_index)
+            if tab_index is None:
+                return
+            if not self.workflow_tab_widget.close_tab(tab_index):
+                logger.info("收藏取消勾选时用户保留了工作流标签，恢复勾选: %s", filepath)
+                self._restore_favorite_checked(filepath)
         except Exception:
             logger.exception("同步收藏工作流勾选状态失败: %s", filepath)
+
+    def _restore_favorite_checked(self, filepath: str) -> None:
+        panel = getattr(self, "parameter_panel", None)
+        if panel is not None and hasattr(panel, "set_favorite_checked"):
+            panel.set_favorite_checked(filepath, True)
     def _auto_load_recent_workflows(self):
         """自动加载最近打开的工作流"""
         try:
@@ -41,11 +66,7 @@ class MainWindowFavoritesMixin:
                 for filepath in favorite_filepaths:
                     task_id = self._open_workflow_reference(filepath, switch_to_tab=False)
                     task = self.task_manager.get_task(task_id) if task_id is not None else None
-                    if (
-                        first_task_id is None
-                        and task is not None
-                        and not getattr(task, 'read_only_mode', False)
-                    ):
+                    if first_task_id is None and task is not None:
                         first_task_id = task_id
                 if first_task_id is not None:
                     tab_index = self.workflow_tab_widget.task_to_tab.get(first_task_id)
@@ -69,21 +90,27 @@ class MainWindowFavoritesMixin:
             favorites_path = get_favorites_path()
             if not os.path.exists(favorites_path):
                 return []
-            workspaces, favorites, changed = load_workspace_favorites_snapshot(favorites_path)
+            workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(favorites_path)
             if changed:
-                save_workspace_favorites_snapshot(favorites_path, workspaces, favorites)
+                save_workspace_favorites_snapshot(
+                    favorites_path,
+                    workspaces,
+                    favorites,
+                    excluded_paths=excluded_paths,
+                    extra_paths=extra_paths,
+                )
             checked_paths: List[str] = []
             for item in favorites:
                 if not isinstance(item, dict):
                     continue
-                if not bool(item.get('checked', True)):
+                if not bool(item.get('checked', False)):
                     continue
                 raw_path = str(item.get('filepath') or '').strip()
                 if not raw_path:
                     continue
-                abs_path = os.path.abspath(raw_path)
-                if os.path.exists(abs_path):
-                    checked_paths.append(abs_path)
+                resolved = resolve_existing_workflow_path(raw_path)
+                if resolved and os.path.exists(resolved):
+                    checked_paths.append(resolved)
             dedup_paths: List[str] = []
             seen = set()
             for path in checked_paths:
@@ -163,10 +190,16 @@ class MainWindowFavoritesMixin:
             favorites_path = get_favorites_path()
             if not os.path.exists(favorites_path):
                 return False
-            workspaces, favorites, changed = load_workspace_favorites_snapshot(favorites_path)
+            workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(favorites_path)
             if changed:
-                save_workspace_favorites_snapshot(favorites_path, workspaces, favorites)
-            return bool(workspaces or favorites)
+                save_workspace_favorites_snapshot(
+                    favorites_path,
+                    workspaces,
+                    favorites,
+                    excluded_paths=excluded_paths,
+                    extra_paths=extra_paths,
+                )
+            return bool(workspaces or favorites or extra_paths)
         except Exception:
             return False
     def _refresh_open_workflow_gallery_dir(self, filepath: str, gallery_dir: str, workflow_data: dict | None = None) -> None:

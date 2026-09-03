@@ -13,6 +13,7 @@ RUNTIME_CONFIG_FILENAME = "runtime.json"
 # 独立程序必须跟编辑器同一套截图/键鼠/启停热键；窗口绑定是安装机本地状态，不能打包。
 PACKAGED_RUNTIME_KEYS = (
     "execution_mode",
+    "native_execution_mode",
     "foreground_mouse_driver_backend",
     "foreground_keyboard_driver_backend",
     "foreground_py_backend",
@@ -27,7 +28,10 @@ PACKAGED_RUNTIME_KEYS = (
     "plugin_keypad",
     "plugin_input_display",
     "plugin_input_display_follow",
+    "plugin_bind_kind",
     "plugin_bind_mode",
+    "plugin_text_ime",
+    "plugin_fake_active",
     "binding_method",
     "multi_window_delay",
     "custom_width",
@@ -45,8 +49,6 @@ PLAYER_HOTKEY_MAP = {
 
 
 def snapshot_export_runtime_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
-    from utils.input_simulation.mode_utils import migrate_legacy_normal_hd_config
-
     normalized = apply_sections(config or {})
     snapshot: dict[str, Any] = {}
     for key in PACKAGED_RUNTIME_KEYS:
@@ -54,7 +56,6 @@ def snapshot_export_runtime_config(config: Mapping[str, Any] | None) -> dict[str
             snapshot[key] = normalized[key]
     if not snapshot:
         return {}
-    snapshot = migrate_legacy_normal_hd_config(snapshot)
     from app_core.hotkey_spec import normalize_hotkey
 
     for key in PLAYER_HOTKEY_MAP.values():
@@ -72,7 +73,7 @@ def apply_player_runtime_config(
     result = dict(base_config or {})
     snapshot = snapshot_export_runtime_config(packaged)
     if not snapshot:
-        return apply_sections(result, prefer="flat")
+        return _finalize_player_runtime_config(result)
     bound_windows = result.get("bound_windows")
     target_title = result.get("target_window_title")
     result.update(snapshot)
@@ -80,7 +81,18 @@ def apply_player_runtime_config(
         result["bound_windows"] = bound_windows
     if "target_window_title" in (base_config or {}):
         result["target_window_title"] = target_title
-    return apply_sections(result, prefer="flat")
+    return _finalize_player_runtime_config(result)
+
+
+def _finalize_player_runtime_config(result: dict[str, Any]) -> dict[str, Any]:
+    from utils.input_simulation.mode_utils import resolve_execution_mode
+
+    merged = apply_sections(result)
+    mode = resolve_execution_mode(merged)
+    if mode and mode != str(merged.get("execution_mode") or ""):
+        merged["execution_mode"] = mode
+        merged = apply_sections(merged)
+    return merged
 
 
 def load_packaged_runtime_config(*, package_dir: str = "") -> dict[str, Any]:

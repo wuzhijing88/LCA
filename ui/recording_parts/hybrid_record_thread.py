@@ -150,7 +150,12 @@ class HybridRecordThread(QThread):
         if not key:
             return
 
-        upper_key = key.upper()
+        from app_core.hotkey_spec import normalize_hotkey
+
+        spec = normalize_hotkey(key)
+        if spec:
+            key = spec.split("+")[-1]
+        upper_key = key.upper().replace(" ", "")
         lower_key = key.lower()
 
         if upper_key in ("XBUTTON1", "XBUTTON2"):
@@ -184,6 +189,11 @@ class HybridRecordThread(QThread):
                 "SUBTRACT": "numpad_subtract",
                 "DIVIDE": "numpad_divide",
                 "DECIMAL": "numpad_decimal",
+                "*": "numpad_multiply",
+                "+": "numpad_add",
+                "-": "numpad_subtract",
+                "/": "numpad_divide",
+                ".": "numpad_decimal",
             }
             mapped = num_map.get(num_rest)
             if mapped:

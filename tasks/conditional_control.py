@@ -35,6 +35,10 @@ except ImportError:
 # 定义logger（必须在使用前定义）
 logger = logging.getLogger(__name__)
 
+# 任务类型标识
+TASK_TYPE = "条件控制"
+TASK_NAME = "条件控制"
+
 # --- Comparison Operators Mapping ---
 COMPARISON_OPERATORS = {
     '==': operator.eq,
@@ -114,6 +118,10 @@ def _activate_window_foreground(target_hwnd: Optional[int], logger):
         if not win32gui.IsWindow(target_hwnd):
             logger.warning(f"无法激活目标窗口：句柄 {target_hwnd} 无效或已销毁。")
             return False
+        from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+        if skip_cross_desktop_activation(target_hwnd, log_prefix="条件判断"):
+            return True
         current_foreground_hwnd = win32gui.GetForegroundWindow()
         if current_foreground_hwnd == target_hwnd:
             logger.debug(f"目标窗口 {target_hwnd} 已是前台窗口，无需激活。")

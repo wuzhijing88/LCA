@@ -136,7 +136,13 @@ def load_workflow_file(path: str | Path) -> Dict[str, Any]:
 
 
 def save_workflow_file(path: str | Path, data: dict) -> Path:
-    destination = Path(path)
-    if not is_lca_path(destination):
-        destination = destination.with_suffix(".lca")
-    return save_lca_project(destination, data, display_name=destination.stem)
+    source = Path(path)
+    destination = source if is_lca_path(source) else source.with_suffix(".lca")
+    saved = save_lca_project(destination, data, display_name=destination.stem)
+    if source.suffix.lower() == ".json" and source.is_file():
+        try:
+            if source.resolve() != Path(saved).resolve():
+                source.unlink()
+        except OSError:
+            pass
+    return saved

@@ -27,6 +27,7 @@ from task_workflow.workflow_payload import load_workflow_file
 
 logger = logging.getLogger(__name__)
 
+TASK_TYPE = '子工作流'
 TASK_NAME = '子工作流'
 SUPPORTED_CONNECTION_TYPES = frozenset({"sequential", "success", "failure", "random"})
 

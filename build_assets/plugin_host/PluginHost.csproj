@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <!-- WinExe = Windows subsystem: no console window when launched. -->
     <OutputType>WinExe</OutputType>
     <TargetFramework>net472</TargetFramework>
     <PlatformTarget>x86</PlatformTarget>
@@ -12,4 +13,9 @@
     <Reference Include="System.Drawing" />
     <Reference Include="System.Web.Extensions" />
   </ItemGroup>
+  <!-- Some toolchains still emit CUI despite WinExe; force GUI subsystem after build. -->
+  <Target Name="EnsureWindowsSubsystem" AfterTargets="Build">
+    <Exec Command="python &quot;$(MSBuildThisFileDirectory)set_windows_subsystem.py&quot; &quot;$(TargetPath)&quot;"
+          Condition="Exists('$(TargetPath)')" />
+  </Target>
 </Project>

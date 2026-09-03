@@ -401,7 +401,6 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
             # 【修复】使用全局配置绑定的窗口句柄，而不是临时的 current_scroll_target_hwnd
             scroll_hwnd = target_hwnd
             logger.info(f"执行后台鼠标滚轮: 滚动目标句柄={scroll_hwnd}, 坐标={(target_x, target_y) if target_x is not None else '默认'}, 方向='{direction}', 次数={scroll_count}")
-            # 获取默认坐标（窗口屏幕中心，而不是客户区）
             if target_x is None or target_y is None:
                 try:
                     rect = win32gui.GetWindowRect(scroll_hwnd)
@@ -699,7 +698,11 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
             # 前台模式：激活目标窗口确保滚轮生效
             if target_hwnd:
                 try:
-                    if win32gui.IsWindow(target_hwnd):
+                    from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+                    if skip_cross_desktop_activation(target_hwnd, log_prefix="前台鼠标滚轮"):
+                        pass
+                    elif win32gui.IsWindow(target_hwnd):
                         logger.debug(f"前台模式：激活目标窗口 {target_hwnd}")
                         win32gui.SetForegroundWindow(target_hwnd)
                         sleep_ok, stop_result = _sleep_with_control(0.1, "[前台鼠标滚轮] 窗口激活等待期间检测到暂停/停止请求")

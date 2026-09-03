@@ -383,7 +383,8 @@ def capture_window_smart(
         from utils.capture.screenshot_helper import get_screenshot_engine, _capture_with_engine
 
         engine = get_screenshot_engine()
-        logger.debug(f"[智能截图] 使用 {engine.upper()} 截图引擎")
+        from utils.capture.engine_ids import screenshot_engine_log_label
+        logger.debug(f"[智能截图] 使用 {screenshot_engine_log_label(engine)} 截图引擎")
 
         img_bgr = _capture_with_engine(
             hwnd,
@@ -486,7 +487,9 @@ def capture_and_match_template_smart(
                 match_engine = str(get_screenshot_engine() or "wgc").strip().lower()
             except Exception:
                 match_engine = "wgc"
-        if match_engine not in {"wgc", "printwindow", "gdi", "dxgi"}:
+        from utils.capture.engine_ids import is_supported_screenshot_engine
+
+        if not is_supported_screenshot_engine(match_engine):
             match_engine = "wgc"
 
         timeout = max(0.3, float(capture_timeout))

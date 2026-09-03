@@ -39,7 +39,8 @@ from utils.app_paths import get_sounds_dir
 _IMAGE_FILTER = "图片 (*.bmp *.png *.jpg *.jpeg *.webp)"
 _MODEL_FILTER = "模型 (*.onnx)"
 _AUDIO_FILTER = "音频 (*.wav *.mp3 *.wma *.m4a *.ogg *.flac)"
-_IMPORT_FILTER = f"{_IMAGE_FILTER};;{_MODEL_FILTER};;{_AUDIO_FILTER};;所有文件 (*.*)"
+_REPLAY_FILTER = "回放 (*.replay.json)"
+_IMPORT_FILTER = f"{_IMAGE_FILTER};;{_MODEL_FILTER};;{_AUDIO_FILTER};;{_REPLAY_FILTER};;所有文件 (*.*)"
 
 
 class ScriptResourcePanel(QWidget):
@@ -161,7 +162,7 @@ class ScriptResourcePanel(QWidget):
         layout.addLayout(row)
 
     def _item_label(self, item: Dict[str, Any]) -> str:
-        kind = {"model": "模型", "audio": "音频"}.get(str(item.get("kind") or ""), "图片")
+        kind = {"model": "模型", "audio": "音频", "replay": "回放"}.get(str(item.get("kind") or ""), "图片")
         name = str(item.get("name") or item.get("path") or "")
         if not item.get("exists"):
             state = "文件不在"
@@ -270,6 +271,9 @@ class ScriptResourcePanel(QWidget):
         elif item.get("kind") == "audio":
             filt = f"{_AUDIO_FILTER};;所有文件 (*.*)"
             start = self._sounds_dir or ""
+        elif item.get("kind") == "replay":
+            filt = f"{_REPLAY_FILTER};;所有文件 (*.*)"
+            start = self._images_dir or ""
         else:
             filt = f"{_IMAGE_FILTER};;所有文件 (*.*)"
             start = self._images_dir or ""

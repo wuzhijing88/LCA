@@ -18,17 +18,18 @@ from ui.widgets.custom_widgets import CustomDropdown
 
 TimerComboBox = CustomDropdown
 
-FORM_LABEL_WIDTH = 120
-FORM_VALUE_WIDTH = 100
-FORM_UNIT_WIDTH = 88
-FORM_TIME_WIDTH = 88
+# Structural widths / spin alignment in code. Height / padding / dropdown text-align in themes/*.qss.
+FORM_LABEL_WIDTH = 96
+FORM_VALUE_WIDTH = 96
+FORM_UNIT_WIDTH = 96
+FORM_TIME_WIDTH = 96
 FORM_MODE_WIDTH = 120
 FORM_BUTTON_WIDTH = 88
 FORM_ROW_SPACING = 8
 FORM_TAB_SPACING = 10
-FORM_TAB_MARGINS = (16, 16, 16, 16)
-FORM_DIALOG_MARGINS = (16, 16, 16, 16)
-FORM_DIALOG_SPACING = 12
+FORM_TAB_MARGINS = (16, 14, 16, 14)
+FORM_DIALOG_MARGINS = (16, 14, 16, 14)
+FORM_DIALOG_SPACING = 10
 
 _SUFFIX_HOUR = " \u65f6"
 _SUFFIX_MINUTE = " \u5206"
@@ -40,6 +41,8 @@ _CANCEL_LABEL = "\u53d6\u6d88"
 _OK_LABEL = "\u786e\u5b9a"
 _TARGET_LABEL = "\u76ee\u6807\u7a97\u53e3:"
 _CHOOSE_WINDOW_LABEL = "\u9009\u62e9\u7a97\u53e3"
+
+TIMER_DIALOG_OBJECT_NAME = "timerTaskDialog"
 
 
 class TimerSpinBox(QSpinBox):
@@ -61,17 +64,46 @@ def make_form_label(text):
     label = QLabel(text)
     label.setObjectName("timerFormLabel")
     label.setFixedWidth(FORM_LABEL_WIDTH)
-    label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     return label
 
 
+def _inter_field_gap(separator=None):
+    """Gap between field columns — same width whether blank or a ':' label."""
+    if separator is None:
+        gap = QWidget()
+        gap.setObjectName("timerFieldGap")
+        gap.setFixedWidth(FORM_ROW_SPACING)
+        return gap
+    separator.setFixedWidth(FORM_ROW_SPACING)
+    return separator
+
+
 def add_labeled_row(layout, label_text, *widgets):
+    """Label + up to two fields on a fixed column grid.
+
+    Column positions stay identical across rows so e.g.「0分」lines up with「分钟」.
+    A 3-arg call is (field1, separator, field2); separator is forced to the
+    same width as the normal inter-field gap.
+    """
     row = QHBoxLayout()
-    row.setSpacing(FORM_ROW_SPACING)
+    row.setSpacing(0)
     row.setContentsMargins(0, 0, 0, 0)
+    row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
     row.addWidget(make_form_label(label_text), 0, Qt.AlignmentFlag.AlignVCenter)
-    for widget in widgets:
-        row.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
+    row.addSpacing(FORM_ROW_SPACING)
+
+    if len(widgets) == 1:
+        row.addWidget(widgets[0], 0, Qt.AlignmentFlag.AlignVCenter)
+    elif len(widgets) == 2:
+        row.addWidget(widgets[0], 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(_inter_field_gap(), 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(widgets[1], 0, Qt.AlignmentFlag.AlignVCenter)
+    elif len(widgets) >= 3:
+        row.addWidget(widgets[0], 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(_inter_field_gap(widgets[1]), 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(widgets[2], 0, Qt.AlignmentFlag.AlignVCenter)
+
     row.addStretch(1)
     layout.addLayout(row)
     return row
@@ -79,6 +111,7 @@ def add_labeled_row(layout, label_text, *widgets):
 
 def new_form_container(parent=None):
     box = QWidget(parent)
+    box.setObjectName("timerFormContainer")
     layout = QVBoxLayout(box)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(FORM_TAB_SPACING)
@@ -88,16 +121,33 @@ def new_form_container(parent=None):
 def fit_timer_spinbox(spin, min_width=FORM_VALUE_WIDTH):
     # zh-TW/zh-HK QSpinBox uses Hangzhou numerals (〩 looks like 夕).
     spin.setLocale(_WESTERN_DIGITS)
-    spin.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    spin.setObjectName("timerFormSpin")
+    # Do not put "AlignVCenter | AlignLeft" in QSS — "|" breaks stylesheet parsing.
+    spin.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
     spin.setFixedWidth(int(min_width))
     spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     return spin
 
 
 def fit_timer_combo(combo, min_width=FORM_UNIT_WIDTH):
+    combo.setObjectName("timerFormCombo")
     combo.setFixedWidth(int(min_width))
     combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    button = getattr(combo, "display_button", None)
+    if button is not None:
+        button.setProperty("timerDialogField", True)
+        button.setFixedWidth(int(min_width))
+        style = button.style()
+        if style is not None:
+            style.unpolish(button)
+            style.polish(button)
     return combo
+
+
+def fit_timer_button(button, min_width=FORM_BUTTON_WIDTH):
+    if min_width:
+        button.setMinimumWidth(int(min_width))
+    return button
 
 
 def fill_unit_combo(combo, units, current, default=None):
@@ -121,27 +171,30 @@ def combo_unit_key(combo, default="minutes", allowed=None):
     return normalize_unit(text, default=default, allowed=allowed)
 
 
-def create_timer_dialog_shell(parent, title, width=600, height=460):
+def create_timer_dialog_shell(parent, title, width=560, height=420):
     dialog = QDialog(parent)
     apply_timer_dialog_font(dialog)
+    dialog.setObjectName(TIMER_DIALOG_OBJECT_NAME)
     dialog.setWindowTitle(title)
     dialog.setModal(True)
-    dialog.setMinimumWidth(560)
-    dialog.setMaximumWidth(760)
-    dialog.setMinimumHeight(400)
-    dialog.setMaximumHeight(560)
+    dialog.setMinimumWidth(520)
+    dialog.setMaximumWidth(720)
+    dialog.setMinimumHeight(360)
+    dialog.setMaximumHeight(520)
     dialog.resize(width, height)
     dialog.setSizeGripEnabled(True)
     main_layout = QVBoxLayout(dialog)
     main_layout.setSpacing(FORM_DIALOG_SPACING)
     main_layout.setContentsMargins(*FORM_DIALOG_MARGINS)
     tab_widget = QTabWidget(dialog)
+    tab_widget.setObjectName("timerTaskTabs")
     main_layout.addWidget(tab_widget, 1)
     return dialog, main_layout, tab_widget
 
 
 def add_enable_checkbox(layout, text, checked):
     checkbox = QCheckBox(text)
+    checkbox.setObjectName("timerEnableCheck")
     checkbox.setChecked(bool(checked))
     layout.addWidget(checkbox)
     return checkbox
@@ -160,8 +213,8 @@ def add_time_row(layout, parent, label, hour, minute, spinbox_cls=None):
     minute_box.setSuffix(_SUFFIX_MINUTE)
     fit_timer_spinbox(minute_box, FORM_TIME_WIDTH)
     colon = QLabel(":")
-    colon.setFixedWidth(10)
-    colon.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+    colon.setObjectName("timerFormColon")
+    colon.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
     add_labeled_row(layout, label, hour_box, colon, minute_box)
     return hour_box, minute_box
 
@@ -225,10 +278,12 @@ def add_target_row(layout, summary_text, button_text=_CHOOSE_WINDOW_LABEL):
     summary.setWordWrap(True)
     summary.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     button = QPushButton(button_text)
+    button.setObjectName("timerTargetButton")
     button.setFixedWidth(FORM_BUTTON_WIDTH)
     row = QHBoxLayout()
     row.setSpacing(FORM_ROW_SPACING)
     row.setContentsMargins(0, 0, 0, 0)
+    row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
     row.addWidget(make_form_label(_TARGET_LABEL), 0, Qt.AlignmentFlag.AlignVCenter)
     row.addWidget(summary, 1, Qt.AlignmentFlag.AlignVCenter)
     row.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -240,6 +295,7 @@ def add_next_preview_label(layout, text=""):
     label = QLabel(text)
     label.setObjectName("timerHintLabel")
     label.setWordWrap(True)
+    label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     row = QHBoxLayout()
     row.setSpacing(FORM_ROW_SPACING)
     row.setContentsMargins(0, 0, 0, 0)
@@ -258,6 +314,7 @@ def add_timer_dialog_buttons(main_layout):
     stop_all = QPushButton(_STOP_ALL_LABEL)
     cancel_btn = QPushButton(_CANCEL_LABEL)
     ok_btn = QPushButton(_OK_LABEL)
+    stop_all.setObjectName("timerStopAllButton")
     stop_all.setMinimumWidth(108)
     cancel_btn.setFixedWidth(FORM_BUTTON_WIDTH)
     ok_btn.setFixedWidth(FORM_BUTTON_WIDTH)
@@ -270,6 +327,7 @@ def add_timer_dialog_buttons(main_layout):
 
 def new_tab(tab_widget, title):
     tab = QWidget()
+    tab.setObjectName("timerTaskTab")
     layout = QVBoxLayout(tab)
     layout.setSpacing(FORM_TAB_SPACING)
     layout.setContentsMargins(*FORM_TAB_MARGINS)

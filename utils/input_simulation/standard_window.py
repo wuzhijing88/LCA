@@ -3,12 +3,13 @@
 针对普通应用程序窗口的键盘鼠标模拟
 """
 
+import ctypes
 import time
 import win32gui
 import win32con
 import win32api
-from ..enhanced_child_window_finder import get_child_window_finder
-from ..enhanced_window_activator import get_window_activator
+from utils.window.enhanced_child_window_finder import get_child_window_finder
+from utils.window.enhanced_window_activator import get_window_activator
 from .mode_utils import get_foreground_driver_backends, get_ibinputsimulator_config
 from typing import Optional, List, Any, Tuple
 from .base import BaseInputSimulator, ElementNotFoundError
@@ -31,6 +32,26 @@ _FOREGROUND_DRAG_MIN_DURATION_SECONDS = 0.1
 _FOREGROUND_DRAG_MIN_SLEEP_SECONDS = 0.05
 _FOREGROUND_CLICK_CONFIRM_TIMEOUT_MS = 200
 _BACKGROUND_MESSAGE_CONFIRM_TIMEOUT_MS = 200
+_FOREGROUND_DOUBLE_CLICK_THRESHOLD_RATIO = 0.8
+
+
+def _get_system_double_click_time_seconds() -> float:
+    """读取 Windows 双击时间；读取失败时使用系统常见默认值 500ms。"""
+    try:
+        milliseconds = int(ctypes.windll.user32.GetDoubleClickTime())
+    except Exception:
+        milliseconds = 500
+    if milliseconds <= 0:
+        milliseconds = 500
+    return milliseconds / 1000.0
+
+
+def _clamp_foreground_double_click_interval(interval: float) -> float:
+    """给真实前台输入留出调度余量，避免第二击越过系统双击阈值。"""
+    safe_interval = max(0.0, float(interval or 0.0))
+    system_threshold = _get_system_double_click_time_seconds()
+    safe_upper_bound = max(0.001, system_threshold * _FOREGROUND_DOUBLE_CLICK_THRESHOLD_RATIO)
+    return min(safe_interval, safe_upper_bound)
 
 
 class StandardWindowInputSimulator(BaseInputSimulator):
@@ -61,6 +82,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         self.use_foreground = use_foreground
         self.foreground_driver = foreground_driver
         self.driver = None
+        self._driver_manager_bound = False
         self._ib_runtime_signature = None
         # 记录最近一次成功文本输入的控件句柄（用于后续回车等按键发送）
         self._last_input_control_hwnd = None
@@ -86,8 +108,11 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         
     def _ensure_driver(self) -> bool:
         """Ensure foreground driver is initialized."""
-        if self.driver:
-            return True
+        # Tests and legacy integrations may inject an independent driver.
+        # Only manager-owned references need to follow runtime reconfiguration.
+        if self.driver is not None and not getattr(self, "_driver_manager_bound", False):
+            if self._ib_runtime_signature is None:
+                return True
         if not self.use_foreground:
             return False
         try:
@@ -98,7 +123,10 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 fg_manager.set_forced_mode("pyautogui")
                 if fg_manager.initialize():
                     self.driver = fg_manager.get_active_driver()
+                    self._driver_manager_bound = self.driver is not None
                     return self.driver is not None
+                self.driver = None
+                self._driver_manager_bound = False
                 return False
 
             mouse_backend, keyboard_backend = get_foreground_driver_backends(self.execution_mode)
@@ -112,27 +140,31 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 ib_ahk_dir,
             )
 
-            if self.driver and self._ib_runtime_signature == runtime_signature:
-                active_driver = fg_manager.get_active_driver()
-                if active_driver is self.driver:
-                    return True
-
             if 'ibinputsimulator' in (mouse_backend, keyboard_backend):
                 fg_manager.set_ibinputsimulator_driver(ib_driver, ib_driver_arg, ib_ahk_path, ib_ahk_dir)
 
+            # Re-apply the selected modes on every use.  set_forced_modes() is
+            # a no-op when the configuration is unchanged, but it tears down
+            # the old global drivers when the user switched backends.  This is
+            # essential for cached StandardWindowInputSimulator instances:
+            # their previous self.driver may point at a driver already closed
+            # by the manager.
             fg_manager.set_forced_modes(mouse_backend, keyboard_backend)
 
             if fg_manager.initialize():
                 self.driver = fg_manager.get_active_driver()
+                self._driver_manager_bound = self.driver is not None
                 self._ib_runtime_signature = runtime_signature
                 return self.driver is not None
 
             self.driver = None
+            self._driver_manager_bound = False
             self._ib_runtime_signature = None
             return False
         except Exception as e:
             self.logger.error(f"前台驱动初始化失败：{e}")
             self.driver = None
+            self._driver_manager_bound = False
             self._ib_runtime_signature = None
             return False
 
@@ -140,15 +172,31 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         mouse_backend, _ = get_foreground_driver_backends(self.execution_mode)
         return str(mouse_backend).strip().lower()
 
+    def _is_logitech_foreground_driver(self) -> bool:
+        """罗技驱动的真实输入不依赖目标窗口消息队列确认。
+
+        鼠标点击确认只看鼠标侧驱动；键鼠分离时不能被键盘驱动的类型影响。
+        """
+        driver = getattr(self, "driver", None)
+        if driver is None:
+            return False
+        mouse_driver = getattr(driver, "mouse_driver", None)
+        if mouse_driver is not None:
+            driver = mouse_driver
+        names = (
+            getattr(driver, "_driver_name", ""),
+            getattr(driver, "_runtime_driver_name", ""),
+            type(driver).__name__,
+        )
+        normalized = {str(name or "").strip().lower().replace("_", "") for name in names}
+        return bool(normalized & {"logitech", "logitechghubnew", "ibinputsimulatordriverlogitech"})
+
     def _using_plugin_dx(self) -> bool:
         from .mode_utils import is_plugin_input_backend
 
-        try:
-            from app_core.config_store import load_config
+        from utils.runtime_config import get_runtime_config
 
-            cfg = dict(load_config() or {})
-        except Exception:
-            cfg = {}
+        cfg = get_runtime_config()
         cfg.setdefault("execution_mode", self.execution_mode)
         return bool(is_plugin_input_backend(cfg))
 
@@ -667,45 +715,56 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         window_coords = {root_hwnd: (safe_x, safe_y)}
 
         try:
+            if self._is_desktop_target():
+                desktop_chain = self._resolve_desktop_icon_layer_targets(safe_x, safe_y)
+                if desktop_chain is not None:
+                    return desktop_chain
+
             if not (hasattr(self, 'child_finder') and self.child_finder):
                 return window_chain, window_coords
 
             screen_x, screen_y = win32gui.ClientToScreen(root_hwnd, (safe_x, safe_y))
-            _, chain_dicts, _ = self.child_finder.find_deepest_child(root_hwnd, screen_x, screen_y)
+            deepest_hwnd, chain_dicts, _ = self.child_finder.find_deepest_child(root_hwnd, screen_x, screen_y)
 
             resolved_chain = []
-            if chain_dicts:
-                for item in chain_dicts:
-                    hwnd = item.get('hwnd')
-                    if not hwnd:
+            candidates = [item.get('hwnd') for item in (chain_dicts or [])]
+            # find_deepest_child 用 WindowFromPoint 交叉验证后可能给出比逐层下钻更深的目标，一并纳入
+            candidates.append(deepest_hwnd)
+            for hwnd in candidates:
+                if not hwnd:
+                    continue
+                try:
+                    hwnd = int(hwnd)
+                    if not win32gui.IsWindow(hwnd):
                         continue
-                    try:
-                        hwnd = int(hwnd)
-                        if not win32gui.IsWindow(hwnd):
-                            continue
-                    except Exception:
-                        continue
-                    if hwnd not in resolved_chain:
-                        resolved_chain.append(hwnd)
+                except Exception:
+                    continue
+                if hwnd not in resolved_chain:
+                    resolved_chain.append(hwnd)
 
             if resolved_chain:
                 if resolved_chain[0] != root_hwnd:
                     resolved_chain.insert(0, root_hwnd)
                 window_chain = resolved_chain
-
                 for hwnd in window_chain:
-                    try:
-                        rect = win32gui.GetWindowRect(hwnd)
-                        window_coords[hwnd] = (
-                            int(screen_x - rect[0]),
-                            int(screen_y - rect[1]),
-                        )
-                    except Exception:
-                        window_coords[hwnd] = (safe_x, safe_y)
+                    window_coords[hwnd] = self._screen_to_window_client(hwnd, screen_x, screen_y, (safe_x, safe_y))
         except Exception as e:
             self.logger.debug(f"[鼠标链] 构建失败：{e}")
 
         return window_chain, window_coords
+
+    @staticmethod
+    def _screen_to_window_client(hwnd: int, screen_x: int, screen_y: int, fallback):
+        """鼠标消息的 lParam 是接收窗口的客户区坐标。
+
+        必须用 ScreenToClient 换算：GetWindowRect 含边框/标题栏，顶层窗口（乃至带边框的子控件）
+        用它减会整体偏掉一个边框。
+        """
+        try:
+            client_x, client_y = win32gui.ScreenToClient(int(hwnd), (int(screen_x), int(screen_y)))
+            return int(client_x), int(client_y)
+        except Exception:
+            return int(fallback[0]), int(fallback[1])
 
     def _is_desktop_target(self) -> bool:
         try:
@@ -714,6 +773,40 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             return bool(is_desktop_window(self.hwnd))
         except Exception:
             return False
+
+    def _resolve_desktop_icon_layer_targets(self, client_x: int, client_y: int):
+        """绑定「桌面」时把后台消息定向到图标层 (Progman → SHELLDLL_DefView → SysListView32)。
+
+        桌面窗口的“子窗口”是所有顶层窗口，按点位向下找会落到任务栏、透明覆盖层或别的程序上；
+        用户绑定桌面要操作的是桌面本身。图标层找不到时返回 None，沿用通用解析。
+        """
+        from utils.window.window_identity import find_desktop_icon_layer
+
+        host, defview, listview = find_desktop_icon_layer()
+        if not defview:
+            return None
+        try:
+            screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (int(client_x), int(client_y)))
+        except Exception:
+            screen_x, screen_y = int(client_x), int(client_y)
+        chain = [self.hwnd]
+        for hwnd in (host, defview, listview):
+            if hwnd and hwnd not in chain:
+                try:
+                    if win32gui.IsWindow(hwnd):
+                        chain.append(int(hwnd))
+                except Exception:
+                    continue
+        coords = {self.hwnd: (int(client_x), int(client_y))}
+        for hwnd in chain[1:]:
+            coords[hwnd] = self._screen_to_window_client(hwnd, screen_x, screen_y, (client_x, client_y))
+        if not getattr(self, "_desktop_icon_layer_logged", False):
+            self._desktop_icon_layer_logged = True
+            self.logger.info(
+                "目标是桌面，后台消息定向到图标层: host=0x%X defview=0x%X listview=0x%X",
+                int(host or 0), int(defview or 0), int(listview or 0),
+            )
+        return chain, coords
 
     def get_virtual_cursor(self) -> Tuple[int, int]:
         if self._virtual_cursor:
@@ -963,10 +1056,40 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             _precise_sleep(0.008)
         return True
 
+    # 命中测试说“透明”的窗口不接鼠标消息，系统会把输入交给它下面的窗口
+    _HTTRANSPARENT = -1
+    _NCHITTEST_TIMEOUT_MS = 200
+
     def _send_mouse_message_to_chain(self, window_chain, window_coords, msg: int, wparam: int) -> bool:
-        """向窗口链发送鼠标消息，至少一个句柄成功即视为成功。"""
+        """发送后台鼠标消息，并兼容由父窗口处理输入的自绘窗口。
+
+        很多游戏、模拟器和 Chromium/Qt 自绘窗口虽然能命中更深的渲染子窗口，真正处理
+        WM_*BUTTON* 的却仍是绑定的根窗口。只向最深子窗口发送会让后台一、后台二一起失效，
+        因此普通窗口沿用根到子的兼容分发。资源管理器和桌面图标层会对重复消息产生副作用，
+        这类 Shell 窗口仍只发送给实际命中的接收窗口。
+        """
+        chain = []
+        seen = set()
+        for hwnd in window_chain or ():
+            try:
+                hwnd = int(hwnd)
+            except Exception:
+                continue
+            if not hwnd or hwnd in seen or not self._is_window_alive(hwnd):
+                continue
+            seen.add(hwnd)
+            chain.append(hwnd)
+        if not chain:
+            return False
+
+        if self._should_invoke_shell_item(chain):
+            receiver = self._pick_mouse_receiver(chain, window_coords)
+            targets = [receiver] if receiver else []
+        else:
+            targets = chain
+
         delivered = False
-        for target_hwnd in window_chain:
+        for target_hwnd in targets:
             coord_x, coord_y = window_coords.get(target_hwnd, window_coords.get(self.hwnd, (0, 0)))
             lparam = self._make_mouse_lparam(int(coord_x), int(coord_y))
             try:
@@ -975,6 +1098,54 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             except Exception:
                 continue
         return delivered
+
+    def _pick_mouse_receiver(self, window_chain, window_coords) -> int:
+        """从最深层往上找第一个存活且 WM_NCHITTEST 不返回 HTTRANSPARENT 的窗口。"""
+        chain = [int(hwnd) for hwnd in (window_chain or ()) if hwnd]
+        if not chain:
+            return 0
+        cache_key = (tuple(chain), tuple(window_coords.get(chain[-1], (0, 0))))
+        cached = getattr(self, "_mouse_receiver_cache", None)
+        if cached and cached[0] == cache_key:
+            return cached[1]
+        receiver = 0
+        for hwnd in reversed(chain):
+            if not self._is_window_alive(hwnd):
+                continue
+            if len(chain) > 1 and hwnd != chain[0] and self._hit_test_transparent(hwnd, window_coords.get(hwnd)):
+                continue
+            receiver = hwnd
+            break
+        if not receiver:
+            receiver = chain[0]
+        self._mouse_receiver_cache = (cache_key, receiver)
+        return receiver
+
+    def _hit_test_transparent(self, hwnd: int, client_xy) -> bool:
+        send_timeout = getattr(win32gui, "SendMessageTimeout", None)
+        if not callable(send_timeout) or not client_xy:
+            return False
+        try:
+            screen_x, screen_y = win32gui.ClientToScreen(int(hwnd), (int(client_xy[0]), int(client_xy[1])))
+            lparam = self._make_mouse_lparam(int(screen_x), int(screen_y))
+            result = send_timeout(
+                int(hwnd),
+                win32con.WM_NCHITTEST,
+                0,
+                lparam,
+                win32con.SMTO_ABORTIFHUNG,
+                self._NCHITTEST_TIMEOUT_MS,
+            )
+        except Exception:
+            return False
+        code = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else result
+        try:
+            code = int(code)
+        except Exception:
+            return False
+        if code > 0x7FFFFFFF:
+            code -= 0x100000000
+        return code == self._HTTRANSPARENT
 
     def _screen_to_client(self, x: int, y: int):
         try:
@@ -1079,46 +1250,149 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         except Exception:
             return False
 
-    def double_click(self, x: int, y: int, button: str = 'left') -> bool:
+    def double_click(
+        self,
+        x: int,
+        y: int,
+        button: str = 'left',
+        interval: Optional[float] = None,
+        hold_duration: Optional[float] = None,
+    ) -> bool:
+        """真正的双击。
+
+        后台消息模式下两次单击永远不会被系统合成 WM_xBUTTONDBLCLK，必须自己发完整序列
+        DOWN → UP → DBLCLK → UP；插件走大漠 LeftDoubleClick；前台由驱动打两次真实点击让系统合成。
+        """
+        try:
+            safe_interval = (
+                _DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS if interval is None else max(0.0, float(interval))
+            )
+        except Exception:
+            safe_interval = _DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
+        try:
+            safe_hold = DEFAULT_CLICK_HOLD_SECONDS if hold_duration is None else max(0.0, float(hold_duration))
+        except Exception:
+            safe_hold = DEFAULT_CLICK_HOLD_SECONDS
         try:
             if self._using_plugin_dx():
-                return bool(self._plugin_dx().double_click(int(x), int(y), button=button))
-            if self.use_foreground:
-                if not self._ensure_driver():
-                    return False
-                interval = _DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
-                first_ok = bool(
-                    self.driver.click_mouse(
-                        int(x),
-                        int(y),
-                        button=button,
-                        clicks=1,
-                        interval=0.0,
-                        duration=0.0,
-                    )
-                )
-                if not first_ok:
-                    return False
-                if interval > 0:
-                    _precise_sleep(interval)
                 return bool(
-                    self.driver.click_mouse(
-                        int(x),
-                        int(y),
-                        button=button,
-                        clicks=1,
-                        interval=0.0,
-                        duration=0.0,
+                    self._plugin_dx().double_click(
+                        int(x), int(y), button=button, interval=safe_interval, hold_duration=safe_hold
                     )
                 )
-            client_x, client_y = int(x), int(y)
-            msg = win32con.WM_LBUTTONDBLCLK if button == 'left' else (
-                win32con.WM_RBUTTONDBLCLK if button == 'right' else win32con.WM_MBUTTONDBLCLK
-            )
-            window_chain, window_coords = self._resolve_mouse_message_targets(client_x, client_y)
-            return self._send_mouse_message_to_chain(window_chain, window_coords, msg, 0)
+            if self.use_foreground:
+                foreground_interval = _clamp_foreground_double_click_interval(safe_interval)
+                if foreground_interval < safe_interval:
+                    self.logger.debug(
+                        "前台双击间隔 %.3fs 超过安全阈值，已收敛为 %.3fs",
+                        safe_interval,
+                        foreground_interval,
+                    )
+                return self._foreground_click(
+                    int(x),
+                    int(y),
+                    button,
+                    2,
+                    foreground_interval,
+                    safe_hold,
+                    atomic_sequence=True,
+                )
+            return self._background_double_click(int(x), int(y), button, safe_interval, safe_hold)
         except Exception:
             return False
+
+    def _background_double_click(
+        self,
+        client_x: int,
+        client_y: int,
+        button: str,
+        interval: float,
+        hold_duration: float,
+    ) -> bool:
+        if button == 'left':
+            down_msg, up_msg, dbl_msg = win32con.WM_LBUTTONDOWN, win32con.WM_LBUTTONUP, win32con.WM_LBUTTONDBLCLK
+            wparam_down = win32con.MK_LBUTTON
+        elif button == 'right':
+            down_msg, up_msg, dbl_msg = win32con.WM_RBUTTONDOWN, win32con.WM_RBUTTONUP, win32con.WM_RBUTTONDBLCLK
+            wparam_down = win32con.MK_RBUTTON
+        else:
+            down_msg, up_msg, dbl_msg = win32con.WM_MBUTTONDOWN, win32con.WM_MBUTTONUP, win32con.WM_MBUTTONDBLCLK
+            wparam_down = win32con.MK_MBUTTON
+
+        self._activate_background_point(client_x, client_y)
+        window_chain, window_coords = self._resolve_mouse_message_targets(client_x, client_y)
+        if self.enable_message_guard:
+            if not self._send_mouse_message_to_chain(
+                window_chain,
+                window_coords,
+                win32con.WM_MOUSEMOVE,
+                0,
+            ):
+                return False
+            if not self._sync_async_mouse_phase(window_chain):
+                self.logger.error("后台双击移动消息没有送到窗口")
+                return False
+        # 与系统合成的真实双击一致：第二次按下用 DBLCLK 代替 DOWN
+        for index, press_msg in enumerate((down_msg, dbl_msg)):
+            if index > 0 and interval > 0:
+                _precise_sleep(interval)
+            if not self._send_mouse_message_to_chain(window_chain, window_coords, press_msg, wparam_down):
+                return False
+            if hold_duration > 0:
+                _precise_sleep(hold_duration)
+            if not self._send_mouse_message_to_chain(window_chain, window_coords, up_msg, 0):
+                return False
+            # 后台二是 PostMessage：必须等第一击真正处理完再发 DBLCLK，
+            # 否则资源管理器/自绘控件可能只看到一次选中或把第二击丢掉。
+            if not self._sync_async_mouse_phase(window_chain):
+                self.logger.error("后台双击阶段消息没有送到窗口")
+                return False
+        self._remember_cursor(client_x, client_y)
+        self._remember_target_control(window_chain)
+        if self.enable_message_guard and not self._confirm_background_message_delivery(window_chain):
+            self.logger.error("后台双击消息没有送到窗口")
+            return False
+        return True
+
+    def _sync_async_mouse_phase(self, window_chain) -> bool:
+        """后台二每个鼠标阶段后同步目标线程；后台一由 SendMessage 自身保证同步。"""
+        if not self.use_async_message:
+            return True
+        return self._confirm_background_message_delivery(window_chain)
+
+    _SHELL_VIEW_CLASSES = frozenset({"shelldll_defview", "syslistview32"})
+    _SHELL_FRAME_CLASSES = frozenset({"cabinetwclass", "explorewclass", "progman", "workerw"})
+
+    def _should_invoke_shell_item(self, window_chain) -> bool:
+        """桌面图标层或资源管理器文件列表：注入双击打不开，只能选中后再回车。"""
+        hwnds = [int(hwnd) for hwnd in (window_chain or ()) if hwnd]
+        classes = [self._control_class_name(hwnd).strip().lower() for hwnd in hwnds]
+        if any(name in self._SHELL_FRAME_CLASSES or name == "shelldll_defview" for name in classes):
+            return True
+        for hwnd, name in zip(hwnds, classes):
+            if name != "syslistview32":
+                continue
+            try:
+                title = str(win32gui.GetWindowText(int(hwnd)) or "").strip().lower()
+            except Exception:
+                title = ""
+            if title == "folderview":
+                return True
+        try:
+            hwnd = int(self.hwnd or 0)
+            for _ in range(8):
+                if not hwnd:
+                    break
+                name = self._control_class_name(hwnd).strip().lower()
+                if name in self._SHELL_FRAME_CLASSES or name == "shelldll_defview":
+                    return True
+                parent = int(win32gui.GetParent(hwnd) or 0)
+                if parent == hwnd:
+                    break
+                hwnd = parent
+        except Exception:
+            pass
+        return False
 
     def drag(self, start_x: int, start_y: int, end_x: int, end_y: int,
              duration: float = 1.0, button: str = 'left') -> bool:
@@ -1511,7 +1785,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                     return False
                 return self.driver.type_text(text)
             if self._using_plugin_dx():
-                return bool(self._plugin_dx().key_press_str(str(text or "")))
+                return bool(self._plugin_dx().send_text(str(text or "")))
             return self._find_and_send_to_input_control(text, stop_checker=stop_checker)
         except InterruptedError:
             raise
@@ -1543,6 +1817,15 @@ class StandardWindowInputSimulator(BaseInputSimulator):
                 )
             except Exception:
                 safe_hold_duration = DEFAULT_CLICK_HOLD_SECONDS
+
+            if safe_clicks == 2:
+                return self._background_double_click(
+                    client_x,
+                    client_y,
+                    button,
+                    safe_interval,
+                    safe_hold_duration,
+                )
 
             if button == 'left':
                 down_msg, up_msg = win32con.WM_LBUTTONDOWN, win32con.WM_LBUTTONUP
@@ -1625,6 +1908,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         clicks: int,
         interval: float,
         duration: Optional[float] = None,
+        *,
+        atomic_sequence: bool = False,
     ) -> bool:
         """Foreground click helper."""
         try:
@@ -1689,25 +1974,44 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             except Exception:
                 return False
 
-            for click_index in range(safe_clicks):
-                if click_index > 0 and safe_interval > 0:
-                    _precise_sleep(safe_interval)
+            if atomic_sequence:
                 click_ok = bool(
                     self.driver.click_mouse(
                         target_x,
                         target_y,
                         button=button,
-                        clicks=1,
-                        interval=0.0,
+                        clicks=safe_clicks,
+                        interval=safe_interval,
                         duration=safe_duration,
                     )
                 )
                 if not click_ok:
                     return False
+            else:
+                for click_index in range(safe_clicks):
+                    if click_index > 0 and safe_interval > 0:
+                        _precise_sleep(safe_interval)
+                    click_ok = bool(
+                        self.driver.click_mouse(
+                            target_x,
+                            target_y,
+                            button=button,
+                            clicks=1,
+                            interval=0.0,
+                            duration=safe_duration,
+                        )
+                    )
+                    if not click_ok:
+                        return False
             if self.enable_message_guard:
                 if not self._confirm_click_delivery(target_x, target_y):
-                    self.logger.warning("点击发出去了，但没确认到结果")
-                    return False
+                    if self._is_logitech_foreground_driver():
+                        # 罗技硬件注入已由驱动返回成功；窗口线程的 WM_NULL 确认
+                        # 只能说明消息队列状态，不能作为真实鼠标输入的失败判据。
+                        self.logger.debug("罗技点击已由驱动确认，跳过窗口消息确认失败判定")
+                    else:
+                        self.logger.warning("点击发出去了，但没确认到结果")
+                        return False
             return True
         except Exception as e:
             self.logger.debug(f"[前台点击] 执行失败：{e}")

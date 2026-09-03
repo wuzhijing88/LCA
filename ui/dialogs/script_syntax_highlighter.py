@@ -9,6 +9,8 @@ from typing import Dict, List, Tuple
 from PySide6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat
 
 
+from task_workflow.script_sandbox import COMMAND_NAMES
+
 _KEYWORDS = (
     "否则如果",
     "如果",
@@ -43,56 +45,13 @@ _KEYWORDS = (
 )
 _CONSTANTS = ("真", "假", "空", "True", "False", "None")
 _RUNTIME = ("变量", "上次", "文字", "找图", "检测", "卡片", "剪贴板", "窗口")
-_ACTIONS = (
-    "找图",
-    "找色",
-    "找所有图",
-    "等图",
-    "等色",
-    "等文字",
-    "等图消失",
-    "等色消失",
-    "等文字消失",
-    "取色",
-    "比色",
-    "点击",
-    "按下",
-    "松开",
-    "按住",
-    "连点",
-    "相对移动",
-    "鼠标位置",
-    "移动",
-    "拖拽",
-    "滚轮",
-    "按键",
-    "输入",
-    "延时",
-    "等毫秒",
-    "激活",
-    "播放",
-    "停止播放",
-    "找字",
-    "找字库",
-    "等字库",
-    "等字库消失",
-    "点字库",
-    "点文字",
-    "点元素",
-    "检测",
-    "持续检测",
-    "停止检测",
-    "持续找图",
-    "停止找图",
-    "多线程",
-    "关闭线程",
-    "距离",
-    "角度",
-    "成功",
-    "失败",
-    "记录",
-)
-_ACTION_METHODS = ("获取", "设置", "增加")
+
+
+def script_action_names():
+    return COMMAND_NAMES
+
+
+_ACTION_METHODS = ("获取", "设置", "增加", "设置分辨率")
 _BUILTINS = (
     "随机",
     "开方",
@@ -188,7 +147,7 @@ class ScriptSyntaxHighlighter(QSyntaxHighlighter):
         self._formats = self._build_formats()
         self._keyword_re = _word_pattern(_KEYWORDS)
         self._constant_re = _word_pattern(_CONSTANTS)
-        action_names = "|".join(re.escape(word) for word in _ACTIONS)
+        action_names = "|".join(re.escape(word) for word in script_action_names())
         method_names = "|".join(re.escape(word) for word in _ACTION_METHODS)
         runtime_names = "|".join(re.escape(word) for word in _RUNTIME)
         field_names = "|".join(re.escape(word) for word in _FIELDS)

@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+TASK_TYPE = "线程控制"
 TASK_NAME = "线程控制"
 
 
@@ -159,19 +160,19 @@ def _control_single_thread(
         if action_key == "start_from_card":
             target = start_card_id
             if target is None:
-                return True, "未提供指定卡片，已跳过", "执行下一步", None
+                return False, "未提供指定卡片，已跳过", "执行下一步", None
         else:
             target = getattr(executor, "start_card_id", None)
             if target is None:
-                return True, "未找到工作流起始卡片，已跳过", "执行下一步", None
+                return False, "未找到工作流起始卡片，已跳过", "执行下一步", None
 
         existing_id = _resolve_existing_card_id(executor, target)
         if existing_id is None:
-            return True, f"目标卡片不存在: {target}，已跳过", "执行下一步", None
+            return False, f"目标卡片不存在: {target}，已跳过", "执行下一步", None
 
         return True, f"单线程跳转到卡片 {existing_id}", "跳转到步骤", existing_id
 
-    return True, f"未知动作 {action}，已跳过", "执行下一步", None
+    return False, f"未知动作 {action}，已跳过", "执行下一步", None
 
 
 def execute_task(
@@ -205,11 +206,9 @@ def execute_task(
         )
         if single_ok:
             logger.info("当前不是多线程会话，线程控制卡按单线程模式处理: %s", single_message)
-        else:
-            logger.warning("当前不是多线程会话，线程控制卡按单线程模式处理失败: %s", single_message)
-        if not single_ok:
-            logger.warning("单线程控制执行失败: %s", single_message)
-        return True, single_action, single_next_card_id
+            return True, single_action, single_next_card_id
+        logger.warning("当前不是多线程会话，线程控制卡按单线程模式处理失败: %s", single_message)
+        return False, single_action, single_next_card_id
 
     try:
         success, message = session.control_thread(
@@ -220,7 +219,7 @@ def execute_task(
         )
     except Exception as exc:
         logger.error("线程控制执行异常: %s", exc, exc_info=True)
-        return True, "执行下一步", None
+        return False, "执行下一步", None
 
     logger.info(
         "[线程控制] action=%s, target=%s, start_card_id=%s, success=%s, message=%s",
@@ -231,5 +230,6 @@ def execute_task(
         message,
     )
     if not success:
-        logger.warning("线程控制命令未成功执行，但不终止当前工作流: %s", message)
+        logger.warning("线程控制命令未成功执行: %s", message)
+        return False, "执行下一步", None
     return True, "执行下一步", None

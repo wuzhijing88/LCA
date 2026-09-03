@@ -6,6 +6,7 @@ import logging
 from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+TASK_TYPE = '随机跳转'
 TASK_NAME = '随机跳转'
 DEFAULT_BRANCH_WEIGHT = 1
 

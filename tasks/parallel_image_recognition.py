@@ -370,6 +370,12 @@ class ParallelImageRecognizer:
                         ))
 
         results.sort(key=lambda r: r.index)
+        if mode == RecognitionMode.FIRST_MATCH:
+            # 并发任务可能在 stop_event 设置前同时完成；对外严格只返回
+            # 按输入顺序的第一个成功结果，避免调用方误点多张图片。
+            first_success = next((result for result in results if result.success), None)
+            if first_success is not None:
+                results = [first_success]
         return results
 
     def _recognize_single_image(self, task: ImageTask, screenshot: Optional[np.ndarray], stop_event: threading.Event) -> RecognitionResult:

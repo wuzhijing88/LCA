@@ -20,6 +20,7 @@ from utils.match.resolution_aware_matcher import smart_match_template
 from utils.capture.screenshot_helper import (
     _capture_with_engine,
     cleanup_screenshot_engine,
+    cleanup_screenshot_engines_on_stop as _cleanup_screenshot_engines_on_stop_impl,
     clear_screenshot_cache as _clear_screenshot_cache_impl,
     get_last_screenshot_error as _get_last_capture_error,
     get_screenshot_engine,
@@ -52,11 +53,13 @@ class _CaptureInFlight:
 
 def _normalize_engine(engine: Optional[str]) -> str:
     text = str(engine or "").strip().lower()
-    if text in {"wgc", "printwindow", "gdi", "dxgi"}:
+    from utils.capture.engine_ids import is_supported_screenshot_engine
+
+    if is_supported_screenshot_engine(text):
         return text
     try:
         current = str(get_screenshot_engine() or "wgc").strip().lower()
-        if current in {"wgc", "printwindow", "gdi", "dxgi"}:
+        if is_supported_screenshot_engine(current):
             return current
     except Exception:
         pass
@@ -693,6 +696,22 @@ def clear_screenshot_runtime_state(hwnd: Optional[int] = None) -> None:
     _clear_shared_capture_state(hwnd=hwnd)
     if hwnd is None:
         clear_motion_state(state_key=None)
+
+
+def cleanup_screenshot_engines_on_stop(keep_current_engine: bool = True) -> None:
+    """停止任务时的截图清理入口：先清共享帧/移动检测运行态，再交给引擎层清理，最后解除插件对目标窗口的绑定。"""
+    try:
+        clear_screenshot_runtime_state(hwnd=None)
+    except Exception as exc:
+        logger.debug("停止时清理截图运行态失败: %s", exc)
+    _cleanup_screenshot_engines_on_stop_impl(keep_current_engine=keep_current_engine)
+    try:
+        from utils.plugin.session import unbind_shared_plugin_windows
+
+        if unbind_shared_plugin_windows():
+            logger.info("停止时已解除插件窗口绑定")
+    except Exception as exc:
+        logger.debug("停止时解除插件绑定失败: %s", exc)
 
 
 def get_screenshot_capabilities() -> Dict[str, bool]:

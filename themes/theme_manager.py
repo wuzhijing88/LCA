@@ -173,6 +173,7 @@ class ThemeManager:
             'accent': '#0078d4',
             'accent_hover': '#1084d8',
             'accent_pressed': '#006cbe',
+            'accent_text': '#ffffff',
             'success': '#107c10',
             'warning': '#ff8c00',
             'error': '#e81123',
@@ -205,6 +206,7 @@ class ThemeManager:
             'accent': '#0078d4',
             'accent_hover': '#1084d8',
             'accent_pressed': '#006cbe',
+            'accent_text': '#ffffff',
             'success': '#107c10',
             'warning': '#ffa500',
             'error': '#f1707b',
@@ -482,7 +484,7 @@ class ThemeManager:
             }}
             QAbstractItemView::item:selected, QListView::item:selected {{
                 background-color: {selected};
-                color: #ffffff;
+                color: {self.get_color('accent_text')};
             }}
         """
 
@@ -490,13 +492,24 @@ class ThemeManager:
         if popup is None:
             return
         try:
-            from PySide6.QtWidgets import QComboBox
+            from PySide6.QtWidgets import QComboBox, QDialog, QMainWindow
 
             name = str(popup.objectName() or "")
             if name in {"scriptCompleterPopup", "customDropdownPopup", "customDropdownList"}:
                 return
-            if isinstance(popup, QComboBox):
+            # 绝不能把主题套到 Combo/对话框/主窗本身（view.window() 误判时会整窗被涂坏）
+            if isinstance(popup, (QComboBox, QDialog, QMainWindow)):
                 return
+            class_name = ""
+            try:
+                class_name = popup.metaObject().className()
+            except Exception:
+                class_name = ""
+            if class_name and class_name not in {"QComboBoxPrivateContainer", "QFrame", "QWidget"}:
+                # 只接受下拉容器及其常见基类
+                if "ComboBox" not in class_name and "Popup" not in class_name:
+                    pass
+
             from themes.rounded_popup import COMBO_RADIUS, apply_rounded_popup, apply_transparent_popup_palette
 
             apply_rounded_popup(
@@ -519,6 +532,10 @@ class ThemeManager:
                 viewport = item.viewport() if hasattr(item, "viewport") else None
                 if viewport is not None:
                     apply_transparent_popup_palette(viewport)
+            if not popup.isVisible():
+                popup.show()
+            popup.raise_()
+            popup.update()
         except RuntimeError:
             return
 

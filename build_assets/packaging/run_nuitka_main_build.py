@@ -19,6 +19,7 @@ PROJECT_ROOT_FOR_IMPORTS = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT_FOR_IMPORTS))
 
+from build_assets.packaging.stage_packaged_runtime_assets import iter_plugin_pack_files
 from services.ocr_runtime_contract import (
     OCR_MODEL_DIRECTORY,
     OCR_MODEL_FILES,
@@ -33,15 +34,21 @@ LOCAL_INCLUDE_PACKAGES = (
     "app_core",
 )
 
-# 第三方包：整包纳入
+# 第三方包：整包纳入（含 .pyd 扩展模块）
 THIRD_PARTY_INCLUDE_PACKAGES = (
     "uiautomation",
     "winrt",
     "dxcam",
+)
+
+# 第三方纯 Python 包：展开为模块列表纳入，展开时跳过 NOFOLLOW_IMPORTS 覆盖的子树。
+# 若用 --include-package，Nuitka 会尝试包含被 --nofollow-import-to 否决的模块，每个打一条
+# "Not allowed to include module" 警告；显式列出就不会打架。
+THIRD_PARTY_EXPAND_PACKAGES = (
     "rapidocr",
 )
 
-INCLUDE_PACKAGES = LOCAL_INCLUDE_PACKAGES + THIRD_PARTY_INCLUDE_PACKAGES
+INCLUDE_PACKAGES = LOCAL_INCLUDE_PACKAGES + THIRD_PARTY_INCLUDE_PACKAGES + THIRD_PARTY_EXPAND_PACKAGES
 
 INCLUDE_PACKAGE_DATA = (
     "rapidocr",
@@ -54,7 +61,7 @@ INCLUDE_MODULES = (
     "services.dict_ocr_service",
     "services.screenshot_pool",
     "ui.dialogs.dict_maker_dialog",
-    "utils.dxgi_capture",
+    "utils.capture.dxgi_capture",
     "utils.capture.engine_ids",
     "utils.plugin.capture",
     "utils.plugin.runtime",
@@ -62,7 +69,6 @@ INCLUDE_MODULES = (
     "utils.plugin.dx_input",
     "utils.plugin.protocol",
     "utils.input.normal_hd_driver",
-    "services.multiprocess_match_worker",
     "task_workflow.process_worker",
     "win32gui",
     "win32ui",
@@ -114,7 +120,24 @@ NOFOLLOW_IMPORTS = (
     "paddle",
     "tensorrt",
     "torch",
+    "cuda",
     "zstandard",
+    # onnxruntime 只用 InferenceSession；tools/transformers/quantization 是模型工具链，
+    # 会拖进 sympy(55MB 源码)+mpmath+protobuf+flatbuffers，运行时用不到。
+    "onnxruntime.tools",
+    "onnxruntime.transformers",
+    "onnxruntime.quantization",
+    "sympy",
+    "mpmath",
+    "google.protobuf",
+    "flatbuffers",
+    # rapidocr 只用 onnxruntime 后端；其余推理后端胶水层是死代码，
+    # get_engine() 按分支懒 import，不跟进也不会影响启动。
+    "rapidocr.inference_engine.paddle",
+    "rapidocr.inference_engine.pytorch",
+    "rapidocr.inference_engine.openvino",
+    "rapidocr.inference_engine.tensorrt",
+    "rapidocr.inference_engine.mnn",
     # cryptography 会可选 import bcrypt；Nuitka 跟进后若找不到 _bcrypt.pyd 会直接崩溃。
     "cryptography",
     "bcrypt",
@@ -332,6 +355,41 @@ def _iter_local_package_modules(project_root: Path, package_name: str) -> list[s
     return modules
 
 
+def _is_nofollow_module(module_name: str) -> bool:
+    for blocked in NOFOLLOW_IMPORTS:
+        if module_name == blocked or module_name.startswith(blocked + "."):
+            return True
+    return False
+
+
+def _iter_third_party_package_modules(package_name: str) -> list[str]:
+    """site-packages 里的纯 Python 包展开为模块列表；被 nofollow 覆盖的子树直接不列。"""
+    import importlib.util
+
+    spec = importlib.util.find_spec(package_name)
+    if spec is None or not spec.submodule_search_locations:
+        raise FileNotFoundError(f"Missing third-party package for Nuitka include: {package_name}")
+    modules: list[str] = []
+    seen: set[str] = set()
+    for location in spec.submodule_search_locations:
+        package_root = Path(location)
+        for path in sorted(package_root.rglob("*.py")):
+            if not path.is_file() or _is_packaging_test_path(path):
+                continue
+            relative = path.relative_to(package_root).with_suffix("")
+            parts = [package_name, *relative.parts]
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            module_name = ".".join(parts)
+            if module_name in seen or _is_nofollow_module(module_name):
+                continue
+            seen.add(module_name)
+            modules.append(module_name)
+    if package_name not in seen:
+        modules.insert(0, package_name)
+    return modules
+
+
 def _build_command(project_root: Path, output_dir: str) -> list[str]:
     command = [
         sys.executable,
@@ -352,16 +410,26 @@ def _build_command(project_root: Path, output_dir: str) -> list[str]:
         f"{','.join(LOCAL_INCLUDE_PACKAGES)} modules={len(local_modules)} (tests excluded)"
     )
 
+    third_party_modules: list[str] = []
+    for package_name in THIRD_PARTY_EXPAND_PACKAGES:
+        third_party_modules.extend(_iter_third_party_package_modules(package_name))
+    print(
+        "nuitka_third_party_expanded="
+        f"{','.join(THIRD_PARTY_EXPAND_PACKAGES)} modules={len(third_party_modules)} (nofollow subtrees skipped)"
+    )
+
     command.extend(f"--include-package={package_name}" for package_name in THIRD_PARTY_INCLUDE_PACKAGES)
     command.extend(f"--include-package-data={package_name}" for package_name in INCLUDE_PACKAGE_DATA)
     command.extend(f"--include-module={module_name}" for module_name in local_modules)
+    command.extend(f"--include-module={module_name}" for module_name in third_party_modules)
     command.extend(f"--include-module={module_name}" for module_name in INCLUDE_MODULES)
     command.extend(f"--nofollow-import-to={module_name}" for module_name in NOFOLLOW_IMPORTS)
     command.extend(f"--noinclude-qt-plugins={plugin_name}" for plugin_name in NOINCLUDE_QT_PLUGINS)
     command.append("--noinclude-qt-translations")
     command.extend(f"--include-data-dir={source}={target}" for source, target in DATA_DIR_SPECS)
-    if (project_root / "tools" / "plugin").is_dir():
-        command.append("--include-data-dir=tools/plugin=tools/plugin")
+    for name, _item in iter_plugin_pack_files(project_root / "tools" / "plugin"):
+        rel = f"tools/plugin/{name}"
+        command.append(f"--include-data-files={rel}={rel}")
     command.extend(f"--include-data-files={source}={target}" for source, target in DATA_FILE_SPECS)
     command.extend(f"--noinclude-dlls={pattern}" for pattern in NOINCLUDE_DLLS)
     command.extend(f"--noinclude-data-files={pattern}" for pattern in NOINCLUDE_DATA_FILES)
@@ -449,6 +517,30 @@ def _is_unused_qt_editor_path(relative_path: Path) -> bool:
     if name == "qtwebengineprocess.exe":
         return True
     return "qtwebengine" in name or "qt6webengine" in name
+
+
+# 非 onnxruntime 的 rapidocr 推理后端目录；nofollow 只挡编译，Nuitka 仍可能落下包桩，构建后一并删掉。
+UNUSED_RAPIDOCR_BACKEND_DIRS = (
+    Path("rapidocr") / "inference_engine" / "paddle",
+    Path("rapidocr") / "inference_engine" / "pytorch",
+    Path("rapidocr") / "inference_engine" / "openvino",
+    Path("rapidocr") / "inference_engine" / "tensorrt",
+    Path("rapidocr") / "inference_engine" / "mnn",
+)
+
+
+def _remove_unused_rapidocr_backends(dist_dir: Path) -> list[tuple[Path, int]]:
+    removed: list[tuple[Path, int]] = []
+    if not dist_dir.is_dir():
+        return removed
+    for relative in UNUSED_RAPIDOCR_BACKEND_DIRS:
+        target = dist_dir / relative
+        if not target.is_dir():
+            continue
+        size = sum(int(p.stat().st_size) for p in target.rglob("*") if p.is_file())
+        _remove_tree(target)
+        removed.append((relative, size))
+    return removed
 
 
 def _remove_unused_bundled_tools(dist_dir: Path) -> list[tuple[Path, int]]:
@@ -735,6 +827,16 @@ def main() -> int:
             f"{len(removed_excluded_dlls)} files, {removed_size / 1024 / 1024:.2f} MB"
         )
         for relative_path, _file_size in removed_excluded_dlls:
+            print(f"  - {relative_path.as_posix()}")
+
+    removed_unused_backends = _remove_unused_rapidocr_backends(result_exe.parent)
+    if removed_unused_backends:
+        removed_size = sum(file_size for _relative_path, file_size in removed_unused_backends)
+        print(
+            "removed_unused_rapidocr_backends="
+            f"{len(removed_unused_backends)} dirs, {removed_size / 1024 / 1024:.2f} MB"
+        )
+        for relative_path, _file_size in removed_unused_backends:
             print(f"  - {relative_path.as_posix()}")
 
     removed_unused_tools = _remove_unused_bundled_tools(result_exe.parent)

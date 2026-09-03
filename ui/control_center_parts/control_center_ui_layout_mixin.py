@@ -144,7 +144,7 @@ class ControlCenterUiLayoutMixin:
         )
         self.pause_all_btn = self._make_toolbar_button(
             "暂停",
-            "暂停或恢复正在运行的窗口 (F11)",
+            "暂停或恢复正在运行的窗口",
             lambda _checked=False: self.toggle_pause_all_tasks(),
         )
         self.timer_btn = self._make_toolbar_button(
@@ -152,10 +152,16 @@ class ControlCenterUiLayoutMixin:
             "设置定时启动、停止、暂停",
             self.open_timer_dialog,
         )
+        self.stability_test_btn = self._make_toolbar_button(
+            "稳定性实测",
+            "为每个窗口生成互不相同的全功能随机脚本并启动",
+            self.run_stability_test,
+        )
         toolbar.addWidget(self.start_all_btn)
         toolbar.addWidget(self.stop_all_btn)
         toolbar.addWidget(self.pause_all_btn)
         toolbar.addWidget(self.timer_btn)
+        toolbar.addWidget(self.stability_test_btn)
         return toolbar
 
     def _create_status_bar(self):
@@ -194,29 +200,75 @@ class ControlCenterUiLayoutMixin:
 
 
     def _setup_shortcuts(self):
-        """设置快捷键"""
-        from PySide6.QtGui import QShortcut, QKeySequence
+        """注册开始/停止/暂停热键，键位跟随全局设置。"""
+        self._refresh_shortcuts()
+
+    def _refresh_shortcuts(self):
         from PySide6.QtCore import Qt
+        from PySide6.QtGui import QKeySequence, QShortcut
 
-        # F9 - 全部启动
-        self.start_all_shortcut = QShortcut(QKeySequence("F9"), self)
-        self.start_all_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self.start_all_shortcut.activated.connect(self.start_all_tasks)
-        logger.info("中控软件：已注册F9快捷键（全部启动）")
+        from app_core.hotkey_spec import display_hotkey
+        from app_core.player.hotkey_runtime import install_global_player_hotkeys
+        from .control_center_hotkeys import resolve_control_center_hotkeys, to_qt_shortcut_text
 
-        # F10 - 全部停止
-        self.stop_all_shortcut = QShortcut(QKeySequence("F10"), self)
-        self.stop_all_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self.stop_all_shortcut.activated.connect(self.stop_all_tasks)
-        logger.info("中控软件：已注册F10快捷键（全部停止）")
+        self._release_control_center_hotkeys()
+        get_parent_config = getattr(self, "_get_parent_config", None)
+        config = get_parent_config() if callable(get_parent_config) else None
+        hotkeys = resolve_control_center_hotkeys(config)
+        callbacks = {
+            "start": self.start_all_tasks,
+            "stop": self.stop_all_tasks,
+            "pause": self.toggle_pause_all_tasks,
+        }
+        session = install_global_player_hotkeys(self, hotkeys, callbacks)
+        self._cc_hotkey_session = session
+        self._cc_window_shortcuts = []
+        if not session.keyboard_active:
+            for action, callback in callbacks.items():
+                text = to_qt_shortcut_text(hotkeys.get(action))
+                if not text:
+                    continue
+                shortcut = QShortcut(QKeySequence(text), self)
+                shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+                shortcut.activated.connect(callback)
+                self._cc_window_shortcuts.append(shortcut)
+        self._apply_hotkey_button_tooltips(hotkeys)
+        logger.info(
+            "中控软件：已按全局设置注册热键 start=%s stop=%s pause=%s",
+            display_hotkey(hotkeys["start"]),
+            display_hotkey(hotkeys["stop"]),
+            display_hotkey(hotkeys["pause"]),
+        )
 
-        # F11 - 全部暂停/恢复
-        self.pause_all_shortcut = QShortcut(QKeySequence("F11"), self)
-        self.pause_all_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self.pause_all_shortcut.activated.connect(self._on_pause_shortcut)
-        logger.info("中控软件：已注册F11快捷键（全部暂停/恢复）")
+    def _apply_hotkey_button_tooltips(self, hotkeys):
+        from app_core.hotkey_spec import display_hotkey
+
+        start_hint = display_hotkey(hotkeys.get("start"))
+        stop_hint = display_hotkey(hotkeys.get("stop"))
+        pause_hint = display_hotkey(hotkeys.get("pause"))
+        if hasattr(self, "start_all_btn") and self.start_all_btn is not None:
+            self.start_all_btn.setToolTip(f"启动已分配工作流的窗口；有选中时只启动选中 ({start_hint})")
+        if hasattr(self, "stop_all_btn") and self.stop_all_btn is not None:
+            self.stop_all_btn.setToolTip(f"停止正在运行的窗口；有选中时只停止选中 ({stop_hint})")
+        if hasattr(self, "pause_all_btn") and self.pause_all_btn is not None:
+            self.pause_all_btn.setToolTip(f"暂停或恢复正在运行的窗口 ({pause_hint})")
+
+    def _release_control_center_hotkeys(self):
+        session = getattr(self, "_cc_hotkey_session", None)
+        if session is not None:
+            try:
+                session.release()
+            except Exception:
+                logger.debug("释放中控全局热键失败", exc_info=True)
+        self._cc_hotkey_session = None
+        for shortcut in list(getattr(self, "_cc_window_shortcuts", []) or []):
+            try:
+                shortcut.setEnabled(False)
+                shortcut.deleteLater()
+            except Exception:
+                pass
+        self._cc_window_shortcuts = []
 
     def _on_pause_shortcut(self):
-        """F11快捷键回调"""
-        logger.info("=== 中控软件：F11快捷键被触发 ===")
+        logger.info("=== 中控软件：暂停快捷键被触发 ===")
         self.toggle_pause_all_tasks()

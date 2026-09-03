@@ -160,19 +160,25 @@ class MainWindowPlatformMixin:
 
                     window_manager = get_universal_window_manager()
 
+                    from utils.window.hwnd_utils import as_hwnd
+
+                    safe_hwnd = as_hwnd(target_hwnd)
                     result = window_manager.adjust_single_window(
-
-                        target_hwnd, target_client_width, target_client_height, async_mode=False
-
+                        safe_hwnd, target_client_width, target_client_height
                     )
 
                     if result.success:
-
                         logging.info(f"Single-window mode: resize succeeded: {result.message}")
-
+                        if hasattr(self, "_show_resolution_status"):
+                            self._show_resolution_status(
+                                f"窗口分辨率已调整: {target_client_width}x{target_client_height}"
+                            )
                     else:
-
                         logging.warning(f"Single-window mode: resize failed: {result.message}")
+                        if hasattr(self, "_show_resolution_status"):
+                            self._show_resolution_status(
+                                f"窗口分辨率调整失败: {result.message}"
+                            )
 
                 else:
 

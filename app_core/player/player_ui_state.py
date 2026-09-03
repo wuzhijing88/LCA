@@ -18,6 +18,7 @@ def player_ui_state_path(userdata_dir: str | Path) -> Path:
 def default_player_ui_state() -> Dict[str, Any]:
     return {
         "group_loops": 1,
+        "group_loops_by_list": {},
         "loops_by_id": {},
         "settings": {},
         "schedule_alarms": [],
@@ -53,6 +54,13 @@ def load_player_ui_state(userdata_dir: str | Path) -> Dict[str, Any]:
             sid = str(key or "").strip()
             if sid:
                 loops[sid] = normalize_script_loop_count(value, 1)
+    group_loops_raw = raw.get("group_loops_by_list")
+    group_loops_by_list: Dict[str, int] = {}
+    if isinstance(group_loops_raw, Mapping):
+        for key, value in group_loops_raw.items():
+            list_id = str(key or "").strip()
+            if list_id:
+                group_loops_by_list[list_id] = normalize_script_loop_count(value, 1)
     settings = raw.get("settings")
     alarms = raw.get("schedule_alarms")
     list_order = []
@@ -83,6 +91,7 @@ def load_player_ui_state(userdata_dir: str | Path) -> Dict[str, Any]:
         win_h = 0
     return {
         "group_loops": normalize_script_loop_count(raw.get("group_loops"), 1),
+        "group_loops_by_list": group_loops_by_list,
         "loops_by_id": loops,
         "settings": dict(settings) if isinstance(settings, Mapping) else {},
         "schedule_alarms": normalize_schedule_alarms(alarms) if alarms else [],
@@ -101,6 +110,14 @@ def save_player_ui_state(userdata_dir: str | Path, state: Mapping[str, Any] | No
     payload = default_player_ui_state()
     if isinstance(state, Mapping):
         payload["group_loops"] = normalize_script_loop_count(state.get("group_loops"), 1)
+        group_loops_raw = state.get("group_loops_by_list")
+        group_loops_by_list: Dict[str, int] = {}
+        if isinstance(group_loops_raw, Mapping):
+            for key, value in group_loops_raw.items():
+                list_id = str(key or "").strip()
+                if list_id:
+                    group_loops_by_list[list_id] = normalize_script_loop_count(value, 1)
+        payload["group_loops_by_list"] = group_loops_by_list
         loops_raw = state.get("loops_by_id")
         loops: Dict[str, int] = {}
         if isinstance(loops_raw, Mapping):

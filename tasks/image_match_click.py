@@ -33,6 +33,7 @@ if is_smart_capture_available():
 else:
     logger.warning("[图片识别] 截图引擎不可用")
 
+TASK_TYPE = "图片点击"
 TASK_NAME = "图片点击"
 
 
@@ -223,47 +224,48 @@ def locate_image_in_window(
     ), absolute_image_path
 
 
-# Define activation helper function (or assume it's imported from utils)
 def _activate_window_foreground(target_hwnd: Optional[int], logger):
-    # 工具 修复：简化窗口激活逻辑
+    """前台找图点击前激活目标窗口；丢焦时走统一激活工具（含 AttachThreadInput）。"""
     import os
-    is_multi_window_mode = os.environ.get('MULTI_WINDOW_MODE') == 'true'
 
+    is_multi_window_mode = os.environ.get("MULTI_WINDOW_MODE") == "true"
     if is_multi_window_mode:
         logger.debug(f"靶心 多窗口模式：跳过窗口激活，窗口 {target_hwnd}")
-        return True  # 在多窗口模式下，不激活窗口但返回成功
+        return True
 
-    # ... (Activation logic as defined above) ...
     if not target_hwnd:
         logger.debug("前台模式执行，但未提供目标窗口句柄，无法激活。")
         return False
+
     try:
         if not win32gui.IsWindow(target_hwnd):
             logger.warning(f"无法激活目标窗口：句柄 {target_hwnd} 无效或已销毁。")
             return False
+    except Exception as e:
+        logger.warning(f"检查目标窗口 {target_hwnd} 时出错: {e}。")
+        return False
+
+    try:
         current_foreground_hwnd = win32gui.GetForegroundWindow()
         if current_foreground_hwnd == target_hwnd:
             logger.debug(f"目标窗口 {target_hwnd} 已是前台窗口，无需激活。")
             return True
-        if win32gui.IsIconic(target_hwnd):
-            logger.info(f"目标窗口 {target_hwnd} 已最小化，尝试恢复并激活...")
-            win32gui.ShowWindow(target_hwnd, win32con.SW_RESTORE)
-            precise_sleep(0.15)
-            win32gui.SetForegroundWindow(target_hwnd)
-            precise_sleep(0.15)
-            logger.info(f"窗口 {target_hwnd} 已尝试恢复并设置为前台。")
-        else:
-            logger.info(f"尝试将窗口 {target_hwnd} 设置为前台...")
-            win32gui.SetForegroundWindow(target_hwnd)
-            precise_sleep(0.1)
-        return True
+    except Exception:
+        pass
+
+    try:
+        from utils.window.window_activation_utils import activate_window
+
+        activated = activate_window(int(target_hwnd), log_prefix="图片点击")
+        if activated:
+            logger.info(f"已激活目标窗口: {activated}")
+            return True
+        logger.warning(f"激活目标窗口失败: hwnd={target_hwnd}")
+        return False
     except Exception as e:
         logger.warning(f"设置前台窗口 {target_hwnd} 时出错: {e}。")
         return False
 
-
-# 任务类型标识
-TASK_TYPE = "图片点击" # Get logger instance
 
 
 def requires_input_lock(_params: Dict[str, Any]) -> bool:
@@ -314,7 +316,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "type": "select",
             "options": ["完整点击", "双击", "仅按下", "仅松开"],
             "default": "完整点击",
-            "tooltip": "完整点击=按下+松开，双击=连续两次完整点击，仅按下=只按下不松开，仅松开=只松开不按下"
+            "tooltip": "完整点击=按下+松开，双击=发送标准双击消息序列，仅按下=只按下不松开，仅松开=只松开不按下"
         },
         "enable_auto_release": {
             "label": "启用自动弹起",
@@ -481,8 +483,17 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
 def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mode: str, target_hwnd: Optional[int], window_region: Optional[Tuple[int, int, int, int]], card_id: Optional[int], **kwargs) -> Tuple[bool, str, Optional[int]]:
     """Executes the Find Image and Click task in the specified mode."""
 
-    # 从 kwargs 中获取 get_image_data 函数
+    # 从 kwargs 中获取 get_image_data 函数；独立程序子进程走内存图库
     get_image_data = kwargs.get('get_image_data', None)
+    if get_image_data is None:
+        try:
+            from utils.match.template_preloader import get_memory_image_provider
+
+            provider = get_memory_image_provider()
+            if callable(provider):
+                get_image_data = provider
+        except Exception:
+            pass
 
 
     # 1. 参数获取与检查
@@ -1081,6 +1092,21 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 else:
                     from ctypes import wintypes
                     import ctypes
+                    import os
+
+                    # 只在前台模式且非多窗口模式下激活窗口
+                    is_multi_window_mode = os.environ.get('MULTI_WINDOW_MODE') == 'true'
+                    should_activate = (
+                        effective_execution_mode.startswith('foreground') and not is_multi_window_mode
+                    )
+
+                    if should_activate:
+                        # 连线执行时前台可能被前序键鼠步骤/系统抢走（罗技驱动下常见到 Program Manager）。
+                        # 必须先激活再换算屏幕坐标，避免激活后窗口位移导致点偏。
+                        _activate_window_foreground(target_hwnd, logger)
+                    else:
+                        reason = "多窗口模式" if is_multi_window_mode else "非前台模式"
+                        logger.info(f"靶心 [{reason}] 跳过窗口激活，直接在窗口 {target_hwnd} 中点击")
 
                     # 使用ClientToScreen转换客户区坐标为屏幕坐标
                     point = wintypes.POINT(int(dpi_adjusted_click_x), int(dpi_adjusted_click_y))
@@ -1095,20 +1121,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                     else:
                         logger.error("[前台点击] ClientToScreen转换失败，终止本次点击以避免非客户区偏移")
                         raise RuntimeError("ClientToScreen转换失败")
-
-                    # 工具 修复：简化窗口激活逻辑
-                    import os
-                    is_multi_window_mode = os.environ.get('MULTI_WINDOW_MODE') == 'true'
-
-                    # 只在前台模式且非多窗口模式下激活窗口
-                    should_activate = (effective_execution_mode.startswith('foreground') and not is_multi_window_mode)
-
-                    if should_activate:
-                        # 严格模式：点击阶段不再做窗口激活，避免插入额外系统动作。
-                        logger.info("[前台点击] 严格模式：跳过点击前窗口激活")
-                    else:
-                        reason = "多窗口模式" if is_multi_window_mode else "非前台模式"
-                        logger.info(f"靶心 [{reason}] 跳过窗口激活，直接在窗口 {target_hwnd} 中点击")
 
                     logger.info(f"[前台点击] 执行点击: 屏幕坐标({screen_click_x}, {screen_click_y}), 按钮={button_param}, 动作={click_action}, 次数={clicks}")
 

@@ -7,13 +7,14 @@
 """
 
 import logging
+import time
 import ctypes
 from ctypes import wintypes
 from typing import Optional, Tuple, List
 from PySide6.QtWidgets import (QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
                                 QMessageBox, QApplication, QLabel)
 from PySide6.QtCore import Signal, QPoint, QRect, Qt, QTimer, QThread
-from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QImage, QPixmap
+from PySide6.QtGui import QCursor, QPainter, QPen, QColor, QBrush, QImage, QPixmap
 
 from utils.window.window_coordinate_common import (
     get_qt_virtual_desktop_rect,
@@ -100,6 +101,7 @@ class GlobalInputMonitor(QThread):
 
     esc_pressed = Signal()
     right_click = Signal()
+    arrow_nudge = Signal(int, int)  # dx, dy（客户区物理像素）
 
     # Windows钩子常量
     WH_KEYBOARD_LL = 13
@@ -107,6 +109,17 @@ class GlobalInputMonitor(QThread):
     WM_KEYDOWN = 0x0100
     WM_RBUTTONDOWN = 0x0204
     VK_ESCAPE = 0x1B
+    VK_SHIFT = 0x10
+    VK_LEFT = 0x25
+    VK_UP = 0x26
+    VK_RIGHT = 0x27
+    VK_DOWN = 0x28
+    ARROW_DELTA = {
+        0x25: (-1, 0),
+        0x26: (0, -1),
+        0x27: (1, 0),
+        0x28: (0, 1),
+    }
     LRESULT = wintypes.LPARAM
 
     # 定义KBDLLHOOKSTRUCT结构
@@ -186,6 +199,10 @@ class GlobalInputMonitor(QThread):
             PostThreadMessageW.restype = wintypes.BOOL
             self._post_thread_message = PostThreadMessageW
 
+            GetAsyncKeyState = user32.GetAsyncKeyState
+            GetAsyncKeyState.argtypes = [ctypes.c_int]
+            GetAsyncKeyState.restype = ctypes.c_short
+
             # 定义钩子回调函数
             def keyboard_callback(nCode, wParam, lParam):
                 try:
@@ -196,6 +213,12 @@ class GlobalInputMonitor(QThread):
                         if vk_code == self.VK_ESCAPE:
                             logger.debug(f"[全局钩子] 检测到ESC键 (VK={vk_code})")
                             self.esc_pressed.emit()
+                        else:
+                            delta = self.ARROW_DELTA.get(int(vk_code))
+                            if delta is not None:
+                                step = 10 if (GetAsyncKeyState(self.VK_SHIFT) & 0x8000) else 1
+                                self.arrow_nudge.emit(int(delta[0]) * step, int(delta[1]) * step)
+                                return self.LRESULT(1)
                 except Exception as e:
                     logger.error(f"[全局钩子] 键盘回调异常: {e}")
                 return CallNextHookEx(self.keyboard_hook, nCode, wParam, lParam)
@@ -313,6 +336,10 @@ class ColorCoordinatePickerOverlay(QWidget):
         self.click_pos = QPoint()
         self.selected_color = None  # (r, g, b)
         self.mouse_pos = QPoint()  # 当前鼠标位置
+        self._aim_client_pos: Optional[Tuple[int, int]] = None  # 当前瞄准的客户区物理像素
+        self._aim_overlay_pos: Optional[QPoint] = None  # 键盘微调对应的覆盖层坐标
+        self._last_nudge_at = 0.0
+        self._last_nudge_delta = (0, 0)
         self.magnifier_enabled = True  # 放大镜功能开关
         self.selected_points: List[Tuple[int, int, int, int, int]] = []
         if initial_points:
@@ -361,6 +388,7 @@ class ColorCoordinatePickerOverlay(QWidget):
         self.input_monitor = GlobalInputMonitor()
         self.input_monitor.esc_pressed.connect(self._on_global_esc)
         self.input_monitor.right_click.connect(self._on_global_right_click)
+        self.input_monitor.arrow_nudge.connect(self._on_arrow_nudge)
 
         configure_opaque_picker_overlay(self)
         self._closing = False
@@ -589,14 +617,38 @@ class ColorCoordinatePickerOverlay(QWidget):
             return (r, g, b)
         return None
 
+    def _resolve_aim_client_pos(self, mouse_pos: Optional[QPoint] = None) -> Optional[Tuple[int, int]]:
+        """当前瞄准的客户区物理像素。键盘微调以此为准，避免高 DPI 量化丢像素。"""
+        if self._aim_client_pos is not None:
+            return int(self._aim_client_pos[0]), int(self._aim_client_pos[1])
+
+        pos = mouse_pos if mouse_pos is not None else self.mouse_pos
+        if pos is None or pos.isNull() or not self.window_info:
+            return None
+        relative_pos = self._get_relative_coordinates(pos)
+        return int(relative_pos.x()), int(relative_pos.y())
+
+    def _clamp_client_pos(self, x: int, y: int) -> Tuple[int, int]:
+        width, height = get_window_client_physical_size(self.window_info)
+        return (
+            max(0, min(int(x), max(0, int(width) - 1))),
+            max(0, min(int(y), max(0, int(height) - 1))),
+        )
+
+    def _get_aim_marker_repaint_rect(self, overlay_pos: QPoint) -> QRect:
+        if overlay_pos is None or overlay_pos.isNull():
+            return QRect()
+        return QRect(int(overlay_pos.x()) - 14, int(overlay_pos.y()) - 14, 28, 28)
+
     def _get_magnifier_layout(self, mouse_pos: QPoint) -> Optional[Tuple[QRect, QRect, int, int]]:
         """计算放大镜与信息框布局。"""
         if not self.window_info:
             return None
 
-        relative_pos = self._get_relative_coordinates(mouse_pos)
-        center_x = int(relative_pos.x())
-        center_y = int(relative_pos.y())
+        aim = self._resolve_aim_client_pos(mouse_pos)
+        if aim is None:
+            return None
+        center_x, center_y = aim
 
         grid_size = int(self._magnifier_grid_size)
         pixel_size = int(self._magnifier_pixel_size)
@@ -635,10 +687,18 @@ class ColorCoordinatePickerOverlay(QWidget):
             return QRect()
 
         mag_rect, info_rect, _cx, _cy = layout
-        return mag_rect.united(info_rect).adjusted(-2, -2, 2, 2)
+        dirty = mag_rect.united(info_rect).adjusted(-2, -2, 2, 2)
+        marker = self._get_aim_marker_repaint_rect(mouse_pos)
+        if not marker.isEmpty():
+            dirty = dirty.united(marker)
+        if self._aim_client_pos is not None:
+            aim_overlay = self._relative_to_overlay_point(self._aim_client_pos[0], self._aim_client_pos[1])
+            if aim_overlay is not None:
+                dirty = dirty.united(self._get_aim_marker_repaint_rect(aim_overlay))
+        return dirty
 
     def _request_magnifier_update(self, previous_pos: QPoint, current_pos: QPoint):
-        """按旧/新位置局部刷新放大镜区域。"""
+        """按旧/新位置局部刷新放大镜与瞄准准星。"""
         old_rect = self._get_magnifier_repaint_rect(previous_pos)
         new_rect = self._get_magnifier_repaint_rect(current_pos)
 
@@ -1005,6 +1065,25 @@ class ColorCoordinatePickerOverlay(QWidget):
             painter.drawRect(bg_rect)
             painter.drawText(text_pos, info_text)
 
+    def _draw_live_aim_marker(self, painter: QPainter):
+        """在当前瞄准像素上画空心准星，中间留出 1px 方便看清目标色。"""
+        aim = self._resolve_aim_client_pos()
+        if aim is None:
+            return
+        point = self._relative_to_overlay_point(aim[0], aim[1])
+        if point is None:
+            return
+
+        outer = self._get_picker_color('picker_crosshair_outer')
+        inner = self._get_picker_color('picker_crosshair_inner')
+        gap = 2
+        arm = 10
+        for pen in (QPen(outer, 3), QPen(inner, 1)):
+            painter.setPen(pen)
+            painter.drawLine(point.x() - arm, point.y(), point.x() - gap, point.y())
+            painter.drawLine(point.x() + gap, point.y(), point.x() + arm, point.y())
+            painter.drawLine(point.x(), point.y() - arm, point.x(), point.y() - gap)
+            painter.drawLine(point.x(), point.y() + gap, point.x(), point.y() + arm)
 
     def _get_picker_color(self, color_key: str) -> QColor:
         """从主题管理器获取颜色选择器的颜色"""
@@ -1085,10 +1164,11 @@ class ColorCoordinatePickerOverlay(QWidget):
                 painter.drawText(target_rect.topLeft() + QPoint(10, 25),
                                f"目标窗口: {self.target_window_title}")
                 painter.drawText(target_rect.topLeft() + QPoint(10, 50),
-                               "左键连续取色，完成后点‘完成取色’")
+                               "左键连续取色，方向键微调1像素(Shift=10)，完成后点‘完成取色’")
 
         # 绘制已选择点
         self._draw_selected_points(painter)
+        self._draw_live_aim_marker(painter)
 
         # 绘制放大镜预览
         if self.magnifier_enabled and not self.mouse_pos.isNull() and self.window_info:
@@ -1297,6 +1377,7 @@ class ColorCoordinatePickerOverlay(QWidget):
         """鼠标移动事件 - 仅局部刷新放大镜区域，避免全屏重绘卡顿"""
         previous_pos = QPoint(self.mouse_pos)
         self.mouse_pos = event.pos()
+        self._sync_aim_from_mouse(event.pos())
 
         # 用户有活动，重置超时定时器
         if hasattr(self, 'timeout_timer') and self.timeout_timer.isActive():
@@ -1361,8 +1442,12 @@ class ColorCoordinatePickerOverlay(QWidget):
                 logger.info("[鼠标事件] 点击位置在目标窗口内")
                 self.click_pos = event.pos()
 
-                # 转换为相对坐标
-                relative_pos = self._get_relative_coordinates(event.pos())
+                # 键盘微调后以瞄准像素为准，避免高 DPI 下点击坐标被量化偏移
+                aim = self._resolve_aim_client_pos(event.pos())
+                if aim is not None:
+                    relative_pos = QPoint(int(aim[0]), int(aim[1]))
+                else:
+                    relative_pos = self._get_relative_coordinates(event.pos())
                 logger.info(f"[鼠标事件] 相对坐标: ({relative_pos.x()}, {relative_pos.y()})")
 
                 # 获取该位置的像素颜色
@@ -1389,12 +1474,83 @@ class ColorCoordinatePickerOverlay(QWidget):
             logger.info("[鼠标事件] 右键点击，取消选择")
             self._request_close()
 
+    def _sync_aim_from_mouse(self, overlay_pos: QPoint):
+        """鼠标移动时更新瞄准点；若仍停在键盘微调的同一视觉像素上则保持客户区坐标。"""
+        locked = self._aim_overlay_pos
+        if locked is not None and self._aim_client_pos is not None:
+            if abs(int(overlay_pos.x()) - int(locked.x())) <= 1 and abs(int(overlay_pos.y()) - int(locked.y())) <= 1:
+                return
+        relative_pos = self._get_relative_coordinates(overlay_pos)
+        self._aim_client_pos = (int(relative_pos.x()), int(relative_pos.y()))
+        self._aim_overlay_pos = None
+
+    def _on_arrow_nudge(self, dx: int, dy: int):
+        if getattr(self, "_closing", False):
+            return
+        self._nudge_picker_by(int(dx), int(dy))
+
+    def _nudge_picker_by(self, dx: int, dy: int):
+        """按客户区物理像素移动瞄准点，并同步真实光标。"""
+        if getattr(self, "_closing", False) or not self.window_info:
+            return
+        if not dx and not dy:
+            return
+
+        now = time.monotonic()
+        delta = (int(dx), int(dy))
+        if delta == self._last_nudge_delta and (now - self._last_nudge_at) < 0.02:
+            return
+        self._last_nudge_at = now
+        self._last_nudge_delta = delta
+
+        aim = self._resolve_aim_client_pos()
+        if aim is None:
+            cursor_local = self.mapFromGlobal(QCursor.pos())
+            if cursor_local.isNull():
+                return
+            relative_pos = self._get_relative_coordinates(cursor_local)
+            aim = (int(relative_pos.x()), int(relative_pos.y()))
+
+        next_x, next_y = self._clamp_client_pos(aim[0] + dx, aim[1] + dy)
+        overlay_point = self._relative_to_overlay_point(next_x, next_y)
+        if overlay_point is None:
+            return
+
+        previous_pos = QPoint(self.mouse_pos)
+        self._aim_client_pos = (next_x, next_y)
+        self._aim_overlay_pos = QPoint(overlay_point)
+        QCursor.setPos(self.mapToGlobal(overlay_point))
+        self.mouse_pos = QPoint(overlay_point)
+
+        if hasattr(self, 'timeout_timer') and self.timeout_timer.isActive():
+            self.timeout_timer.start()
+
+        self._request_magnifier_update(previous_pos, self.mouse_pos)
+        self._last_magnifier_mouse_pos = QPoint(self.mouse_pos)
+        logger.debug("找色瞄准微调: (%s, %s) -> (%s, %s)", aim[0], aim[1], next_x, next_y)
+
     def keyPressEvent(self, event):
-        """键盘事件"""
+        """键盘事件。方向键由全局钩子优先处理；钩子未生效时这里兜底。"""
         logger.info(f"[键盘事件] 接收到键盘事件: 键={event.key()}")
         if event.key() == Qt.Key.Key_Escape:
             logger.info("ESC键退出")
             self._request_close()
+            event.accept()
+            return
+
+        arrow_delta = {
+            Qt.Key.Key_Left: (-1, 0),
+            Qt.Key.Key_Right: (1, 0),
+            Qt.Key.Key_Up: (0, -1),
+            Qt.Key.Key_Down: (0, 1),
+        }
+        delta = arrow_delta.get(event.key())
+        if delta is not None:
+            step = 10 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 1
+            self._nudge_picker_by(delta[0] * step, delta[1] * step)
+            event.accept()
+            return
+
         event.accept()
 
     def closeEvent(self, event):
@@ -1424,6 +1580,10 @@ class ColorCoordinatePickerOverlay(QWidget):
                     monitor.right_click.disconnect()
                 except Exception:
                     pass
+                try:
+                    monitor.arrow_nudge.disconnect()
+                except Exception:
+                    pass
                 if monitor.isRunning():
                     monitor.stop()
                     if not monitor.wait(2000):
@@ -1444,6 +1604,10 @@ class ColorCoordinatePickerOverlay(QWidget):
             self._magnifier_cache_center = None
             self._magnifier_cache_pixmap = None
             self._last_magnifier_mouse_pos = QPoint()
+            self._aim_client_pos = None
+            self._aim_overlay_pos = None
+            self._last_nudge_at = 0.0
+            self._last_nudge_delta = (0, 0)
             self.selected_points = []
             self.original_mouse_pos = None
             logger.debug("取色器资源已全部释放")

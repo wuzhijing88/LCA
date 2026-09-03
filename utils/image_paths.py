@@ -9,9 +9,19 @@ import sys
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# 工程包资源解析钩子：由 app_core.lca_format.session 注册，utils 层不感知 .lca 会话。
+PackageAssetResolver = Callable[[str], Optional[str]]
+_package_asset_resolver: Optional[PackageAssetResolver] = None
+
+
+def set_package_asset_resolver(resolver: Optional[PackageAssetResolver]) -> None:
+    """注册“逻辑路径 -> 包内资源落盘路径”的解析回调（传 None 可取消）。"""
+    global _package_asset_resolver
+    _package_asset_resolver = resolver if callable(resolver) else None
 
 
 class ImagePathResolver:
@@ -76,16 +86,14 @@ class ImagePathResolver:
         if not raw_path or not raw_path.strip():
             return None
         raw_path = raw_path.strip()
-        try:
-            from app_core.lca_format.session import get_active
-
-            session = get_active()
-            if session is not None:
-                package_path = session.resolve_asset(raw_path)
+        package_resolver = _package_asset_resolver
+        if package_resolver is not None:
+            try:
+                package_path = package_resolver(raw_path)
                 if package_path:
                     return package_path
-        except Exception as exc:
-            logger.debug("[路径解析器] LCA 包资源解析失败: %s", exc)
+            except Exception as exc:
+                logger.debug("[路径解析器] LCA 包资源解析失败: %s", exc)
         if raw_path.startswith("memory://"):
             return raw_path
         if self._cache_enabled:

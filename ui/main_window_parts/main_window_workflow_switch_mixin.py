@@ -238,6 +238,12 @@ class MainWindowWorkflowSwitchMixin:
 
             return True
 
+        from ui.control_center_parts.control_center_shutdown import shutdown_blocks_execution
+
+        if shutdown_blocks_execution(getattr(self, "_control_center_shutdown", None)):
+            logger.debug("检测到中控仍在关闭收尾")
+            return True
+
         return False
 
     def _open_workflow_reference(self, filepath: str, switch_to_tab: bool = True) -> Optional[int]:
@@ -248,10 +254,24 @@ class MainWindowWorkflowSwitchMixin:
 
     def _find_or_import_workflow(self, filepath: str, switch_to_tab: bool = True) -> Optional[int]:
         """查找已打开的工作流或导入新工作流，返回task_id"""
-        abs_filepath = os.path.abspath(filepath)
+        from task_workflow.workspace import (
+            favorite_path_key,
+            resolve_existing_workflow_path,
+            workflow_path_keys,
+        )
+
+        resolved_path = resolve_existing_workflow_path(filepath)
+        abs_filepath = os.path.abspath(resolved_path or filepath)
+        candidates = set(workflow_path_keys(abs_filepath))
         # 检查是否已打开
         for task in self.task_manager.get_all_tasks():
-            if task.filepath and os.path.abspath(task.filepath) == abs_filepath:
+            task_paths = []
+            if task.filepath:
+                task_paths.append(task.filepath)
+            source_ref = str(getattr(task, 'source_ref', '') or '')
+            if source_ref:
+                task_paths.append(source_ref)
+            if candidates and any(favorite_path_key(path) in candidates for path in task_paths):
                 # 已打开，切换到对应标签页
                 tab_index = self.workflow_tab_widget.task_to_tab.get(task.task_id)
                 if switch_to_tab and tab_index is not None:
@@ -259,4 +279,4 @@ class MainWindowWorkflowSwitchMixin:
                 logger.info(f"工作流已打开，复用: {task.name}, task_id={task.task_id}")
                 return task.task_id
         # 未打开，导入新工作流
-        return self.workflow_tab_widget.import_workflow(filepath, activate_tab=switch_to_tab)
+        return self.workflow_tab_widget.import_workflow(abs_filepath, activate_tab=switch_to_tab)

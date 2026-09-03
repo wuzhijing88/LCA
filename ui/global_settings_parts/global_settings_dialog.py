@@ -1,3 +1,4 @@
+import copy
 import logging
 
 from PySide6.QtGui import QShowEvent
@@ -47,22 +48,17 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         self.setMinimumWidth(680)
         self.setMaximumWidth(760)
         self.setMinimumHeight(280)
-        self.setMaximumHeight(640)
+        self.setMaximumHeight(720)
         self.resize(700, 460)
-        from utils.input_simulation.mode_utils import migrate_legacy_normal_hd_config
-
-        self.current_config = migrate_legacy_normal_hd_config(current_config)
-        # 窗口行为默认值兜底（旧配置缺失键时默认启用）
-        self.current_config.setdefault('enable_canvas_grid', True)
-        self.current_config.setdefault('enable_card_snap', True)
-        self.current_config.setdefault('enable_parameter_panel_snap', True)
-        self.current_config.setdefault('enable_floating_status_window', True)
-        self.current_config.setdefault('enable_connection_line_animation', True)
-        self.bound_windows = current_config.get('bound_windows', [])  # 绑定的窗口列表
+        # 对话框只编辑自己的副本。取消时主窗口配置不受影响，确定时由
+        # MainWindow._apply_global_settings 统一写回并保存。
+        self.current_config = copy.deepcopy(dict(current_config or {}))
+        self.bound_windows = self.current_config.get('bound_windows', [])  # 绑定的窗口列表
         if not isinstance(self.bound_windows, list):
             self.bound_windows = []
+            self.current_config['bound_windows'] = self.bound_windows
         normalize_bound_windows_hwnds(self.bound_windows)
-        self.window_binding_mode = current_config.get('window_binding_mode', 'single')  # 'single' 或 'multiple'
+        self.window_binding_mode = self.current_config.get('window_binding_mode', 'single')  # 'single' 或 'multiple'
         # 调试：记录初始化时的绑定窗口信息
         logger.info(f"GlobalSettingsDialog初始化: 加载了 {len(self.bound_windows)} 个绑定窗口")
         for i, window in enumerate(self.bound_windows):
@@ -100,7 +96,7 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         # --- 创建各个标签页 ---
         self._create_window_tab()
         self._create_execution_tab()
-        self._create_plugin_tab()
+        self._create_plugin_auth_tab()
         self._create_hotkey_tab()
         self._create_other_tab()
         self._create_about_tab()
@@ -144,6 +140,7 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         # 在初始化时检查窗口状态
         self._check_and_cleanup_closed_windows()
         self._update_execution_mode_visibility()
+        self._refresh_plugin_probe_feedback(refresh_combo=False)
         # 不在初始化后 adjustSize / 二次 recenter：首帧改几何会闪黑边
         # 居中由 MainWindow._present_global_settings_dialog 在 show 前完成
 
@@ -152,3 +149,10 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
+        # 以插件配置打开时，首帧后再按内容拉高，避免执行页被卷进滚动区
+        if not getattr(self, "_plugin_height_adjusted_on_show", False):
+            self._plugin_height_adjusted_on_show = True
+            if self._selected_input_backend() == "plugin":
+                from PySide6.QtCore import QTimer
+
+                QTimer.singleShot(0, self._adjust_dialog_height_only)

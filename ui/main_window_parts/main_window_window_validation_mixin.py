@@ -383,10 +383,14 @@ class MainWindowWindowValidationMixin:
 
                             continue
 
+                        from utils.window.hwnd_utils import as_hwnd
+
+                        safe_hwnd = as_hwnd(hwnd)
+                        if not safe_hwnd:
+                            logger.warning(f"调整窗口失败: {title} - 无效句柄")
+                            continue
                         result = window_manager.adjust_single_window(
-
-                            hwnd, target_width, target_height, async_mode=True
-
+                            safe_hwnd, target_width, target_height
                         )
 
                         if result.success:

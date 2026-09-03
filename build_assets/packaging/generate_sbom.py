@@ -31,12 +31,21 @@ def build_sbom(manifest: dict) -> dict:
             }
         )
     for dependency in manifest.get("python_dependencies", []):
+        properties = [
+            {"name": "lca:direct", "value": "true" if dependency.get("direct", True) else "false"},
+            {"name": "lca:bundled", "value": "true" if dependency.get("bundled", True) else "false"},
+        ]
+        required_by = dependency.get("required_by") or []
+        if required_by:
+            properties.append({"name": "lca:required_by", "value": ",".join(str(x) for x in required_by)})
         components.append(
             {
                 "type": "library",
                 "name": dependency.get("name"),
                 "version": dependency.get("version"),
                 "purl": f"pkg:pypi/{dependency.get('name')}@{dependency.get('version')}",
+                "scope": "required" if dependency.get("bundled", True) else "excluded",
+                "properties": properties,
             }
         )
     return {

@@ -121,9 +121,8 @@ def _recognize_text_with_shared_inflight(
     - 当前轮次完成后立即失效，不保留旧结果
     """
     def _do_recognize_once() -> List[Dict[str, Any]]:
-        # 把“进程分配 + OCR识别”收敛为一次真实执行，避免等待线程再次触发扩容
-        if not multi_ocr_pool.check_and_ensure_process_for_window(window_hwnd, window_title):
-            raise RuntimeError(f"无法确保OCR子进程: {window_hwnd}")
+        # recognize_text 内部会分配/等待 worker，并先登记在途请求，
+        # 避免先预创建再识别时被空闲热重置插进 reset_engine 帧。
         recognized_once = multi_ocr_pool.recognize_text(
             window_title=window_title,
             window_hwnd=window_hwnd,
@@ -454,7 +453,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     ocr_image = None
 
     try:
-        # 1. 获取OCR引擎（支持打包后运行）
+        # 1. 获取OCR引擎（支持打包后运行）。OCR文字识别始终走 RapidOCR；插件模式只影响截图来源。
         try:
             ocr_engine = _get_ocr_engine()
             if not ocr_engine:
@@ -556,7 +555,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         except Exception:
             pass
 
-        # 捕获窗口
+        # 捕获窗口（插件引擎时截图池会走大漠截图，识别仍用 RapidOCR）
         window_image = _capture_window_for_ocr(target_hwnd, timeout=4.0)
         if window_image is None:
             detail = f"OCR截图失败，窗口句柄={target_hwnd}"
@@ -635,7 +634,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 card_id,
                 stop_checker,
                 params,
-                detail=f"OCR识别服务启动失败: {e}",
+                detail=f"OCR识别失败: {e}",
             )
 
         # OCR识别完成后检查停止请求

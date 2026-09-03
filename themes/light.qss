@@ -59,6 +59,16 @@ QPushButton:checked {
     color: #ffffff;
 }
 
+QPushButton#HotkeyCaptureButton {
+    padding: 4px 12px;
+    min-height: 28px;
+}
+
+QPushButton#HotkeyCaptureButton[listening="true"] {
+    border-color: #0078d4;
+    color: #0078d4;
+}
+
 /* 涓昏鎿嶄綔鎸夐挳 */
 QPushButton[primary="true"] {
     background-color: #0078d4;
@@ -432,6 +442,40 @@ QCheckBox::indicator:checked:hover {
 }
 
 QCheckBox::indicator:disabled {
+    background-color: #f5f5f5;
+    border-color: #e0e0e0;
+}
+
+/* 脚本列表等：QListWidget 勾选与 QCheckBox 同款 */
+QListWidget#PlayerScriptListView::indicator,
+QListWidget#DesignerScriptList::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #d0d0d0;
+    border-radius: 3px;
+    background-color: #ffffff;
+}
+
+QListWidget#PlayerScriptListView::indicator:hover,
+QListWidget#DesignerScriptList::indicator:hover {
+    border-color: #b0b0b0;
+}
+
+QListWidget#PlayerScriptListView::indicator:checked,
+QListWidget#DesignerScriptList::indicator:checked {
+    background-color: #0078d4;
+    border-color: #0078d4;
+    image: url(themes/icons/check-white.svg);
+}
+
+QListWidget#PlayerScriptListView::indicator:checked:hover,
+QListWidget#DesignerScriptList::indicator:checked:hover {
+    background-color: #1084d8;
+    border-color: #1084d8;
+}
+
+QListWidget#PlayerScriptListView::indicator:disabled,
+QListWidget#DesignerScriptList::indicator:disabled {
     background-color: #f5f5f5;
     border-color: #e0e0e0;
 }
@@ -1272,6 +1316,30 @@ QPushButton#customDropdownButton:focus {
     border-color: #0078d4;
 }
 
+/* 定时任务对话框：SpinBox / 下拉同高同宽，文字统一左对齐（主窗口+中控共用） */
+#timerTaskDialog QSpinBox#timerFormSpin,
+#timerTaskDialog QPushButton#customDropdownButton[timerDialogField="true"] {
+    min-height: 30px;
+    max-height: 30px;
+    padding-top: 0px;
+    padding-bottom: 0px;
+    padding-left: 12px;
+    padding-right: 28px;
+}
+
+#timerTaskDialog QPushButton#customDropdownButton[timerDialogField="true"] {
+    text-align: left;
+}
+
+#timerTaskDialog QLabel#timerFormLabel,
+#timerTaskDialog QLabel#timerFormColon {
+    min-height: 30px;
+}
+
+#timerTaskDialog QLabel#timerHintLabel {
+    color: #666666;
+}
+
 QLineEdit#customDropdownEdit {
     padding: 6px 12px;
     min-height: 24px;
@@ -1402,9 +1470,18 @@ QListWidget#customDropdownList::item:selected:hover {
 #CustomTitleBar QToolButton {
     background-color: transparent;
     border: none;
+    outline: none;
     padding: 4px;
     border-radius: 4px;
     color: #333333;
+}
+
+#CustomTitleBar QToolButton:hover,
+#CustomTitleBar QToolButton:pressed,
+#CustomTitleBar QToolButton:checked,
+#CustomTitleBar QToolButton:focus {
+    border: none;
+    outline: none;
 }
 
 #CustomTitleBar QToolButton:hover {
@@ -1420,10 +1497,11 @@ QListWidget#customDropdownList::item:selected:hover {
 }
 
 /* 鏍囬鏍忕獥鍙ｆ寜閽?*/
-#CustomTitleBar QPushButton#windowButton {
+#CustomTitleBar QToolButton#windowButton {
     background-color: transparent;
     border: none;
-    padding: 0px 10px;
+    outline: none;
+    padding: 0px;
     margin: 0px 2px;
     border-radius: 4px;
     color: #666666;
@@ -1433,37 +1511,41 @@ QListWidget#customDropdownList::item:selected:hover {
     min-height: 30px;
 }
 
-#CustomTitleBar QPushButton#windowButton:hover {
+#CustomTitleBar QToolButton#windowButton:hover {
     background-color: #e8e8e8;
+    border: none;
     color: #333333;
 }
 
-#CustomTitleBar QPushButton#windowButton:pressed {
+#CustomTitleBar QToolButton#windowButton:pressed,
+#CustomTitleBar QToolButton#windowButton:checked {
     background-color: #d8d8d8;
+    border: none;
 }
 
-/* 鍏抽棴鎸夐挳鐗规畩鏍峰紡 */
-#CustomTitleBar QPushButton#closeButton {
+/* 关闭按钮：悬停/按下必须红底（覆盖通用 QToolButton 灰底） */
+#CustomTitleBar QToolButton#closeButton {
     background-color: transparent;
     border: none;
-    padding: 0px 10px;
+    outline: none;
+    padding: 0px;
     margin: 0px 2px;
     border-radius: 4px;
     color: #666666;
-    font-family: "Segoe UI Symbol", "Segoe UI Emoji", "Arial";
-    font-size: 14px;
     min-width: 36px;
     min-height: 30px;
 }
 
-#CustomTitleBar QPushButton#closeButton:hover {
-    background-color: #e81123;
+#CustomTitleBar QToolButton#closeButton:hover,
+#CustomTitleBar QToolButton#closeButton:pressed,
+#CustomTitleBar QToolButton#closeButton[closeHover="true"] {
+    background-color: #e81123 !important;
+    border: none;
     color: white;
 }
 
-#CustomTitleBar QPushButton#closeButton:pressed {
-    background-color: #b00000;
-    color: white;
+#CustomTitleBar QToolButton#closeButton:pressed {
+    background-color: #b00000 !important;
 }
 
 #CustomTitleBar QLabel#titleLabel {

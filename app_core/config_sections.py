@@ -1,4 +1,8 @@
-"""Typed logical sections layered over the legacy flat config mapping."""
+"""Typed logical sections layered over the flat config mapping.
+
+Flat keys are the single source of truth. Section dicts are derived mirrors
+written for readability of the JSON file; they never override flat keys.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 
 # 出厂快捷键必须互不重复。缺任一键时，热键注册会各自 fallback，容易再次撞车。
 DEFAULT_HOTKEYS = {
@@ -30,6 +34,8 @@ SECTION_FIELDS = {
     ),
     "execution": (
         "execution_mode",
+        # 插件后端只能按后台执行，但保留用户最后选择的原生模式。
+        "native_execution_mode",
         "foreground_mouse_driver_backend",
         "foreground_keyboard_driver_backend",
         "foreground_py_backend",
@@ -45,9 +51,12 @@ SECTION_FIELDS = {
         "plugin_keypad",
         "plugin_input_display",
         "plugin_input_display_follow",
+        "plugin_bind_kind",
         "plugin_bind_mode",
+        "plugin_text_ime",
+        "plugin_fake_active",
         "plugin_reg_code",
-        "plugin_dir",
+        "plugin_extra_code",
         "binding_method",
         "window_binding_mode",
         "multi_window_delay",
@@ -63,28 +72,29 @@ SECTION_FIELDS = {
 }
 
 
-def apply_sections(config: Mapping[str, Any], *, prefer: str = "section") -> dict[str, Any]:
-    """Return a flat-compatible config with canonical section mirrors.
+def apply_sections(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy with every section mirror rebuilt from the flat keys.
 
-    prefer="section": nested section overwrites flat keys (load / migrate).
-    prefer="flat": flat keys overwrite section mirrors (save after UI edits).
+    Flat keys always win. A section value whose flat key is absent is lifted
+    to the flat level once so callers only ever need to read flat keys.
     """
-    use_flat = str(prefer or "section").strip().lower() == "flat"
     result = dict(config)
     for section_name, field_names in SECTION_FIELDS.items():
         existing = result.get(section_name)
-        section = dict(existing) if isinstance(existing, Mapping) else {}
+        old_section = dict(existing) if isinstance(existing, Mapping) else {}
+        section: dict[str, Any] = {}
         for field_name in field_names:
-            if use_flat and field_name in result:
+            if field_name in result:
                 section[field_name] = result[field_name]
-            elif field_name in section:
-                result[field_name] = section[field_name]
-            elif field_name in result:
-                section[field_name] = result[field_name]
+            elif field_name in old_section:
+                result[field_name] = old_section[field_name]
+                section[field_name] = old_section[field_name]
         result[section_name] = section
     result["schema_version"] = CONFIG_SCHEMA_VERSION
     # Session-only snapshots are never persisted as a second source of truth.
     result.pop("active_bound_windows", None)
+    result.pop("active_window_binding_mode", None)
+    result.pop("active_target_window_title", None)
     return result
 
 

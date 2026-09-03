@@ -116,8 +116,6 @@ def load_files_into_memory(files: Mapping[str, bytes]) -> None:
         elif norm.startswith("assets/sounds/"):
             put_player_memory_file("sounds/" + norm[len("assets/sounds/") :], data)
             put_player_memory_file(norm.rsplit("/", 1)[-1], data)
-        elif norm.startswith("assets/maps/"):
-            put_player_memory_file("maps/" + norm[len("assets/maps/") :], data)
         elif norm.startswith("ui_assets/"):
             put_player_memory_file(norm, data)
             put_player_memory_file(norm.rsplit("/", 1)[-1], data)

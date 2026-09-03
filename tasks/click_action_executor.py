@@ -368,6 +368,52 @@ def _is_target_window_foreground(target_hwnd: Any) -> bool:
         return False
 
 
+def _ensure_target_window_foreground_for_click(
+    target_hwnd: Any,
+    *,
+    mode_label: str,
+    log_obj: Any,
+) -> bool:
+    """完整点击前确保目标在前台；丢焦时尝试恢复一次（罗技连线场景常见）。"""
+    safe_hwnd = _safe_int(target_hwnd, default=0, minimum=0)
+    if safe_hwnd <= 0:
+        return True
+    if _is_target_window_foreground(safe_hwnd):
+        return True
+
+    front = _front_window_name()
+    if front:
+        _log(
+            log_obj,
+            "warning",
+            f"[{mode_label}] 要点的窗口不在最前面（现在最前面是「{front}」），尝试重新激活",
+        )
+    else:
+        _log(log_obj, "warning", f"[{mode_label}] 要点的窗口不在最前面，尝试重新激活")
+
+    try:
+        from utils.window.window_activation_utils import activate_window
+
+        activate_window(safe_hwnd, log_prefix=str(mode_label or "前台点击"))
+    except Exception as err:
+        _log(log_obj, "warning", f"[{mode_label}] 重新激活目标窗口失败: {err}")
+
+    if _is_target_window_foreground(safe_hwnd):
+        _log(log_obj, "info", f"[{mode_label}] 已重新激活目标窗口，继续点击")
+        return True
+
+    front_after = _front_window_name()
+    if front_after:
+        _log(
+            log_obj,
+            "warning",
+            f"[{mode_label}] 要点的窗口不在最前面（现在最前面是「{front_after}」），已取消点击",
+        )
+    else:
+        _log(log_obj, "warning", f"[{mode_label}] 要点的窗口不在最前面，已取消点击")
+    return False
+
+
 def _front_window_name() -> str:
     try:
         import win32gui
@@ -483,6 +529,47 @@ def _prefer_atomic_foreground_click(simulator: Any) -> bool:
         pass
 
     return False
+
+
+def _invoke_native_double_click(
+    simulator: Any,
+    x: int,
+    y: int,
+    button_type: str,
+    interval: float,
+    hold_duration: float,
+    mode_label: str,
+    log_obj: Any,
+) -> Optional[bool]:
+    """优先用模拟器自己的 double_click。
+
+    后台消息 / 插件消息注入下，两次单击不会被目标识别为双击（系统只为真实输入合成 WM_xBUTTONDBLCLK），
+    只有模拟器知道该发 DBLCLK 消息还是调大漠 LeftDoubleClick。模拟器没有该接口时返回 None，由调用方退回两次单击。
+    """
+    double_fn = getattr(simulator, "double_click", None)
+    if not callable(double_fn):
+        return None
+    kwargs: dict = {}
+    try:
+        params = inspect.signature(double_fn).parameters
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if "interval" in params or accepts_var_kw:
+            kwargs["interval"] = float(interval)
+        if "hold_duration" in params or accepts_var_kw:
+            kwargs["hold_duration"] = float(hold_duration)
+    except (TypeError, ValueError):
+        kwargs = {}
+    try:
+        return bool(double_fn(int(x), int(y), button_type, **kwargs))
+    except TypeError:
+        try:
+            return bool(double_fn(int(x), int(y), button_type))
+        except Exception as err:
+            _log(log_obj, "error", f"[{mode_label}] 双击执行失败: {err}")
+            return False
+    except Exception as err:
+        _log(log_obj, "error", f"[{mode_label}] 双击执行失败: {err}")
+        return False
 
 
 def _invoke_atomic_click_hold(
@@ -742,7 +829,7 @@ def execute_simulator_click_action(
             simulator,
             execution_mode,
         )
-        is_complete_click = (click_action == "完整点击")
+        requires_foreground_click_precheck = click_action in {"完整点击", "双击"}
         # 根因修复：前台驱动在高负载下可能消费到旧坐标，执行层需在每次点击前做强制落位校验。
         def _align_foreground_cursor() -> bool:
             return _ensure_foreground_cursor_ready(
@@ -783,8 +870,8 @@ def execute_simulator_click_action(
                 _log(logger_obj, "warning", f"[{mode_label}] 点击前稳定等待被中断")
                 return False
 
-        # 仅“完整点击”执行点击前验证；验证失败前禁止发送任何点击。
-        if foreground_context and is_complete_click:
+        # 完整点击和双击都是真实前台按下/松开序列；验证失败前禁止发送任何点击。
+        if foreground_context and requires_foreground_click_precheck:
             pressed_before_click = _is_mouse_button_pressed(button_type)
             if pressed_before_click is True:
                 _log(logger_obj, "warning", f"[{mode_label}] 点击前检测到鼠标按键残留按下，尝试自动释放")
@@ -800,16 +887,11 @@ def execute_simulator_click_action(
                     _log(logger_obj, "warning", f"[{mode_label}] 鼠标还按着没松开，没法点，已取消点击")
                     return False
             safe_target_hwnd = _safe_int(target_hwnd, default=0, minimum=0)
-            if safe_target_hwnd > 0 and not _is_target_window_foreground(safe_target_hwnd):
-                front = _front_window_name()
-                if front:
-                    _log(
-                        logger_obj,
-                        "warning",
-                        f"[{mode_label}] 要点的窗口不在最前面（现在最前面是「{front}」），已取消点击",
-                    )
-                else:
-                    _log(logger_obj, "warning", f"[{mode_label}] 要点的窗口不在最前面，已取消点击")
+            if safe_target_hwnd > 0 and not _ensure_target_window_foreground_for_click(
+                safe_target_hwnd,
+                mode_label=mode_label,
+                log_obj=logger_obj,
+            ):
                 return False
             if not _align_foreground_cursor():
                 _log(logger_obj, "warning", f"[{mode_label}] 鼠标没移到要点的位置，已取消点击")
@@ -917,60 +999,46 @@ def execute_simulator_click_action(
                                 success = False
                                 break
             elif click_action == "双击":
-                if not hasattr(simulator, "click"):
-                    _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持click接口")
-                    return False
-                atomic_click_hold_supported = _supports_atomic_click_hold(simulator)
                 dbl_interval = safe_interval if safe_interval > 0 else DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
-                if atomic_click_hold_supported:
-                    first_ok = bool(
-                        simulator.click(
-                            int(x),
-                            int(y),
-                            button=button_type,
-                            clicks=1,
-                            interval=0.0,
-                            duration=complete_click_hold_duration,
-                        )
-                    )
+                native_double = _invoke_native_double_click(
+                    simulator,
+                    int(x),
+                    int(y),
+                    button_type,
+                    dbl_interval,
+                    complete_click_hold_duration,
+                    mode_label,
+                    logger_obj,
+                )
+                if native_double is not None:
+                    success = bool(native_double)
                 else:
-                    first_ok = bool(
-                        simulator.click(
-                            int(x),
-                            int(y),
-                            button=button_type,
-                            clicks=1,
-                            interval=0.0,
-                        )
-                    )
-                if not first_ok:
-                    success = False
-                else:
-                    if dbl_interval > 0:
-                        if not _sleep_with_stop(dbl_interval, stop_checker):
+                    # 模拟器没有 double_click 时退回两次单击（只对前台真实输入有效，系统会自行合成双击）
+                    if not hasattr(simulator, "click"):
+                        _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持click接口")
+                        return False
+                    atomic_click_hold_supported = _supports_atomic_click_hold(simulator)
+
+                    def _single_click() -> bool:
+                        if atomic_click_hold_supported:
+                            return bool(
+                                simulator.click(
+                                    int(x),
+                                    int(y),
+                                    button=button_type,
+                                    clicks=1,
+                                    interval=0.0,
+                                    duration=complete_click_hold_duration,
+                                )
+                            )
+                        return bool(simulator.click(int(x), int(y), button=button_type, clicks=1, interval=0.0))
+
+                    success = _single_click()
+                    if success:
+                        if dbl_interval > 0 and not _sleep_with_stop(dbl_interval, stop_checker):
                             _log(logger_obj, "warning", f"[{mode_label}] 双击间隔被中断")
                             return False
-                    if atomic_click_hold_supported:
-                        success = bool(
-                            simulator.click(
-                                int(x),
-                                int(y),
-                                button=button_type,
-                                clicks=1,
-                                interval=0.0,
-                                duration=complete_click_hold_duration,
-                            )
-                        )
-                    else:
-                        success = bool(
-                            simulator.click(
-                                int(x),
-                                int(y),
-                                button=button_type,
-                                clicks=1,
-                                interval=0.0,
-                            )
-                        )
+                        success = _single_click()
             elif click_action == "仅按下":
                 effective_hold_duration = (
                     safe_hold_duration if safe_hold_duration > 0 else DEFAULT_CLICK_HOLD_SECONDS
@@ -1109,7 +1177,6 @@ def execute_simulator_click_action(
             elif total_wait_ms > 20.0:
                 _log(logger_obj, "debug", f"[{mode_label}] 等待输入锁 {total_wait_ms:.1f}ms")
             return _run_click_action_locked(resolved_lock_resource)
-
 
 
 

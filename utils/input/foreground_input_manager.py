@@ -42,11 +42,24 @@ def _get_default_screen_size() -> Tuple[int, int]:
 
 
 class _SplitForegroundDriverProxy:
-    """将鼠标和键盘操作分发到不同驱动。"""
+    """将鼠标和键盘操作分发到不同驱动。
+
+    只暴露显式的键鼠接口；需要看底层驱动的调用方用 mouse_driver / keyboard_driver。
+    不做 __getattr__ 透传：透传会让鼠标驱动的私有属性（如 _driver_name）
+    冒充整个代理，键盘侧的驱动类型被误判。
+    """
 
     def __init__(self, mouse_driver, keyboard_driver):
         self._mouse_driver = mouse_driver
         self._keyboard_driver = keyboard_driver
+
+    @property
+    def mouse_driver(self):
+        return self._mouse_driver
+
+    @property
+    def keyboard_driver(self):
+        return self._keyboard_driver
 
     @staticmethod
     def _safe_call(driver, method_name: str, *args, **kwargs):
@@ -123,6 +136,10 @@ class _SplitForegroundDriverProxy:
     def key_up(self, key):
         return self._safe_call(self._keyboard_driver, "key_up", key)
 
+    def modified_key_press(self, key, held_keys=None, duration=DEFAULT_KEY_HOLD_SECONDS):
+        """Ib 驱动的组合键原子接口；键盘侧驱动不提供时返回 False，由调用方回退到 down/up。"""
+        return self._safe_call(self._keyboard_driver, "modified_key_press", key, held_keys, duration)
+
     def release_all_keys(self) -> bool:
         release_method = getattr(self._keyboard_driver, "release_all_keys", None)
         if callable(release_method):
@@ -183,13 +200,6 @@ class _SplitForegroundDriverProxy:
                 except Exception:
                     pass
 
-    def __getattr__(self, name: str):
-        if self._mouse_driver and hasattr(self._mouse_driver, name):
-            return getattr(self._mouse_driver, name)
-        if self._keyboard_driver and hasattr(self._keyboard_driver, name):
-            return getattr(self._keyboard_driver, name)
-        raise AttributeError(name)
-
 
 class ForegroundInputManager:
     """前台输入驱动管理器"""
@@ -200,6 +210,7 @@ class ForegroundInputManager:
         self._interception_driver = None
         self._pyautogui_driver = None
         self._ibinputsimulator_driver = None
+        self._normal_hd_driver = None
         self._active_driver = None
         self._driver_type = None
         self._initialization_attempted = False
@@ -256,7 +267,10 @@ class ForegroundInputManager:
     @staticmethod
     def _normalize_forced_mode(mode: str) -> str:
         normalized_mode = str(mode or "").strip().lower()
-        if normalized_mode not in ('interception', 'pyautogui', 'ibinputsimulator'):
+        from utils.input.normal_hd_driver import normalize_normal_hd_backend
+
+        normalized_mode = normalize_normal_hd_backend(normalized_mode)
+        if normalized_mode not in ('interception', 'pyautogui', 'ibinputsimulator', 'normal.hd'):
             raise ValueError(f"不支持的驱动模式: {mode!r}")
         return normalized_mode
 
@@ -288,6 +302,7 @@ class ForegroundInputManager:
                     self._interception_driver,
                     self._pyautogui_driver,
                     self._ibinputsimulator_driver,
+                    self._normal_hd_driver,
                 ]
             )
         for driver in drivers_to_release:
@@ -318,6 +333,7 @@ class ForegroundInputManager:
                 self._interception_driver,
                 self._pyautogui_driver,
                 self._ibinputsimulator_driver,
+                getattr(self, "_normal_hd_driver", None),
             ):
                 if not driver:
                     continue
@@ -341,8 +357,17 @@ class ForegroundInputManager:
         self._interception_driver = None
         self._pyautogui_driver = None
         self._ibinputsimulator_driver = None
+        self._normal_hd_driver = None
         self._initialization_attempted = False
         self._last_failure_time = 0.0
+
+    def reset_runtime(self) -> None:
+        """释放当前运行时驱动，但保留用户选择的驱动配置。
+
+        全局设置切到后台或切换前台模式时调用，避免旧前台驱动继续存活并
+        被后续任务误用。下次进入前台模式时会按最新配置重新初始化。
+        """
+        self._release_runtime_drivers()
 
     def set_forced_modes(self, mouse_mode: str, keyboard_mode: str) -> None:
         normalized_mouse_mode = self._normalize_forced_mode(mouse_mode)
@@ -436,10 +461,35 @@ class ForegroundInputManager:
             if self._initialize_ibinputsimulator(set_active=set_active):
                 return self._ibinputsimulator_driver
             return None
+        if normalized_mode == 'normal.hd':
+            if self._initialize_normal_hd(set_active=set_active):
+                return self._normal_hd_driver
+            return None
 
         if self._initialize_interception(set_active=set_active):
             return self._interception_driver
         return None
+
+    def _initialize_normal_hd(self, set_active: bool = True) -> bool:
+        logger.info("正在初始化前台二扫描码输入（SendInput）...")
+        try:
+            from utils.input.normal_hd_driver import NormalHdDriver
+
+            if self._normal_hd_driver is None:
+                self._normal_hd_driver = NormalHdDriver()
+            if self._normal_hd_driver.initialize():
+                if set_active:
+                    self._active_driver = self._normal_hd_driver
+                    self._driver_type = "normal.hd"
+                logger.info("前台二扫描码输入初始化成功")
+                return True
+            logger.warning("前台二扫描码输入初始化失败")
+            self._normal_hd_driver = None
+            return False
+        except Exception as exc:
+            logger.warning("前台二扫描码输入初始化失败: %s", exc)
+            self._normal_hd_driver = None
+            return False
     def _initialize_interception(self, set_active: bool = True) -> bool:
         """尝试初始化Interception驱动"""
         logger.info("正在初始化Interception驱动...")
@@ -742,10 +792,11 @@ class ForegroundInputManager:
                         safe_duration = 0.0
 
                     down_flag, up_flag = self._button_flags(button)
-                    for i in range(safe_clicks):
-                        if i > 0 and safe_interval > 0:
-                            _precise_sleep(safe_interval)
-                        with self._send_lock:
+                    # 整个多击序列共用一把发送锁，避免双击间隔期间插入其它鼠标事件。
+                    with self._send_lock:
+                        for i in range(safe_clicks):
+                            if i > 0 and safe_interval > 0:
+                                _precise_sleep(safe_interval)
                             if not self._ensure_cursor_pos(tx, ty):
                                 return False
                             hold_seconds = safe_duration if safe_duration > 0 else _default_atomic_click_hold_seconds()
@@ -1149,16 +1200,6 @@ class ForegroundInputManager:
         """检查 Interception 驱动是否可用"""
         return bool(self._driver_type and 'interception' in str(self._driver_type))
 
-    def set_target_window(self, hwnd: int) -> None:
-        """
-        设置目标窗口（用于PyAutoGUI激活窗口）
-
-        Args:
-            hwnd: 窗口句柄
-        """
-        if self._driver_type == 'pyautogui' and hasattr(self, '_pyautogui_fallback') and self._pyautogui_fallback:
-            self._pyautogui_fallback.set_target_window(hwnd)
-
     def close(self) -> None:
         """清理资源"""
         try:
@@ -1181,13 +1222,13 @@ for _method_name in (
     "set_ibinputsimulator_driver",
     "release_all_inputs",
     "_release_runtime_drivers",
+    "reset_runtime",
     "set_forced_modes",
     "set_forced_mode",
     "initialize",
     "get_driver_type",
     "get_active_driver",
     "is_interception_available",
-    "set_target_window",
     "close",
 ):
     _original_method = getattr(ForegroundInputManager, _method_name, None)

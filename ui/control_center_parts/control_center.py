@@ -20,10 +20,11 @@ from ..control_center_parts.control_center_workflow_runtime_mixin import Control
 from ..control_center_parts.control_center_workflow_assignment_mixin import ControlCenterWorkflowAssignmentMixin
 from ..control_center_parts.control_center_window_task_mixin import ControlCenterWindowTaskMixin
 from ..control_center_parts.control_center_batch_ops_mixin import ControlCenterBatchOpsMixin
+from ..control_center_parts.control_center_stability_test_mixin import ControlCenterStabilityTestMixin
 from utils.window.window_coordinate_common import get_available_geometry_for_widget, clamp_preferred_window_size
 
 
-class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, ControlCenterPauseTimerMixin, ControlCenterTimerDialogMixin, ControlCenterUiLayoutMixin, ControlCenterWindowLifecycleMixin, ControlCenterWindowTableMixin, ControlCenterWorkflowRuntimeMixin, ControlCenterWorkflowAssignmentMixin, ControlCenterWindowTaskMixin, ControlCenterBatchOpsMixin, QMainWindow):
+class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, ControlCenterPauseTimerMixin, ControlCenterTimerDialogMixin, ControlCenterUiLayoutMixin, ControlCenterWindowLifecycleMixin, ControlCenterWindowTableMixin, ControlCenterWorkflowRuntimeMixin, ControlCenterWorkflowAssignmentMixin, ControlCenterWindowTaskMixin, ControlCenterBatchOpsMixin, ControlCenterStabilityTestMixin, QMainWindow):
     """中控软件主窗口 - 多窗口工作流管理"""
 
     def __init__(self, bound_windows: List[Dict], task_modules: Dict[str, Any], parent=None):
@@ -59,6 +60,10 @@ class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, Con
         self._runner_start_queue = deque()
         self._runner_dispatch_suspended = False
         self._runner_dispatch_in_progress = False
+        self._dead_hwnd_stopped = set()
+        self._hwnd_watchdog_timer = None
+        self._stability_test_active = False
+        self._stability_test_snapshot = None
 
         # 临时工作流配置文件路径
         try:
@@ -89,6 +94,7 @@ class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, Con
         self._refresh_all_window_workflow_cells()
         self._persist_bound_window_identities()
         self.setup_timer()
+        self._setup_hwnd_watchdog()
         self._setup_shortcuts()
 
     def sort_windows_by_title(self, windows):

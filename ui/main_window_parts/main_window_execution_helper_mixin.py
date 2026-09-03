@@ -352,9 +352,13 @@ class MainWindowExecutionHelperMixin:
 
         for task_item, latest_workflow_data in tasks_to_save:
 
+            old_filepath = task_item.filepath
+
             if task_item.save_and_backup(workflow_data=latest_workflow_data):
 
                 saved_count += 1
+
+                self._sync_favorite_path_after_save(old_filepath, task_item)
 
                 logger.info(f"任务 '{task_item.name}' 保存和备份成功")
 

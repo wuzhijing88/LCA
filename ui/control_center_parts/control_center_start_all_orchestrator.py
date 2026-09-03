@@ -110,51 +110,6 @@ def _confirm_invalid_windows_start(self, invalid_windows, interactive=True) -> b
     return True
 
 
-def _filter_yolo_blocked_windows(self, valid_windows, target_window_ids, interactive=True):
-    blocked_windows = {}
-    collect_blocked_windows = getattr(self, "_collect_yolo_blocked_windows", None)
-    if callable(collect_blocked_windows):
-        try:
-            blocked_windows = collect_blocked_windows(target_window_ids)
-        except Exception as e:
-            logger.error(f"\u6536\u96c6YOLO\u53d7\u9650\u7a97\u53e3\u5931\u8d25: {e}")
-            blocked_windows = {}
-    if not blocked_windows:
-        return valid_windows
-
-    blocked_window_ids = set(blocked_windows.keys())
-    filtered_windows = []
-    for item in valid_windows:
-        job_id = str(item.get("job_id") or "")
-        if not job_id:
-            try:
-                row = int(item.get("row"))
-                job_id = self._window_runtime_id(self.sorted_windows[row], row)
-            except Exception:
-                job_id = str(item.get("hwnd", item.get("row")))
-        if job_id not in blocked_window_ids:
-            filtered_windows.append(item)
-    preview_lines = []
-    for window_id, info in blocked_windows.items():
-        title = str((info or {}).get("title") or window_id)
-        workflow_names = (info or {}).get("workflow_names") or []
-        preview_workflows = "\u3001".join([str(name) for name in workflow_names[:2]]) if workflow_names else "\u672a\u77e5\u5de5\u4f5c\u6d41"
-        if len(workflow_names) > 2:
-            preview_workflows += f" \u7b49{len(workflow_names)}\u4e2a"
-        preview_lines.append(f"  - {title}: {preview_workflows}")
-
-    if interactive:
-        warning_message = "以下窗口包含 YOLO 工作流，已从中控启动队列移除：\n\n"
-        warning_message += "\n".join(preview_lines[:8])
-        if len(preview_lines) > 8:
-            warning_message += f"\n  - 其余 {len(preview_lines) - 8} 个窗口"
-        warning_message += "\n\n请在主窗口单开执行这些 YOLO 工作流。"
-        QMessageBox.warning(self, "已过滤YOLO窗口", warning_message)
-    self.log_message(f"已过滤 {len(blocked_windows)} 个包含YOLO任务的窗口")
-    logger.warning("\u4e2d\u63a7\u542f\u52a8\u8fc7\u6ee4YOLO\u7a97\u53e3: %s", sorted(blocked_window_ids))
-    return filtered_windows
-
-
 def _handle_control_center_batch_start(self, valid_windows):
     self._pending_valid_windows = valid_windows
     has_ocr_workflow = _control_center_has_ocr_workflow(self, valid_windows)
@@ -173,12 +128,28 @@ def _handle_control_center_batch_start(self, valid_windows):
 
 def control_center_start_all_tasks(ctx, interactive=True):
     self = ctx
+    if getattr(self, "_is_closing", False):
+        return
     logger.info("开始启动所有工作流")
     self.log_message("正在启动所有工作流...")
     target_window_ids = getattr(self, "_cc_active_start_window_filter", None)
     if target_window_ids:
         logger.info(f"中控启动过滤窗口: {sorted(target_window_ids)}")
     if _check_parent_window_running_conflict(self, interactive=interactive):
+        return
+    from ui.control_center_parts.control_center_policy import (
+        CONTROL_CENTER_FOREGROUND_BLOCK_MESSAGE,
+        control_center_allows_execution_mode,
+        resolve_control_center_execution_mode,
+    )
+
+    execution_mode = resolve_control_center_execution_mode(self)
+    if not control_center_allows_execution_mode(execution_mode):
+        logger.warning("前台模式禁止中控启动: mode=%s", execution_mode)
+        if interactive:
+            QMessageBox.warning(self, "无法启动", CONTROL_CENTER_FOREGROUND_BLOCK_MESSAGE)
+        else:
+            self.log_message("中控定时启动跳过：当前为前台模式")
         return
     _cancel_control_center_ocr_cleanup(self)
     if hasattr(self, "_refresh_bound_window_handles"):
@@ -189,9 +160,6 @@ def control_center_start_all_tasks(ctx, interactive=True):
     valid_windows, invalid_windows = _collect_start_candidate_windows(self, target_window_ids)
     if not _confirm_invalid_windows_start(self, invalid_windows, interactive=interactive):
         return
-    valid_windows = _filter_yolo_blocked_windows(
-        self, valid_windows, target_window_ids, interactive=interactive
-    )
     if not valid_windows:
         self.log_message("\u6ca1\u6709\u53ef\u542f\u52a8\u7684\u76ee\u6807\u7a97\u53e3\uff08\u8bf7\u68c0\u67e5\u7a97\u53e3\u9009\u62e9\u548c\u5de5\u4f5c\u6d41\u5206\u914d\uff09")
         return

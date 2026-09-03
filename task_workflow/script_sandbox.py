@@ -69,6 +69,9 @@ COMMAND_NAMES = (
     "激活",
     "播放",
     "停止播放",
+    "回放",
+    "截图",
+    "等按键",
     "记录",
     "成功",
     "失败",
@@ -130,6 +133,7 @@ ALLOWED_CALLS = {
     "变量.增加",
     "剪贴板.获取",
     "剪贴板.设置",
+    "窗口.设置分辨率",
     *COMMAND_NAMES,
     *_BUILTIN_CALLS,
     *_EXCEPTION_NAMES,
@@ -173,8 +177,6 @@ _FORBIDDEN_NODE_CN = {
     "ClassDef": "类定义",
     "With": "with 语句",
     "AsyncWith": "异步 with",
-    "Try": "try 语句",
-    "Raise": "抛出异常",
     "Lambda": "匿名函数",
     "Await": "await",
     "Yield": "yield",
@@ -184,9 +186,39 @@ _FORBIDDEN_NODE_CN = {
     "Delete": "删除",
     "AnnAssign": "类型注解",
     "NamedExpr": "海象运算符",
-    "Attribute": "属性访问",
-    "Return": "返回，请改用 成功() 或 失败()",
+    "GeneratorExp": "生成器表达式",
 }
+_FORBIDDEN_ATTRS = frozenset(
+    {
+        "gi_frame",
+        "gi_code",
+        "gi_running",
+        "gi_yieldfrom",
+        "f_back",
+        "f_builtins",
+        "f_globals",
+        "f_locals",
+        "f_code",
+        "f_trace",
+        "f_lasti",
+        "f_lineno",
+        "cr_frame",
+        "cr_code",
+        "cr_await",
+        "cr_running",
+        "cr_origin",
+        "tb_frame",
+        "tb_next",
+        "tb_lasti",
+        "tb_lineno",
+        "co_code",
+        "co_consts",
+        "co_names",
+        "co_varnames",
+        "func_globals",
+        "func_code",
+    }
+)
 
 _SYNTAX_CN = (
     ("'break' outside loop", "中断 只能写在循环里"),
@@ -268,7 +300,6 @@ ALLOWED_NODES = (
     ast.ListComp,
     ast.SetComp,
     ast.DictComp,
-    ast.GeneratorExp,
     ast.comprehension,
     ast.IfExp,
 )
@@ -305,19 +336,33 @@ class _Guard:
     ) -> None:
         self.ops = 0
         self.loops = 0
-        self.max_ops = max_ops
-        self.max_loop = max_loop
-        self.hang = True
-        self.deadline = None
+        self.max_ops = int(max_ops)
+        self.max_loop = int(max_loop)
+        self.hang = bool(hang)
+        self.timeout = float(timeout)
+        self.deadline = time.monotonic() + self.timeout if self.timeout > 0 else None
         self.stop_checker = stop_checker
         self.pause_checker = pause_checker
 
     def __call__(self) -> None:
+        self.ops += 1
+        if self.ops > self.max_ops:
+            raise ScriptError("执行步数过多")
+        self._check_deadline()
         self._check_stop()
         self._wait_pause()
 
     def loop(self) -> None:
+        self.loops += 1
+        if self.loops > self.max_loop:
+            raise ScriptError("循环次数过多")
         self()
+
+    def _check_deadline(self) -> None:
+        if self.deadline is None:
+            return
+        if time.monotonic() >= float(self.deadline):
+            raise ScriptError("执行超时")
 
     def _check_stop(self) -> None:
         if not callable(self.stop_checker):
@@ -346,7 +391,7 @@ class _Guard:
             self._check_stop()
             time.sleep(0.05)
             if self.deadline is not None:
-                self.deadline += 0.05
+                self.deadline = float(self.deadline) + 0.05
 
 
 def _is_outcome_call(stmt: ast.AST) -> str:
@@ -466,9 +511,63 @@ def cursor_in_string_or_comment(line: str, column: int) -> bool:
     return quote is not None
 
 
+_QUOTE_CHARS = frozenset(char for char, mapped in _CN_PUNCT_MAP.items() if mapped in {'"', "'"}) | {'"', "'"}
+
+
 def normalize_script_punctuation(source: str) -> str:
-    """把输入里的中文/全角标点一律换成代码用的英文标点。"""
-    return "".join(map_script_punct_char(char) for char in str(source or ""))
+    """把代码里的中文/全角标点换成英文标点；字符串和注释里的内容原样保留。
+
+    用户要输入/记录的文本（"你好，世界。"）不能被改成半角，否则打进游戏里的字都变了。
+    中文引号“ ”「 」可以用来开闭字符串，配对的那个也会被换成英文引号。
+    """
+    text = str(source or "")
+    out: list[str] = []
+    quote: Optional[str] = None
+    escape = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if quote is not None:
+            if escape:
+                escape = False
+                out.append(char)
+            elif char == "\\":
+                escape = True
+                out.append(char)
+            elif quote == '"""' or quote == "'''":
+                if text.startswith(quote, index):
+                    out.append(quote)
+                    index += 3
+                    quote = None
+                    continue
+                out.append(char)
+            elif char in _QUOTE_CHARS and map_script_punct_char(char) == quote:
+                out.append(quote)
+                quote = None
+            else:
+                out.append(char)
+            index += 1
+            continue
+        if char == "#":
+            newline = text.find("\n", index)
+            if newline < 0:
+                out.append(text[index:])
+                break
+            out.append(text[index:newline])
+            index = newline
+            continue
+        if text.startswith('"""', index) or text.startswith("'''", index):
+            quote = text[index : index + 3]
+            out.append(quote)
+            index += 3
+            continue
+        mapped = map_script_punct_char(char)
+        if mapped in {'"', "'"}:
+            quote = mapped
+        out.append(mapped)
+        index += 1
+    return "".join(out)
 
 
 def translate_cn_script(source: str) -> str:
@@ -962,6 +1061,8 @@ class _ScriptNamespace(dict):
         if isinstance(current, _CommandSlot):
             current.bind(value)
             return
+        if key in _PROTECTED_ASSIGN_NAMES:
+            raise ScriptError(f"不能给命令名赋值：{key}")
         dict.__setitem__(self, key, value)
 
     def install_command(self, name: str, callback: Any) -> None:
@@ -986,6 +1087,7 @@ def validate_script(source: str) -> None:
             for child in ast.walk(node):
                 if isinstance(child, ast.Return):
                     returns_in_func.add(id(child))
+    protected_assigns = _PROTECTED_ASSIGN_NAMES | user_funcs
     for node in ast.walk(tree):
         if not isinstance(node, ALLOWED_NODES):
             name = type(node).__name__
@@ -997,6 +1099,8 @@ def validate_script(source: str) -> None:
         if isinstance(node, ast.Attribute):
             if "__" in node.attr:
                 raise ScriptError("禁止访问双下划线属性", lineno=getattr(node, "lineno", None))
+            if node.attr in _FORBIDDEN_ATTRS:
+                raise ScriptError("禁止访问该属性", lineno=getattr(node, "lineno", None))
         if isinstance(node, ast.Call):
             path = _call_path(node.func)
             method = path.split(".")[-1] if path else ""
@@ -1010,16 +1114,27 @@ def validate_script(source: str) -> None:
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 for name in _assigned_names(target):
-                    if name in _PROTECTED_ASSIGN_NAMES:
-                        raise ScriptError(f"不能给命令名赋值：{name}", lineno=getattr(node, "lineno", None))
+                    if name in protected_assigns:
+                        raise ScriptError(f"不能给命令名赋值：{_display_ident(name)}", lineno=getattr(node, "lineno", None))
         if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-            if node.target.id in _PROTECTED_ASSIGN_NAMES:
-                raise ScriptError(f"不能给命令名赋值：{node.target.id}", lineno=getattr(node, "lineno", None))
+            if node.target.id in protected_assigns:
+                raise ScriptError(f"不能给命令名赋值：{_display_ident(node.target.id)}", lineno=getattr(node, "lineno", None))
 
 
+def _display_ident(name: str) -> str:
+    """校验发生在中文关键字译成 Python 之后；报错时把中文名一并带上，例如 range（范围）。"""
+    for chinese, english in _CN_IDENT_MAP.items():
+        if english == name and chinese != name:
+            return f"{name}（{chinese}）"
+    return name
+
+
+# 内置函数、异常名不能被当变量覆盖。命令名例外：`找字 = 找字(目标=...)` 是刻意支持的写法，
+# 命名空间里的 _CommandSlot 会在同名赋值后仍保持可调用（见 test_script_command_assign）。
 _PROTECTED_ASSIGN_NAMES = frozenset(
     {
         *_BUILTIN_CALLS,
+        *_EXCEPTION_NAMES,
         "range",
         "len",
         "int",
@@ -1032,6 +1147,7 @@ _PROTECTED_ASSIGN_NAMES = frozenset(
         "True",
         "False",
         "None",
+        "__guard",
     }
 )
 _PROTECTED_FUNC_NAMES = frozenset({*COMMAND_NAMES, *_PROTECTED_ASSIGN_NAMES})
@@ -1241,6 +1357,9 @@ class _WindowView:
     def __init__(self, host) -> None:
         self._host = host
 
+    def 设置分辨率(self, *args, 报错=True):
+        return self._host.设置分辨率(*args, 报错=报错)
+
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise ScriptError("禁止访问该属性")
@@ -1273,6 +1392,9 @@ def run_script(
     if placeholder:
         raise ScriptError(placeholder)
     tree = parse_script(source)
+    user_funcs = {
+        node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    }
     tree = _GuardInsert().visit(tree)
     ast.fix_missing_locations(tree)
     runtime_logger = logger_obj or logger
@@ -1302,15 +1424,21 @@ def run_script(
     def _fail(detail: Any = "") -> None:
         raise ScriptOutcome(False, str(detail or "判断失败"))
 
+    def _is_user_func(func: Any) -> bool:
+        name = str(getattr(func, "__name__", "") or "")
+        return name in user_funcs and namespace.get(name) is func
+
     def _start_thread(目标: Any, 名字: Any = None) -> Any:
         func = 目标
         label = 名字
         if isinstance(目标, str):
+            if 目标 not in user_funcs:
+                raise ScriptError("多线程请传入子程序，例如 多线程(按W)")
             func = namespace.get(目标)
             if not callable(func):
                 raise ScriptError(f"没有这个子程序：{目标}")
             label = 名字 or 目标
-        if not callable(func):
+        if not callable(func) or not _is_user_func(func):
             raise ScriptError("多线程请传入子程序，例如 多线程(按W)")
         return host.多线程(func, label)
 
@@ -1357,6 +1485,9 @@ def run_script(
         "激活": host.激活,
         "播放": host.播放,
         "停止播放": host.停止播放,
+        "回放": host.回放,
+        "截图": _CallableLast(host.截图, store, "image", host),
+        "等按键": host.等按键,
         "找字": host.找字,
         "找字库": host.找字库,
         "等字库": host.等字库,
@@ -1423,11 +1554,13 @@ def run_script(
         value = dict.get(namespace, name)
         if value is not None:
             namespace.install_command(name, value)
+    result = None
     try:
         try:
             exec(compile(tree, "<script>", "exec"), namespace, namespace)  # noqa: S102
+            result = (True, "")
         except ScriptOutcome as outcome:
-            return outcome.success, outcome.detail
+            result = (outcome.success, outcome.detail)
         except ScriptError:
             raise
         except AttributeError as exc:
@@ -1445,7 +1578,7 @@ def run_script(
             _raise_script_error(f"参数不对: {message}", exc)
         except ValueError as exc:
             message = str(exc)
-            if message.startswith(("不允许", "未找到", "能力不可", "已停止", "执行超时", "点击缺少", "移动缺少", "拖拽缺少", "取色缺少", "框内点缺少", "随机点缺少", "距离缺少", "角度缺少", "开方", "多线程", "检测", "持续检测", "持续找图", "没有框", "停止检查", "暂停检查", "文字请用", "区域请写成")):
+            if message.startswith(("不允许", "未找到", "能力不可", "已停止", "执行超时", "点击缺少", "移动缺少", "拖拽缺少", "取色缺少", "框内点缺少", "随机点缺少", "距离缺少", "角度缺少", "开方", "多线程", "检测", "持续检测", "持续找图", "没有框", "停止检查", "暂停检查", "文字请用", "区域请写成", "单独一个", "宽高", "窗口", "没有当前", "没有可调整", "当前窗口", "脚本不能", "缺少资源", "回放", "不认识", "截图", "等按键")):
                 _raise_script_error(message, exc)
             _raise_script_error(f"运行失败: {message}", exc)
         except NameError as exc:
@@ -1464,6 +1597,9 @@ def run_script(
             if "outside function" in message and "return" in message:
                 _raise_script_error("不能单独写返回，请用 成功() 或 失败()", exc)
             _raise_script_error(f"运行失败: {exc}", exc)
-        return True, ""
     finally:
         host.close()
+    failure = host.thread_failure()
+    if failure:
+        raise ScriptError(f"线程失败: {failure}")
+    return result if result is not None else (True, "")

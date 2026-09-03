@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import html
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QMimeData, QPoint, QRectF, QTime, Qt, Signal
 from PySide6.QtGui import (
@@ -196,6 +196,19 @@ def player_panel_frame_qss(
         frame
         + f"QFrame#{name} QLabel {{ color:{text}; background:transparent;"
         f" border:none; font-size:{size}px; }}"
+    )
+
+
+def player_rich_text_qss(*, text: str, font_size: int = 12) -> str:
+    """多行说明：与脚本列表/日志等面板一致——透明底 + 主题描边。"""
+    size = max(8, min(72, int(font_size or 12)))
+    color = str(text or theme_color("text"))
+    return (
+        f"color:{color}; font-size:{size}px;"
+        f" background:transparent; background-color:transparent;"
+        f" border:1px solid {theme_color('border')};"
+        f" border-radius:{PLAYER_PANEL_RADIUS}px;"
+        f" padding:6px 8px;"
     )
 
 
@@ -636,25 +649,86 @@ class OnceAwareCheckBox(QCheckBox):
 
 
 class PlayerScriptListView(QListWidget):
-    """支持带 itemWidget 的行内拖拽调序（Qt InternalMove 在 setItemWidget 下不可用）。"""
+    """支持带 itemWidget 的行内拖拽调序（Qt InternalMove 在 setItemWidget 下不可用）。
+
+    注意：不可 takeItem 后再 setItemWidget——takeItem 会销毁行控件导致闪退。
+    拖拽时按鼠标位置实时交换行数据（控件槽位不动）。
+    """
 
     order_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._reorder_enabled = True
+        self._dragging_row = -1
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         # 不用内置 InternalMove：与 setItemWidget 不兼容
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDragEnabled(False)
+        self.viewport().setAcceptDrops(True)
 
     def set_reorder_enabled(self, enabled: bool) -> None:
         self._reorder_enabled = bool(enabled)
+        if not self._reorder_enabled:
+            self._dragging_row = -1
 
     def reorder_enabled(self) -> bool:
         return bool(self._reorder_enabled)
+
+    def begin_row_drag(self, row: int) -> None:
+        self._dragging_row = int(row)
+
+    def end_row_drag(self) -> None:
+        self._dragging_row = -1
+
+    def _viewport_pos(self, pos: QPoint, *, source: Optional[QWidget] = None) -> QPoint:
+        if source is None:
+            return self.viewport().mapFrom(self, pos)
+        return self.viewport().mapFromGlobal(source.mapToGlobal(pos))
+
+    def insert_row_for_viewport_pos(self, viewport_pos: QPoint) -> int:
+        target_item = self.itemAt(viewport_pos)
+        if target_item is None:
+            return self.count()
+        to_row = self.row(target_item)
+        rect = self.visualItemRect(target_item)
+        if viewport_pos.y() > rect.center().y():
+            to_row += 1
+        return to_row
+
+    def _snapshot_row(self, index: int) -> Optional[dict]:
+        item = self.item(index)
+        if item is None:
+            return None
+        widget = self.itemWidget(item)
+        if isinstance(widget, PlayerScriptTaskRow):
+            return widget.export_state()
+        sid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not sid:
+            return None
+        return {
+            "script_id": sid,
+            "title": str(item.data(SCRIPT_ITEM_TITLE_ROLE) or sid),
+            "loops": int(item.data(SCRIPT_ITEM_LOOPS_ROLE) or 1),
+            "check_state": int(Qt.CheckState.Checked),
+            "locked": False,
+        }
+
+    def _apply_row_snapshot(self, index: int, snap: Mapping[str, Any]) -> None:
+        item = self.item(index)
+        if item is None:
+            return
+        sid = str(snap.get("script_id") or "").strip()
+        title = str(snap.get("title") or sid)
+        loops = int(snap.get("loops") or 1)
+        item.setData(Qt.ItemDataRole.UserRole, sid)
+        item.setData(SCRIPT_ITEM_TITLE_ROLE, title)
+        item.setData(SCRIPT_ITEM_LOOPS_ROLE, loops)
+        widget = self.itemWidget(item)
+        if isinstance(widget, PlayerScriptTaskRow):
+            widget.import_state(snap)
 
     def move_row(self, from_row: int, to_row: int) -> bool:
         """把 from_row 移到目标下标 to_row（移动前的目标位置，可等于 count 表示末尾）。"""
@@ -664,57 +738,61 @@ class PlayerScriptListView(QListWidget):
         insert_at = max(0, min(count, int(to_row)))
         if insert_at == from_row or insert_at == from_row + 1:
             return False
-        item = self.item(from_row)
-        widget = self.itemWidget(item) if item is not None else None
-        taken = self.takeItem(from_row)
-        if taken is None:
-            return False
+        snapshots: List[dict] = []
+        for index in range(count):
+            snap = self._snapshot_row(index)
+            if snap is None:
+                return False
+            snapshots.append(snap)
+        moving = snapshots.pop(from_row)
         if insert_at > from_row:
             insert_at -= 1
-        self.insertItem(insert_at, taken)
-        if widget is not None:
-            self.setItemWidget(taken, widget)
+        snapshots.insert(insert_at, moving)
+        for index, snap in enumerate(snapshots):
+            self._apply_row_snapshot(index, snap)
+        if self._dragging_row == from_row:
+            self._dragging_row = insert_at
         self.setCurrentRow(insert_at)
         self.order_changed.emit()
         return True
 
+    def reorder_drag_to(self, viewport_pos: QPoint) -> bool:
+        if not self._reorder_enabled or self._dragging_row < 0:
+            return False
+        to_row = self.insert_row_for_viewport_pos(viewport_pos)
+        return self.move_row(self._dragging_row, to_row)
+
+    def _accept_script_drag(self, event) -> bool:
+        return bool(
+            self._reorder_enabled
+            and event.mimeData() is not None
+            and event.mimeData().hasFormat(SCRIPT_ROW_MIME)
+        )
+
     def dropEvent(self, event):
-        if not self._reorder_enabled or event.mimeData() is None:
+        if not self._accept_script_drag(event):
             event.ignore()
             return
-        if not event.mimeData().hasFormat(SCRIPT_ROW_MIME):
-            event.ignore()
-            return
-        try:
-            from_row = int(bytes(event.mimeData().data(SCRIPT_ROW_MIME)).decode("utf-8"))
-        except (TypeError, ValueError, UnicodeDecodeError):
-            event.ignore()
-            return
-        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-        target_item = self.itemAt(pos)
-        if target_item is None:
-            to_row = self.count()
-        else:
-            to_row = self.row(target_item)
-            rect = self.visualItemRect(target_item)
-            if pos.y() > rect.center().y():
-                to_row += 1
-        if self.move_row(from_row, to_row):
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        # 行已在 dragMove 中按鼠标实时挪动，松手只收尾
+        self.end_row_drag()
+        event.acceptProposedAction()
 
     def dragEnterEvent(self, event):
-        if self._reorder_enabled and event.mimeData() and event.mimeData().hasFormat(SCRIPT_ROW_MIME):
+        if self._accept_script_drag(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        if self._reorder_enabled and event.mimeData() and event.mimeData().hasFormat(SCRIPT_ROW_MIME):
-            event.acceptProposedAction()
-        else:
+        if not self._accept_script_drag(event):
             event.ignore()
+            return
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        self.reorder_drag_to(self._viewport_pos(pos))
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        super().dragLeaveEvent(event)
 
 
 class PlayerScriptTaskRow(QWidget):
@@ -738,6 +816,7 @@ class PlayerScriptTaskRow(QWidget):
         self._drag_start: Optional[QPoint] = None
         self.setObjectName("PlayerScriptTaskRow")
         self.setAutoFillBackground(False)
+        self.setAcceptDrops(bool(interactive))
         layout = QHBoxLayout(self)
         layout.setContentsMargins(2, 0, 2, 0)
         layout.setSpacing(6)
@@ -801,6 +880,88 @@ class PlayerScriptTaskRow(QWidget):
             return False
         return True
 
+    def export_state(self) -> dict:
+        try:
+            check_state = int(self._check.checkState().value)
+        except Exception:
+            check_state = int(Qt.CheckState.Checked.value)
+        return {
+            "script_id": str(self.script_id or ""),
+            "title": str(self._title or self.script_id or ""),
+            "loops": self.loops(),
+            "check_state": check_state,
+            "locked": bool(self._locked),
+        }
+
+    def import_state(self, snap: Mapping[str, Any]) -> None:
+        sid = str(snap.get("script_id") or "").strip()
+        title = str(snap.get("title") or sid)
+        loops = max(1, int(snap.get("loops") or 1))
+        try:
+            state = Qt.CheckState(int(snap.get("check_state") or int(Qt.CheckState.Checked)))
+        except (TypeError, ValueError):
+            state = Qt.CheckState.Checked
+        self.script_id = sid
+        self._title = title
+        try:
+            self._check.blockSignals(True)
+            self._spin.blockSignals(True)
+            self._name.setText(title)
+            self._spin.setValue(loops)
+            self._check.setCheckState(state)
+            self._sync_once_badge()
+        except RuntimeError:
+            return
+        finally:
+            try:
+                self._check.blockSignals(False)
+                self._spin.blockSignals(False)
+            except RuntimeError:
+                pass
+        self.set_locked(bool(snap.get("locked")))
+
+    def _row_index_in_list(self, list_w: QListWidget) -> int:
+        for index in range(list_w.count()):
+            item = list_w.item(index)
+            if item is not None and list_w.itemWidget(item) is self:
+                return index
+        return -1
+
+    def _forward_drag_pos(self, event) -> QPoint:
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        return pos
+
+    def dragEnterEvent(self, event):
+        list_w = self._list_view()
+        if (
+            isinstance(list_w, PlayerScriptListView)
+            and list_w.reorder_enabled()
+            and event.mimeData()
+            and event.mimeData().hasFormat(SCRIPT_ROW_MIME)
+        ):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        list_w = self._list_view()
+        if not isinstance(list_w, PlayerScriptListView) or not list_w.reorder_enabled():
+            event.ignore()
+            return
+        if not event.mimeData() or not event.mimeData().hasFormat(SCRIPT_ROW_MIME):
+            event.ignore()
+            return
+        list_w.reorder_drag_to(list_w._viewport_pos(self._forward_drag_pos(event), source=self))
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        list_w = self._list_view()
+        if isinstance(list_w, PlayerScriptListView):
+            list_w.end_row_drag()
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
     def mousePressEvent(self, event: QMouseEvent):
         if (
             self._interactive
@@ -830,12 +991,7 @@ class PlayerScriptTaskRow(QWidget):
         if list_w is None or not reorder_ok:
             self._drag_start = None
             return
-        row = -1
-        for index in range(list_w.count()):
-            item = list_w.item(index)
-            if item is not None and list_w.itemWidget(item) is self:
-                row = index
-                break
+        row = self._row_index_in_list(list_w)
         if row < 0:
             self._drag_start = None
             return
@@ -848,7 +1004,13 @@ class PlayerScriptTaskRow(QWidget):
             drag.setPixmap(pixmap)
             drag.setHotSpot(event.position().toPoint())
         self._drag_start = None
-        drag.exec(Qt.DropAction.MoveAction)
+        if isinstance(list_w, PlayerScriptListView):
+            list_w.begin_row_drag(row)
+        try:
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            if isinstance(list_w, PlayerScriptListView):
+                list_w.end_row_drag()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         self._drag_start = None
@@ -1043,26 +1205,24 @@ def script_loops_from_refs(refs: Dict[str, Any]) -> Dict[str, int]:
     from app_core.player.package import normalize_script_loop_count
 
     loops: Dict[str, int] = {}
-    list_w = refs.get("script_list_widget")
-    if list_w is None:
-        return loops
-    try:
-        for index in range(list_w.count()):
-            item = list_w.item(index)
-            if item is None:
-                continue
-            sid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-            if not sid:
-                continue
-            row = _script_row_from_item(list_w, item)
-            if row is not None:
-                loops[sid] = row.loops()
-            else:
-                loops[sid] = normalize_script_loop_count(
-                    item.data(SCRIPT_ITEM_LOOPS_ROLE), 1
-                )
-    except RuntimeError:
-        return loops
+    for list_w in iter_script_list_widgets(refs):
+        try:
+            for index in range(list_w.count()):
+                item = list_w.item(index)
+                if item is None:
+                    continue
+                sid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                if not sid:
+                    continue
+                row = _script_row_from_item(list_w, item)
+                if row is not None:
+                    loops[sid] = row.loops()
+                else:
+                    loops[sid] = normalize_script_loop_count(
+                        item.data(SCRIPT_ITEM_LOOPS_ROLE), 1
+                    )
+        except RuntimeError:
+            continue
     return loops
 
 
@@ -1083,31 +1243,64 @@ def apply_script_loops_to_refs(
     *,
     loops_by_id: Optional[Mapping[str, int]] = None,
     group_loops: Optional[int] = None,
+    group_loops_by_list: Optional[Mapping[str, int]] = None,
 ):
     """把持久化次数写回脚本列表行内 Spin。"""
     from app_core.player.package import normalize_script_loop_count
 
     counts = loops_by_id or {}
-    list_w = refs.get("script_list_widget")
-    if list_w is not None and counts:
-        try:
-            for index in range(list_w.count()):
-                item = list_w.item(index)
-                if item is None:
+    if counts:
+        for list_w in iter_script_list_widgets(refs):
+            try:
+                for index in range(list_w.count()):
+                    item = list_w.item(index)
+                    if item is None:
+                        continue
+                    sid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                    if not sid or sid not in counts:
+                        continue
+                    value = normalize_script_loop_count(counts.get(sid), 1)
+                    item.setData(SCRIPT_ITEM_LOOPS_ROLE, value)
+                    row = _script_row_from_item(list_w, item)
+                    if row is not None:
+                        row._spin.blockSignals(True)
+                        row._spin.setValue(value)
+                        row._spin.blockSignals(False)
+            except RuntimeError:
+                continue
+    applied_group = False
+    if isinstance(group_loops_by_list, Mapping):
+        mapping = refs.get("script_lists")
+        spins_by_id = refs.get("group_loop_spins_by_id")
+        if isinstance(spins_by_id, Mapping) and spins_by_id:
+            for list_id, value in group_loops_by_list.items():
+                spin = spins_by_id.get(str(list_id))
+                if spin is None:
                     continue
-                sid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-                if not sid or sid not in counts:
+                try:
+                    normalized = normalize_script_loop_count(value, 1)
+                    spin.blockSignals(True)
+                    spin.setValue(normalized)
+                    spin.blockSignals(False)
+                    applied_group = True
+                except RuntimeError:
                     continue
-                value = normalize_script_loop_count(counts.get(sid), 1)
-                item.setData(SCRIPT_ITEM_LOOPS_ROLE, value)
-                row = _script_row_from_item(list_w, item)
-                if row is not None:
-                    row._spin.blockSignals(True)
-                    row._spin.setValue(value)
-                    row._spin.blockSignals(False)
-        except RuntimeError:
-            pass
-    if group_loops is not None:
+        elif isinstance(mapping, Mapping) and mapping:
+            spins = refs.get("group_loop_spins") or []
+            order = [str(key) for key in (refs.get("script_list_order") or mapping.keys())]
+            for index, list_id in enumerate(order):
+                if index >= len(spins) or list_id not in group_loops_by_list:
+                    continue
+                try:
+                    normalized = normalize_script_loop_count(group_loops_by_list[list_id], 1)
+                    spin = spins[index]
+                    spin.blockSignals(True)
+                    spin.setValue(normalized)
+                    spin.blockSignals(False)
+                    applied_group = True
+                except RuntimeError:
+                    continue
+    if group_loops is not None and not applied_group:
         value = normalize_script_loop_count(group_loops, 1)
         refs["group_loops"] = value
         spin = refs.get("group_loop_spin")
@@ -1230,12 +1423,65 @@ def apply_script_run_status(
             continue
 
 
+def _iter_script_task_rows(list_w: QListWidget) -> List["PlayerScriptTaskRow"]:
+    rows: List[PlayerScriptTaskRow] = []
+    if list_w is None:
+        return rows
+    try:
+        for index in range(list_w.count()):
+            item = list_w.item(index)
+            if item is None:
+                continue
+            row = _script_row_from_item(list_w, item)
+            if row is not None:
+                rows.append(row)
+    except RuntimeError:
+        return []
+    return rows
+
+
+def set_all_script_checks(list_w: QListWidget, checked: bool) -> None:
+    """将该列表内全部脚本勾选或取消勾选。"""
+    state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+    for row in _iter_script_task_rows(list_w):
+        try:
+            row._check.blockSignals(True)
+            row._check.setCheckState(state)
+            row._check.blockSignals(False)
+            row._sync_once_badge()
+        except RuntimeError:
+            pass
+
+
+def sync_script_select_all_box(list_w: QListWidget, select_all: Optional[QCheckBox] = None) -> None:
+    """按行勾选状态同步标题行全选框。
+
+    无勾选 → 未勾选；有任意勾选（含部分/全部）→ 已勾选。
+    """
+    box = select_all if select_all is not None else getattr(list_w, "_select_all_box", None)
+    if box is None:
+        return
+    rows = _iter_script_task_rows(list_w)
+    try:
+        box.blockSignals(True)
+        if rows and any(row.is_checked() for row in rows):
+            box.setCheckState(Qt.CheckState.Checked)
+        else:
+            box.setCheckState(Qt.CheckState.Unchecked)
+        box.blockSignals(False)
+    except RuntimeError:
+        pass
+
+
 def set_script_list_locked(refs: Dict[str, Any], locked: bool):
     """运行中锁定勾选/拖拽/次数，但保持列表可见以便显示执行状态。"""
     for list_w in iter_script_list_widgets(refs):
         try:
             if isinstance(list_w, PlayerScriptListView):
                 list_w.set_reorder_enabled(not locked)
+            select_all = getattr(list_w, "_select_all_box", None)
+            if select_all is not None:
+                select_all.setEnabled(not locked)
             for index in range(list_w.count()):
                 item = list_w.item(index)
                 if item is None:
@@ -1296,6 +1542,98 @@ def selected_script_ids_by_list_from_refs(refs: Dict[str, Any]) -> Dict[str, Lis
     if single is not None:
         return {"__main__": selected_script_ids_from_list_widget(single)}
     return {}
+
+
+def script_ids_in_list_widget(list_w: Any) -> List[str]:
+    ids: List[str] = []
+    if list_w is None:
+        return ids
+    try:
+        for index in range(list_w.count()):
+            item = list_w.item(index)
+            if item is None:
+                continue
+            sid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if sid:
+                ids.append(sid)
+    except RuntimeError:
+        return ids
+    return ids
+
+
+def script_item_orders_from_refs(refs: Dict[str, Any]) -> Dict[str, List[str]]:
+    mapping = refs.get("script_lists")
+    if not isinstance(mapping, dict) or not mapping:
+        single = refs.get("script_list_widget")
+        if single is not None:
+            return {"__main__": script_ids_in_list_widget(single)}
+        return {}
+    return {
+        str(key): script_ids_in_list_widget(widget)
+        for key, widget in mapping.items()
+        if widget is not None
+    }
+
+
+def apply_script_item_order_to_list_widget(list_w: Any, ordered_ids: Sequence[str] | None) -> bool:
+    """按 ordered_ids 重排列表行（交换行数据，不 takeItem，避免销毁 itemWidget）。"""
+    if list_w is None or not ordered_ids:
+        return False
+    try:
+        current = script_ids_in_list_widget(list_w)
+    except RuntimeError:
+        return False
+    if not current:
+        return False
+    desired: List[str] = []
+    seen = set()
+    for sid in ordered_ids:
+        s = str(sid or "").strip()
+        if s and s in current and s not in seen:
+            desired.append(s)
+            seen.add(s)
+    for s in current:
+        if s not in seen:
+            desired.append(s)
+            seen.add(s)
+    if desired == current:
+        return False
+    if isinstance(list_w, PlayerScriptListView):
+        by_id = {}
+        for index in range(list_w.count()):
+            snap = list_w._snapshot_row(index)
+            if snap and snap.get("script_id"):
+                by_id[str(snap["script_id"])] = snap
+        for index, sid in enumerate(desired):
+            snap = by_id.get(sid)
+            if snap is not None:
+                list_w._apply_row_snapshot(index, snap)
+        list_w.order_changed.emit()
+        return True
+    # 非 PlayerScriptListView：仅改 UserRole（无行控件时）
+    for index, sid in enumerate(desired):
+        item = list_w.item(index)
+        if item is not None:
+            item.setData(Qt.ItemDataRole.UserRole, sid)
+    return True
+
+
+def apply_script_item_orders_to_refs(
+    refs: Dict[str, Any], item_orders: Mapping[str, Sequence[str]] | None
+) -> None:
+    if not isinstance(item_orders, Mapping):
+        return
+    mapping = refs.get("script_lists")
+    if isinstance(mapping, dict) and mapping:
+        for key, list_w in mapping.items():
+            apply_script_item_order_to_list_widget(list_w, item_orders.get(str(key)))
+        return
+    single = refs.get("script_list_widget")
+    if single is not None:
+        preferred = item_orders.get("__main__")
+        if preferred is None and item_orders:
+            preferred = next(iter(item_orders.values()), None)
+        apply_script_item_order_to_list_widget(single, preferred)
 
 
 def selected_script_ids_from_refs(refs: Dict[str, Any]) -> List[str]:
@@ -1370,6 +1708,7 @@ def populate_custom_player_body(
         else [str(x) for x in ui.get("list_order") if str(x or "").strip()],
         "group_loop_spin": None,
         "group_loop_spins": [],
+        "group_loop_spins_by_id": {},
         "group_loops": 1,
         "settings_button": None,
         "progress_label": None,
@@ -1526,14 +1865,13 @@ def populate_custom_player_body(
             _track(page, in_zone, label)
         elif kind == "rich_text":
             label = QLabel(str(widget.get("text") or ""), body)
+            label.setObjectName("PlayerRichText")
             label.setGeometry(*geo)
             label.setWordWrap(True)
             label.setAlignment(_qt_text_align(str(widget.get("align") or "left")))
             color = resolve_widget_color(widget, "color", "text")
-            size = int(widget.get("font_size") or 12)
-            label.setStyleSheet(
-                f"color:{color}; font-size:{size}px; background:transparent; border:none;"
-            )
+            size = resolve_widget_font_size(widget, 12)
+            label.setStyleSheet(player_rich_text_qss(text=color, font_size=size))
             node = label
             _track(page, in_zone, label)
         elif kind == "tabs":
@@ -1592,17 +1930,22 @@ def populate_custom_player_body(
                 f" QFrame#PlayerScriptList QListWidget::item:focus {{"
                 f" background:transparent; background-color:transparent;"
                 f" color:{text_c}; border:none; margin:0px; padding:0px; outline:none; }}"
+                f"QFrame#PlayerScriptList QWidget#PlayerScriptListHeader {{"
+                f" background:transparent; background-color:transparent; border:none; }}"
                 f"QFrame#PlayerScriptList QCheckBox {{"
-                f" spacing:0; background:transparent; border:none; }}"
+                f" spacing:4px; color:{text_c}; font-size:{font_px}px;"
+                f" background:transparent; background-color:transparent; border:none; padding:0; }}"
                 f"QFrame#PlayerScriptList QCheckBox::indicator {{"
                 f" width:16px; height:16px; border:1px solid {border}; border-radius:3px;"
-                f" background:transparent; }}"
+                f" background:transparent; background-color:transparent; }}"
                 f"QFrame#PlayerScriptList QCheckBox::indicator:hover {{ border-color:{border_hi}; }}"
                 f"QFrame#PlayerScriptList QCheckBox::indicator:checked {{"
                 f" background-color:{accent}; border-color:{accent};"
                 f" image:url(themes/icons/check-white.svg); }}"
                 f"QFrame#PlayerScriptList QCheckBox::indicator:checked:hover {{"
                 f" background-color:{accent_hover}; border-color:{accent_hover}; }}"
+                f"QFrame#PlayerScriptList QCheckBox::indicator:disabled {{"
+                f" background:transparent; background-color:transparent; border-color:{border}; }}"
                 f"QFrame#PlayerScriptList QSpinBox {{ color:{text_c}; font-size:{font_px}px;"
                 f" background:transparent; border:1px solid {border}; border-radius:4px;"
                 f" min-height:22px; max-height:24px; padding:0 2px; }}"
@@ -1619,9 +1962,29 @@ def populate_custom_player_body(
             layout.setContentsMargins(8, 6, 8, 6)
             layout.setSpacing(4)
             title = str(widget.get("title") or "").strip()
+            header = QWidget(frame)
+            header.setObjectName("PlayerScriptListHeader")
+            header.setAutoFillBackground(False)
+            header_row = QHBoxLayout(header)
+            header_row.setContentsMargins(0, 0, 0, 0)
+            header_row.setSpacing(6)
+            hint_text = ""
             if title:
-                hint = QLabel(title if not interactive_buttons else f"{title}（可拖拽调顺序）")
-                layout.addWidget(hint)
+                hint_text = title if not interactive_buttons else f"{title}（可拖拽调顺序）"
+            hint = QLabel(hint_text, header)
+            hint.setStyleSheet("background:transparent; border:none;")
+            select_all = QCheckBox("全选", header)
+            select_all.setObjectName("PlayerScriptSelectAll")
+            # 文案在左、勾选框在右：全选 ☐
+            select_all.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+            select_all.setToolTip("全选 / 取消全选")
+            select_all.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            select_all.setAutoFillBackground(False)
+            select_all.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            select_all.setEnabled(interactive_buttons)
+            header_row.addWidget(hint, 1)
+            header_row.addWidget(select_all, 0, Qt.AlignmentFlag.AlignRight)
+            layout.addWidget(header)
             list_w = PlayerScriptListView(frame)
             list_w.setObjectName("PlayerScriptListView")
             list_w.setAutoFillBackground(False)
@@ -1631,10 +1994,27 @@ def populate_custom_player_body(
             list_w.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             list_w.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
             list_w.set_reorder_enabled(interactive_buttons)
+            list_w._select_all_box = select_all
+            list_key = str(widget.get("id") or f"script_list_{len(refs.get('script_lists') or {})}")
             if interactive_buttons:
                 list_w.setToolTip("勾选要执行的脚本；右侧改次数；按住名称拖拽调整顺序")
             else:
                 list_w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                select_all.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+            def _on_row_check_changed(_checked: bool = False, _list=list_w) -> None:
+                sync_script_select_all_box(_list)
+                if on_scripts_changed is not None:
+                    on_scripts_changed(selected_script_ids_from_refs(refs))
+
+            def _on_select_all_clicked(_checked: bool = False, _list=list_w, _box=select_all) -> None:
+                rows = _iter_script_task_rows(_list)
+                all_on = bool(rows) and all(row.is_checked() for row in rows)
+                set_all_script_checks(_list, not all_on)
+                sync_script_select_all_box(_list, _box)
+                if on_scripts_changed is not None:
+                    on_scripts_changed(selected_script_ids_from_refs(refs))
+
             for item in widget.get("items") or []:
                 if not isinstance(item, dict):
                     continue
@@ -1660,23 +2040,33 @@ def populate_custom_player_body(
                 list_item.setSizeHint(task_row.sizeHint())
                 list_w.addItem(list_item)
                 list_w.setItemWidget(list_item, task_row)
-                if interactive_buttons and on_scripts_changed is not None:
-                    task_row._check.toggled.connect(
-                        lambda *_args: on_scripts_changed(selected_script_ids_from_refs(refs))
-                    )
+                if interactive_buttons:
+                    task_row._check.toggled.connect(_on_row_check_changed)
                 if interactive_buttons and on_loops_changed is not None:
                     task_row._spin.valueChanged.connect(lambda *_args: on_loops_changed())
+            if interactive_buttons:
+                select_all.clicked.connect(_on_select_all_clicked)
             if interactive_buttons and on_scripts_changed is not None:
                 list_w.order_changed.connect(
                     lambda: on_scripts_changed(selected_script_ids_from_refs(refs))
                 )
+            sync_script_select_all_box(list_w, select_all)
             layout.addWidget(list_w, 1)
+            sep = QFrame(frame)
+            sep.setObjectName("PlayerGroupLoopSep")
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setFrameShadow(QFrame.Shadow.Plain)
+            sep.setFixedHeight(1)
+            sep.setStyleSheet(
+                f"QFrame#PlayerGroupLoopSep {{ background:{border}; border:none; max-height:1px; }}"
+            )
+            layout.addWidget(sep)
             group_bar = QFrame(frame)
             group_bar.setObjectName("PlayerGroupLoopBar")
             group_bar.setFrameShape(QFrame.Shape.NoFrame)
             group_bar.setAutoFillBackground(False)
             group_row = QHBoxLayout(group_bar)
-            group_row.setContentsMargins(2, 2, 2, 0)
+            group_row.setContentsMargins(2, 6, 2, 0)
             group_row.setSpacing(6)
             group_lab = QLabel("整组循环")
             group_spin = QSpinBox(group_bar)
@@ -1693,7 +2083,6 @@ def populate_custom_player_body(
             group_row.addWidget(group_lab, 1)
             group_row.addWidget(group_spin, 0)
             layout.addWidget(group_bar)
-            list_key = str(widget.get("id") or f"script_list_{len(refs.get('script_lists') or {})}")
             lists_map = dict(refs.get("script_lists") or {})
             lists_map[list_key] = list_w
             refs["script_lists"] = lists_map
@@ -1707,6 +2096,10 @@ def populate_custom_player_body(
             spins = list(refs.get("group_loop_spins") or [])
             spins.append(group_spin)
             refs["group_loop_spins"] = spins
+            spins_by_id = dict(refs.get("group_loop_spins_by_id") or {})
+            if list_key:
+                spins_by_id[list_key] = group_spin
+            refs["group_loop_spins_by_id"] = spins_by_id
             refs["group_loops"] = normalize_script_loop_count(widget.get("group_loops"), 1)
 
             def _on_group_changed(value: int):

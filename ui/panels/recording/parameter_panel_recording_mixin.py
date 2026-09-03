@@ -9,6 +9,13 @@ from utils.window.window_activation_utils import (
     resolve_window_client_rect,
 )
 from utils.window.window_activation_utils import show_and_raise_widget
+from app_core.hotkey_spec import (
+    display_hotkey,
+    is_mouse_hotkey,
+    mouse_hook_button,
+    normalize_hotkey,
+    to_keyboard_lib,
+)
 
 class ParameterPanelRecordingMixin:
 
@@ -118,43 +125,41 @@ class ParameterPanelRecordingMixin:
             import keyboard
             # 从父窗口获取录制快捷键配置
             if hasattr(self.parent_window, 'record_hotkey'):
-                record_key = self.parent_window.record_hotkey.lower()
+                record_key = normalize_hotkey(self.parent_window.record_hotkey)
                 conflicts = {}
                 if hasattr(self.parent_window, '_get_hotkey_value'):
                     conflicts = {
-                        '启动任务': self.parent_window._get_hotkey_value('start').lower(),
-                        '停止任务': self.parent_window._get_hotkey_value('stop').lower(),
-                        '暂停/恢复': self.parent_window._get_hotkey_value('pause').lower(),
+                        '启动任务': self.parent_window._get_hotkey_value('start'),
+                        '停止任务': self.parent_window._get_hotkey_value('stop'),
+                        '暂停/恢复': self.parent_window._get_hotkey_value('pause'),
                     }
                 replay_key = ''
                 if hasattr(self.parent_window, 'replay_hotkey'):
-                    replay_key = self.parent_window.replay_hotkey.lower()
+                    replay_key = normalize_hotkey(self.parent_window.replay_hotkey)
                     conflicts['回放'] = replay_key
                 for name, key in conflicts.items():
                     if key and record_key == key:
-                        QMessageBox.warning(self, "快捷键冲突", f"录制快捷键与{name}快捷键冲突：{record_key.upper()}")
+                        QMessageBox.warning(self, "快捷键冲突", f"录制快捷键与{name}快捷键冲突：{display_hotkey(record_key)}")
                         return
 
-                # 注册快捷键
-                if record_key in ['xbutton1', 'xbutton2']:
-                    # 鼠标侧键
+                if is_mouse_hotkey(record_key):
                     import mouse
-                    mouse_button = 'x' if record_key == 'xbutton1' else 'x2'
+                    mouse_button = mouse_hook_button(record_key)
                     self._record_mouse_hook = mouse.on_button(
                         self._on_record_hotkey,
                         buttons=(mouse_button,),
                         types=('down',)
                     )
-                    logger.info(f"录制快捷键已注册: {record_key.upper()} (鼠标侧键)")
+                    logger.info(f"录制快捷键已注册: {display_hotkey(record_key)} (鼠标侧键)")
                 else:
-                    # 键盘快捷键
+                    lib_key = to_keyboard_lib(record_key)
                     self._record_hotkey_handle = keyboard.add_hotkey(
-                        record_key,
+                        lib_key,
                         self._on_record_hotkey,
                         trigger_on_release=False,
                         suppress=True
                     )
-                    logger.info(f"录制快捷键已注册: {record_key.upper()}")
+                    logger.info(f"录制快捷键已注册: {display_hotkey(record_key)}")
 
                 self._record_hotkey_registered = True
             else:
@@ -197,6 +202,9 @@ class ParameterPanelRecordingMixin:
                 pass
             if not self._is_recording_panel_active:
                 return
+            parent = getattr(self, "parent_window", None)
+            if parent is not None and hasattr(parent, "is_hotkey_listen_enabled") and not parent.is_hotkey_listen_enabled():
+                return
 
             logger.debug(f"录制快捷键触发，当前状态: _recording_active={getattr(self, '_recording_active', False)}")
 
@@ -229,43 +237,41 @@ class ParameterPanelRecordingMixin:
             import keyboard
             # 从父窗口获取回放快捷键配置
             if hasattr(self.parent_window, 'replay_hotkey'):
-                replay_key = self.parent_window.replay_hotkey.lower()
+                replay_key = normalize_hotkey(self.parent_window.replay_hotkey)
                 conflicts = {}
                 if hasattr(self.parent_window, '_get_hotkey_value'):
                     conflicts = {
-                        '启动任务': self.parent_window._get_hotkey_value('start').lower(),
-                        '停止任务': self.parent_window._get_hotkey_value('stop').lower(),
-                        '暂停/恢复': self.parent_window._get_hotkey_value('pause').lower(),
+                        '启动任务': self.parent_window._get_hotkey_value('start'),
+                        '停止任务': self.parent_window._get_hotkey_value('stop'),
+                        '暂停/恢复': self.parent_window._get_hotkey_value('pause'),
                     }
                 record_key = ''
                 if hasattr(self.parent_window, 'record_hotkey'):
-                    record_key = self.parent_window.record_hotkey.lower()
+                    record_key = normalize_hotkey(self.parent_window.record_hotkey)
                     conflicts['录制'] = record_key
                 for name, key in conflicts.items():
                     if key and replay_key == key:
-                        QMessageBox.warning(self, "快捷键冲突", f"回放快捷键与{name}快捷键冲突：{replay_key.upper()}")
+                        QMessageBox.warning(self, "快捷键冲突", f"回放快捷键与{name}快捷键冲突：{display_hotkey(replay_key)}")
                         return
 
-                # 注册快捷键
-                if replay_key in ['xbutton1', 'xbutton2']:
-                    # 鼠标侧键
+                if is_mouse_hotkey(replay_key):
                     import mouse
-                    mouse_button = 'x' if replay_key == 'xbutton1' else 'x2'
+                    mouse_button = mouse_hook_button(replay_key)
                     self._replay_mouse_hook = mouse.on_button(
                         self._on_replay_hotkey,
                         buttons=(mouse_button,),
                         types=('down',)
                     )
-                    logger.info(f"回放快捷键已注册: {replay_key.upper()} (鼠标侧键)")
+                    logger.info(f"回放快捷键已注册: {display_hotkey(replay_key)} (鼠标侧键)")
                 else:
-                    # 键盘快捷键
+                    lib_key = to_keyboard_lib(replay_key)
                     self._replay_hotkey_handle = keyboard.add_hotkey(
-                        replay_key,
+                        lib_key,
                         self._on_replay_hotkey,
                         trigger_on_release=False,
                         suppress=True
                     )
-                    logger.info(f"回放快捷键已注册: {replay_key.upper()}")
+                    logger.info(f"回放快捷键已注册: {display_hotkey(replay_key)}")
 
                 self._replay_hotkey_registered = True
             else:
@@ -308,6 +314,9 @@ class ParameterPanelRecordingMixin:
                 pass
             if not self._is_recording_panel_active:
                 return
+            parent = getattr(self, "parent_window", None)
+            if parent is not None and hasattr(parent, "is_hotkey_listen_enabled") and not parent.is_hotkey_listen_enabled():
+                return
 
             # 触发回放操作
             logger.info("快捷键触发:开始回放")
@@ -348,11 +357,21 @@ class ParameterPanelRecordingMixin:
             return None
 
         try:
-            return self._parse_recorded_actions_payload(recorded_data)
+            payload = self._parse_recorded_actions_payload(recorded_data)
         except ValueError as e:
             logger.error(f"录制数据格式错误: {e}")
             self._show_replay_message(QMessageBox.Icon.Critical, '错误', str(e))
             return None
+
+        if not payload.get('actions'):
+            logger.warning('没有可回放的录制数据')
+            self._show_replay_message(
+                QMessageBox.Icon.Warning,
+                '提示',
+                '没有可回放的录制数据，请先录制操作',
+            )
+            return None
+        return payload
 
     def _parse_recorded_actions_payload(self, recorded_data):
         data = json.loads(recorded_data) if isinstance(recorded_data, str) else recorded_data
@@ -709,7 +728,7 @@ class ParameterPanelRecordingMixin:
                 record_hotkey = getattr(self.parent_window, 'record_hotkey', None)
         except Exception:
             record_hotkey = None
-        return record_hotkey
+        return normalize_hotkey(record_hotkey) or record_hotkey
 
     def _start_recording_capture_thread(self, options: Dict[str, Any], window_rect):
         from ui.recording_parts.hybrid_record_thread import HybridRecordThread

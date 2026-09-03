@@ -1135,6 +1135,15 @@ class WorkflowTabWidget(QTabWidget):
             return True
         return state != "stopped"
 
+    def close_tab(self, index: int) -> bool:
+        """关闭一个工作流标签：有未保存更改时先问用户（保存 / 放弃 / 取消），与关闭程序时的逻辑一致。
+
+        所有"关闭某个工作流"的入口（标签 ×、右键菜单、收藏勾选/移除）都应走这里；
+        `close_tab_silent` 只留给启动阶段按收藏同步标签这种不可能有未保存编辑的场景。
+        返回是否真的关闭了。
+        """
+        return self._on_tab_close_requested(index)
+
     def _on_tab_close_requested(self, index: int) -> bool:
         """标签页关闭请求"""
         # "+"标签页不可关闭
@@ -1163,11 +1172,12 @@ class WorkflowTabWidget(QTabWidget):
         if task.modified:
             reply = QMessageBox.question(
                 self,
-                "保存更改",
-                f"任务 '{task.name}' 有未保存的更改，是否保存？",
+                "未保存的更改",
+                f"任务 '{task.name}' 有未保存的更改，关闭前是否保存？",
                 QMessageBox.StandardButton.Save |
                 QMessageBox.StandardButton.Discard |
-                QMessageBox.StandardButton.Cancel
+                QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save,
             )
 
             if reply == QMessageBox.StandardButton.Save:
@@ -1185,7 +1195,7 @@ class WorkflowTabWidget(QTabWidget):
                         logger.info("用户取消了另存为，不关闭标签页")
                         return False
                 else:
-                    if not task.save():
+                    if not self._persist_task(task):
                         QMessageBox.warning(self, "保存失败", f"无法保存任务 '{task.name}'")
                         return False
             elif reply == QMessageBox.StandardButton.Cancel:
@@ -1495,6 +1505,18 @@ class WorkflowTabWidget(QTabWidget):
         tooltip = f"任务: {task.name}\n路径: {task.filepath}\n状态: {task.status}"
         self.setTabToolTip(tab_index, tooltip)
 
+    def _persist_task(self, task, *, old_filepath: str | None = None, workflow_data=None) -> bool:
+        previous = old_filepath if old_filepath is not None else (task.filepath or "")
+        if not task.save_and_backup(workflow_data=workflow_data):
+            return False
+        new_filepath = task.filepath or ""
+        if previous and new_filepath:
+            from task_workflow.workspace import favorite_path_key
+
+            if favorite_path_key(previous) != favorite_path_key(new_filepath):
+                self.workflow_renamed.emit(task.task_id, previous, new_filepath, task.name)
+        return True
+
     def _save_task(self, task_id: int):
         """保存任务"""
         task = self.task_manager.get_task(task_id)
@@ -1514,8 +1536,7 @@ class WorkflowTabWidget(QTabWidget):
             self._save_task_as(task_id)
             return
 
-        # 保存到文件
-        if task.save():
+        if self._persist_task(task):
             QMessageBox.information(self, "保存成功", f"任务 '{task.name}' 已保存")
             self._update_tab_status(task_id)
         else:
@@ -1556,8 +1577,7 @@ class WorkflowTabWidget(QTabWidget):
         task.filepath = filepath
         task.name = os.path.basename(filepath)
 
-        # 保存到文件
-        if task.save():
+        if self._persist_task(task, old_filepath=old_filepath):
             QMessageBox.information(self, "保存成功", f"任务已另存为: {filepath}")
             self._update_tab_status(task_id)
         else:

@@ -4,7 +4,6 @@ from functools import partial
 from typing import Dict, List, Optional
 from PySide6.QtWidgets import QMessageBox
 from app_core.control_plane import JobState
-from ..main_window_parts.main_window_support import normalize_execution_mode_setting
 from ..control_center_parts.control_center_runtime import WindowTaskRunner
 from typing import Tuple
 from ..control_center_parts.control_center_runtime import TaskState
@@ -97,9 +96,12 @@ class ControlCenterWindowTaskMixin:
             self._set_step_cell(row, step_info)
 
     def start_window_task(self, row):
+        if getattr(self, "_is_closing", False):
+            return False
         self._refresh_bound_window_handles()
         window_info = self.sorted_windows[row]
         window_id = self._window_runtime_id(window_info, row)
+        self._dead_hwnd_stopped.discard(str(window_id))
         workflows = self._prepare_window_workflows_for_start(window_info, window_id)
         if workflows is None:
             return False
@@ -146,6 +148,64 @@ class ControlCenterWindowTaskMixin:
         )
         return True
 
+    def _on_runner_runtime_alert(self, window_id, message):
+        text = str(message or "").strip()
+        if not text:
+            return
+        title = str(window_id or "").strip() or "未知窗口"
+        self.log_message(f"窗口{title}: {text}")
+
+    def _setup_hwnd_watchdog(self):
+        from PySide6.QtCore import QTimer
+
+        timer = getattr(self, "_hwnd_watchdog_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(2000)
+            timer.timeout.connect(self._check_running_window_handles)
+            self._hwnd_watchdog_timer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def _stop_hwnd_watchdog(self):
+        timer = getattr(self, "_hwnd_watchdog_timer", None)
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except Exception:
+            pass
+
+    def _check_running_window_handles(self):
+        if getattr(self, "_is_closing", False):
+            return
+        from utils.window.window_identity import is_window_alive
+        from .control_center_dispatch import (
+            CONTROL_CENTER_DEAD_HWND_MESSAGE,
+            collect_dead_running_window_ids,
+            select_unnotified_ids,
+        )
+
+        notified = getattr(self, "_dead_hwnd_stopped", set())
+        dead_ids = collect_dead_running_window_ids(self.window_runners, is_window_alive)
+        new_ids = select_unnotified_ids(dead_ids, notified)
+        if not new_ids:
+            return
+        for window_id in new_ids:
+            notified.add(window_id)
+            logger.warning("中控检测到目标窗口失效: window_id=%s", window_id)
+            try:
+                self._direct_stop_window_task(window_id)
+            except Exception as exc:
+                logger.error("停止失效窗口失败: window_id=%s, error=%s", window_id, exc)
+            self._update_single_window_table_status(
+                window_id,
+                "执行失败",
+                CONTROL_CENTER_DEAD_HWND_MESSAGE,
+            )
+            self.log_message(f"窗口{window_id}: {CONTROL_CENTER_DEAD_HWND_MESSAGE}")
+        self._dead_hwnd_stopped = notified
+
     def _is_start_aborted(self, window_id: str) -> bool:
         scheduler = getattr(self, "scheduler", None)
         if scheduler is None:
@@ -183,9 +243,15 @@ class ControlCenterWindowTaskMixin:
             QMessageBox.warning(self, "\u8b66\u544a", "\u8bf7\u5148\u4e3a\u8be5\u7a97\u53e3\u5206\u914d\u5de5\u4f5c\u6d41")
             return None
 
-        blocked_workflows = self._collect_yolo_workflow_names(workflows)
-        if blocked_workflows:
-            self._show_yolo_workflow_block_warning(window_info, window_id, blocked_workflows)
+        from ui.control_center_parts.control_center_policy import (
+            CONTROL_CENTER_FOREGROUND_BLOCK_MESSAGE,
+            control_center_allows_execution_mode,
+            resolve_control_center_execution_mode,
+        )
+
+        execution_mode = resolve_control_center_execution_mode(self)
+        if not control_center_allows_execution_mode(execution_mode):
+            QMessageBox.warning(self, "无法启动", CONTROL_CENTER_FOREGROUND_BLOCK_MESSAGE)
             return None
         return workflows
 
@@ -219,27 +285,6 @@ class ControlCenterWindowTaskMixin:
             return []
         return workflows
 
-    def _show_yolo_workflow_block_warning(self, window_info: Dict, window_id: str, blocked_workflows: List[str]):
-        window_title = str(window_info.get("title", "\u672a\u77e5\u7a97\u53e3"))
-        preview_lines = [f"  - {name}" for name in blocked_workflows[:6]]
-        if len(blocked_workflows) > 6:
-            preview_lines.append(f"  - \u5176\u4f59 {len(blocked_workflows) - 6} \u4e2a\u5de5\u4f5c\u6d41")
-        warning_message = (
-            "\u4e2d\u63a7\u591a\u5f00\u4e0d\u652f\u6301\u6267\u884c YOLO \u4efb\u52a1\u3002\n"
-            "\u8bf7\u5728\u4e3b\u7a97\u53e3\u5355\u5f00\u6267\u884c\u4ee5\u4e0b\u5de5\u4f5c\u6d41\uff1a\n\n"
-            f"\u7a97\u53e3\uff1a{window_title}\n"
-            "\u5de5\u4f5c\u6d41\uff1a\n"
-            + "\n".join(preview_lines)
-        )
-        QMessageBox.warning(self, "\u542f\u52a8\u5df2\u62e6\u622a", warning_message)
-        self.log_message(f"\u5df2\u62e6\u622a\uff1a\u7a97\u53e3 {window_title} \u5305\u542b YOLO \u5de5\u4f5c\u6d41")
-        logger.warning(
-            "\u4e2d\u63a7\u542f\u52a8\u62e6\u622a\uff1a\u7a97\u53e3%s(%s)\u5305\u542bYOLO\u5de5\u4f5c\u6d41: %s",
-            window_title,
-            window_id,
-            blocked_workflows,
-        )
-
     def _get_configured_execution_mode(self) -> Optional[str]:
         try:
             get_parent_config = getattr(self, "_get_parent_config", None)
@@ -252,10 +297,9 @@ class ControlCenterWindowTaskMixin:
             configured_mode = str(config.get("execution_mode") or "").strip()
             if not configured_mode:
                 return None
-            return normalize_execution_mode_setting(configured_mode)
+            return configured_mode
         except Exception:
             return None
-        return None
 
     def _build_window_task_runners(
         self,
@@ -306,6 +350,7 @@ class ControlCenterWindowTaskMixin:
         runner.setProperty("workflow_name", workflow_name)
         runner.status_updated.connect(self.on_window_status_updated)
         runner.step_updated.connect(self.on_window_step_updated)
+        runner.runtime_alert.connect(self._on_runner_runtime_alert)
         runner.finished.connect(runner.deleteLater)
         runner.task_completed.connect(
             partial(self.on_workflow_completed, workflow_index=workflow_index)

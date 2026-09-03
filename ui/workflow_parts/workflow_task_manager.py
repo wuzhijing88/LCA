@@ -433,7 +433,7 @@ class WorkflowTaskManager(QObject):
 
         # 停止时统一清理YOLO运行时（含遗留子进程兜底）
         try:
-            from utils.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
+            from app_core.runtime.runtime_image_cleanup import cleanup_yolo_runtime_on_stop
             cleanup_yolo_runtime_on_stop(
                 release_engine=True,
                 compact_memory=True,

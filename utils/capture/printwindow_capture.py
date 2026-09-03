@@ -3,30 +3,179 @@
 """
 PrintWindow 截图引擎
 
-特性:
-- 基于 Win32 PrintWindow API
-- 支持后台窗口截图
-- DPI 感知和多显示器兼容
-- 完整的资源管理和清理
-
-依赖:
-    pip install pywin32 numpy opencv-python
+借鉴 OP gdi/gdi2：UpdateWindow 后重试、flags=0 兼容、GetDIBits 读图。
+仍优先 PW_RENDERFULLCONTENT；失败不回退 BitBlt / 其他引擎。
 """
 
-import logging
-import numpy as np
-import threading
 import ctypes
+import logging
+import threading
+from ctypes import wintypes
 from typing import Optional, Tuple
-from dataclasses import dataclass
+
+import cv2
+import numpy as np
+import win32gui
+import win32ui
 
 from utils.capture.hwnd_capture_utils import CaptureStats, crop_frame_by_hwnd, get_window_rect_with_dwm, resolve_capture_target
 
 logger = logging.getLogger(__name__)
 
-import cv2
-import win32gui
-import win32ui
+PW_RENDERFULLCONTENT = 0x00000002
+BI_RGB = 0
+DIB_RGB_COLORS = 0
+BLACKNESS = 0x00000042
+
+_last_failure_reason = ""
+_last_failure_lock = threading.Lock()
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", BITMAPINFOHEADER),
+        ("bmiColors", wintypes.DWORD * 3),
+    ]
+
+
+def _set_last_failure_reason(reason: str) -> None:
+    global _last_failure_reason
+    with _last_failure_lock:
+        _last_failure_reason = str(reason or "").strip()
+
+
+def get_last_printwindow_capture_failure_reason() -> str:
+    with _last_failure_lock:
+        return str(_last_failure_reason or "")
+
+
+def _user32():
+    lib = ctypes.WinDLL("user32", use_last_error=True)
+    lib.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+    lib.PrintWindow.restype = wintypes.BOOL
+    lib.UpdateWindow.argtypes = [wintypes.HWND]
+    lib.UpdateWindow.restype = wintypes.BOOL
+    return lib
+
+
+def _gdi32():
+    lib = ctypes.WinDLL("gdi32", use_last_error=True)
+    lib.GetDIBits.argtypes = [
+        wintypes.HDC,
+        wintypes.HBITMAP,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.c_void_p,
+        ctypes.POINTER(BITMAPINFO),
+        wintypes.UINT,
+    ]
+    lib.GetDIBits.restype = ctypes.c_int
+    lib.GetBitmapBits.argtypes = [wintypes.HBITMAP, ctypes.c_long, ctypes.c_void_p]
+    lib.GetBitmapBits.restype = ctypes.c_long
+    lib.PatBlt.argtypes = [
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.DWORD,
+    ]
+    lib.PatBlt.restype = wintypes.BOOL
+    return lib
+
+
+def print_window_with_op_retry(hwnd: int, hdc: int, user32=None) -> bool:
+    """先 RENDERFULLCONTENT，失败则 UpdateWindow 再试，最后 flags=0。不走 BitBlt。"""
+    lib = user32 if user32 is not None else _user32()
+    target = int(hwnd)
+    target_dc = int(hdc)
+
+    if lib.PrintWindow(target, target_dc, PW_RENDERFULLCONTENT):
+        return True
+
+    try:
+        lib.UpdateWindow(target)
+    except Exception:
+        logger.debug("UpdateWindow 失败，继续 PrintWindow 重试", exc_info=True)
+
+    if lib.PrintWindow(target, target_dc, PW_RENDERFULLCONTENT):
+        logger.debug("PrintWindow 在 UpdateWindow 后成功: hwnd=%s", target)
+        return True
+
+    if lib.PrintWindow(target, target_dc, 0):
+        logger.debug("PrintWindow 以 flags=0 成功: hwnd=%s", target)
+        return True
+    return False
+
+
+def _new_bitmap_info(width: int, height: int, top_down: bool) -> BITMAPINFO:
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = int(width)
+    bmi.bmiHeader.biHeight = -int(height) if top_down else int(height)
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = BI_RGB
+    bmi.bmiHeader.biSizeImage = int(width) * int(height) * 4
+    return bmi
+
+
+def read_printwindow_bitmap_bgra(
+    hdc: int,
+    hbitmap: int,
+    width: int,
+    height: int,
+    gdi32=None,
+) -> Optional[np.ndarray]:
+    """优先 GetDIBits；仅当读同一张 HBITMAP 失败时才用 GetBitmapBits。"""
+    if width <= 0 or height <= 0:
+        return None
+
+    lib = gdi32 if gdi32 is not None else _gdi32()
+    nbytes = int(width) * int(height) * 4
+    buf = (ctypes.c_ubyte * nbytes)()
+    buf_ptr = ctypes.cast(buf, ctypes.c_void_p)
+
+    def _getdibits(top_down: bool) -> bool:
+        bmi = _new_bitmap_info(width, height, top_down)
+        lines = lib.GetDIBits(
+            int(hdc),
+            int(hbitmap),
+            0,
+            int(height),
+            buf_ptr,
+            ctypes.byref(bmi),
+            DIB_RGB_COLORS,
+        )
+        return int(lines or 0) == int(height)
+
+    if _getdibits(True):
+        return np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 4)).copy()
+
+    if _getdibits(False):
+        img = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 4)).copy()
+        return np.ascontiguousarray(np.flipud(img))
+
+    bits = lib.GetBitmapBits(int(hbitmap), nbytes, buf_ptr)
+    if int(bits or 0) != nbytes:
+        return None
+    return np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 4)).copy()
 
 
 class PrintWindowCapture:
@@ -43,8 +192,8 @@ class PrintWindowCapture:
         self._black_border_min_ratio = 0.02
         self._black_border_min_area_ratio = 0.40
 
-    def _auto_fix_black_borders(self, img_bgr: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
-        """Auto-crop black borders and resize to target size."""
+    def _auto_fix_black_borders(self, img_bgr: np.ndarray, target_size: Tuple[int, int] = None) -> np.ndarray:
+        """裁掉黑边，保持像素比例；不再强制 resize 回原尺寸。"""
         try:
             if img_bgr is None:
                 return img_bgr
@@ -71,11 +220,8 @@ class PrintWindowCapture:
                 return img_bgr
             if (bw * bh) < (self._black_border_min_area_ratio * w * h):
                 return img_bgr
-            cropped = img_bgr[y:y + bh, x:x + bw]
-            target_w, target_h = target_size
-            if target_w > 0 and target_h > 0 and (bw != target_w or bh != target_h):
-                cropped = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-            return cropped
+            # 只裁剪黑边，禁止再拉回原尺寸，否则上下/左右去边后会被非等比拉伸。
+            return img_bgr[y:y + bh, x:x + bw].copy()
         except Exception as e:
             logger.debug(f"黑边修复失败：{e}")
             return img_bgr
@@ -102,6 +248,7 @@ class PrintWindowCapture:
         dc_mem = None
         dc_compatible = None
         bitmap = None
+        old_bitmap = None
         capture_lock_acquired = False
         target_info = resolve_capture_target(hwnd)
         target_hwnd = target_info.target_hwnd
@@ -111,9 +258,14 @@ class PrintWindowCapture:
             self._capture_lock.acquire()
             capture_lock_acquired = True
 
-            # 检查窗口有效性
-            if not win32gui.IsWindow(target_hwnd):
+            if not win32gui.IsWindow(target_hwnd) or not win32gui.IsWindow(capture_hwnd):
+                _set_last_failure_reason("无效的窗口句柄")
                 logger.error(f"无效的窗口句柄: {target_hwnd}")
+                return None
+
+            if win32gui.IsIconic(capture_hwnd) or win32gui.IsIconic(target_hwnd):
+                _set_last_failure_reason("窗口已最小化，PrintWindow 无法抓取最小化窗口")
+                logger.error(f"窗口已最小化: target={target_hwnd}, capture={capture_hwnd}")
                 return None
 
             rect = win32gui.GetWindowRect(capture_hwnd)
@@ -125,6 +277,7 @@ class PrintWindowCapture:
             height = int(window_rect[3] - window_rect[1])
 
             if width <= 0 or height <= 0:
+                _set_last_failure_reason(f"无效的窗口尺寸: {width}x{height}")
                 logger.error(f"无效的窗口尺寸: {width}x{height}")
                 return None
 
@@ -133,35 +286,44 @@ class PrintWindowCapture:
             capture_width = width
             capture_height = height
 
-            # 创建设备上下文
             dc_window = win32gui.GetWindowDC(capture_hwnd)
             dc_mem = win32ui.CreateDCFromHandle(dc_window)
             dc_compatible = dc_mem.CreateCompatibleDC()
 
-            # 创建位图
             bitmap = win32ui.CreateBitmap()
             bitmap.CreateCompatibleBitmap(dc_mem, capture_width, capture_height)
-            dc_compatible.SelectObject(bitmap)
+            old_bitmap = dc_compatible.SelectObject(bitmap)
+            mem_hdc = dc_compatible.GetSafeHdc()
 
-            # 使用 PrintWindow 捕获 (通过 ctypes 调用)
-            # PW_CLIENTONLY = 0x1, PW_RENDERFULLCONTENT = 0x2
-            flags = 0x00000002  # PW_RENDERFULLCONTENT
+            try:
+                _gdi32().PatBlt(int(mem_hdc), 0, 0, capture_width, capture_height, BLACKNESS)
+            except Exception:
+                logger.debug("PrintWindow 清空位图失败，继续抓图", exc_info=True)
 
-            # ctypes 调用 PrintWindow
-            user32 = ctypes.windll.user32
-            result = user32.PrintWindow(capture_hwnd, dc_compatible.GetSafeHdc(), flags)
-
-            if result == 0:
+            if not print_window_with_op_retry(capture_hwnd, mem_hdc):
+                _set_last_failure_reason(
+                    f"PrintWindow 调用失败: hwnd={capture_hwnd}（已重试 UpdateWindow 与 flags=0，未回退 BitBlt）"
+                )
                 logger.error(f"PrintWindow 调用失败: hwnd={capture_hwnd}")
                 return None
 
-            # 转换为 numpy 数组
-            bmp_bits = bitmap.GetBitmapBits(True)
+            if old_bitmap is not None:
+                try:
+                    dc_compatible.SelectObject(old_bitmap)
+                except Exception:
+                    logger.debug("PrintWindow 还原位图失败", exc_info=True)
 
-            img = np.frombuffer(bmp_bits, dtype=np.uint8)
-            img.shape = (capture_height, capture_width, 4)
+            img = read_printwindow_bitmap_bgra(
+                hdc=int(mem_hdc),
+                hbitmap=int(bitmap.GetHandle()),
+                width=capture_width,
+                height=capture_height,
+            )
+            if img is None:
+                _set_last_failure_reason("无法读取 PrintWindow 位图像素")
+                logger.error(f"PrintWindow 读位图失败: hwnd={capture_hwnd}")
+                return None
 
-            # BGRA -> BGR
             img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
             img_bgr = crop_frame_by_hwnd(
@@ -173,29 +335,29 @@ class PrintWindowCapture:
                 capture_dwm_rect=dwm_rect,
             )
             if img_bgr is None:
+                _set_last_failure_reason(
+                    f"PrintWindow 句柄裁剪失败: target={target_hwnd}, capture={capture_hwnd}, client={client_area_only}"
+                )
                 logger.error(
                     f"PrintWindow 句柄裁剪失败: target={target_hwnd}, capture={capture_hwnd}, client={client_area_only}"
                 )
                 return None
 
-            height, width = img_bgr.shape[:2]
-
-
-
             if self.auto_fix_black_borders:
-                img_bgr = self._auto_fix_black_borders(img_bgr, (width, height))
+                img_bgr = self._auto_fix_black_borders(img_bgr)
 
-            # 更新统计
             elapsed_ms = (time.time() - start_time) * 1000
             with self.lock:
                 self.stats.total_captures += 1
                 self.stats.success_captures += 1
                 self.stats.total_time_ms += elapsed_ms
 
+            _set_last_failure_reason("")
             logger.debug(f"PrintWindow 截图成功: {img_bgr.shape}, {elapsed_ms:.1f}ms")
             return img_bgr
 
         except Exception as e:
+            _set_last_failure_reason(f"{type(e).__name__}: {e}")
             logger.error(f"PrintWindow 截图失败: {e}")
             with self.lock:
                 self.stats.total_captures += 1
@@ -203,7 +365,12 @@ class PrintWindowCapture:
             return None
 
         finally:
-            # 清理资源
+            try:
+                if dc_compatible is not None and old_bitmap is not None:
+                    dc_compatible.SelectObject(old_bitmap)
+            except Exception:
+                pass
+
             try:
                 if bitmap:
                     win32gui.DeleteObject(bitmap.GetHandle())

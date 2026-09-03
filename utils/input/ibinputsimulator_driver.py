@@ -22,7 +22,8 @@ from typing import Any, List, Optional, Sequence, Tuple
 from utils.app_paths import get_app_root
 from utils.input_simulation.mode_utils import normalize_ib_driver_name
 from utils.input.input_timing import DEFAULT_CLICK_HOLD_SECONDS, DEFAULT_KEY_HOLD_SECONDS
-from utils.input.logitech_runtime import detect_logitech_runtime
+from utils.input.logitech_mouse_move import plan_logitech_absolute_move
+from utils.input.logitech_runtime import detect_logitech_runtime, lgs_pointer_acceleration_enabled
 from utils.precise_sleep import precise_sleep as _shared_precise_sleep
 
 
@@ -222,6 +223,13 @@ class IbInputSimulatorDriver:
                     f"product={runtime_result.detected_name} {runtime_result.detected_version}, "
                     f"source={runtime_result.source}"
                 )
+                if lgs_pointer_acceleration_enabled() is True:
+                    # DLL 会对每个相对位移做加速补偿，光标校准容差 1px 很难收敛，
+                    # 表现为鼠标抖动、TargetVerifyFailed 反复重试甚至重建 worker。
+                    logger.warning(
+                        "[IbInputSimulator][Logitech] LGS 已开启指针加速(pointer.hasAcceleration=true)，"
+                        "罗技相对位移会被驱动二次变形，点击落点可能不稳。请在 LGS 里关闭“指针加速”。"
+                    )
             else:
                 self._runtime_driver_name = self._driver_name
             if self._ready and self._is_alive():
@@ -1272,13 +1280,100 @@ class IbInputSimulatorDriver:
         class INPUT(ctypes.Structure):
             _fields_ = [("type", wintypes.DWORD), ("union", INPUT_UNION)]
 
-        flags = 0 if key_down else 0x0002
-        input_item = INPUT(type=1, union=INPUT_UNION(ki=KEYBDINPUT(vk_code, 0, flags, 0, None)))
+        # 修饰键走扫描码注入，避免仅填 VK 时目标程序读不到 Shift/Ctrl 状态。
+        KEYEVENTF_EXTENDEDKEY = 0x0001
+        KEYEVENTF_KEYUP = 0x0002
+        KEYEVENTF_SCANCODE = 0x0008
+        MAPVK_VK_TO_VSC_EX = 4
+        scan_raw = int(ctypes.windll.user32.MapVirtualKeyW(int(vk_code), MAPVK_VK_TO_VSC_EX) or 0)
+        if not scan_raw:
+            scan_raw = int(ctypes.windll.user32.MapVirtualKeyW(int(vk_code), 0) or 0)
+
+        lower_key = str(key or "").strip().lower()
+        extended = lower_key in {"rctrl", "ralt", "lwin", "rwin", "win"} or scan_raw > 0xFF
+        scan_code = scan_raw & 0xFF
+        if scan_code:
+            flags = KEYEVENTF_SCANCODE
+            wvk = 0
+            wscan = scan_code
+        else:
+            flags = 0
+            wvk = int(vk_code)
+            wscan = 0
+        if extended:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        if not key_down:
+            flags |= KEYEVENTF_KEYUP
+
+        input_item = INPUT(type=1, union=INPUT_UNION(ki=KEYBDINPUT(wvk, wscan, flags, 0, None)))
         sent = ctypes.windll.user32.SendInput(1, ctypes.byref(input_item), ctypes.sizeof(INPUT))
         return int(sent or 0) == 1
 
     def _should_use_sendinput_modifier_support(self) -> bool:
-        return str(self._driver_name or "").strip().lower() == "logitech"
+        return self._uses_logitech_mouse()
+
+    def _uses_logitech_mouse(self) -> bool:
+        names = {
+            str(self._driver_name or "").strip().lower(),
+            str(getattr(self, "_runtime_driver_name", "") or "").strip().lower(),
+        }
+        return bool(names & {"logitech", "logitechghubnew"})
+
+    def _read_system_cursor_pos(self) -> Tuple[int, int]:
+        point = wintypes.POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+            return int(point.x), int(point.y)
+        return 0, 0
+
+    def _request_logitech_absolute_pixels(
+        self,
+        x: int,
+        y: int,
+        *,
+        recover: bool,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """罗技只发相对位移。像素绝对包会被 DLL 塌到屏幕原点。"""
+        target_x = int(x)
+        target_y = int(y)
+        try:
+            ctypes.windll.user32.SetCursorPos(target_x, target_y)
+            _shared_precise_sleep(0.002)
+        except Exception:
+            pass
+        last_error: Optional[Exception] = None
+        for _ in range(4):
+            current_x, current_y = self._read_system_cursor_pos()
+            kind, delta_x, delta_y = plan_logitech_absolute_move(
+                target_x,
+                target_y,
+                current_x,
+                current_y,
+            )
+            if kind == "noop":
+                return True
+            try:
+                if recover:
+                    if not self._request_with_mouse_alignment_recovery(
+                        "move_mouse",
+                        delta_x,
+                        delta_y,
+                        False,
+                        timeout=timeout,
+                    ):
+                        return False
+                else:
+                    self._request("move_mouse", delta_x, delta_y, False, timeout=timeout)
+            except Exception as exc:
+                last_error = exc
+                continue
+        current_x, current_y = self._read_system_cursor_pos()
+        kind, _, _ = plan_logitech_absolute_move(target_x, target_y, current_x, current_y)
+        if kind == "noop":
+            return True
+        if last_error is not None and not recover:
+            raise last_error
+        return False
 
     def _sendinput_set_key_state(self, key: Any, key_down: bool) -> bool:
         if not self._should_use_sendinput_modifier_support():
@@ -1387,7 +1482,10 @@ class IbInputSimulatorDriver:
 
     def move_mouse(self, x: int, y: int, absolute: bool = True) -> bool:
         with self._mouse_lock:
-            self._request("move_mouse", int(x), int(y), bool(absolute))
+            if bool(absolute) and self._uses_logitech_mouse():
+                self._request_logitech_absolute_pixels(int(x), int(y), recover=False)
+            else:
+                self._request("move_mouse", int(x), int(y), bool(absolute))
         return True
 
     def click_mouse(self, x=None, y=None, button='left', clicks=1, interval=0.0, duration=0.0, **_kwargs) -> bool:
@@ -1418,13 +1516,7 @@ class IbInputSimulatorDriver:
                 for i in range(safe_clicks):
                     if i > 0 and safe_interval > 0:
                         _shared_precise_sleep(safe_interval)
-                    if not self._request_with_mouse_alignment_recovery(
-                        "move_mouse",
-                        target_x,
-                        target_y,
-                        True,
-                        timeout=self._mouse_request_timeout,
-                    ):
+                    if not self._move_mouse_for_click(target_x, target_y):
                         return False
                     if not self._dispatch_mouse_button_event("mouse_down", normalized_button, target_x, target_y):
                         return False
@@ -1437,6 +1529,22 @@ class IbInputSimulatorDriver:
 
         return True
 
+    def _move_mouse_for_click(self, target_x: int, target_y: int) -> bool:
+        if self._uses_logitech_mouse():
+            return self._request_logitech_absolute_pixels(
+                int(target_x),
+                int(target_y),
+                recover=True,
+                timeout=self._mouse_request_timeout,
+            )
+        return self._request_with_mouse_alignment_recovery(
+            "move_mouse",
+            int(target_x),
+            int(target_y),
+            True,
+            timeout=self._mouse_request_timeout,
+        )
+
     def mouse_down(self, x=None, y=None, button='left') -> bool:
         if x is None or y is None:
             return False
@@ -1444,13 +1552,7 @@ class IbInputSimulatorDriver:
         target_y = int(y)
         normalized_button = self._normalize_button(button)
         with self._mouse_lock:
-            if not self._request_with_mouse_alignment_recovery(
-                "move_mouse",
-                target_x,
-                target_y,
-                True,
-                timeout=self._mouse_request_timeout,
-            ):
+            if not self._move_mouse_for_click(target_x, target_y):
                 return False
             if not self._dispatch_mouse_button_event("mouse_down", normalized_button, target_x, target_y):
                 return False
@@ -1464,13 +1566,7 @@ class IbInputSimulatorDriver:
         target_y = int(y)
         normalized_button = self._normalize_button(button)
         with self._mouse_lock:
-            if not self._request_with_mouse_alignment_recovery(
-                "move_mouse",
-                target_x,
-                target_y,
-                True,
-                timeout=self._mouse_request_timeout,
-            ):
+            if not self._move_mouse_for_click(target_x, target_y):
                 return False
             if not self._dispatch_mouse_button_event("mouse_up", normalized_button, target_x, target_y):
                 return False
@@ -1478,16 +1574,21 @@ class IbInputSimulatorDriver:
         return True
 
     def drag_mouse(self, start_x, start_y, end_x, end_y, button='left', duration=1.0) -> bool:
+        normalized_button = self._normalize_button(button)
         with self._mouse_lock:
+            # 拖拽期间按钮一直按着；请求超时/进程死掉时 release_all_inputs 必须知道要补弹起。
+            self._pressed_mouse_buttons.add(normalized_button)
             self._request(
                 "drag_mouse",
                 int(start_x),
                 int(start_y),
                 int(end_x),
                 int(end_y),
-                self._normalize_button(button),
+                normalized_button,
                 max(0.0, float(duration)),
+                timeout=self._drag_request_timeout(duration),
             )
+            self._pressed_mouse_buttons.discard(normalized_button)
         return True
 
     def drag_path(self, points, duration=1.0, button='left', timestamps=None) -> bool:
@@ -1496,15 +1597,33 @@ class IbInputSimulatorDriver:
         points_text = self._serialize_points(points)
         if not points_text:
             raise ValueError("drag_path 参数无效")
+        normalized_button = self._normalize_button(button)
+        total_duration = float(duration or 0.0)
+        if timestamps:
+            try:
+                total_duration = max(total_duration, float(timestamps[-1]))
+            except Exception:
+                pass
         with self._mouse_lock:
+            self._pressed_mouse_buttons.add(normalized_button)
             self._request(
                 "drag_path",
                 points_text,
                 max(0.0, float(duration)),
-                self._normalize_button(button),
+                normalized_button,
                 self._serialize_timestamps(timestamps),
+                timeout=self._drag_request_timeout(total_duration),
             )
+            self._pressed_mouse_buttons.discard(normalized_button)
         return True
+
+    def _drag_request_timeout(self, duration: Any) -> float:
+        """拖拽是长操作，超时要覆盖整段时长，否则慢拖拽会在中途被判超时并留下按下状态。"""
+        try:
+            seconds = max(0.0, float(duration or 0.0))
+        except Exception:
+            seconds = 0.0
+        return max(float(self._mouse_request_timeout), seconds + 5.0)
 
     def scroll_mouse(self, direction, clicks=1, x=None, y=None) -> bool:
         normalized = "up" if str(direction or "").strip().lower() == "up" else "down"

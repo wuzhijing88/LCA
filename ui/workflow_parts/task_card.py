@@ -1538,8 +1538,8 @@ class TaskCard(QGraphicsObject):
         self.update()
         return True
 
-    def open_parameter_dialog(self):
-        """请求打开当前卡片的参数面板。"""
+    def open_parameter_panel(self):
+        """请求主窗口为当前卡片显示参数面板。"""
         if self._is_workflow_running():
             return False
 

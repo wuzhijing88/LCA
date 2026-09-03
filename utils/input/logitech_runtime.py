@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import re
 from ctypes import wintypes
@@ -41,6 +42,25 @@ _GHUB_BUS_INTERFACE_GUIDS = (
     "{1abc05c0-c378-41b9-9cef-df1aba82b015}",
     "{dfbedcdb-2148-416d-9e4d-cecc2424128c}",
 )
+
+
+def lgs_pointer_acceleration_enabled() -> Optional[bool]:
+    """读 LGS settings.json 里的 pointer.hasAcceleration。
+
+    IbInputSimulator 的 Logitech send type 会按这个开关对每个相对位移做
+    compensate_lgs_acceleration 二次变形，1px 级校准在开关打开时很难收敛。
+    找不到文件或字段时返回 None。
+    """
+    try:
+        path = os.path.expandvars(r"%LOCALAPPDATA%\Logitech\Logitech Gaming Software\settings.json")
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    pointer = data.get("pointer") if isinstance(data, dict) else None
+    if not isinstance(pointer, dict) or "hasAcceleration" not in pointer:
+        return None
+    return bool(pointer.get("hasAcceleration"))
 
 
 @dataclass(frozen=True)

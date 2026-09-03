@@ -7,18 +7,21 @@ from typing import Iterable
 
 NATIVE_SCREENSHOT_ENGINES = ("wgc", "printwindow", "gdi", "dxgi")
 
-PLUGIN_SCREENSHOT_ENGINES = (
+PLUGIN_SCREENSHOT_BASIC_ENGINES = (
     "normal",
     "plugin.gdi",
     "gdi2",
     "dx",
     "dx2",
     "dx3",
+)
+PLUGIN_SCREENSHOT_EX_ENGINES = (
     "dx.d3d9",
     "dx.d3d10",
     "dx.d3d11",
     "opengl",
 )
+PLUGIN_SCREENSHOT_ENGINES = PLUGIN_SCREENSHOT_BASIC_ENGINES + PLUGIN_SCREENSHOT_EX_ENGINES
 
 PLUGIN_SCREENSHOT_ENGINE_ALIASES = (
     "opengl.std",
@@ -53,7 +56,7 @@ _SCREENSHOT_ENGINE_LABELS = {
     "printwindow": "PrintWindow",
     "gdi": "GDI",
     "dxgi": "DXGI",
-    "normal": "正常",
+    "normal": "通用",
     "plugin.gdi": "GDI",
     "gdi2": "GDI2",
     "dx": "DX",
@@ -68,11 +71,15 @@ _SCREENSHOT_ENGINE_LABELS = {
     "opengl.es": "OpenGL",
 }
 
-_LEGACY_ENGINE_MIGRATION = {
-    "normal.wgc": "gdi2",
-    "normal.dxgi": "gdi2",
-    "dx.d3d12": "dx.d3d11",
-    "opengl.fi": "opengl",
+_DM_DISPLAY_MAP = {
+    "plugin.gdi": "gdi",
+    "opengl": "dx.graphic.opengl",
+    "opengl.std": "dx.graphic.opengl",
+    "opengl.nox": "dx.graphic.opengl",
+    "opengl.es": "dx.graphic.opengl.esv2",
+    "dx.d3d9": "dx.graphic.3d.8",
+    "dx.d3d10": "dx.graphic.3d.10plus",
+    "dx.d3d11": "dx.graphic.3d.10plus",
 }
 
 SCREENSHOT_ENGINE_UI_GROUPS = (
@@ -98,16 +105,20 @@ def canonicalize_screenshot_engine(engine: object) -> str:
     return mode
 
 
-def migrate_screenshot_engine(engine: object) -> str:
-    mode = normalize_screenshot_engine(engine)
-    return _LEGACY_ENGINE_MIGRATION.get(mode, mode)
-
-
 def to_dm_display_mode(engine: object) -> str:
+    raw = normalize_screenshot_engine(engine)
+    mapped = _DM_DISPLAY_MAP.get(raw)
+    if mapped:
+        return mapped
     mode = canonicalize_screenshot_engine(engine)
-    if mode == "plugin.gdi":
-        return "gdi"
-    return mode
+    return _DM_DISPLAY_MAP.get(mode, mode)
+
+
+def iter_plugin_screenshot_ui_groups() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return (
+        ("基础绑定", PLUGIN_SCREENSHOT_BASIC_ENGINES),
+        ("高级绑定", PLUGIN_SCREENSHOT_EX_ENGINES),
+    )
 
 
 def is_supported_screenshot_engine(engine: object) -> bool:
@@ -129,6 +140,13 @@ def is_background_screenshot_engine(engine: object) -> bool:
 def screenshot_engine_label(engine: object) -> str:
     normalized = normalize_screenshot_engine(engine)
     return _SCREENSHOT_ENGINE_LABELS.get(normalized, normalized or "未知引擎")
+
+
+def screenshot_engine_log_label(engine: object) -> str:
+    label = screenshot_engine_label(engine)
+    if is_plugin_screenshot_engine(engine):
+        return f"大漠({label})"
+    return label
 
 
 def iter_supported_screenshot_engines() -> Iterable[str]:

@@ -158,8 +158,11 @@ class RoundedPopupFrame(QFrame):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # 整窗透明后再画圆角，避免直角黑/白底露出来（不靠 setMask）
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         path = QPainterPath()
         path.addRoundedRect(0.5, 0.5, self.width() - 1, self.height() - 1, self._radius, self._radius)
         painter.fillPath(path, QBrush(self._bg_color))
@@ -305,29 +308,37 @@ class CustomDropdown(QWidget):
         text = _get_theme_color("text", "#333333")
         border = _get_theme_color("border", "#d0d0d0")
         hover = _get_theme_color("hover", "#e8e8e8")
+        selected = _get_theme_color("selected", "#0078d4")
+        accent_text = _get_theme_color("accent_text", "#ffffff")
+        self.popup_frame.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.popup_frame.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.popup_frame.setAutoFillBackground(False)
         self.popup_frame.setBackgroundColor(card)
         self.popup_frame.setBorderColor(border)
         self.list_widget.setStyleSheet(
             f"""
             QListWidget#customDropdownList,
             QListWidget#customDropdownList::viewport {{
-                background-color: {card};
+                background-color: transparent;
                 color: {text};
                 border: none;
                 outline: none;
             }}
             QListWidget#customDropdownList::item {{
-                background-color: {card};
+                background-color: transparent;
                 color: {text};
                 padding: 0px;
                 min-height: 18px;
                 margin: 0px;
             }}
-            QListWidget#customDropdownList::item:hover,
-            QListWidget#customDropdownList::item:selected,
-            QListWidget#customDropdownList::item:selected:hover {{
+            QListWidget#customDropdownList::item:hover {{
                 background-color: {hover};
                 color: {text};
+            }}
+            QListWidget#customDropdownList::item:selected,
+            QListWidget#customDropdownList::item:selected:hover {{
+                background-color: {selected};
+                color: {accent_text};
             }}
             """
         )
@@ -446,6 +457,8 @@ class CustomDropdown(QWidget):
         try:
             if not item:
                 return
+            if not (item.flags() & Qt.ItemFlag.ItemIsEnabled):
+                return
             old_text = self._current_text
             old_index = self._current_index
             row = self.list_widget.row(item)
@@ -501,7 +514,7 @@ class CustomDropdown(QWidget):
         finally:
             self._syncing_item_widths = False
 
-    def addItem(self, text: str, data=None):
+    def addItem(self, text: str, data=None, *, enabled: bool = True):
         self._items.append(text)
         item = QListWidgetItem(text)
         item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -510,16 +523,35 @@ class CustomDropdown(QWidget):
         item_height = max(self._item_height, font_metrics.height() + 12)
         item.setSizeHint(QSize(text_width + 30, item_height))
         self._item_height = max(self._item_height, item_height)
+        if not enabled:
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            muted = QColor(_get_theme_color("text_secondary", "#888888"))
+            item.setForeground(QBrush(muted))
         self.list_widget.addItem(item)
 
+        index = len(self._items) - 1
         if data is not None:
-            self._item_data[len(self._items) - 1] = data
+            self._item_data[index] = data
 
-        if len(self._items) == 1:
-            self._current_index = 0
+        if self._current_index < 0 and enabled:
+            self._current_index = index
             self._current_text = text
             self._sync_display_text(text)
 
+        self._sync_item_widths()
+
+    def addSeparator(self):
+        """添加不可选分隔线，兼容分组下拉。"""
+        text = "────────"
+        self._items.append(text)
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+        muted = QColor(_get_theme_color("border", "#cccccc"))
+        item.setForeground(QBrush(muted))
+        font_metrics = QFontMetrics(self.list_widget.font())
+        item.setSizeHint(QSize(font_metrics.horizontalAdvance(text) + 30, max(18, font_metrics.height())))
+        self.list_widget.addItem(item)
         self._sync_item_widths()
 
     def addItems(self, texts: list):
@@ -564,6 +596,9 @@ class CustomDropdown(QWidget):
             self._current_index = -1
             self._current_text = text
             self._sync_display_text(text)
+        # 与 QComboBox 一致：blockSignals(True) 时不向外发信号
+        if self.signalsBlocked():
+            return
         if old_index != self._current_index:
             self.currentIndexChanged.emit(self._current_index)
         if old_text != self._current_text:
@@ -576,6 +611,8 @@ class CustomDropdown(QWidget):
             self._current_index = index
             self._current_text = self._items[index]
             self._sync_display_text(self._current_text)
+            if self.signalsBlocked():
+                return
             if old_index != self._current_index:
                 self.currentIndexChanged.emit(index)
             if old_text != self._current_text:
@@ -590,6 +627,11 @@ class CustomDropdown(QWidget):
 
     def itemData(self, index: int):
         return self._item_data.get(index, None)
+
+    def setItemToolTip(self, index: int, tooltip: str):
+        item = self.list_widget.item(index) if 0 <= index < len(self._items) else None
+        if item is not None:
+            item.setToolTip(str(tooltip or ""))
 
     def setItemText(self, index: int, text: str):
         if 0 <= index < len(self._items):
@@ -632,6 +674,33 @@ class CustomDropdown(QWidget):
         if self._line_edit is not None:
             self._line_edit.setToolTip(tooltip)
 
+    def _capped_layout_width(self):
+        max_width = int(self.maximumWidth())
+        if max_width >= 16777215:
+            return None
+        min_width = int(self.minimumWidth())
+        if min_width > 0:
+            return min(min_width, max_width)
+        return min(200, max_width)
+
+    def sizeHint(self) -> QSize:
+        if self._line_edit is not None:
+            hint = self._line_edit.sizeHint()
+        else:
+            hint = self.display_button.sizeHint()
+        capped = self._capped_layout_width()
+        width = capped if capped is not None else hint.width()
+        return QSize(width, hint.height())
+
+    def minimumSizeHint(self) -> QSize:
+        if self._line_edit is not None:
+            hint = self._line_edit.minimumSizeHint()
+        else:
+            hint = self.display_button.minimumSizeHint()
+        capped = self._capped_layout_width()
+        width = capped if capped is not None else hint.width()
+        return QSize(width, hint.height())
+
     def setMinimumWidth(self, width: int):
         super().setMinimumWidth(width)
         if self._line_edit is None:
@@ -646,6 +715,23 @@ class CustomDropdown(QWidget):
         super().setFixedWidth(width)
         if self._line_edit is None:
             self.display_button.setFixedWidth(width)
+
+    def setFixedHeight(self, height: int):
+        super().setFixedHeight(height)
+        if self._line_edit is None:
+            self.display_button.setFixedHeight(height)
+        elif self._line_edit is not None:
+            self._line_edit.setFixedHeight(height)
+
+    def setFixedSize(self, width, height=None):
+        if height is None and hasattr(width, "width") and hasattr(width, "height"):
+            size = width
+            width, height = size.width(), size.height()
+        super().setFixedSize(int(width), int(height))
+        if self._line_edit is None:
+            self.display_button.setFixedSize(int(width), int(height))
+        else:
+            self._line_edit.setFixedHeight(int(height))
 
     def setEnabled(self, enabled: bool):
         super().setEnabled(enabled)

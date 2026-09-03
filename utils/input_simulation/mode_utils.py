@@ -1,16 +1,8 @@
 """Helpers for normalizing execution modes in native input paths."""
 
-import os
 import re
 from collections.abc import Mapping
 from typing import Optional, Tuple
-
-from utils.app_paths import get_config_path
-
-
-_CONFIG_CACHE_PATH: Optional[str] = None
-_CONFIG_CACHE_MTIME: Optional[float] = None
-_CONFIG_CACHE_DATA: dict = {}
 
 SUPPORTED_IB_DRIVERS = {
     "Logitech",
@@ -59,9 +51,6 @@ def _normalize_backend_token(value: object) -> str:
 
 def require_foreground_backend(value: object) -> str:
     backend = _normalize_backend_token(value)
-    # 旧配置可能把 normal.hd 写在驱动字段里；驱动下拉已移除，回落到默认驱动。
-    if backend == "normal.hd":
-        return _DEFAULT_FOREGROUND_BACKEND
     if backend not in SUPPORTED_FOREGROUND_BACKENDS:
         raise ValueError(f"不支持的前台驱动: {value!r}")
     return backend
@@ -96,57 +85,15 @@ def parse_foreground_py_backend(config: Optional[Mapping] = None) -> str:
     values = dict(config or {})
     raw = values.get("foreground_py_backend")
     if raw is None or str(raw).strip() == "":
-        # 兼容：曾把 normal.hd 配在前台一驱动字段
-        mouse = str(values.get("foreground_mouse_driver_backend") or "").strip().lower()
-        keyboard = str(values.get("foreground_keyboard_driver_backend") or "").strip().lower()
-        if mouse in {"normal.hd", "normal_hd"} or keyboard in {"normal.hd", "normal_hd"}:
-            return "normal.hd"
         return _DEFAULT_FOREGROUND_PY_BACKEND
     return require_foreground_py_backend(raw)
 
 
-def migrate_legacy_normal_hd_config(config: Optional[Mapping] = None) -> dict:
-    """把误放在前台一驱动里的 normal.hd 迁到前台二输入方式。"""
-    result = dict(config or {})
-    mouse = _normalize_backend_token(result.get("foreground_mouse_driver_backend"))
-    keyboard = _normalize_backend_token(result.get("foreground_keyboard_driver_backend"))
-    had_hd = mouse == "normal.hd" or keyboard == "normal.hd"
-    if had_hd:
-        if not str(result.get("foreground_py_backend") or "").strip():
-            result["foreground_py_backend"] = "normal.hd"
-        if mouse == "normal.hd":
-            result["foreground_mouse_driver_backend"] = _DEFAULT_FOREGROUND_BACKEND
-        if keyboard == "normal.hd":
-            result["foreground_keyboard_driver_backend"] = _DEFAULT_FOREGROUND_BACKEND
-        if str(result.get("execution_mode") or "").strip().lower() == "foreground_driver":
-            result["execution_mode"] = "foreground_py"
-    result.setdefault("foreground_py_backend", _DEFAULT_FOREGROUND_PY_BACKEND)
-    return result
-
-
 def _read_main_config() -> dict:
-    global _CONFIG_CACHE_PATH, _CONFIG_CACHE_MTIME, _CONFIG_CACHE_DATA
-    from app_core.config_store import load_config
+    """Always read through the process-wide provider; config_store caches by file signature."""
+    from utils.runtime_config import get_runtime_config
 
-    config_path = get_config_path()
-    try:
-        mtime = os.path.getmtime(config_path)
-    except OSError:
-        mtime = None
-
-    if (
-        _CONFIG_CACHE_PATH == config_path
-        and _CONFIG_CACHE_MTIME == mtime
-        and isinstance(_CONFIG_CACHE_DATA, dict)
-        and _CONFIG_CACHE_DATA
-    ):
-        return _CONFIG_CACHE_DATA
-
-    data = load_config()
-    _CONFIG_CACHE_PATH = config_path
-    _CONFIG_CACHE_MTIME = mtime
-    _CONFIG_CACHE_DATA = data
-    return data
+    return get_runtime_config()
 
 
 def normalize_execution_mode(execution_mode: Optional[str]) -> str:
@@ -168,18 +115,22 @@ def is_background_mode(execution_mode: Optional[str]) -> bool:
     return normalize_execution_mode(execution_mode) == "background"
 
 
-def is_dx_input_mode(execution_mode: Optional[str]) -> bool:
-    return str(execution_mode or "").strip().lower() in {"background_dx", "background_op_dx"}
-
-
 def is_plugin_input_backend(config: Optional[Mapping] = None) -> bool:
     values = dict(config or {})
-    backend = str(values.get("input_backend") or "").strip().lower()
-    if backend == "plugin":
-        return True
-    if backend == "native":
-        return False
-    return is_dx_input_mode(values.get("execution_mode"))
+    return str(values.get("input_backend") or "").strip().lower() == "plugin"
+
+
+# 大漠绑定后按窗口客户区坐标后台收发消息，前台驱动/激活/屏幕坐标换算都不适用
+PLUGIN_EXECUTION_MODE = "background_sendmessage"
+
+
+def resolve_execution_mode(config: Optional[Mapping] = None) -> str:
+    """配置里的执行模式经插件后端归一：键鼠走插件时任何前台模式都按后台执行。"""
+    values = dict(config or {})
+    mode = str(values.get("execution_mode") or "").strip()
+    if is_plugin_input_backend(values) and is_foreground_mode(mode):
+        return PLUGIN_EXECUTION_MODE
+    return mode
 
 
 def get_ibinputsimulator_config() -> Tuple[str, str, str, str]:

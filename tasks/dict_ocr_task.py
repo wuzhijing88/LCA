@@ -428,25 +428,6 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
     }
 
 
-def open_dict_maker(params: Dict[str, Any], **kwargs) -> bool:
-    from ui.dialogs.dict_maker_dialog import DictMakerDialog, apply_dict_maker_result_to_panel
-
-    parent = kwargs.get("parameter_panel") or kwargs.get("main_window")
-    dialog = DictMakerDialog(
-        parent,
-        target_hwnd=kwargs.get("target_hwnd"),
-        params=params or {},
-    )
-    if dialog.exec():
-        apply_dict_maker_result_to_panel(
-            kwargs.get("parameter_panel"),
-            dialog.saved_dict_path,
-            dialog.saved_color_format,
-        )
-        return True
-    return True
-
-
 def test_dict_ocr_output(params: Dict[str, Any], **kwargs) -> bool:
     import subprocess
     import tempfile

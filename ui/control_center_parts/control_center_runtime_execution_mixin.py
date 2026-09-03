@@ -8,6 +8,7 @@ from app_core.runtime.execution_coordinator import (
 )
 from task_workflow.thread_start import THREAD_START_TASK_TYPE
 
+from .control_center_policy import resolve_control_center_screenshot_engine
 from .control_center_runtime_types import TaskState
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ class WindowTaskRunnerExecutionMixin:
                 cards_data=cards_dict,
                 connections_data=connections_list,
                 execution_mode=execution_mode,
-                screenshot_engine=self._runtime_config.get("screenshot_engine"),
+                screenshot_engine=resolve_control_center_screenshot_engine(self),
                 images_dir=images_dir,
                 workflow_id=workflow_id,
                 workflow_filepath=self.workflow_file_path,
@@ -164,6 +165,8 @@ class WindowTaskRunnerExecutionMixin:
                 target_hwnd=window_hwnd,
                 thread_labels=thread_labels,
                 bound_windows=self.bound_windows,
+                custom_width=(self._runtime_config or {}).get("custom_width"),
+                custom_height=(self._runtime_config or {}).get("custom_height"),
                 parent=None,
             )
 
@@ -196,6 +199,16 @@ class WindowTaskRunnerExecutionMixin:
                 self._on_card_finished,
                 Qt.ConnectionType.QueuedConnection
             )
+            if hasattr(self.executor, "error_occurred"):
+                self.executor.error_occurred.connect(
+                    self._on_executor_error,
+                    Qt.ConnectionType.QueuedConnection,
+                )
+            if hasattr(self.executor, "show_warning"):
+                self.executor.show_warning.connect(
+                    self._on_executor_warning,
+                    Qt.ConnectionType.QueuedConnection,
+                )
             self._set_state(TaskState.RUNNING, "工作流启动中")
             logger.info(f"窗口工作流已启动: {window_title} (HWND: {window_hwnd})")
 
@@ -251,6 +264,23 @@ class WindowTaskRunnerExecutionMixin:
             self._emit_step("步骤执行成功")
         else:
             self._emit_step("步骤执行失败")
+
+    def _emit_runtime_alert(self, message: str):
+        text = str(message or "").strip()
+        if not text:
+            return
+        self._emit_step(text)
+        self.runtime_alert.emit(self.window_id, text)
+
+    def _on_executor_error(self, card_id, error_message):
+        from .control_center_dispatch import format_runner_runtime_alert
+
+        self._emit_runtime_alert(format_runner_runtime_alert("error", card_id, error_message))
+
+    def _on_executor_warning(self, title, message):
+        from .control_center_dispatch import format_runner_runtime_alert
+
+        self._emit_runtime_alert(format_runner_runtime_alert("warning", title, message))
 
     def _on_execution_finished(self, success: bool, message: str):
         """工作流执行完成回调"""

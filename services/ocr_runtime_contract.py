@@ -29,10 +29,11 @@ OCR_REQUIRED_REQUIREMENTS: Final[Mapping[str, str]] = MappingProxyType({
     "onnxruntime-directml": "1.23.0",
 })
 
+# DirectML 放在 exe 旁供 DLL 搜索；onnxruntime 本体只留 capi，避免根目录再拷一份。
 OCR_REQUIRED_RUNTIME_DLLS: Final = (
     "DirectML.dll",
-    "onnxruntime.dll",
-    "onnxruntime_providers_shared.dll",
+    "onnxruntime/capi/onnxruntime.dll",
+    "onnxruntime/capi/onnxruntime_providers_shared.dll",
 )
 
 __all__ = [

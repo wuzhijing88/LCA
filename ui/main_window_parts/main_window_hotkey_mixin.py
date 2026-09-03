@@ -2,6 +2,16 @@ import logging
 from PySide6.QtCore import QThread, QTimer
 
 from app_core.config_sections import DEFAULT_HOTKEYS
+from app_core.hotkey_spec import (
+    display_hotkey,
+    first_conflict,
+    is_hotkey_capture_active,
+    is_mouse_hotkey,
+    mouse_hook_button,
+    normalize_hotkey,
+    spec_from_keyboard_event,
+    to_keyboard_lib,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -11,6 +21,7 @@ _HOTKEY_FIELDS = {
     "pause": "pause_workflow_hotkey",
     "record": "record_hotkey",
     "replay": "replay_hotkey",
+    "close_listen": "close_listen_hotkey",
 }
 
 class MainWindowHotkeyMixin:
@@ -37,62 +48,34 @@ class MainWindowHotkeyMixin:
             logger.debug("快捷键更新错误详情", exc_info=True)
 
     def _get_hotkey_value(self, hotkey_type: str) -> str:
-        """获取标准化后的启动、停止、暂停、录制或回放热键值。"""
+        """获取标准化后的热键值。"""
         config_key = _HOTKEY_FIELDS.get(hotkey_type)
         if not config_key:
             return DEFAULT_HOTKEYS["start_task_hotkey"]
 
         default = DEFAULT_HOTKEYS[config_key]
         attr = getattr(self, config_key, None)
+        raw = None
+        if hasattr(attr, "key_value"):
+            raw = attr.key_value()
+        elif hasattr(attr, "currentData"):
+            raw = attr.currentData()
+        elif isinstance(attr, str):
+            raw = attr
+        else:
+            raw = self.config.get(config_key, default)
+        return normalize_hotkey(raw) or default
 
-        if hasattr(attr, "currentData"):
-            value = attr.currentData()
-            return value.upper() if value else default
-        if isinstance(attr, str):
-            return attr.upper()
-        return self.config.get(config_key, default).upper()
+    def is_hotkey_listen_enabled(self) -> bool:
+        return bool(getattr(self, "_hotkey_listen_enabled", True))
 
     def _resolve_hotkey_conflicts(self, action_keys: dict, action_names: dict):
         """过滤重复热键，并返回保留项和冲突说明。"""
-        preferred_order = ["start", "stop", "pause", "record", "replay"]
-        resolved = {}
-        seen = {}
-        conflicts = []
-
-        for action in preferred_order:
-            key = action_keys.get(action)
-            if not key:
-                continue
-
-            normalized = str(key).upper()
-            if normalized in seen:
-                conflicts.append(
-                    f"{normalized}: "
-                    f"{action_names.get(seen[normalized], seen[normalized])} / "
-                    f"{action_names.get(action, action)}"
-                )
-                continue
-
-            seen[normalized] = action
-            resolved[action] = key
-
-        for action, key in action_keys.items():
-            if action in preferred_order or not key:
-                continue
-
-            normalized = str(key).upper()
-            if normalized in seen:
-                conflicts.append(
-                    f"{normalized}: "
-                    f"{action_names.get(seen[normalized], seen[normalized])} / "
-                    f"{action_names.get(action, action)}"
-                )
-                continue
-
-            seen[normalized] = action
-            resolved[action] = key
-
-        return resolved, conflicts
+        return first_conflict(
+            action_keys,
+            action_names,
+            ["close_listen", "start", "stop", "pause", "record", "replay"],
+        )
 
     def _update_hotkeys_original_mode(self):
 
@@ -162,15 +145,17 @@ class MainWindowHotkeyMixin:
 
             # 获取快捷键设置
 
-            start_key = self._get_hotkey_value('start').lower()
+            start_key = self._get_hotkey_value('start')
 
-            stop_key = self._get_hotkey_value('stop').lower()
+            stop_key = self._get_hotkey_value('stop')
 
-            pause_key = self._get_hotkey_value('pause').lower()
+            pause_key = self._get_hotkey_value('pause')
 
-            record_key = self._get_hotkey_value('record').lower()
+            record_key = self._get_hotkey_value('record')
 
-            replay_key = self._get_hotkey_value('replay').lower()
+            replay_key = self._get_hotkey_value('replay')
+
+            close_listen_key = self._get_hotkey_value('close_listen')
 
             action_names = {
 
@@ -183,6 +168,8 @@ class MainWindowHotkeyMixin:
                 'record': '录制',
 
                 'replay': '回放',
+
+                'close_listen': '关闭监听',
 
             }
 
@@ -198,6 +185,8 @@ class MainWindowHotkeyMixin:
 
                 'replay': replay_key,
 
+                'close_listen': close_listen_key,
+
             }
 
             action_keys, conflict_messages = self._resolve_hotkey_conflicts(action_keys, action_names)
@@ -211,6 +200,8 @@ class MainWindowHotkeyMixin:
             record_key = action_keys.get('record')
 
             replay_key = action_keys.get('replay')
+
+            close_listen_key = action_keys.get('close_listen')
 
             failed_hotkeys = []
 
@@ -232,25 +223,15 @@ class MainWindowHotkeyMixin:
 
             # 鼠标侧键处理
 
-            needs_mouse = any(k in ['xbutton1', 'xbutton2'] for k in [start_key, stop_key, pause_key, record_key, replay_key])
+            mouse_keys = {action: key for action, key in action_keys.items() if is_mouse_hotkey(key)}
 
-            if needs_mouse:
-
-                self._setup_mouse_hotkeys(start_key, stop_key, pause_key, record_key, replay_key, failed_hotkeys)
+            self._setup_mouse_hotkeys(mouse_keys, failed_hotkeys)
 
             # 键盘热键处理 - 使用更可靠的方法
 
             keyboard_keys = {
 
-                'start': start_key if start_key not in ['xbutton1', 'xbutton2'] else None,
-
-                'stop': stop_key if stop_key not in ['xbutton1', 'xbutton2'] else None,
-
-                'pause': pause_key if pause_key not in ['xbutton1', 'xbutton2'] else None,
-
-                'record': record_key if record_key not in ['xbutton1', 'xbutton2'] else None,
-
-                'replay': replay_key if replay_key not in ['xbutton1', 'xbutton2'] else None,
+                action: key for action, key in action_keys.items() if key and not is_mouse_hotkey(key)
 
             }
 
@@ -260,9 +241,11 @@ class MainWindowHotkeyMixin:
 
             logger.info(
 
-                f"✓ 快捷键系统已更新 - 启动: {(start_key or '-').upper()}, 停止: {(stop_key or '-').upper()}, "
+                f"✓ 快捷键系统已更新 - 启动: {display_hotkey(start_key)}, 停止: {display_hotkey(stop_key)}, "
 
-                f"暂停: {(pause_key or '-').upper()}, 录制: {(record_key or '-').upper()}, 回放: {(replay_key or '-').upper()}"
+                f"暂停: {display_hotkey(pause_key)}, 录制: {display_hotkey(record_key)}, "
+
+                f"回放: {display_hotkey(replay_key)}, 关闭监听: {display_hotkey(close_listen_key)}"
 
             )
 
@@ -306,40 +289,6 @@ class MainWindowHotkeyMixin:
 
         import keyboard
 
-        # 按键映射 - 统一转换为 keyboard 库使用的格式
-
-        key_name_map = {
-
-            'f1': 'f1', 'f2': 'f2', 'f3': 'f3', 'f4': 'f4',
-
-            'f5': 'f5', 'f6': 'f6', 'f7': 'f7', 'f8': 'f8',
-
-            'f9': 'f9', 'f10': 'f10', 'f11': 'f11', 'f12': 'f12',
-
-            'home': 'home', 'end': 'end',
-
-            'insert': 'insert', 'delete': 'delete',
-
-            'pageup': 'page up', 'pagedown': 'page down',
-
-            'printscreen': 'print screen', 'scrolllock': 'scroll lock', 'pause': 'pause',
-
-            'numlock': 'num lock',
-
-            'num0': 'num 0', 'num1': 'num 1', 'num2': 'num 2', 'num3': 'num 3',
-
-            'num4': 'num 4', 'num5': 'num 5', 'num6': 'num 6', 'num7': 'num 7',
-
-            'num8': 'num 8', 'num9': 'num 9',
-
-            'nummultiply': 'num *', 'numadd': 'num +', 'numsubtract': 'num -',
-
-            'numdivide': 'num /', 'numdecimal': 'num .',
-
-        }
-
-        # 回调映射
-
         callback_map = {
 
             'start': self._on_start_task_hotkey,
@@ -351,6 +300,8 @@ class MainWindowHotkeyMixin:
             'record': self._on_record_hotkey,
 
             'replay': self._on_replay_hotkey,
+
+            'close_listen': self._on_close_listen_hotkey,
 
         }
 
@@ -366,87 +317,21 @@ class MainWindowHotkeyMixin:
 
             'replay': '回放',
 
+            'close_listen': '关闭监听',
+
         }
-
-        def _normalize_keypad_event_name(name: str) -> str:
-
-            """Normalize keypad event names to match our key map."""
-
-            if not name:
-
-                return name
-
-            keypad_nav_map = {
-
-                'end': 'num 1',
-
-                'down': 'num 2',
-
-                'page down': 'num 3',
-
-                'pagedown': 'num 3',
-
-                'left': 'num 4',
-
-                'clear': 'num 5',
-
-                'right': 'num 6',
-
-                'home': 'num 7',
-
-                'up': 'num 8',
-
-                'page up': 'num 9',
-
-                'pageup': 'num 9',
-
-                'insert': 'num 0',
-
-                'delete': 'num .',
-
-            }
-
-            if name in keypad_nav_map:
-
-                return keypad_nav_map[name]
-
-            if len(name) == 1 and name.isdigit():
-
-                return f"num {name}"
-
-            if name in ('+', '-', '*', '/'):
-
-                return f"num {name}"
-
-            if name in ('decimal', '.', 'separator'):
-
-                return "num ."
-
-            return name
-
-        # 创建按键到动作的映射
 
         key_to_action = {}
 
         for action, key in keyboard_keys.items():
 
-            if not key:
+            spec = normalize_hotkey(key)
+
+            if not spec:
 
                 continue
 
-            if key in key_name_map:
-
-                normalized_key = key_name_map[key]
-
-                key_to_action[normalized_key] = action
-
-            else:
-
-                failed_hotkeys.append(f"{action_names.get(action, action)}({key.upper()})")
-
-                logger.warning(f"不支持的快捷键配置: {action} -> {key}")
-
-        # 保存按键状态，用于防止重复触发
+            key_to_action[spec] = action
 
         self._hotkey_pressed_state = {}
 
@@ -456,39 +341,51 @@ class MainWindowHotkeyMixin:
 
             try:
 
-                key_name = event.name.lower() if event.name else ''
+                if is_hotkey_capture_active():
 
-                if getattr(event, 'is_keypad', False):
+                    return
 
-                    key_name = _normalize_keypad_event_name(key_name)
+                if event.event_type == 'up':
 
-                if key_name in key_to_action:
+                    base = normalize_hotkey(getattr(event, 'name', ''))
 
-                    action = key_to_action[key_name]
+                    if base:
 
-                    if event.event_type == 'down':
+                        for spec in list(self._hotkey_pressed_state):
 
-                        # 检查是否已经按下（防止重复触发）
+                            if spec == base or spec.endswith('+' + base):
 
-                        if not self._hotkey_pressed_state.get(key_name, False):
+                                self._hotkey_pressed_state[spec] = False
 
-                            self._hotkey_pressed_state[key_name] = True
+                    return
 
-                            callback = callback_map.get(action)
+                spec = spec_from_keyboard_event(event)
 
-                            if callback:
+                if not spec or spec not in key_to_action:
 
-                                self._queue_hotkey_callback(callback)
+                    return
 
-                    elif event.event_type == 'up':
+                action = key_to_action[spec]
 
-                        self._hotkey_pressed_state[key_name] = False
+                if action != 'close_listen' and not self.is_hotkey_listen_enabled():
+
+                    return
+
+                if self._hotkey_pressed_state.get(spec, False):
+
+                    return
+
+                self._hotkey_pressed_state[spec] = True
+
+                callback = callback_map.get(action)
+
+                if callback:
+
+                    self._queue_hotkey_callback(callback)
 
             except Exception as e:
 
                 logger.debug(f"热键事件处理异常: {e}")
-
-        # 注册低级钩子
 
         try:
 
@@ -496,23 +393,19 @@ class MainWindowHotkeyMixin:
 
             self._keyboard_hooks.append(hook)
 
-            # 记录已注册的热键
-
             for action, key in keyboard_keys.items():
 
-                if key and key in key_name_map:
+                if key:
 
-                    logger.info(f"{action_names.get(action, action)}快捷键已设置: {key.upper()} (低级钩子模式)")
+                    logger.info(f"{action_names.get(action, action)}快捷键已设置: {display_hotkey(key)} (低级钩子模式)")
 
         except Exception as e:
-
-            # 回退到传统方式
 
             logger.warning(f"低级钩子注册失败: {e}，尝试传统方式")
 
             self._setup_keyboard_hotkeys_fallback(keyboard_keys, failed_hotkeys)
 
-    def _setup_mouse_hotkeys(self, start_key, stop_key, pause_key, record_key, replay_key, failed_hotkeys):
+    def _setup_mouse_hotkeys(self, mouse_keys, failed_hotkeys):
 
         """设置鼠标侧键热键"""
 
@@ -536,20 +429,6 @@ class MainWindowHotkeyMixin:
 
             self._mouse_hooks = []
 
-            mouse_keys = {
-
-                'start': start_key if start_key in ['xbutton1', 'xbutton2'] else None,
-
-                'stop': stop_key if stop_key in ['xbutton1', 'xbutton2'] else None,
-
-                'pause': pause_key if pause_key in ['xbutton1', 'xbutton2'] else None,
-
-                'record': record_key if record_key in ['xbutton1', 'xbutton2'] else None,
-
-                'replay': replay_key if replay_key in ['xbutton1', 'xbutton2'] else None,
-
-            }
-
             callback_map = {
 
                 'start': self._on_start_task_hotkey,
@@ -562,13 +441,30 @@ class MainWindowHotkeyMixin:
 
                 'replay': self._on_replay_hotkey,
 
+                'close_listen': self._on_close_listen_hotkey,
+
             }
 
-            action_names = {'start': '启动任务', 'stop': '停止任务', 'pause': '暂停/恢复', 'record': '录制', 'replay': '回放'}
+            action_names = {
+                'start': '启动任务',
+                'stop': '停止任务',
+                'pause': '暂停/恢复',
+                'record': '录制',
+                'replay': '回放',
+                'close_listen': '关闭监听',
+            }
 
-            def make_mouse_callback(callback):
+            def make_mouse_callback(action, callback):
 
                 def _handler(*args, **kwargs):
+
+                    if is_hotkey_capture_active():
+
+                        return
+
+                    if action != 'close_listen' and not self.is_hotkey_listen_enabled():
+
+                        return
 
                     self._queue_hotkey_callback(callback)
 
@@ -582,15 +478,15 @@ class MainWindowHotkeyMixin:
 
                 try:
 
-                    mouse_button = 'x' if key == 'xbutton1' else 'x2'
+                    mouse_button = mouse_hook_button(key)
 
                     callback = callback_map.get(action)
 
-                    if callback:
+                    if callback and mouse_button:
 
                         hook = mouse.on_button(
 
-                            make_mouse_callback(callback),
+                            make_mouse_callback(action, callback),
 
                             buttons=(mouse_button,),
 
@@ -600,11 +496,11 @@ class MainWindowHotkeyMixin:
 
                         self._mouse_hooks.append(hook)
 
-                        logger.info(f"{action_names.get(action, action)}快捷键已设置: {key.upper()} (鼠标侧键)")
+                        logger.info(f"{action_names.get(action, action)}快捷键已设置: {display_hotkey(key)} (鼠标侧键)")
 
                 except Exception as e:
 
-                    failed_hotkeys.append(f"{action_names.get(action, action)}({key.upper()})")
+                    failed_hotkeys.append(f"{action_names.get(action, action)}({display_hotkey(key)})")
 
                     logger.error(f"设置{action_names.get(action, action)}鼠标侧键失败: {e}")
 
@@ -678,13 +574,24 @@ class MainWindowHotkeyMixin:
 
             'replay': self._on_replay_hotkey,
 
+            'close_listen': self._on_close_listen_hotkey,
+
         }
 
-        action_names = {'start': '启动任务', 'stop': '停止任务', 'pause': '暂停/恢复', 'record': '录制', 'replay': '回放'}
+        action_names = {
+            'start': '启动任务',
+            'stop': '停止任务',
+            'pause': '暂停/恢复',
+            'record': '录制',
+            'replay': '回放',
+            'close_listen': '关闭监听',
+        }
 
         for action, key in keyboard_keys.items():
 
-            if not key:
+            lib_key = to_keyboard_lib(key)
+
+            if not lib_key:
 
                 continue
 
@@ -694,13 +601,16 @@ class MainWindowHotkeyMixin:
 
                 if callback:
 
-                    # 不使用 suppress，避免和其他程序冲突
-
                     hotkey = keyboard.add_hotkey(
 
-                        key,
+                        lib_key,
 
-                        lambda cb=callback: self._queue_hotkey_callback(cb),
+                        lambda cb=callback, act=action: (
+                            None
+                            if is_hotkey_capture_active()
+                            or (act != "close_listen" and not self.is_hotkey_listen_enabled())
+                            else self._queue_hotkey_callback(cb)
+                        ),
 
                         trigger_on_release=False,
 
@@ -710,11 +620,11 @@ class MainWindowHotkeyMixin:
 
                     self._registered_hotkeys.append(hotkey)
 
-                    logger.info(f"{action_names.get(action, action)}快捷键已设置: {key.upper()} (传统模式)")
+                    logger.info(f"{action_names.get(action, action)}快捷键已设置: {display_hotkey(key)} (传统模式)")
 
             except Exception as e:
 
-                failed_hotkeys.append(f"{action_names.get(action, action)}({key.upper()})")
+                failed_hotkeys.append(f"{action_names.get(action, action)}({display_hotkey(key)})")
 
                 logger.error(f"设置{action_names.get(action, action)}快捷键失败: {e}")
 
@@ -752,6 +662,40 @@ class MainWindowHotkeyMixin:
                 tray.show_message("LCA", message)
             except Exception:
                 pass
+
+    def _on_close_listen_hotkey(self):
+        """关闭/重新开启全局快捷键监听。该键在关闭监听后仍有效。"""
+        try:
+            if QThread.currentThread() != self.thread():
+                QTimer.singleShot(0, self, self._on_close_listen_hotkey)
+                return
+            import time
+
+            current_time = time.time()
+            last = float(getattr(self, "_last_close_listen_hotkey_time", 0.0) or 0.0)
+            if current_time - last < 0.4:
+                return
+            self._last_close_listen_hotkey_time = current_time
+            self._hotkey_listen_enabled = not self.is_hotkey_listen_enabled()
+            key_text = display_hotkey(self._get_hotkey_value("close_listen"))
+            if self._hotkey_listen_enabled:
+                message = f"快捷键监听已开启（{key_text} 可关闭）"
+            else:
+                message = f"快捷键监听已关闭（{key_text} 重新开启，该快捷键除外）"
+            logger.info(message)
+            if hasattr(self, "_update_step_details"):
+                try:
+                    self._update_step_details(message)
+                except Exception:
+                    pass
+            tray = getattr(self, "system_tray_manager", None)
+            if tray is not None and hasattr(tray, "show_message"):
+                try:
+                    tray.show_message("LCA", message)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error("关闭监听快捷键处理失败: %s", e)
 
     def _on_record_hotkey(self):
         """录制快捷键回调"""

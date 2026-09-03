@@ -1,22 +1,21 @@
 """
-增强的窗口激活模块
+后台激活消息序列：不改前台、不改真实焦点，只用消息让目标窗口“以为”自己被点击激活了。
 
-v2.1 优化:
-1. AttachThreadInput - 线程附加技术
-2. WA_CLICKACTIVE - 精确的点击激活
-3. GetLastError 错误码分析
-4. 键盘激活模式 - 键盘输入前先点击激活
-5. 完整的消息序列 - WM_NCHITTEST、WM_NCACTIVATE、WM_ACTIVATEAPP 等
-6. PostMessage 异步发送优化
+- WA_CLICKACTIVE 点击激活
+- 键盘激活模式：键盘输入前先来一次点击激活
+- 完整消息序列：WM_NCHITTEST、WM_NCACTIVATE、WM_ACTIVATEAPP、WM_ACTIVATE、WM_SETFOCUS、WM_MOUSEACTIVATE…
+- PostMessage 异步发送可选
+
+这里刻意不用 AttachThreadInput：整套流程只发消息，附加线程输入对它毫无帮助，
+反而会在解除附加的瞬间把目标线程的焦点/激活状态搅乱——资源管理器随后收到的
+双击就只当成“选中”，文件永远打不开。
 """
 
 import win32gui
 import win32con
-import win32api
-import ctypes
 import time
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -31,84 +30,35 @@ WM_KILLFOCUS = 0x0008
 
 
 class EnhancedWindowActivator:
-    """增强的窗口激活器 - 完整的激活消息序列 (v2.1)"""
+    """后台激活器：向目标窗口发送完整的“被点击激活”消息序列。"""
 
-    def __init__(self, enable_logging: bool = False, enable_thread_attach: bool = True):
-        """
-        初始化激活器
-
-        Args:
-            enable_logging: 是否启用详细日志输出
-            enable_thread_attach: 是否启用线程附加技术
-        """
+    def __init__(self, enable_logging: bool = False):
         self.enable_logging = enable_logging
-        self.enable_thread_attach = enable_thread_attach
-        self.kernel32 = ctypes.windll.kernel32
-        self.user32 = ctypes.windll.user32
 
     def _makelong(self, low: int, high: int) -> int:
         """组合两个16位值为一个32位值"""
         return ((int(high) & 0xFFFF) << 16) | (int(low) & 0xFFFF)
 
-    def _attach_thread_input(self, hwnd: int) -> Tuple[bool, int, int]:
-        """
-        尝试附加到目标窗口的线程
-
-        Args:
-            hwnd: 目标窗口句柄
-
-        Returns:
-            Tuple[bool, int, int]: (是否成功附加, 当前线程ID, 目标线程ID)
-        """
-        if not self.enable_thread_attach:
-            return False, 0, 0
-
+    @staticmethod
+    def _window_thread_id(hwnd: int) -> int:
         try:
-            current_tid = self.kernel32.GetCurrentThreadId()
-            target_tid = self.user32.GetWindowThreadProcessId(hwnd, None)
+            import win32process
 
-            if target_tid == 0 or current_tid == target_tid:
-                return False, current_tid, target_tid
+            thread_id, _pid = win32process.GetWindowThreadProcessId(int(hwnd))
+            return int(thread_id or 0)
+        except Exception:
+            return 0
 
-            attached = self.user32.AttachThreadInput(current_tid, target_tid, True)
-
-            if attached:
-                if self.enable_logging:
-                    logger.debug(f"[线程附加] 成功: {current_tid} -> {target_tid}")
-                return True, current_tid, target_tid
-
-            error_code = self.kernel32.GetLastError()
-
-            if error_code == 87:  # ERROR_INVALID_PARAMETER - 已附加
-                if self.enable_logging:
-                    logger.debug("[线程附加] 已附加 (错误码87)")
-                return True, current_tid, target_tid
-            elif error_code == 5:  # ERROR_ACCESS_DENIED
-                if self.enable_logging:
-                    logger.debug("[线程附加] 权限不足 (错误码5)")
-                return False, current_tid, target_tid
-            else:
-                if self.enable_logging:
-                    logger.debug(f"[线程附加] 失败 (错误码{error_code})")
-                return False, current_tid, target_tid
-
-        except Exception as e:
-            if self.enable_logging:
-                logger.debug(f"[线程附加] 异常: {e}")
-            return False, 0, 0
-
-    def _detach_thread_input(self, current_tid: int, target_tid: int) -> None:
-        """解除线程附加"""
-        if current_tid == 0 or target_tid == 0:
-            return
-
+    @staticmethod
+    def _client_point_for(target_hwnd: int, parent_hwnd: int, client_x: int, client_y: int):
+        """鼠标消息的坐标必须是接收窗口自己的客户区坐标；传进来的是父窗口客户区坐标。"""
+        if int(target_hwnd) == int(parent_hwnd):
+            return int(client_x), int(client_y)
         try:
-            self.user32.AttachThreadInput(current_tid, target_tid, False)
-            if self.enable_logging:
-                logger.debug(f"[线程附加] 已解除: {current_tid} -x- {target_tid}")
-        except Exception as e:
-            if self.enable_logging:
-                logger.debug(f"[线程附加] 解除异常: {e}")
+            screen_x, screen_y = win32gui.ClientToScreen(int(parent_hwnd), (int(client_x), int(client_y)))
+            return win32gui.ScreenToClient(int(target_hwnd), (screen_x, screen_y))
+        except Exception:
+            return int(client_x), int(client_y)
 
     def _send_nchittest(self, hwnd: int, screen_x: int, screen_y: int) -> int:
         """
@@ -162,9 +112,7 @@ class EnhancedWindowActivator:
         """
         # 选择发送函数
         send_fn = win32gui.PostMessage if use_post_message else win32gui.SendMessage
-
-        # ========== 步骤0: 线程附加 ==========
-        attached, current_tid, target_tid = self._attach_thread_input(parent_hwnd)
+        target_tid = self._window_thread_id(parent_hwnd)
 
         try:
             # 获取屏幕坐标用于命中测试
@@ -255,29 +203,23 @@ class EnhancedWindowActivator:
 
             # ========== 步骤8: WM_MOUSEMOVE ==========
             try:
+                move_x, move_y = self._client_point_for(target_hwnd, parent_hwnd, client_x, client_y)
                 if self.enable_logging:
-                    logger.debug(f"[激活序列] 步骤8: WM_MOUSEMOVE -> ({client_x}, {client_y})")
-                lparam_move = win32api.MAKELONG(client_x, client_y)
+                    logger.debug(f"[激活序列] 步骤8: WM_MOUSEMOVE -> ({move_x}, {move_y})")
+                lparam_move = self._makelong(move_x, move_y)
                 send_fn(target_hwnd, win32con.WM_MOUSEMOVE, 0, lparam_move)
             except Exception as e:
                 if self.enable_logging:
                     logger.warning(f"[激活序列] WM_MOUSEMOVE 失败: {e}")
 
-            mode_str = "线程附加+异步" if attached and use_post_message else \
-                       "线程附加" if attached else \
-                       "异步" if use_post_message else "标准"
             if self.enable_logging:
-                logger.info(f"[激活序列] 完成 ({mode_str}模式)")
+                logger.info(f"[激活序列] 完成 ({'异步' if use_post_message else '标准'}模式)")
 
             return True
 
         except Exception as e:
             logger.error(f"[激活序列] 激活失败: {e}")
             return False
-
-        finally:
-            if attached:
-                self._detach_thread_input(current_tid, target_tid)
 
     def activate_for_keyboard(
         self,
@@ -305,9 +247,6 @@ class EnhancedWindowActivator:
         Returns:
             bool: 是否成功
         """
-        # ========== 步骤0: 线程附加 ==========
-        attached, current_tid, target_tid = self._attach_thread_input(parent_hwnd)
-
         try:
             target_hwnd = child_hwnd if child_hwnd else parent_hwnd
 
@@ -315,7 +254,6 @@ class EnhancedWindowActivator:
                 logger.debug(f"[键盘激活] 准备通过左键点击激活窗口 0x{parent_hwnd:08X}")
 
             # ========== 步骤1: 完整的点击激活序列 ==========
-            # 调用现有的 activate_for_click 来执行完整激活
             self.activate_for_click(
                 parent_hwnd=parent_hwnd,
                 child_hwnd=target_hwnd,
@@ -326,16 +264,14 @@ class EnhancedWindowActivator:
 
             # ========== 步骤2: 发送一次快速左键点击 (Jiao-Jiao 技术) ==========
             try:
+                click_x, click_y = self._client_point_for(target_hwnd, parent_hwnd, client_x, client_y)
                 if self.enable_logging:
-                    logger.debug(f"[键盘激活] 发送左键点击到 ({client_x}, {client_y})")
+                    logger.debug(f"[键盘激活] 发送左键点击到 ({click_x}, {click_y})")
 
-                lparam = win32api.MAKELONG(client_x, client_y)
+                lparam = self._makelong(click_x, click_y)
 
-                # 发送 WM_LBUTTONDOWN
-                win32gui.SendMessage(target_hwnd, win32con.WM_LBUTTONDOWN, 0, lparam)
+                win32gui.SendMessage(target_hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
                 time.sleep(0.01)
-
-                # 发送 WM_LBUTTONUP
                 win32gui.SendMessage(target_hwnd, win32con.WM_LBUTTONUP, 0, lparam)
 
                 # Jiao-Jiao 的延迟: 50ms
@@ -354,11 +290,6 @@ class EnhancedWindowActivator:
         except Exception as e:
             logger.error(f"[键盘激活] 激活失败: {e}")
             return False
-
-        finally:
-            # ========== 清理: 解除线程附加 ==========
-            if attached:
-                self._detach_thread_input(current_tid, target_tid)
 
     def activate_for_drag(
         self,
@@ -384,8 +315,7 @@ class EnhancedWindowActivator:
         Returns:
             bool: 是否成功
         """
-        # 线程附加
-        attached, current_tid, target_tid = self._attach_thread_input(parent_hwnd)
+        target_tid = self._window_thread_id(parent_hwnd)
 
         try:
             # 获取屏幕坐标
@@ -443,10 +373,10 @@ class EnhancedWindowActivator:
 
             # 步骤6: WM_MOUSEMOVE - 鼠标移动到起点（无需点击）
             try:
+                move_x, move_y = self._client_point_for(target_hwnd, parent_hwnd, client_x, client_y)
                 if self.enable_logging:
-                    logger.debug(f"[拖拽激活] 步骤6: WM_MOUSEMOVE 到 ({client_x}, {client_y})")
-                lparam = win32api.MAKELONG(client_x, client_y)
-                win32gui.SendMessage(target_hwnd, win32con.WM_MOUSEMOVE, 0, lparam)
+                    logger.debug(f"[拖拽激活] 步骤6: WM_MOUSEMOVE 到 ({move_x}, {move_y})")
+                win32gui.SendMessage(target_hwnd, win32con.WM_MOUSEMOVE, 0, self._makelong(move_x, move_y))
             except Exception as e:
                 if self.enable_logging:
                     logger.debug(f"[拖拽激活] WM_MOUSEMOVE 异常: {e}")
@@ -458,11 +388,6 @@ class EnhancedWindowActivator:
         except Exception as e:
             logger.error(f"[拖拽激活] 激活失败: {e}")
             return False
-
-        finally:
-            # 清理: 解除线程附加
-            if attached:
-                self._detach_thread_input(current_tid, target_tid)
 
     def ensure_window_restored(self, hwnd: int) -> bool:
         """
@@ -479,6 +404,10 @@ class EnhancedWindowActivator:
             show_cmd = placement[1]
 
             if show_cmd == win32con.SW_SHOWMINIMIZED:
+                from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+                if skip_cross_desktop_activation(hwnd, log_prefix="窗口恢复"):
+                    return False
                 if self.enable_logging:
                     logger.info(f"窗口 0x{hwnd:08X} 处于最小化状态，正在恢复...")
 

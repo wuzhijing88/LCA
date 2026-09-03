@@ -150,19 +150,25 @@ class MainWindowUiSetupMixin:
         self.main_layout.setSpacing(0)
         # --- Custom Title Bar ---
         # Create the list of actions AFTER _create_actions has run
-        title_bar_actions = [self.toggle_action, self.save_action, self.load_action, self.new_workflow_action, self.run_action, self.debug_run_action, self.timer_action, self.global_settings_action]
+        title_bar_actions = [self.toggle_action, self.save_action, self.load_action, self.new_workflow_action, self.export_standalone_action, self.run_action, self.debug_run_action, self.timer_action, self.global_settings_action]
         self.title_bar = CustomTitleBar(self, actions=title_bar_actions)
         self.main_layout.addWidget(self.title_bar)
         self.title_bar.set_file_actions_visible(self.file_actions_visible)
         # 为定时器按钮设置特殊样式（放大字体和颜色）
-        if self.timer_action in self.title_bar.action_buttons:
-            timer_button = self.title_bar.action_buttons[self.timer_action]
-            timer_button.setIconSize(QSize(26, 26))  # 设置图标大小
-            # 不再使用硬编码样式，让全局主题控制按钮样式
-            # 按钮样式现在由 themes/dark.qss 和 themes/light.qss 中的 #CustomTitleBar QToolButton 统一管理
-        if self.run_action in self.title_bar.action_buttons:
-            run_button = self.title_bar.action_buttons[self.run_action]
-            run_button.setIconSize(QSize(24, 24))
+        # 标题栏图标统一尺寸，与现代细线图标集匹配
+        for action in (
+            getattr(self, "toggle_action", None),
+            getattr(self, "save_action", None),
+            getattr(self, "load_action", None),
+            getattr(self, "new_workflow_action", None),
+            getattr(self, "export_standalone_action", None),
+            getattr(self, "run_action", None),
+            getattr(self, "debug_run_action", None),
+            getattr(self, "timer_action", None),
+            getattr(self, "global_settings_action", None),
+        ):
+            if action in self.title_bar.action_buttons:
+                self.title_bar.action_buttons[action].setIconSize(QSize(22, 22))
         # 初始化工具栏（注释代码已移除）
         # --- Add DPI Notification Widget ---
         from ..system_parts.dpi_notification_widget import DPINotificationWidget

@@ -87,10 +87,36 @@ def connect_main_window_runtime_bindings(
     logging.info("运行时状态管理链路已完成")
 
 
+def schedule_startup_background_prewarms():
+    try:
+        from utils.plugin.runtime import schedule_plugin_host_prewarm
+
+        schedule_plugin_host_prewarm()
+    except Exception:
+        logging.debug("后台预热插件宿主失败", exc_info=True)
+    try:
+        from services.ocr_pool_policy import schedule_ocr_pool_prewarm
+
+        schedule_ocr_pool_prewarm()
+    except Exception:
+        logging.debug("后台预热 OCR 子进程失败", exc_info=True)
+    try:
+        from task_workflow.workflow_worker_pool import schedule_workflow_worker_prewarm
+
+        schedule_workflow_worker_prewarm()
+    except Exception:
+        logging.debug("后台预热工作流子进程失败", exc_info=True)
+
+
 def start_log_maintenance_loop(app, loop_factory):
     log_maintenance_loop = loop_factory()
     log_maintenance_loop.start()
     app.log_maintenance_loop = log_maintenance_loop
+    threading.Thread(
+        target=schedule_startup_background_prewarms,
+        daemon=True,
+        name="StartupPrewarmSchedule",
+    ).start()
     return log_maintenance_loop
 
 
@@ -146,6 +172,20 @@ def run_qt_event_loop(
             cleanup_runtime_state_variables_cb()
         except Exception as error:
             logging.warning(f"[运行态] 清理失败: {error}")
+
+        try:
+            from utils.plugin.runtime import terminate_plugin_host
+
+            terminate_plugin_host()
+        except Exception as error:
+            logging.debug("退出时关闭插件宿主失败: %s", error)
+
+        try:
+            from task_workflow.workflow_worker_pool import shutdown_warm_workflow_workers
+
+            shutdown_warm_workflow_workers()
+        except Exception as error:
+            logging.debug("退出时关闭预热工作流子进程失败: %s", error)
 
         teardown_results = get_runtime_lifecycle().teardown(final=True)
         failed_teardowns = [result for result in teardown_results if not result.ok]

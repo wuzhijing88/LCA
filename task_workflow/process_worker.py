@@ -30,12 +30,12 @@ MAX_WORKER_LOG_MESSAGE_CHARS = 512
 
 
 def _resolve_worker_screenshot_engine(payload: Dict[str, Any]) -> str:
-    valid_engines = {"wgc", "printwindow", "gdi", "dxgi"}
+    from utils.capture.engine_ids import is_supported_screenshot_engine
 
     requested_engine = str(payload.get("screenshot_engine") or "").strip().lower()
     if not requested_engine:
         raise ValueError("工作流子进程载荷缺少 screenshot_engine")
-    if requested_engine not in valid_engines:
+    if not is_supported_screenshot_engine(requested_engine):
         raise ValueError(f"工作流子进程载荷包含无效 screenshot_engine: {requested_engine}")
     return requested_engine
 
@@ -181,6 +181,21 @@ class _SocketSignalBridge:
     def send_failed(self) -> bool:
         return self._send_failed.is_set()
 
+    def send_idle(self) -> bool:
+        return self._send({"type": "idle"})
+
+    def unbind_executor(self) -> None:
+        for signal_obj, handler in self._handlers:
+            try:
+                signal_obj.disconnect(handler)
+            except Exception:
+                pass
+        self._handlers.clear()
+
+    def reset_for_next_run(self) -> None:
+        self.unbind_executor()
+        self._finished_sent = False
+
     def bind_executor(self, executor_obj: Any) -> None:
         for signal_name in self._FORWARDED_SIGNALS:
             signal_obj = getattr(executor_obj, signal_name, None)
@@ -230,19 +245,7 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def _materialize_workflow_reference(payload: Dict[str, Any]) -> Dict[str, Any]:
-    reference = payload.get("workflow_reference")
-    if not isinstance(reference, dict):
-        return payload
-    path = os.path.abspath(str(reference.get("path") or ""))
-    expected_hash = str(reference.get("sha256") or "").strip().lower()
-    if not path or not os.path.isfile(path):
-        raise FileNotFoundError(f"workflow reference not found: {path}")
-    actual_hash = _sha256_file(path)
-    if not expected_hash or actual_hash != expected_hash:
-        raise ValueError(f"workflow reference hash mismatch: {path}")
-    with open(path, "r", encoding="utf-8") as stream:
-        workflow_data = json.load(stream)
+def _attach_workflow_graph(payload: Dict[str, Any], workflow_data: Dict[str, Any]) -> Dict[str, Any]:
     from task_workflow.workflow_sanitize import sanitize_workflow_data
 
     sanitize_workflow_data(workflow_data)
@@ -259,6 +262,8 @@ def _materialize_workflow_reference(payload: Dict[str, Any]) -> Dict[str, Any]:
         cards_data = raw_cards
     else:
         raise ValueError("workflow reference cards must be a list or dictionary")
+    if not cards_data:
+        raise ValueError("workflow reference cards missing")
     connections_data = workflow_data.get("connections") or []
     if not isinstance(connections_data, list):
         raise ValueError("workflow reference connections must be a list")
@@ -268,11 +273,51 @@ def _materialize_workflow_reference(payload: Dict[str, Any]) -> Dict[str, Any]:
     return materialized
 
 
+def _load_memory_workflow(memory_uri: str) -> Dict[str, Any]:
+    from app_core.player.memory_store import get_player_memory_json
+    from app_core.player.runtime_images import ensure_player_image_memory
+
+    ensure_player_image_memory()
+    workflow_data = get_player_memory_json(memory_uri)
+    if not isinstance(workflow_data, dict):
+        raise FileNotFoundError("workflow reference not found")
+    return workflow_data
+
+
+def _materialize_workflow_reference(payload: Dict[str, Any]) -> Dict[str, Any]:
+    reference = payload.get("workflow_reference")
+    if not isinstance(reference, dict):
+        return payload
+    memory_uri = str(reference.get("memory_uri") or "").strip()
+    if memory_uri:
+        return _attach_workflow_graph(payload, _load_memory_workflow(memory_uri))
+    path = os.path.abspath(str(reference.get("path") or ""))
+    expected_hash = str(reference.get("sha256") or "").strip().lower()
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError("workflow reference not found")
+    actual_hash = _sha256_file(path)
+    if not expected_hash or actual_hash != expected_hash:
+        raise ValueError("workflow reference hash mismatch")
+    with open(path, "r", encoding="utf-8") as stream:
+        workflow_data = json.load(stream)
+    if not isinstance(workflow_data, dict):
+        raise ValueError("workflow reference format invalid")
+    return _attach_workflow_graph(payload, workflow_data)
+
+
 def _create_executor(payload: Dict[str, Any]):
     from task_workflow.runtime_factory import create_inprocess_runtime
 
     payload = _materialize_workflow_reference(payload)
     return create_inprocess_runtime(payload)
+
+
+def _preimport_worker_runtime() -> None:
+    from tasks import get_task_modules
+
+    get_task_modules()
+    from task_workflow.runtime_factory import create_inprocess_runtime  # noqa: F401
+    from utils.capture.screenshot_helper import get_screenshot_engine  # noqa: F401
 
 
 def _is_socket_peer_closed(sock: socket.socket) -> bool:
@@ -292,6 +337,15 @@ def _is_socket_peer_closed(sock: socket.socket) -> bool:
         return False
     except OSError:
         return True
+
+
+def _wait_for_init_message(sock: socket.socket, *, poll_timeout: float = 1.0):
+    while True:
+        message = recv_message(sock, timeout=poll_timeout, logger=logger)
+        if message is not None:
+            return message
+        if _is_socket_peer_closed(sock):
+            return None
 
 
 def _control_loop(
@@ -361,6 +415,9 @@ def run_workflow_worker_standalone(port: int) -> int:
         logger=logger,
     )
     _configure_faulthandler()
+    # 注册规范化配置提供者。utils 层读配置只走 utils.runtime_config，
+    # 子进程不导入本模块就拿不到经过校验的配置。
+    import app_core.config_store  # noqa: F401
 
     if not port:
         logger.error("工作流子进程缺少端口参数")
@@ -377,64 +434,91 @@ def run_workflow_worker_standalone(port: int) -> int:
             logger.error("工作流子进程缺少认证令牌")
             return 3
         bridge = _SocketSignalBridge(sock, auth_token=auth_token)
+        try:
+            _preimport_worker_runtime()
+        except Exception as exc:
+            logger.warning("工作流子进程预导入运行时失败: %s", exc)
         if not bridge.send_ready():
             logger.error("工作流子进程发送 ready 失败")
             return 3
 
-        init_message = recv_message(sock, timeout=20.0, logger=logger)
-        if not isinstance(init_message, dict) or str(init_message.get("command") or "") != "init":
-            logger.error("工作流子进程未收到 init 消息: %s", init_message)
-            return 4
+        while True:
+            init_message = _wait_for_init_message(sock)
+            if not isinstance(init_message, dict) or str(init_message.get("command") or "") != "init":
+                if init_message is None:
+                    logger.info("工作流子进程父连接已关闭")
+                    return 0
+                logger.error("工作流子进程未收到 init 消息: %s", init_message)
+                return 4
 
-        payload = init_message.get("payload")
-        if not isinstance(payload, dict):
-            logger.error("工作流子进程收到的 payload 非法")
-            return 5
+            payload = init_message.get("payload")
+            if not isinstance(payload, dict):
+                logger.error("工作流子进程收到的 payload 非法")
+                return 5
 
-        try:
-            _apply_worker_runtime_preferences(payload)
-        except Exception as exc:
-            logger.error("工作流子进程运行参数无效: %s", exc)
-            return 6
-
-        try:
-            executor_obj = _create_executor(payload)
-        except Exception as exc:
-            logger.exception("工作流子进程创建执行器失败: %s", exc)
-            return 7
-        bridge.bind_executor(executor_obj)
-
-        control_thread = threading.Thread(
-            target=_control_loop,
-            args=(sock, executor_obj, stop_event),
-            daemon=True,
-            name="WorkflowWorkerControl",
-        )
-        control_thread.start()
-
-        try:
-            with bind_diagnostic_context(
-                workflow_id=str(payload.get("workflow_id") or ""),
-                worker_pid=os.getpid(),
-            ):
-                executor_obj.run()
-        except Exception as exc:
-            logger.exception("工作流子进程执行失败: %s", exc)
             try:
-                if not bridge.send_execution_finished(False, f"执行错误: {exc}"):
-                    return 9
-            except Exception as finish_exc:
-                logger.error("执行异常后无法发送完成信号: %s", finish_exc)
-                return 9
-            return 8
+                _apply_worker_runtime_preferences(payload)
+            except Exception as exc:
+                logger.error("工作流子进程运行参数无效: %s", exc)
+                return 6
 
-        if bridge.send_failed:
-            logger.error("工作流子进程通信发送失败")
-            return 9
-        if not bridge.finished_sent:
-            logger.error("工作流执行器违反完成协议：run() 返回前未发送 execution_finished")
-            return 10
-        return 0
+            try:
+                from app_core.player.runtime_images import ensure_player_image_memory
+
+                if ensure_player_image_memory():
+                    logger.info("工作流子进程已装载独立程序内存图库")
+            except Exception as exc:
+                logger.warning("工作流子进程装载内存图库失败: %s", exc)
+
+            try:
+                executor_obj = _create_executor(payload)
+            except Exception as exc:
+                logger.exception("工作流子进程创建执行器失败: %s", exc)
+                return 7
+
+            stop_event.clear()
+            bridge.bind_executor(executor_obj)
+            control_thread = threading.Thread(
+                target=_control_loop,
+                args=(sock, executor_obj, stop_event),
+                daemon=True,
+                name="WorkflowWorkerControl",
+            )
+            control_thread.start()
+
+            try:
+                with bind_diagnostic_context(
+                    workflow_id=str(payload.get("workflow_id") or ""),
+                    worker_pid=os.getpid(),
+                ):
+                    executor_obj.run()
+            except Exception as exc:
+                logger.exception("工作流子进程执行失败: %s", exc)
+                try:
+                    if not bridge.send_execution_finished(False, f"执行错误: {exc}"):
+                        return 9
+                except Exception as finish_exc:
+                    logger.error("执行异常后无法发送完成信号: %s", finish_exc)
+                    return 9
+                return 8
+            finally:
+                stop_event.set()
+                if control_thread is not None and control_thread.is_alive():
+                    try:
+                        control_thread.join(timeout=1.0)
+                    except Exception:
+                        pass
+
+            if bridge.send_failed:
+                logger.error("工作流子进程通信发送失败")
+                return 9
+            if not bridge.finished_sent:
+                logger.error("工作流执行器违反完成协议：run() 返回前未发送 execution_finished")
+                return 10
+            bridge.reset_for_next_run()
+            if not bridge.send_idle():
+                logger.error("工作流子进程发送 idle 失败")
+                return 9
     finally:
         global _FAULT_HANDLER_STREAM
         stop_event.set()

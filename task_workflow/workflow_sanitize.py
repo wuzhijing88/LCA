@@ -18,14 +18,39 @@ DEAD_CARD_PARAM_KEYS = (
 )
 REMOVED_COORDINATE_SOURCE_MODES = ("通过变量",)
 DEFAULT_COORDINATE_SOURCE_MODE = "坐标工具获取坐标"
+YOLO_TASK_TYPE = "YOLO目标检测"
+YOLO_REMOVED_ACTION_PARAM_KEYS = (
+    "---action---",
+    "---click_offset---",
+    "---target---",
+    "action_type",
+    "approach_mode",
+    "click_action",
+    "click_button",
+    "click_enable_auto_release",
+    "click_hold_duration",
+    "fixed_offset_x",
+    "fixed_offset_y",
+    "keypress_key",
+    "offset_selector_tool",
+    "position_mode",
+    "random_offset_x",
+    "random_offset_y",
+    "refresh_classes",
+    "target_classes",
+    "target_selection",
+)
 
 
-def sanitize_card_parameters(parameters: Any) -> Dict[str, Any]:
+def sanitize_card_parameters(parameters: Any, task_type: Any = "") -> Dict[str, Any]:
     if not isinstance(parameters, Mapping):
         return {}
     cleaned = dict(parameters)
     for key in DEAD_CARD_PARAM_KEYS:
         cleaned.pop(key, None)
+    if str(task_type or "").strip() == YOLO_TASK_TYPE:
+        for key in YOLO_REMOVED_ACTION_PARAM_KEYS:
+            cleaned.pop(key, None)
     source_mode = str(cleaned.get("coordinate_source_mode") or "").strip()
     if source_mode in REMOVED_COORDINATE_SOURCE_MODES:
         cleaned["coordinate_source_mode"] = DEFAULT_COORDINATE_SOURCE_MODE
@@ -48,5 +73,8 @@ def sanitize_workflow_data(workflow_data: Any) -> Any:
         for card in cards:
             if not isinstance(card, dict):
                 continue
-            card["parameters"] = sanitize_card_parameters(card.get("parameters"))
+            card["parameters"] = sanitize_card_parameters(
+                card.get("parameters"),
+                card.get("task_type"),
+            )
     return workflow_data

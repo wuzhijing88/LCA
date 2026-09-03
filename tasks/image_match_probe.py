@@ -243,7 +243,9 @@ def _test_with_opencv(image_paths: List[str], target_hwnd: int, confidence: floa
                 match_engine = str(get_screenshot_engine() or "wgc").strip().lower()
             except Exception:
                 match_engine = "wgc"
-            if match_engine not in {"wgc", "printwindow", "gdi", "dxgi"}:
+            from utils.capture.engine_ids import is_supported_screenshot_engine
+
+            if not is_supported_screenshot_engine(match_engine):
                 match_engine = "wgc"
 
             match_response = capture_and_match_template_smart(

@@ -563,7 +563,7 @@ class WorkflowContext:
         cleared_count = 0
         for card_id in list(self.card_data.keys()):
             card_data = self.card_data[card_id]
-            memory_keys = ['clicked_images', 'success_images']
+            memory_keys = ['clicked_images', 'success_images', 'multi_image_round_active']
             for key in memory_keys:
                 if key in card_data:
                     del card_data[key]
@@ -1086,3 +1086,16 @@ def get_latest_yolo_result(workflow_id: str = "default") -> Optional[Dict[str, A
     """获取最新YOLO检测结果的便捷函数"""
     context = get_workflow_context(workflow_id)
     return context.get_latest_yolo_result()
+
+
+def _register_ocr_pool_resource_key_resolver() -> None:
+    """让 OCR 池按当前工作流上下文路由资源通道，服务层不直接依赖执行层。"""
+    try:
+        from services.multiprocess_ocr_pool import set_resource_key_resolver
+
+        set_resource_key_resolver(get_current_resource_lane_key)
+    except Exception as exc:  # pragma: no cover - 仅在服务层不可用时触发
+        logger.debug("注册 OCR 池资源通道解析器失败: %s", exc)
+
+
+_register_ocr_pool_resource_key_resolver()

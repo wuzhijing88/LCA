@@ -15,7 +15,7 @@ from ui.system_parts.message_box_translator import place_dialog_on_screen
 logger = logging.getLogger(__name__)
 
 # 导入窗口隐藏管理器
-from utils.window.hwnd_utils import as_hwnd
+from utils.window.hwnd_utils import as_hwnd, get_window_text
 from utils.window.window_identity import is_desktop_window
 from utils.window.window_hider import WindowHider
 from utils.window.window_overlay_utils import (
@@ -48,6 +48,7 @@ class WindowPickerOverlay(QWidget):
     """窗口选择器覆盖层 - 跟踪鼠标位置并高亮显示窗口"""
 
     window_selected = Signal(object, str)  # hwnd, title；object 避免 Qt int32 把 HWND 收成负数
+    picker_closed = Signal()
 
     def __init__(
         self,
@@ -85,11 +86,14 @@ class WindowPickerOverlay(QWidget):
 
         self.desktop_pixmap = None
         self._highlight_overlay_rect = QRect()
+        self._pending_selection = None
+        self._close_finished = False
+        self._monitor_rects = None
         configure_opaque_picker_overlay(self)
 
         logger.info("创建窗口选择器覆盖层")
 
-        # 设置全屏覆盖
+        # 设置全屏覆盖。先截虚拟桌面再显示不透明层，否则用户只能看到黑底绿框。
         self._setup_fullscreen_overlay()
         from PySide6.QtWidgets import QApplication
         QApplication.processEvents()
@@ -108,10 +112,7 @@ class WindowPickerOverlay(QWidget):
 
     @staticmethod
     def _get_window_text_safe(hwnd: int) -> str:
-        try:
-            return (win32gui.GetWindowText(hwnd) or "").strip()
-        except Exception:
-            return ""
+        return get_window_text(hwnd)
 
     @staticmethod
     def _get_window_class_safe(hwnd: int) -> str:
@@ -190,6 +191,30 @@ class WindowPickerOverlay(QWidget):
             return title
         return "桌面"
 
+    def _monitor_rect_list(self):
+        if self._monitor_rects is not None:
+            return self._monitor_rects
+        rects = []
+        try:
+            for monitor in win32api.EnumDisplayMonitors():
+                monitor_info = win32api.GetMonitorInfo(monitor[0])
+                rects.append(monitor_info["Monitor"])
+        except Exception:
+            rects = []
+        self._monitor_rects = rects
+        return rects
+
+    def _rect_on_any_monitor(self, rect) -> bool:
+        for monitor_rect in self._monitor_rect_list():
+            if not (
+                rect[2] < monitor_rect[0]
+                or rect[0] > monitor_rect[2]
+                or rect[3] < monitor_rect[1]
+                or rect[1] > monitor_rect[3]
+            ):
+                return True
+        return not self._monitor_rect_list()
+
     def _set_current_desktop_target(self, hwnd: int) -> None:
         hwnd = as_hwnd(hwnd)
         title = self._desktop_display_title(hwnd)
@@ -254,17 +279,7 @@ class WindowPickerOverlay(QWidget):
 
                 # 检查是否在屏幕范围内
                 try:
-                    monitors = win32api.EnumDisplayMonitors()
-                    on_screen = False
-
-                    for monitor in monitors:
-                        monitor_info = win32api.GetMonitorInfo(monitor[0])
-                        monitor_rect = monitor_info['Monitor']
-
-                        if not (rect[2] < monitor_rect[0] or rect[0] > monitor_rect[2] or
-                                rect[3] < monitor_rect[1] or rect[1] > monitor_rect[3]):
-                            on_screen = True
-                            break
+                    on_screen = self._rect_on_any_monitor(rect)
 
                     if not on_screen:
                         self._show_binding_error("窗口在屏幕外", f"窗口 '{title}' 当前不在任何屏幕的可见范围内，无法选择。")
@@ -340,18 +355,7 @@ class WindowPickerOverlay(QWidget):
 
                 # 检查窗口是否在屏幕范围内
                 try:
-                    monitors = win32api.EnumDisplayMonitors()
-                    on_screen = False
-
-                    for monitor in monitors:
-                        monitor_info = win32api.GetMonitorInfo(monitor[0])
-                        monitor_rect = monitor_info['Monitor']
-
-                        # 检查窗口是否与显示器有交集
-                        if not (rect[2] < monitor_rect[0] or rect[0] > monitor_rect[2] or
-                                rect[3] < monitor_rect[1] or rect[1] > monitor_rect[3]):
-                            on_screen = True
-                            break
+                    on_screen = self._rect_on_any_monitor(rect)
 
                     if not on_screen:
                         self._show_binding_error("窗口在屏幕外", f"窗口 '{title}' 当前不在任何屏幕的可见范围内，无法绑定。\n\n窗口位置: ({rect[0]}, {rect[1]}, {rect[2]}, {rect[3]})\n\n请将窗口移动到屏幕内后再次尝试。")
@@ -422,9 +426,14 @@ class WindowPickerOverlay(QWidget):
                 }}
             """)
 
-            # 显示消息框
+            # 显示消息框。必须先放开鼠标抓取，否则 ApplicationModal 覆盖层会把提示框卡死。
+            release_overlay_input(self)
             place_dialog_on_screen(msg_box, reference_widget=self.parentWidget())
-            msg_box.exec()
+            try:
+                msg_box.exec()
+            finally:
+                if not getattr(self, "_closing", False) and self.isVisible():
+                    grab_overlay_input(self, log_prefix="窗口选择覆盖层")
 
         except Exception as e:
             logger.error(f"显示错误消息框失败: {e}")
@@ -510,20 +519,7 @@ class WindowPickerOverlay(QWidget):
 
                     # 检查窗口是否在屏幕范围内（排除屏幕外的窗口）
                     try:
-                        monitors = win32api.EnumDisplayMonitors()
-                        on_screen = False
-
-                        for monitor in monitors:
-                            monitor_info = win32api.GetMonitorInfo(monitor[0])
-                            monitor_rect = monitor_info['Monitor']
-
-                            # 检查窗口是否与显示器有交集
-                            if not (rect[2] < monitor_rect[0] or rect[0] > monitor_rect[2] or
-                                    rect[3] < monitor_rect[1] or rect[1] > monitor_rect[3]):
-                                on_screen = True
-                                break
-
-                        if not on_screen:
+                        if self._monitor_rect_list() and not self._rect_on_any_monitor(rect):
                             return True
                     except Exception:
                         # 如果检查失败，假设窗口在屏幕上
@@ -572,11 +568,7 @@ class WindowPickerOverlay(QWidget):
                     # 检查鼠标是否在窗口内
                     if (rect[0] <= cursor_pos[0] <= rect[2] and
                         rect[1] <= cursor_pos[1] <= rect[3]):
-                        # 获取窗口标题
-                        try:
-                            title = win32gui.GetWindowText(enum_hwnd)
-                        except Exception:
-                            title = ""
+                        title = self._get_window_text_safe(enum_hwnd)
 
                         # 计算窗口面积
                         area = window_width * window_height
@@ -817,10 +809,9 @@ class WindowPickerOverlay(QWidget):
                 except Exception as e:
                     logger.error(f"模拟器渲染窗口检测失败，使用原窗口: {e}", exc_info=True)
 
-                # 发送窗口选择信号
+                # 先关闭覆盖层再发信号，避免抓鼠/模态覆盖层把后续对话框卡死
                 logger.info(f"窗口验证通过，确认绑定: {final_title} (句柄: {final_hwnd})")
-                self.window_selected.emit(as_hwnd(final_hwnd), final_title)
-                self.close()
+                self._accept_locked_window(final_hwnd, final_title)
         elif event.button() == Qt.MouseButton.RightButton:
             logger.info(f"[鼠标事件] 右键点击，当前锁定状态: {self.is_locked}")
             if self.is_locked:
@@ -835,6 +826,29 @@ class WindowPickerOverlay(QWidget):
                 # 如果未锁定，右键退出
                 logger.info("右键点击，取消窗口选择")
                 self.close()
+
+    def _accept_locked_window(self, hwnd: int, title: str) -> None:
+        self._pending_selection = (as_hwnd(hwnd), str(title or ""))
+        if self.isVisible():
+            self.close()
+            return
+        self._finish_picker_close()
+
+    def _finish_picker_close(self) -> None:
+        if getattr(self, "_close_finished", False):
+            return
+        self._close_finished = True
+        self._closing = True
+        if hasattr(self, "mouse_timer"):
+            self.mouse_timer.stop()
+        release_overlay_input(self)
+        restored_count = self.window_hider.restore_all()
+        logger.info(f"已恢复 {restored_count} 个窗口显示")
+        pending = self._pending_selection
+        self._pending_selection = None
+        if pending:
+            self.window_selected.emit(as_hwnd(pending[0]), pending[1])
+        self.picker_closed.emit()
 
     def keyPressEvent(self, event):
         """键盘事件"""
@@ -870,12 +884,5 @@ class WindowPickerOverlay(QWidget):
 
     def closeEvent(self, event):
         """关闭事件"""
-        self._closing = True
-        if hasattr(self, 'mouse_timer'):
-            self.mouse_timer.stop()
-
-        release_overlay_input(self)
-        restored_count = self.window_hider.restore_all()
-        logger.info(f"已恢复 {restored_count} 个窗口显示")
-
+        self._finish_picker_close()
         super().closeEvent(event)

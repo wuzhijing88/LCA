@@ -10,7 +10,7 @@ from typing import List, Dict, Any
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
-    QInputDialog, QSpinBox, QDoubleSpinBox, QGroupBox,
+    QInputDialog, QGroupBox,
     QFormLayout, QLineEdit, QCheckBox, QSplitter, QTextEdit, QWidget,
     QFrame, QSizePolicy
 )
@@ -22,25 +22,10 @@ from utils.window.window_activation_utils import (
     resolve_replay_window_offsets_from_config,
 )
 from ..widgets.custom_widgets import CustomDropdown as QComboBox
+from ..widgets.no_wheel_spinbox import NoWheelDoubleSpinBox, NoWheelSpinBox
 from utils.window.window_coordinate_common import get_available_geometry_for_widget, clamp_preferred_window_size
 
 logger = logging.getLogger(__name__)
-
-
-# ===== 自定义SpinBox类，禁用滚轮修改数值 =====
-class NoWheelSpinBox(QSpinBox):
-    """禁用滚轮事件的QSpinBox"""
-    def wheelEvent(self, event):
-        event.ignore()
-
-
-class NoWheelDoubleSpinBox(QDoubleSpinBox):
-    """禁用滚轮事件的QDoubleSpinBox"""
-    def wheelEvent(self, event):
-        event.ignore()
-
-# ===== 统一下拉框样式 =====
-# ================================================
 
 
 class ActionEditorDialog(QDialog):

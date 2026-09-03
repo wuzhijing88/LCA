@@ -65,6 +65,10 @@ class WindowAdapter:
             import win32con
             import win32gui
 
+            from utils.window.virtual_desktop import skip_cross_desktop_activation
+
+            if skip_cross_desktop_activation(handle, log_prefix="WindowAdapter"):
+                return True
             if win32gui.IsIconic(handle):
                 win32gui.ShowWindow(handle, win32con.SW_RESTORE)
             win32gui.SetForegroundWindow(handle)

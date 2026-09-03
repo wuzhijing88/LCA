@@ -16,10 +16,51 @@ from typing import List, Dict, Optional, Tuple, Any, Callable
 from dataclasses import dataclass
 from utils.app_paths import get_config_path
 from utils.universal_resolution_adapter import get_universal_adapter, REFERENCE_WIDTH, REFERENCE_HEIGHT
+from utils.window.hwnd_utils import as_hwnd
 from .window_finder import resolve_unique_window_hwnd
 
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_adjust_target_size(
+    target_width: Optional[int],
+    target_height: Optional[int],
+    *,
+    global_size: Optional[Tuple[int, int]] = None,
+    reference_size: Tuple[int, int] = (REFERENCE_WIDTH, REFERENCE_HEIGHT),
+) -> Tuple[int, int]:
+    """决定最终客户区目标尺寸。
+
+    调用方显式传入正数宽高时原样使用，不会因为等于参考分辨率就被全局配置覆盖。
+    只有宽或高缺失/非正时，才用全局设置补齐；仍不可用再用参考分辨率。
+    """
+    try:
+        width = None if target_width is None else int(target_width)
+    except (TypeError, ValueError):
+        width = None
+    try:
+        height = None if target_height is None else int(target_height)
+    except (TypeError, ValueError):
+        height = None
+
+    if width is not None and height is not None and width > 0 and height > 0:
+        return (width, height)
+
+    global_width = global_height = 0
+    if isinstance(global_size, tuple) and len(global_size) == 2:
+        try:
+            global_width = int(global_size[0] or 0)
+            global_height = int(global_size[1] or 0)
+        except (TypeError, ValueError):
+            global_width = global_height = 0
+
+    if width is None or width <= 0:
+        width = global_width if global_width > 0 else int(reference_size[0])
+    if height is None or height <= 0:
+        height = global_height if global_height > 0 else int(reference_size[1])
+    return (int(width), int(height))
+
 
 @dataclass
 class WindowAdjustmentResult:
@@ -66,24 +107,33 @@ class UniversalWindowManager:
                 except Exception as e:
                     logger.error(f"窗口调整回调执行失败: {e}")
     
-    def adjust_single_window(self, hwnd: int, target_width: int = REFERENCE_WIDTH,
-                           target_height: int = REFERENCE_HEIGHT, async_mode: bool = False) -> WindowAdjustmentResult:
-        """调整单个窗口分辨率"""
+    def adjust_single_window(
+        self,
+        hwnd: int,
+        target_width: Optional[int] = None,
+        target_height: Optional[int] = None,
+        async_mode: bool = False,
+    ) -> WindowAdjustmentResult:
+        """调整单个窗口客户区到目标分辨率。
+
+        ``async_mode`` 保留兼容：真正异步由调用方把整批调整放到后台线程。
+        本方法始终同步执行并返回实际结果。
+        """
         start_time = time.time()
-
-        # 如果没有指定目标分辨率，尝试从全局设置获取
-        if target_width == REFERENCE_WIDTH and target_height == REFERENCE_HEIGHT:
-            try:
-                # 尝试获取全局设置的分辨率
-                global_width, global_height = self._get_global_resolution_settings()
-                if global_width > 0 and global_height > 0:
-                    target_width = global_width
-                    target_height = global_height
-                    logger.info(f"使用全局设置的分辨率: {target_width}x{target_height}")
-            except Exception as e:
-                logger.debug(f"获取全局分辨率设置失败，使用默认值: {e}")
-
-        return self._adjust_standard_window(hwnd, target_width, target_height, start_time)
+        if async_mode:
+            logger.debug("adjust_single_window(async_mode=True) 仍同步执行，批量异步请用后台线程")
+        try:
+            global_size = self._get_global_resolution_settings()
+        except Exception as exc:
+            logger.debug("获取全局分辨率设置失败: %s", exc)
+            global_size = (0, 0)
+        width, height = resolve_adjust_target_size(
+            target_width,
+            target_height,
+            global_size=global_size,
+            reference_size=(REFERENCE_WIDTH, REFERENCE_HEIGHT),
+        )
+        return self._adjust_standard_window(hwnd, width, height, start_time)
 
     def _adjust_standard_window(self, hwnd: int, target_width: int, target_height: int, start_time: float) -> WindowAdjustmentResult:
         """调整标准窗口分辨率"""
@@ -377,6 +427,47 @@ class UniversalWindowManager:
             logger.debug(f"获取全局分辨率设置失败: {e}")
             return (0, 0)
     
+    def collect_enabled_bound_windows(self, windows: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """筛出已启用且句柄有效的绑定窗口，hwnd 统一规范化。"""
+        enabled: List[Dict[str, Any]] = []
+        if not isinstance(windows, list):
+            return enabled
+        for item in windows:
+            if not isinstance(item, dict):
+                continue
+            if item.get("enabled", True) is False:
+                continue
+            hwnd = as_hwnd(item.get("hwnd"))
+            if not hwnd:
+                continue
+            enabled.append(
+                {
+                    "hwnd": hwnd,
+                    "title": str(item.get("title") or "").strip() or "窗口",
+                    "enabled": True,
+                }
+            )
+        return enabled
+
+    def resize_bound_windows(
+        self,
+        windows: Optional[List[Dict[str, Any]]],
+        target_width: int,
+        target_height: int,
+    ) -> List[WindowAdjustmentResult]:
+        """同步调整一批已启用绑定窗口；供后台线程调用。"""
+        targets = self.collect_enabled_bound_windows(windows)
+        results: List[WindowAdjustmentResult] = []
+        for item in targets:
+            results.append(
+                self.adjust_single_window(
+                    int(item["hwnd"]),
+                    int(target_width),
+                    int(target_height),
+                )
+            )
+        return results
+
     def create_adjustment_report(self, results: List[WindowAdjustmentResult]) -> Dict[str, Any]:
         """创建调整报告"""
         if not results:

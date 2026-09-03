@@ -41,167 +41,403 @@
   "python_dependencies": [
     {
       "name": "cffi",
-      "version": "2.0.0"
+      "version": "2.0.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "coloredlogs",
-      "version": "15.0.1"
+      "version": "15.0.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "comtypes",
-      "version": "1.4.15"
+      "version": "1.4.15",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "dxcam",
-      "version": "0.0.5"
+      "version": "0.0.5",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "keyboard",
-      "version": "0.13.5"
+      "version": "0.13.5",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "mouse",
-      "version": "0.7.1"
+      "version": "0.7.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "MouseInfo",
-      "version": "0.1.3"
+      "version": "0.1.3",
+      "direct": true,
+      "bundled": false
     },
     {
       "name": "mss",
-      "version": "10.1.0"
+      "version": "10.1.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "numpy",
-      "version": "2.2.6"
+      "version": "2.2.6",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "onnxruntime-directml",
-      "version": "1.23.0"
+      "version": "1.23.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "opencv-python",
-      "version": "4.13.0.90"
+      "version": "4.13.0.90",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "packaging",
-      "version": "26.1"
+      "version": "26.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "pillow",
-      "version": "12.1.0"
+      "version": "12.1.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "psutil",
-      "version": "7.2.2"
+      "version": "7.2.2",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "PyAutoGUI",
-      "version": "0.9.54"
+      "version": "0.9.54",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "pycparser",
-      "version": "3.0"
+      "version": "3.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "PyGetWindow",
-      "version": "0.0.9"
+      "version": "0.0.9",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "PyMsgBox",
-      "version": "2.0.1"
+      "version": "2.0.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "pynput",
-      "version": "1.8.1"
+      "version": "1.8.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "pyperclip",
-      "version": "1.11.0"
+      "version": "1.11.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "PyRect",
-      "version": "0.2.0"
+      "version": "0.2.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "PyScreeze",
-      "version": "1.0.1"
+      "version": "1.0.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "PySide6_Essentials",
-      "version": "6.10.1"
+      "version": "6.10.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "pytweening",
-      "version": "1.2.0"
-    },
-    {
-      "name": "rapidocr",
-      "version": "3.9.2"
+      "version": "1.2.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "pywin32",
-      "version": "311"
+      "version": "311",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "PyYAML",
-      "version": "6.0.3"
+      "version": "6.0.3",
+      "direct": true,
+      "bundled": true
+    },
+    {
+      "name": "rapidocr",
+      "version": "3.9.2",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "shiboken6",
-      "version": "6.10.1"
+      "version": "6.10.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "six",
-      "version": "1.17.0"
+      "version": "1.17.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "tqdm",
-      "version": "4.67.2"
+      "version": "4.67.2",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "typing_extensions",
-      "version": "4.15.0"
+      "version": "4.15.0",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "uiautomation",
-      "version": "2.0.29"
+      "version": "2.0.29",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-runtime",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-Windows.AI.MachineLearning",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-Windows.Foundation",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-Windows.Graphics",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-Windows.Graphics.Capture",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-Windows.Graphics.Capture.Interop",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-Windows.Graphics.DirectX",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-Windows.Graphics.DirectX.Direct3D11",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
     },
     {
       "name": "winrt-Windows.Graphics.Imaging",
-      "version": "3.2.1"
+      "version": "3.2.1",
+      "direct": true,
+      "bundled": true
+    },
+    {
+      "name": "antlr4-python3-runtime",
+      "version": "4.9.3",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "omegaconf"
+      ]
+    },
+    {
+      "name": "certifi",
+      "version": "2026.1.4",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "requests"
+      ]
+    },
+    {
+      "name": "charset-normalizer",
+      "version": "3.4.4",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "requests"
+      ]
+    },
+    {
+      "name": "colorama",
+      "version": "0.4.6",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "colorlog",
+        "tqdm"
+      ]
+    },
+    {
+      "name": "colorlog",
+      "version": "6.12.0",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "rapidocr"
+      ]
+    },
+    {
+      "name": "flatbuffers",
+      "version": "25.12.19",
+      "direct": false,
+      "bundled": false,
+      "required_by": [
+        "onnxruntime-directml"
+      ]
+    },
+    {
+      "name": "humanfriendly",
+      "version": "10.0",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "coloredlogs"
+      ]
+    },
+    {
+      "name": "idna",
+      "version": "3.11",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "requests"
+      ]
+    },
+    {
+      "name": "mpmath",
+      "version": "1.3.0",
+      "direct": false,
+      "bundled": false,
+      "required_by": [
+        "sympy"
+      ]
+    },
+    {
+      "name": "omegaconf",
+      "version": "2.3.1",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "rapidocr"
+      ]
+    },
+    {
+      "name": "protobuf",
+      "version": "7.34.1",
+      "direct": false,
+      "bundled": false,
+      "required_by": [
+        "onnxruntime-directml"
+      ]
+    },
+    {
+      "name": "pyclipper",
+      "version": "1.4.0",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "rapidocr"
+      ]
+    },
+    {
+      "name": "pyreadline3",
+      "version": "3.5.4",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "humanfriendly"
+      ]
+    },
+    {
+      "name": "requests",
+      "version": "2.32.5",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "rapidocr"
+      ]
+    },
+    {
+      "name": "shapely",
+      "version": "2.1.2",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "rapidocr"
+      ]
+    },
+    {
+      "name": "sympy",
+      "version": "1.14.0",
+      "direct": false,
+      "bundled": false,
+      "required_by": [
+        "onnxruntime-directml"
+      ]
+    },
+    {
+      "name": "urllib3",
+      "version": "2.6.3",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "requests"
+      ]
     }
   ]
 }

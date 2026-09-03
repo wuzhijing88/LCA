@@ -198,8 +198,14 @@ class MainWindowCloseMixin:
                         workflow_data = workflow_view.serialize_workflow()
                         task.update_workflow_data(workflow_data)
                         logger.info(f"已同步任务 '{task.name}' 的工作流数据")
-                # 保存所有已修改的任务
-                saved_count = self.task_manager.save_all_modified()
+                saved_count = 0
+                for task in self.task_manager.get_all_tasks():
+                    if not task.modified:
+                        continue
+                    old_filepath = task.filepath
+                    if task.save_and_backup():
+                        saved_count += 1
+                        self._sync_favorite_path_after_save(old_filepath, task)
                 logger.info(f"已保存 {saved_count} 个任务")
             elif reply == QMessageBox.StandardButton.Discard:
                 pass
