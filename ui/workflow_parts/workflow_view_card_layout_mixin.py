@@ -19,6 +19,9 @@ class WorkflowViewCardLayoutMixin:
             notified = True
         if notified and hasattr(self, "_mark_workflow_dirty"):
             self._mark_workflow_dirty()
+        if notified:
+            from .connection_line import schedule_scene_route_refresh
+            schedule_scene_route_refresh(self.scene, affected_cards=cards)
 
     def _resolve_card_id(self, requested_card_id: Optional[int]) -> int:
         """返回明确指定的 ID，或根据当前卡片集合生成下一个 ID。"""

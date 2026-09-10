@@ -177,6 +177,7 @@ class WorkflowViewConnectionMixin:
         self.connections.append(connection)
 
     def _unmount_connection(self, connection):
+        scene = connection.scene()
         start_card = connection.start_item
         end_card = connection.end_item
         start_card.connections.remove(connection)
@@ -186,6 +187,9 @@ class WorkflowViewConnectionMixin:
         self.scene.removeItem(connection)
         connection.start_item = None
         connection.end_item = None
+        if scene is not None:
+            from .connection_line import schedule_scene_route_refresh
+            schedule_scene_route_refresh(scene)
 
     def _create_registered_connection(self, start_card, end_card, line_type):
         connection = ConnectionLine(start_card, end_card, line_type)
@@ -354,11 +358,13 @@ class WorkflowViewConnectionMixin:
         if self.temp_line is None or self.drag_start_card is None:
             raise RuntimeError("拖拽状态不完整")
 
+        # 以屏幕像素计算容差，缩小画布后仍能轻松接到输入端。
+        snap_distance = 22.0 / max(0.05, abs(self.transform().m11()))
         snap_rect = QRectF(
-            end_pos_scene.x() - SNAP_DISTANCE,
-            end_pos_scene.y() - SNAP_DISTANCE,
-            SNAP_DISTANCE * 2,
-            SNAP_DISTANCE * 2,
+            end_pos_scene.x() - snap_distance,
+            end_pos_scene.y() - snap_distance,
+            snap_distance * 2,
+            snap_distance * 2,
         )
         nearest = None
         nearest_distance = None
@@ -385,10 +391,11 @@ class WorkflowViewConnectionMixin:
             ):
                 continue
 
-            target = card.get_input_port_scene_pos(self.drag_start_port_type)
+            input_type = "sequential" if self.drag_start_port_type == "random" else self.drag_start_port_type
+            target = card.get_input_port_scene_pos(input_type)
             delta = end_pos_scene - target
             distance = delta.x() ** 2 + delta.y() ** 2
-            if distance > SNAP_DISTANCE ** 2:
+            if distance > snap_distance ** 2:
                 continue
             if nearest_distance is None or distance < nearest_distance:
                 nearest = (card, target)
