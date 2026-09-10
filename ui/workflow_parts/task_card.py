@@ -857,6 +857,9 @@ class TaskCard(QGraphicsObject):
                 self._other_selected_cards_start_positions = {}
 
         super().mousePressEvent(event)
+        dragged_cards = [self]
+        dragged_cards.extend(getattr(self, '_other_selected_cards_start_positions', {}).keys())
+        self._refresh_connections_for_cards(dragged_cards, force=True)
 
 
     def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent):
@@ -879,6 +882,20 @@ class TaskCard(QGraphicsObject):
         """在多选卡片完成同一帧位置更新后统一刷新受影响连线。"""
         cards = [self]
         cards.extend(getattr(self, '_other_selected_cards_start_positions', {}).keys())
+        self._refresh_connections_for_cards(cards)
+
+    def _refresh_connections_for_cards(self, cards, *, force=False):
+        """按固定帧率刷新指定卡片的连线，并合并重复连接。"""
+        cards = list(cards)
+        now = time.perf_counter()
+        dragging = any(getattr(card, '_is_dragging', False) for card in cards)
+        if (
+            not force
+            and not dragging
+            and now - self._last_connection_update_time < self._connection_update_interval
+        ):
+            return
+        self._last_connection_update_time = now
         connections = []
         seen = set()
         for card in cards:
@@ -888,9 +905,10 @@ class TaskCard(QGraphicsObject):
                     continue
                 seen.add(marker)
                 connections.append(connection)
-        for connection in connections:
-            if connection.scene() is self.scene():
-                connection.update_path()
+        scene = self.scene()
+        if scene is not None:
+            from .connection_line import update_connection_lines
+            update_connection_lines(scene, connections, affected_cards=cards)
 
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent):
         """Handle mouse release and finalize dragging state."""
@@ -919,6 +937,12 @@ class TaskCard(QGraphicsObject):
 
         self._drag_start_card_pos_for_snap = None
 
+        dragged_cards = [self, *partner_cards]
+        scene = self.scene()
+        if scene is not None:
+            from .connection_line import schedule_scene_route_refresh
+            schedule_scene_route_refresh(scene, affected_cards=dragged_cards)
+
         moved_cards = []
         if start_pos is not None and self.pos() != start_pos:
             moved_cards.append(self)
@@ -934,7 +958,9 @@ class TaskCard(QGraphicsObject):
     def _cancel_drag_state(self):
         """取消拖拽状态并清理辅助线，用于异常中断场景。"""
         other_cards = getattr(self, '_other_selected_cards_start_positions', None)
+        dragged_cards = [self]
         if other_cards:
+            dragged_cards.extend(other_cards.keys())
             for card in list(other_cards.keys()):
                 card._is_dragging = False
                 card._multi_dragging_member = False
@@ -945,6 +971,10 @@ class TaskCard(QGraphicsObject):
         self._drag_start_card_pos_for_snap = None  # 清理吸附用的起始位置
         self._is_dragging = False
         self._clear_snap_guide_lines()
+        scene = self.scene()
+        if scene is not None:
+            from .connection_line import schedule_scene_route_refresh
+            schedule_scene_route_refresh(scene, affected_cards=dragged_cards)
         # 停止拖拽检测定时器
         self._release_drag_check_timer()
 
@@ -1148,7 +1178,8 @@ class TaskCard(QGraphicsObject):
         target_side = "input" if side == "left" else "output"
         return self.hovered_port_side == target_side and self.hovered_port_type == port_type
 
-    def _draw_single_port(self, painter: QPainter, side: str, port_type: str, phase: float, allow_idle_animation: bool):
+    def _draw_single_port(self, painter: QPainter, side: str, port_type: str,
+                          phase: float, allow_idle_animation: bool):
         base_color = self.port_colors.get(port_type, QColor(140, 140, 140))
         is_hovered = self._is_port_hovered(side, port_type)
         can_idle_animate = allow_idle_animation and (not is_hovered) and (not self.isSelected())
@@ -1272,8 +1303,15 @@ class TaskCard(QGraphicsObject):
             if getattr(self, '_multi_dragging_member', False) or getattr(self, '_dragging_multi_selection', False):
                 return result
 
-            for connection in self._validated_connections():
-                connection.update_path()
+            if getattr(self, '_is_dragging', False):
+                self._refresh_connections_for_cards((self,))
+            else:
+                for connection in self._validated_connections():
+                    connection.update_path()
+                scene = self.scene()
+                if scene is not None:
+                    from .connection_line import schedule_scene_route_refresh
+                    schedule_scene_route_refresh(scene, affected_cards=(self,))
 
         return result
 
