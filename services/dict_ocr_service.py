@@ -676,48 +676,6 @@ def write_dict_text_file(path: str, glyphs: Sequence[Glyph], *, append: bool = T
     return added
 
 
-def _dict_memory_keys(raw_path: str) -> List[str]:
-    from task_workflow.resource_path import unwrap_resource_path
-
-    text = (unwrap_resource_path(raw_path) or "").strip().strip('"')
-    if text.startswith("memory://"):
-        text = text[len("memory://") :]
-    text = text.replace("\\", "/").lstrip("/")
-    if not text:
-        return []
-    basename = os.path.basename(text)
-    keys = [
-        text,
-        basename,
-        f"dicts/{basename}",
-        f"assets/dicts/{basename}",
-    ]
-    unique: List[str] = []
-    seen = set()
-    for key in keys:
-        item = str(key or "").strip().lstrip("/")
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        unique.append(item)
-    return unique
-
-
-def _dict_bytes_from_memory(raw_path: str) -> Optional[bytes]:
-    from app_core.player.memory_store import get_player_memory_file, has_player_memory_files
-    from app_core.player.runtime_images import ensure_player_image_memory
-
-    if not has_player_memory_files():
-        ensure_player_image_memory()
-    if not has_player_memory_files():
-        return None
-    for key in _dict_memory_keys(raw_path):
-        data = get_player_memory_file(key)
-        if data is not None:
-            return bytes(data)
-    return None
-
-
 def resolve_dict_path(raw_path: str) -> Optional[str]:
     from task_workflow.resource_path import unwrap_resource_path
     from task_workflow.script_resources import resolve_resource_path
@@ -727,37 +685,22 @@ def resolve_dict_path(raw_path: str) -> Optional[str]:
         return None
     if os.path.isfile(text):
         return os.path.abspath(text)
-    try:
-        from app_core.lca_format.session import get_active
-
-        session = get_active()
-        if session is not None:
-            packaged = session.resolve_asset(text)
-            if packaged and os.path.isfile(packaged):
-                return os.path.abspath(packaged)
-    except Exception:
-        pass
     located = resolve_resource_path(text, enforce_jail=False)
+    if located and str(located).startswith("memory://"):
+        return located
     if located and os.path.isfile(located):
         return os.path.abspath(located)
-    from task_workflow.resource_context import current_dicts_dir, current_images_dir
-
-    basename = os.path.basename(text.replace("\\", "/"))
-    for folder in (current_dicts_dir(), current_images_dir()):
-        if not folder or not basename:
-            continue
-        candidate = os.path.join(folder, basename)
-        if os.path.isfile(candidate):
-            return os.path.abspath(candidate)
     return None
 
 
 def load_dict_library(raw_path: str) -> DictLibrary:
+    from task_workflow.script_resources import read_resource_bytes
+
     path = resolve_dict_path(raw_path)
     raw = b""
     cache_key = ""
     fingerprint = (0, 0, 0)
-    if path:
+    if path and os.path.isfile(path):
         stat = os.stat(path)
         cache_key = os.path.normcase(path)
         fingerprint = (int(stat.st_mtime_ns), int(stat.st_size), 0)
@@ -768,16 +711,16 @@ def load_dict_library(raw_path: str) -> DictLibrary:
         with open(path, "rb") as handle:
             raw = handle.read()
     else:
-        raw = _dict_bytes_from_memory(raw_path) or b""
+        raw = read_resource_bytes(raw_path) or b""
         if not raw:
             raise FileNotFoundError(f"找不到字库文件: {raw_path}")
-        cache_key = "memory:" + "|".join(_dict_memory_keys(raw_path)[:4])
+        cache_key = str(path or raw_path or "memory://dict")
         fingerprint = (0, len(raw), int.from_bytes(raw[:8], "little", signed=False) if raw else 0)
         with _CACHE_LOCK:
             cached = _DICT_CACHE.get(cache_key)
             if cached and cached[0] == fingerprint:
                 return cached[1]
-        path = str(raw_path or "").strip() or "memory://dict"
+        path = str(path or raw_path or "").strip() or "memory://dict"
     library = parse_dict_bytes(raw, path=path)
     if not library.glyphs:
         raise ValueError(f"字库为空或格式无法识别: {path}")

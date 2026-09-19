@@ -19,22 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 def _player_package_resource_dirs(package: PlayerPackage) -> dict[str, str]:
-    userdata = package.userdata_dir
-    images = package.assets_images_dir or ""
-    sounds = package.assets_sounds_dir or os.path.join(userdata, "sounds")
-    dicts = package.assets_dicts_dir or os.path.join(userdata, "dicts")
-    yolo = package.assets_yolo_dir or os.path.join(userdata, "yolo")
-    replays = package.assets_replays_dir or os.path.join(userdata, "replays")
     from utils.app_paths import get_plugin_dir
 
-    plugins = package.assets_plugins_dir or get_plugin_dir()
     return {
-        "images_dir": images,
-        "sounds_dir": sounds,
-        "dicts_dir": dicts,
-        "yolo_dir": yolo,
-        "replays_dir": replays,
-        "plugins_dir": plugins,
+        "images_dir": str(package.assets_images_dir or ""),
+        "sounds_dir": str(package.assets_sounds_dir or ""),
+        "dicts_dir": str(package.assets_dicts_dir or ""),
+        "yolo_dir": str(package.assets_yolo_dir or ""),
+        "replays_dir": str(package.assets_replays_dir or ""),
+        "plugins_dir": str(package.assets_plugins_dir or "") or get_plugin_dir(),
     }
 
 
@@ -44,6 +37,8 @@ def _player_workflow_resource_dirs(
     workflow_filepath: str = "",
 ) -> dict[str, str]:
     package_dirs = _player_package_resource_dirs(package)
+    if bool(getattr(package, "isolated_runtime", False)):
+        return package_dirs
     from task_workflow.workspace import resolve_runtime_resource_dirs
 
     runtime = resolve_runtime_resource_dirs(

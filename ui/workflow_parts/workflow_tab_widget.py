@@ -674,7 +674,22 @@ class WorkflowTabWidget(QTabWidget):
                     task.host_workflow_filepath = str(parent_file or "").strip()
                     logical = str(filepath)[len("memory://"):]
                     task.host_logical_path = logical
-                    apply_resource_dirs_to_task(task, nested_session.resource_dirs())
+                    current_id = self.get_current_task_id()
+                    parent_task = self.task_manager.get_task(current_id) if current_id is not None else None
+                    nested_dirs = {}
+                    if parent_task is not None:
+                        from task_workflow.resource_context import resource_dirs_from_mapping
+
+                        nested_dirs = resource_dirs_from_mapping(parent_task)
+                    apply_resource_dirs_to_task(task, nested_dirs)
+                    images_dir = str(nested_dirs.get("images_dir") or "").strip()
+                    if images_dir:
+                        from app_core.lca_format.session import materialize_package_assets
+
+                        materialize_package_assets(
+                            nested_session,
+                            os.path.dirname(os.path.abspath(images_dir)),
+                        )
                 if jump_config is not None:
                     task.jump_enabled = jump_config['enabled']
                     task.jump_rules = jump_config['rules'].copy()

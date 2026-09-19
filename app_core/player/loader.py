@@ -400,6 +400,7 @@ def load_player_package(package_dir: Path | str) -> PlayerPackage:
                 manifest, workflow_data=workflow_data, ui=ui, package_dir=""
             ),
             runtime_config=load_packaged_runtime_config(),
+            isolated_runtime=True,
         )
 
     if is_player_only_executable() or is_player_mode_requested():
@@ -468,61 +469,12 @@ def load_player_package(package_dir: Path | str) -> PlayerPackage:
             manifest, workflow_data=workflow_data, ui=ui, package_dir=str(root)
         ),
         runtime_config=load_packaged_runtime_config(package_dir=str(root)),
+        isolated_runtime=True,
     )
 
 
 def prepare_player_search_paths(package: PlayerPackage) -> None:
-    from app_core.player.runtime_images import (
-        materialize_player_components,
-        materialize_player_dicts,
-        materialize_player_replays,
-        materialize_player_sounds,
-        materialize_player_yolo,
-    )
+    from app_core.player.runtime_images import ensure_player_image_memory
 
-    # 密封包没有磁盘 assets 目录，音效/回放/字库/模型/组件仍要从 memory 落到 userdata。
-    materialize_player_sounds(package.userdata_dir)
-    materialize_player_replays(package.userdata_dir)
-    materialize_player_dicts(package.userdata_dir)
-    materialize_player_yolo(package.userdata_dir)
-    materialize_player_components(package.userdata_dir)
-    from utils.image_paths import get_image_path_resolver
-
-    resolver = get_image_path_resolver()
-    for search_dir in (package.assets_images_dir, package.assets_dicts_dir):
-        if search_dir:
-            resolver.add_search_path(search_dir, priority=0)
-    sounds_dir = package.assets_sounds_dir
-    if sounds_dir and os.path.isdir(sounds_dir):
-        userdata_sounds = os.path.join(package.userdata_dir, "sounds")
-        os.makedirs(userdata_sounds, exist_ok=True)
-        for name in os.listdir(sounds_dir):
-            source = os.path.join(sounds_dir, name)
-            if not os.path.isfile(source):
-                continue
-            destination = os.path.join(userdata_sounds, name)
-            if os.path.isfile(destination):
-                continue
-            try:
-                os.link(source, destination)
-            except OSError:
-                import shutil
-
-                shutil.copy2(source, destination)
-    components_src = os.path.join(str(package.package_dir or ""), "assets", "components")
-    if os.path.isdir(components_src):
-        userdata_components = os.path.join(package.userdata_dir, "components")
-        os.makedirs(userdata_components, exist_ok=True)
-        for name in os.listdir(components_src):
-            source = os.path.join(components_src, name)
-            if not os.path.isfile(source):
-                continue
-            destination = os.path.join(userdata_components, name)
-            if os.path.isfile(destination):
-                continue
-            try:
-                os.link(source, destination)
-            except OSError:
-                import shutil
-
-                shutil.copy2(source, destination)
+    _ = package
+    ensure_player_image_memory()

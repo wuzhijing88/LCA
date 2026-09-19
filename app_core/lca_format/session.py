@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, Mapping, Optional
+from typing import Iterator, Mapping, Optional
 
 
 _registry: dict[str, "LcaPackageSession"] = {}
@@ -57,8 +58,37 @@ def _package_alias_paths(path: str) -> list[str]:
     return aliases
 
 
+def _file_source_stat(path: object) -> Optional[tuple[int, int]]:
+    text = str(path or "").strip()
+    if not text or not os.path.isfile(text):
+        return None
+    try:
+        stat = os.stat(text)
+        return int(stat.st_mtime_ns), int(stat.st_size)
+    except OSError:
+        return None
+
+
+_ASSET_FOLDER_PREFIXES = (
+    ("assets/images/", "images"),
+    ("images/", "images"),
+    ("assets/sounds/", "sounds"),
+    ("sounds/", "sounds"),
+    ("assets/dicts/", "dicts"),
+    ("dicts/", "dicts"),
+    ("assets/yolo/", "yolo"),
+    ("assets/models/", "yolo"),
+    ("yolo/", "yolo"),
+    ("models/", "yolo"),
+    ("assets/replays/", "replays"),
+    ("replays/", "replays"),
+    ("assets/components/", "plugins"),
+    ("plugins/", "plugins"),
+)
+
+
 class LcaPackageSession:
-    """打开的 LCA 工程所包含文件的只读内存映射。"""
+    """打开的 LCA 工程所包含文件的只读内存映射，供保存/嵌套工作流使用。运行时资源不走这里。"""
 
     def __init__(self, files: Mapping[str, bytes]):
         self._files = {
@@ -66,75 +96,86 @@ class LcaPackageSession:
             for path, data in files.items()
             if _normalize_logical_path(path)
         }
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="lca-package-")
-        self._resolved_assets: dict[str, str] = {}
-        self._resolve_lock = threading.RLock()
+        self._files_lock = threading.RLock()
+        self._source_stat: Optional[tuple[int, int]] = None
+        self._closed = False
+
+    def bind_source(self, path: object) -> None:
+        self._source_stat = _file_source_stat(path)
+
+    def matches_source(self, path: object) -> bool:
+        current = _file_source_stat(path)
+        return current is not None and current == self._source_stat
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with self._files_lock:
+            self._files.clear()
 
     def get_bytes(self, logical_path: object) -> Optional[bytes]:
         path = _normalize_logical_path(logical_path)
-        data = self._files.get(path)
-        if data is not None:
-            return data
-        for alias in _package_alias_paths(path):
-            data = self._files.get(alias)
+        with self._files_lock:
+            data = self._files.get(path)
             if data is not None:
                 return data
+            for alias in _package_alias_paths(path):
+                data = self._files.get(alias)
+                if data is not None:
+                    return data
         return None
 
     def snapshot_files(self) -> dict[str, bytes]:
         """返回包内文件快照，供导出等只读收集流程使用。"""
-        return dict(self._files)
+        with self._files_lock:
+            return dict(self._files)
 
-    def resolve_asset(self, logical_path: object) -> Optional[str]:
-        path = _normalize_logical_path(logical_path)
-        data = self.get_bytes(path)
-        if data is None:
-            return None
-        parts = [part for part in path.split("/") if part not in {"", "."}]
-        if not parts or ".." in parts:
-            return None
-        with self._resolve_lock:
-            existing = self._resolved_assets.get(path)
-            if existing and Path(existing).is_file():
-                return existing
-            destination = Path(self._temp_dir.name).joinpath(*parts)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(data)
-            resolved = str(destination)
-            self._resolved_assets[path] = resolved
-            return resolved
 
-    def resource_root(self) -> str:
-        return self._temp_dir.name
-
-    def resource_dirs(self) -> Dict[str, str]:
-        root = self._temp_dir.name
-        dirs = {
-            "images_dir": os.path.join(root, "assets", "images"),
-            "sounds_dir": os.path.join(root, "assets", "sounds"),
-            "dicts_dir": os.path.join(root, "assets", "dicts"),
-            "yolo_dir": os.path.join(root, "assets", "yolo"),
-            "replays_dir": os.path.join(root, "assets", "replays"),
-            "plugins_dir": os.path.join(root, "assets", "components"),
-        }
-        for path in dirs.values():
-            os.makedirs(path, exist_ok=True)
-        return dirs
+def materialize_package_assets(session: LcaPackageSession, workspace_root: str) -> None:
+    """把包内资源落到工作区。已有文件不覆盖。"""
+    root = str(workspace_root or "").strip()
+    if not root:
+        return
+    base = Path(root)
+    for logical, data in session.snapshot_files().items():
+        path = str(logical or "").replace("\\", "/").strip().lstrip("/")
+        if not path or path == "manifest.json" or path.endswith(".lca"):
+            continue
+        if path.startswith("workflows/") and path.endswith(".json"):
+            continue
+        dest_rel = None
+        for prefix, folder in _ASSET_FOLDER_PREFIXES:
+            if path.startswith(prefix):
+                rest = path[len(prefix) :]
+                dest_rel = Path(folder) / rest if rest else None
+                break
+        if dest_rel is None:
+            continue
+        destination = base / dest_rel
+        if destination.exists():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
 
 
 def register(path: object, session: LcaPackageSession) -> LcaPackageSession:
     if not isinstance(session, LcaPackageSession):
         raise TypeError("session 必须是 LcaPackageSession")
     normalized = _normalize_project_path(path)
+    old: Optional[LcaPackageSession] = None
     with _registry_lock:
+        old = _registry.get(normalized)
         _registry[normalized] = session
+    if old is not None and old is not session:
+        old.close()
     return session
 
 
 def register_temporary(session: LcaPackageSession) -> str:
     if not isinstance(session, LcaPackageSession):
         raise TypeError("session 必须是 LcaPackageSession")
-    path = str(Path(session.resource_root()) / "package.lca")
+    path = os.path.join(tempfile.gettempdir(), f"lca-nested-{uuid.uuid4().hex}.lca")
     register(path, session)
     return _normalize_project_path(path)
 
@@ -204,10 +245,13 @@ def clear_path(path: object) -> None:
         normalized = _normalize_project_path(path)
     except ValueError:
         return
+    old: Optional[LcaPackageSession] = None
     with _registry_lock:
-        _registry.pop(normalized, None)
+        old = _registry.pop(normalized, None)
         if _active_path == normalized:
             _active_path = None
+    if old is not None:
+        old.close()
     _clear_resolver_cache()
 
 
@@ -217,22 +261,3 @@ def deactivate() -> None:
         _active_path = None
     _clear_resolver_cache()
 
-
-def _resolve_active_package_asset(logical_path: str) -> Optional[str]:
-    session = get_active()
-    if session is None:
-        return None
-    return session.resolve_asset(logical_path)
-
-
-def _register_image_path_hook() -> None:
-    """把当前工程会话接到通用图片路径解析器上，避免 utils 层反向依赖本模块。"""
-    try:
-        from utils.image_paths import set_package_asset_resolver
-
-        set_package_asset_resolver(_resolve_active_package_asset)
-    except Exception:
-        pass
-
-
-_register_image_path_hook()

@@ -180,6 +180,16 @@ class YOLOONNXEngine:
             return path
         raise FileNotFoundError(f"模型文件不存在: {text}")
 
+    def _resolve_model_bytes(self) -> bytes:
+        from task_workflow.resource_path import unwrap_resource_path
+        from task_workflow.script_resources import read_resource_bytes
+
+        text = unwrap_resource_path(self.model_path) or ""
+        data = read_resource_bytes(text)
+        if not data:
+            raise FileNotFoundError(f"模型文件不存在: {text}")
+        return data
+
     def _load_model(self) -> bool:
         """加载ONNX模型"""
         if self._model_loaded:
@@ -190,8 +200,19 @@ class YOLOONNXEngine:
                 return True
 
             try:
-                model_path = self._resolve_model_path()
-                if model_path.suffix.lower() != '.onnx':
+                from task_workflow.resource_path import unwrap_resource_path
+                from task_workflow.script_resources import resolve_resource_path
+
+                text = unwrap_resource_path(self.model_path) or ""
+                located = resolve_resource_path(text, enforce_jail=False) if text else ""
+                model_path = Path(located) if located and Path(str(located)).is_file() else None
+                model_bytes = None
+                if model_path is None:
+                    model_bytes = self._resolve_model_bytes()
+                    suffix = Path(str(located or text)).suffix.lower()
+                    if suffix and suffix != ".onnx":
+                        raise ValueError(f"不支持的模型格式: {suffix}，只支持.onnx格式")
+                elif model_path.suffix.lower() != ".onnx":
                     raise ValueError(f"不支持的模型格式: {model_path.suffix}，只支持.onnx格式")
 
                 # 创建ONNX Runtime会话
@@ -215,8 +236,9 @@ class YOLOONNXEngine:
                     list(available_providers),
                 )
 
+                session_source = model_bytes if model_bytes is not None else str(model_path)
                 self._session = ort.InferenceSession(
-                    str(model_path),
+                    session_source,
                     sess_options=sess_options,
                     providers=providers
                 )
@@ -240,10 +262,14 @@ class YOLOONNXEngine:
                         logger.warning("Input size override ignored: static model input shape")
 
                 # 尝试加载类别名称（从元数据或配置文件）
-                self._load_class_names(model_path)
+                if model_path is not None:
+                    self._load_class_names(model_path)
+                else:
+                    metadata_names = self._load_class_names_from_metadata()
+                    self._class_names = metadata_names or []
 
                 self._model_loaded = True
-                logger.info(f"ONNX模型加载成功: {model_path}")
+                logger.info(f"ONNX模型加载成功: {model_path or located or text}")
                 logger.info(f"  输入: {self._input_name} {self._input_shape}")
                 logger.info(f"  输出: {self._output_names}")
                 logger.info(f"  类别数: {len(self._class_names)}")

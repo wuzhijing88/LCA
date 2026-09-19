@@ -383,21 +383,18 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int],
 
 
 def _child_resource_dirs(workflow_data: Optional[Dict[str, Any]], workflow_filepath: Optional[str], nested_session: Any) -> Dict[str, str]:
-    dirs: Dict[str, str] = {}
-    if nested_session is not None and hasattr(nested_session, "resource_dirs"):
-        dirs = dict(nested_session.resource_dirs())
+    from task_workflow.resource_context import current_resource_dirs
+    from task_workflow.workspace import resolve_runtime_resource_dirs, resource_runtime_kwargs
+
+    _ = nested_session
     filepath = str(workflow_filepath or "").strip()
     if filepath and not filepath.startswith("memory://") and os.path.isfile(filepath):
-        from task_workflow.workspace import resolve_runtime_resource_dirs, resource_runtime_kwargs
-
         disk_dirs = resolve_runtime_resource_dirs(
             workflow_data,
             workflow_filepath=filepath,
-            default_images_dir=str(dirs.get("images_dir") or ""),
         )
-        if disk_dirs.get("custom"):
-            dirs = resource_runtime_kwargs(disk_dirs)
-    return dirs
+        return resource_runtime_kwargs(disk_dirs)
+    return current_resource_dirs()
 
 
 def _resolve_child_window(
@@ -543,6 +540,15 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
             start_card_id,
         )
         child_dirs = _child_resource_dirs(workflow_data, workflow_filepath, nested_session)
+        if nested_session is not None:
+            from app_core.lca_format.session import materialize_package_assets
+
+            images_dir = str(child_dirs.get("images_dir") or "").strip()
+            if images_dir:
+                materialize_package_assets(
+                    nested_session,
+                    os.path.dirname(os.path.abspath(images_dir)),
+                )
         bound_windows = kwargs.get("bound_windows")
         if bound_windows is None:
             bound_windows = getattr(parent_executor, "bound_windows", None)

@@ -56,17 +56,20 @@ def bind_resource_dirs(dirs: Optional[Mapping[str, Any]] = None, **kwargs: Any) 
         replays_dir=_text(payload.get("replays_dir")),
         plugins_dir=_text(payload.get("plugins_dir")),
     )
-    _register_resolver_search_dirs(payload)
-
-
-def _register_resolver_search_dirs(payload: Mapping[str, Any]) -> None:
     from utils.image_paths import get_image_path_resolver
 
-    resolver = get_image_path_resolver()
-    for key in ("images_dir", "dicts_dir"):
-        path = _text(payload.get(key))
-        if path and os.path.isdir(path):
-            resolver.add_search_path(path, priority=0)
+    get_image_path_resolver().clear_cache()
+
+
+def bound_search_dirs() -> list:
+    return [
+        bound_images_dir(),
+        bound_dicts_dir(),
+        bound_sounds_dir(),
+        bound_yolo_dir(),
+        bound_replays_dir(),
+        bound_plugins_dir(),
+    ]
 
 
 def bound_images_dir() -> str:

@@ -786,6 +786,7 @@ class PlayerPackage:
     # id -> workflow_data；供脚本列表勾选后切换执行
     scripts: Dict[str, Dict[str, Any]] = field(default_factory=dict, repr=False)
     runtime_config: Dict[str, Any] = field(default_factory=dict)
+    isolated_runtime: bool = False
 
 
 def resolve_ui_asset_bytes(package: Optional[PlayerPackage], relative_or_abs: str) -> Optional[bytes]:

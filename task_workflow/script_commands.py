@@ -3129,7 +3129,7 @@ class CommandHost:
         return ScriptResult({"ok": True, "kind": "audio"})
 
     def 回放(self, 文件: Any, 速度: Any = 1.0, 次数: Any = 1, 等待: Any = True) -> ScriptResult:
-        from task_workflow.script_resources import resolve_resource_path
+        from task_workflow.script_resources import read_resource_bytes
 
         wait = _as_bool(等待)
         if isinstance(次数, bool) or not isinstance(次数, int) or 次数 < 1:
@@ -3143,12 +3143,11 @@ class CommandHost:
             raise ValueError('回放要写文件，例如 回放("replays/过图.replay.json")')
         dirs = self._resource_dirs()
         relative = self._constrain_path(raw)
-        absolute = resolve_resource_path(relative, enforce_jail=True, **dirs)
-        if not absolute or not os.path.isfile(absolute):
+        data = read_resource_bytes(relative, **dirs)
+        if not data:
             raise ValueError(f"回放文件不存在: {raw}")
         try:
-            with open(absolute, encoding="utf-8") as handle:
-                payload = json.loads(handle.read())
+            payload = json.loads(data.decode("utf-8"))
         except Exception as exc:
             raise ValueError(f"回放文件读不出来: {exc}") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("actions"), list):
@@ -3259,13 +3258,14 @@ class CommandHost:
 
     def 截图(self, 文件: Any = None) -> ScriptResult:
         from task_workflow.script_resources import constrain_script_path, script_path_for_file
-        from utils.app_paths import get_images_dir
 
         frame = _capture_window_frame(self.context.get("target_hwnd"))
         if frame is None:
             return ScriptResult({"ok": False, "kind": "image"})
         dirs = dict(self._resource_dirs())
-        root = str(dirs.get("images_dir") or "").strip() or get_images_dir("LCA")
+        root = str(dirs.get("images_dir") or "").strip()
+        if not root:
+            raise ValueError("截图失败：未绑定图片目录")
         dirs["images_dir"] = root
         name = str(文件 or "").strip().replace("\\", "/")
         if not name:

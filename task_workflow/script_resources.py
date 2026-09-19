@@ -308,6 +308,84 @@ def is_allowed_script_path(
     )
 
 
+def _memory_resource_keys(path: str) -> List[str]:
+    text = str(path or "").replace("\\", "/").strip()
+    if text.startswith("memory://"):
+        text = text[len("memory://") :]
+    text = text.lstrip("/")
+    if not text:
+        return []
+    base = os.path.basename(text)
+    keys = [text, base]
+    kind = resource_kind(text) or resource_kind(base)
+    if kind == "image":
+        keys.extend((f"images/{base}", f"assets/images/{base}"))
+    elif kind == "audio":
+        keys.extend((f"sounds/{base}", f"assets/sounds/{base}"))
+    elif kind == "dict":
+        keys.extend((f"dicts/{base}", f"assets/dicts/{base}"))
+    elif kind == "model":
+        keys.extend((f"yolo/{base}", f"models/{base}", f"assets/yolo/{base}", f"assets/models/{base}"))
+    elif kind == "replay":
+        keys.extend((f"replays/{base}", f"assets/replays/{base}"))
+    elif kind == "component":
+        keys.extend((f"plugins/{base}", f"components/{base}", f"assets/components/{base}"))
+    unique: List[str] = []
+    seen = set()
+    for key in keys:
+        item = str(key or "").strip().lstrip("/")
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def _player_memory_bytes(path: str) -> Optional[bytes]:
+    try:
+        from app_core.player.memory_store import get_player_memory_file, has_player_memory_files
+        from app_core.player.runtime_images import ensure_player_image_memory
+    except Exception:
+        return None
+    if not has_player_memory_files():
+        ensure_player_image_memory()
+    if not has_player_memory_files():
+        return None
+    for key in _memory_resource_keys(path):
+        data = get_player_memory_file(key)
+        if data is not None:
+            return bytes(data)
+    return None
+
+
+def read_resource_bytes(
+    path: str,
+    images_dir: str = "",
+    sounds_dir: str = "",
+    dicts_dir: str = "",
+    yolo_dir: str = "",
+    replays_dir: str = "",
+    plugins_dir: str = "",
+) -> Optional[bytes]:
+    """主程序与自定义脚本共用的资源读取：磁盘工作区 / 工程包 / 独立程序内存。"""
+    located = resolve_resource_path(
+        path,
+        images_dir=images_dir,
+        sounds_dir=sounds_dir,
+        dicts_dir=dicts_dir,
+        yolo_dir=yolo_dir,
+        replays_dir=replays_dir,
+        plugins_dir=plugins_dir,
+        enforce_jail=False,
+    )
+    if located and str(located).startswith("memory://"):
+        return _player_memory_bytes(located)
+    if located and os.path.isfile(located):
+        with open(located, "rb") as handle:
+            return handle.read()
+    return _player_memory_bytes(path)
+
+
 def resolve_resource_path(
     path: str,
     images_dir: str = "",
@@ -400,14 +478,6 @@ def resolve_resource_path(
                 os.path.join(root, suffix),
             )
         )
-    try:
-        from utils.image_paths import get_image_path_resolver
-
-        resolved = get_image_path_resolver().resolve(text)
-        if resolved:
-            candidates.insert(0, str(resolved))
-    except Exception:
-        pass
     allowed = []
     existing = []
     for candidate in candidates:
@@ -438,16 +508,11 @@ def resolve_resource_path(
         for absolute in existing:
             if any(_is_under_root(absolute, root) for root in local_roots):
                 return absolute
-    try:
-        from app_core.lca_format.session import get_active
-
-        session = get_active()
-        if session is not None:
-            packaged = session.resolve_asset(text)
-            if packaged and os.path.isfile(packaged):
-                return packaged
-    except Exception:
-        pass
+    memory_hit = _player_memory_bytes(text)
+    if memory_hit is not None:
+        keys = _memory_resource_keys(text)
+        logical = keys[0] if keys else text.replace("\\", "/").lstrip("/")
+        return f"memory://{logical}"
     if existing:
         return existing[0]
     if allowed:
@@ -561,6 +626,42 @@ def script_path_for_file(
         relative = os.path.relpath(absolute, root).replace(os.sep, "/")
         return f"images/{relative}"
     return normalize_workflow_image_path(text)
+
+
+def place_resource_file(
+    source_path: str,
+    kind: str = "",
+    images_dir: str = "",
+    sounds_dir: str = "",
+    dicts_dir: str = "",
+    yolo_dir: str = "",
+    replays_dir: str = "",
+    plugins_dir: str = "",
+) -> str:
+    """把资源放到绑定目录，返回 images/foo.bmp 这类逻辑路径。"""
+    source = os.path.abspath(str(source_path or "").strip())
+    if not source or not os.path.isfile(source):
+        raise FileNotFoundError(f"资源文件不存在: {source_path}")
+    dirs = _current_dirs(images_dir, sounds_dir, dicts_dir, yolo_dir, replays_dir, plugins_dir)
+    detected = str(kind or "").strip() or resource_kind(source)
+    folder_key = {
+        "model": ("yolo_dir", "yolo"),
+        "replay": ("replays_dir", "replays"),
+        "audio": ("sounds_dir", "sounds"),
+        "component": ("plugins_dir", "plugins"),
+        "dict": ("dicts_dir", "dicts"),
+    }.get(detected, ("images_dir", "images"))
+    dest_dir = os.path.abspath(str(dirs.get(folder_key[0]) or dirs["images_dir"] or ""))
+    if not dest_dir:
+        raise ValueError("未绑定资源目录")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_prefix = os.path.normcase(dest_dir) + os.sep
+    if os.path.normcase(source).startswith(dest_prefix) or os.path.normcase(source) == os.path.normcase(dest_dir):
+        return _relative_kind_path(source, dest_dir, folder_key[1])
+    destination = os.path.join(dest_dir, os.path.basename(source))
+    if os.path.normcase(os.path.abspath(destination)) != os.path.normcase(source):
+        shutil.copy2(source, destination)
+    return f"{folder_key[1]}/{os.path.basename(destination)}"
 
 
 def list_card_files(images_dir: str, card_id: Optional[int] = None, workflow_token: str = "") -> List[str]:

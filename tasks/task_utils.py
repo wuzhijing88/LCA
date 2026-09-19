@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
 from collections import OrderedDict
 from utils.window.hwnd_utils import as_hwnd
-from utils.image_paths import ImagePathResolver, get_image_path_resolver
+from utils.image_paths import get_image_path_resolver
 from utils.precise_sleep import precise_sleep as _shared_precise_sleep
 from utils.window.window_coordinate_common import (
     find_region_binding_equivalent_descendant,
@@ -988,20 +988,14 @@ def correct_image_paths(
     if not raw_paths:
         return []
 
-    resolver = get_image_path_resolver()
     valid_count = len([p for p in raw_paths if p and p.strip()])
-    search_dirs = [images_dir] if str(images_dir or "").strip() else None
-
     logger.info(f"[路径纠正] 开始解析 {valid_count} 个图片路径")
-
-    corrected_paths = resolver.resolve_many(
-        raw_paths,
-        filter_invalid=True,
-        search_dirs=search_dirs,
-    )
-
+    corrected_paths = []
+    for item in raw_paths:
+        located = correct_single_image_path(item, card_id=card_id, images_dir=images_dir)
+        if located:
+            corrected_paths.append(located)
     logger.info(f"[路径纠正] 完成，有效路径: {len(corrected_paths)}/{valid_count}")
-
     return corrected_paths
 
 
@@ -1012,7 +1006,7 @@ def correct_single_image_path(
 ) -> Optional[str]:
     """【通用工具】纠正单个图片路径
 
-    优化版本：使用 ImagePathResolver，带缓存
+    走统一资源读取：绑定工作区目录，没有才用工程包。
 
     Args:
         raw_path: 原始路径
@@ -1030,8 +1024,19 @@ def correct_single_image_path(
     if not raw_path:
         return None
 
-    resolver = get_image_path_resolver()
-    search_dirs = [images_dir] if str(images_dir or "").strip() else None
-    return resolver.resolve(raw_path, search_dirs=search_dirs)
+    from task_workflow.script_resources import resolve_resource_path
+
+    kwargs = {}
+    extra = str(images_dir or "").strip()
+    if extra:
+        kwargs["images_dir"] = extra
+    located = resolve_resource_path(str(raw_path).strip(), enforce_jail=False, **kwargs)
+    if not located:
+        return None
+    if str(located).startswith("memory://"):
+        return located
+    if os.path.isfile(located):
+        return located
+    return None
 
 

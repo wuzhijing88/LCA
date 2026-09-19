@@ -56,7 +56,7 @@ class ParameterPanelMediaMixin:
                 return
 
             param_name = self._get_registered_widget_name(line_edit)
-            selected_value = self._normalize_single_image_parameter_value(param_name, filename)
+            selected_value = self._store_resource_in_workspace(filename, param_name)
             line_edit.setText(selected_value)
             self._update_current_parameter_from_widget(line_edit, selected_value)
             self._apply_parameters(auto_close=False)
@@ -279,6 +279,33 @@ class ParameterPanelMediaMixin:
         self._current_screenshot_param_name = None
         self._screenshot_overlay = None
 
+    def _store_resource_in_workspace(self, filepath: str, param_name: Optional[str] = None) -> str:
+        from task_workflow.script_resources import place_resource_file, resource_kind
+
+        kind = ""
+        name = str(param_name or "")
+        if "dict" in name.lower():
+            kind = "dict"
+        elif name.endswith("_image_path") or name == "image_path":
+            kind = "image"
+        elif "sound" in name.lower() or "audio" in name.lower():
+            kind = "audio"
+        else:
+            kind = resource_kind(filepath)
+        try:
+            return place_resource_file(
+                filepath,
+                kind=kind,
+                images_dir=str(getattr(self, "images_dir", "") or ""),
+                sounds_dir=str(getattr(self, "sounds_dir", "") or ""),
+                dicts_dir=str(getattr(self, "dicts_dir", "") or ""),
+                yolo_dir=str(getattr(self, "yolo_dir", "") or ""),
+                replays_dir=str(getattr(self, "replays_dir", "") or ""),
+                plugins_dir=str(getattr(self, "plugins_dir", "") or ""),
+            )
+        except Exception:
+            return self._normalize_single_image_parameter_value(param_name, filepath)
+
     def _import_screenshot_to_parameter(self, filepath: str) -> None:
         param_name = getattr(self, "_current_screenshot_param_name", None)
         target_input = self._resolve_screenshot_target_input(param_name)
@@ -287,7 +314,7 @@ class ParameterPanelMediaMixin:
         if not param_name:
             param_name = "image_path"
 
-        normalized_path = self._normalize_single_image_parameter_value(param_name, filepath)
+        normalized_path = self._store_resource_in_workspace(filepath, param_name)
         if not normalized_path:
             normalized_path = filepath
 

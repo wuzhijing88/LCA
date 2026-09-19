@@ -18,9 +18,11 @@ from app_core.lca_format.constants import (
 from app_core.lca_format.container import LcaFormatError, seal_lca_bytes, unseal_lca_bytes
 from app_core.lca_format.session import (
     LcaPackageSession,
+    clear_path,
     get_active,
     get_active_path,
     get_for_path,
+    materialize_package_assets,
     register,
 )
 from task_workflow.workspace import workflow_resource_dirs
@@ -170,7 +172,6 @@ class _ProjectCollector:
         self.files: Dict[str, bytes] = {}
         self.file_records = []
         self._used_paths = set()
-        self._asset_paths: Dict[Tuple[object, ...], str] = {}
         self._workflow_paths: Dict[Tuple[object, ...], str] = {}
         self._missing = set()
 
@@ -384,33 +385,6 @@ class _ProjectCollector:
         kind: str = "",
     ) -> str:
         kind = str(kind or "").strip() or _kind_for_path(raw_path, key) or "other"
-        package_data = None
-        package_key = raw_path
-        if source_session is not None:
-            package_data = source_session.get_bytes(raw_path)
-            if package_data is None and kind == "dict":
-                basename = Path(str(raw_path or "").replace("\\", "/")).name
-                for candidate in (
-                    f"dicts/{basename}",
-                    f"assets/dicts/{basename}",
-                    f"assets/images/dicts/{basename}",
-                    f"images/dicts/{basename}",
-                    f"assets/images/{basename}",
-                    f"images/{basename}",
-                    basename,
-                ):
-                    package_data = source_session.get_bytes(candidate)
-                    if package_data is not None:
-                        package_key = candidate
-                        break
-        if package_data is not None:
-            identity = ("session", id(source_session), package_key.replace("\\", "/").lower())
-            filename = Path(package_key.replace("\\", "/")).name
-            return _workflow_resource_path(
-                kind,
-                self._register_asset(identity, package_data, filename, kind, package_key),
-            )
-
         resolved = self._resolve_disk_file(
             raw_path,
             source_dir,
@@ -422,20 +396,34 @@ class _ProjectCollector:
             plugins_dir=plugins_dir,
             dicts_dir=dicts_dir,
         )
-        if resolved is None:
-            self._missing.add(raw_path)
-            return raw_path
-        identity = ("disk", os.path.normcase(str(resolved.resolve())))
-        return _workflow_resource_path(
-            kind,
-            self._register_asset(
-                identity,
-                resolved.read_bytes(),
-                resolved.name,
-                kind,
-                raw_path,
-            ),
-        )
+        if resolved is not None:
+            from task_workflow.script_resources import place_resource_file, script_path_for_file
+
+            placed = place_resource_file(
+                str(resolved),
+                kind=kind,
+                images_dir=str(images_dir or ""),
+                sounds_dir=str(sounds_dir or ""),
+                dicts_dir=str(dicts_dir or ""),
+                yolo_dir=str(yolo_dir or ""),
+                replays_dir=str(replays_dir or ""),
+                plugins_dir=str(plugins_dir or ""),
+            )
+            if placed:
+                return placed
+            return script_path_for_file(
+                str(resolved),
+                kind=kind,
+                images_dir=str(images_dir or ""),
+                sounds_dir=str(sounds_dir or ""),
+                dicts_dir=str(dicts_dir or ""),
+                yolo_dir=str(yolo_dir or ""),
+                replays_dir=str(replays_dir or ""),
+                plugins_dir=str(plugins_dir or ""),
+            )
+
+        self._missing.add(raw_path)
+        return raw_path
 
     def _collect_sub_workflow(
         self,
@@ -606,43 +594,10 @@ class _ProjectCollector:
         normalized = text.replace("\\", "/")
         if normalized.lower().startswith(("images/", "sounds/", "yolo/", "replays/", "plugins/", "dicts/")) and root:
             candidates.append(root / normalized.split("/", 1)[1])
-        try:
-            from utils.image_paths import get_image_path_resolver
-
-            image_resolved = get_image_path_resolver().resolve(text)
-            if image_resolved and not str(image_resolved).startswith("memory://"):
-                candidates.append(Path(image_resolved))
-        except Exception:
-            pass
         for candidate in candidates:
             if candidate.is_file():
                 return candidate.resolve()
         return None
-
-    def _register_asset(
-        self,
-        identity: Tuple[object, ...],
-        data: bytes,
-        filename: str,
-        kind: str,
-        original: str,
-    ) -> str:
-        existing = self._asset_paths.get(identity)
-        if existing is not None:
-            return existing
-        folder = {
-            "image": "assets/images",
-            "audio": "assets/sounds",
-            "model": "assets/yolo",
-            "replay": "assets/replays",
-            "dict": "assets/dicts",
-            "component": "assets/components",
-        }.get(kind, "assets/other")
-        logical_path = self._unique_path(folder, filename or "asset")
-        self._asset_paths[identity] = logical_path
-        self.files[logical_path] = bytes(data)
-        self.file_records.append({"path": logical_path, "role": "asset", "original": original})
-        return logical_path
 
     def _unique_path(self, folder: str, filename: str) -> str:
         safe_name = Path(filename).name or "file"
@@ -675,11 +630,14 @@ def ensure_registered_lca_session(path: str | Path) -> Optional[LcaPackageSessio
     if not is_lca_path(text):
         return None
     existing = get_for_path(text)
-    if existing is not None:
+    if existing is not None and existing.matches_source(text):
         return existing
+    if existing is not None:
+        clear_path(text)
     if not Path(text).is_file():
         return None
     _payload, session = load_lca_project(text)
+    session.bind_source(text)
     register(text, session)
     return session
 
@@ -891,12 +849,33 @@ def write_nested_workflow(
         activate(host)
 
 
+def _materialize_loaded_project(
+    path: str | Path,
+    workflow_data: dict,
+    session: LcaPackageSession,
+) -> None:
+    from task_workflow.workspace import extract_workflow_resource_path
+
+    root = extract_workflow_resource_path(workflow_data)
+    if not root:
+        root = str(Path(path).resolve().parent)
+        metadata = workflow_data.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            workflow_data["metadata"] = metadata
+        metadata["custom_resource_path"] = root
+    materialize_package_assets(session, root)
+
+
 def load_lca_project(path: str | Path) -> tuple[dict, LcaPackageSession]:
     try:
         from app_core.lca_format.legacy_convert import convert_project_file
 
         converted = convert_project_file(path)
-        return load_lca_from_bytes(converted.read_bytes())
+        workflow_data, session = load_lca_from_bytes(converted.read_bytes())
+        session.bind_source(path)
+        _materialize_loaded_project(path, workflow_data, session)
+        return workflow_data, session
     except LcaFormatError:
         raise
     except OSError:

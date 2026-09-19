@@ -8,8 +8,6 @@ import os
 import time
 from typing import Callable, Optional
 
-from utils.app_paths import get_app_root
-
 logger = logging.getLogger(__name__)
 
 _MCI_ALIAS = "lca_media"
@@ -17,60 +15,16 @@ _MCI_ALIAS = "lca_media"
 
 def resolve_media_path(raw_path: str) -> Optional[str]:
     from task_workflow.resource_path import unwrap_resource_path
-
-    text = unwrap_resource_path(raw_path) or ""
-    if not text or text.startswith("memory://"):
-        return None
-
     from task_workflow.script_resources import resolve_resource_path
 
+    text = unwrap_resource_path(raw_path) or ""
+    if not text:
+        return None
     located = resolve_resource_path(text, enforce_jail=False)
+    if located and str(located).startswith("memory://"):
+        return located
     if located and os.path.isfile(located):
         return located
-
-    from task_workflow.resource_context import current_images_dir, current_sounds_dir
-
-    images_dir = current_images_dir()
-    sounds_dir = current_sounds_dir()
-    candidates = []
-    if os.path.isabs(text):
-        candidates.append(text)
-    else:
-        normalized = text.replace("\\", "/")
-        basename = os.path.basename(normalized)
-        candidates.append(os.path.abspath(text))
-        candidates.append(os.path.join(get_app_root(), text))
-        lowered = normalized.lower()
-        if lowered.startswith("assets/sounds/"):
-            suffix = normalized[len("assets/sounds/"):].lstrip("/")
-            if suffix:
-                candidates.append(os.path.join(sounds_dir, suffix))
-        if lowered.startswith("sounds/"):
-            suffix = normalized[7:].lstrip("/")
-            if suffix:
-                candidates.append(os.path.join(sounds_dir, suffix))
-                candidates.append(os.path.join(get_app_root(), "sounds", suffix))
-        if lowered.startswith("assets/images/"):
-            suffix = normalized[len("assets/images/"):].lstrip("/")
-            if suffix:
-                candidates.append(os.path.join(images_dir, suffix))
-        if lowered.startswith("images/"):
-            suffix = normalized[7:].lstrip("/")
-            if suffix:
-                candidates.append(os.path.join(images_dir, suffix))
-        if basename:
-            candidates.append(os.path.join(images_dir, basename))
-            candidates.append(os.path.join(sounds_dir, basename))
-            candidates.append(os.path.join(get_app_root(), "sounds", basename))
-
-    seen = set()
-    for item in candidates:
-        normalized = os.path.normpath(item) if item else ""
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        if os.path.exists(normalized):
-            return normalized
     return None
 
 
@@ -80,16 +34,23 @@ def play_audio(
     wait: bool = True,
     stop_checker: Optional[Callable[[], bool]] = None,
 ) -> str:
+    from task_workflow.script_resources import read_resource_bytes
+
     resolved = resolve_media_path(path) or str(path or "").strip()
-    if not resolved or not os.path.exists(resolved):
+    if resolved and os.path.isfile(resolved):
+        stop_audio()
+        ext = os.path.splitext(resolved)[1].lower()
+        if ext == ".wav" and not (wait and stop_checker):
+            _play_wav(resolved, wait=wait)
+            return resolved
+        _play_mci(resolved, wait=wait, stop_checker=stop_checker)
+        return resolved
+    data = read_resource_bytes(path)
+    if not data:
         raise FileNotFoundError(f"音频文件不存在: {path}")
     stop_audio()
-    ext = os.path.splitext(resolved)[1].lower()
-    if ext == ".wav" and not (wait and stop_checker):
-        _play_wav(resolved, wait=wait)
-        return resolved
-    _play_mci(resolved, wait=wait, stop_checker=stop_checker)
-    return resolved
+    _play_wav_bytes(data, wait=wait)
+    return resolved or str(path or "")
 
 
 def stop_audio() -> None:
@@ -116,6 +77,15 @@ def _play_wav(path: str, *, wait: bool) -> None:
     if not wait:
         flags |= winsound.SND_ASYNC
     winsound.PlaySound(path, flags)
+
+
+def _play_wav_bytes(data: bytes, *, wait: bool) -> None:
+    import winsound
+
+    flags = winsound.SND_MEMORY | winsound.SND_NODEFAULT
+    if not wait:
+        flags |= winsound.SND_ASYNC
+    winsound.PlaySound(data, flags)
 
 
 def _mci_send(command: str) -> str:
