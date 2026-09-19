@@ -1677,6 +1677,7 @@ def populate_custom_player_body(
     on_stop: Optional[Callable[[], None]] = None,
     on_bind: Optional[Callable[[], None]] = None,
     on_settings: Optional[Callable[[], None]] = None,
+    on_control_center: Optional[Callable[[], None]] = None,
     on_scripts_changed: Optional[Callable[[List[str]], None]] = None,
     on_loops_changed: Optional[Callable[[], None]] = None,
     on_open_log_dir: Optional[Callable[[], None]] = None,
@@ -1711,6 +1712,7 @@ def populate_custom_player_body(
         "group_loop_spins_by_id": {},
         "group_loops": 1,
         "settings_button": None,
+        "control_center_button": None,
         "progress_label": None,
         "progress_bar": None,
         "progress_frame": None,
@@ -1850,6 +1852,11 @@ def populate_custom_player_body(
                 refs["settings_button"] = btn
                 if interactive_buttons and on_settings is not None:
                     btn.clicked.connect(on_settings)
+            elif action == "control_center":
+                btn.setObjectName("PlayerControlCenterButton")
+                refs["control_center_button"] = btn
+                if interactive_buttons and on_control_center is not None:
+                    btn.clicked.connect(on_control_center)
             node = btn
             _track(page, in_zone, btn)
         elif kind == "label":
@@ -2189,6 +2196,8 @@ def populate_custom_player_body(
             dot.setGeometry(geo[0], geo[1], max(14, size + 4), geo[3])
             label = QLabel("就绪", body)
             label.setObjectName("PlayerStatusLabel")
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             label.setGeometry(
                 geo[0] + max(14, size + 4) + 4,
                 geo[1],

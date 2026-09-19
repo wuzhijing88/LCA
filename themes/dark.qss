@@ -1152,6 +1152,28 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {
     border: none;
 }
 
+#multiInstanceDialog QSpinBox {
+    padding-right: 18px;
+}
+
+#multiInstanceDialog QSpinBox::up-button,
+#multiInstanceDialog QSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 16px;
+    border: none;
+    background: transparent;
+}
+
+#multiInstanceDialog QSpinBox::up-button {
+    subcontrol-position: top right;
+    height: 12px;
+}
+
+#multiInstanceDialog QSpinBox::down-button {
+    subcontrol-position: bottom right;
+    height: 12px;
+}
+
 /* 鏃ユ湡鏃堕棿閫夋嫨鍣?*/
 QDateEdit, QTimeEdit, QDateTimeEdit {
     background-color: #252525;
@@ -2472,4 +2494,42 @@ QListView#scriptCompleterPopup::item:hover {
 QListView#scriptCompleterPopup::item:selected {
     background-color: #0078d4;
     color: #ffffff;
+}
+
+#aiImagePreviewDialog {
+    background-color: transparent;
+    color: #e0e0e0;
+    border: none;
+}
+
+#aiImagePreviewDialog QWidget#aiImagePreviewHeader {
+    background-color: transparent;
+    min-height: 32px;
+}
+
+#aiImagePreviewDialog QPushButton#aiImagePreviewClose {
+    background: transparent;
+    border: none;
+    color: #b0b0b0;
+    font-size: 18px;
+    font-weight: bold;
+    padding: 0px;
+    margin: 0px;
+    min-width: 32px;
+    max-width: 32px;
+    min-height: 32px;
+    max-height: 32px;
+    border-radius: 4px;
+}
+
+#aiImagePreviewDialog QPushButton#aiImagePreviewClose:hover,
+#aiImagePreviewDialog QPushButton#aiImagePreviewClose:pressed {
+    background-color: #e81123;
+    color: #ffffff;
+}
+
+#aiImagePreviewDialog QGraphicsView#aiImagePreviewView {
+    background-color: #252525;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
 }

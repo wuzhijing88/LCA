@@ -1,13 +1,14 @@
 """AI assistant chat helpers.
 
-The UI talks to any OpenAI-compatible chat-completions endpoint. The module
-keeps transport and the knowledge document out of the Qt dialog so it can also
-be used by tests or a future non-Qt client.
+The UI talks to any OpenAI-compatible chat-completions endpoint. Capability
+facts come from searching the public source repository, not a bundled dump.
 """
 
 from __future__ import annotations
 
+import base64
 import http.client
+import io
 import json
 import os
 import socket
@@ -24,10 +25,36 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 DEFAULT_BASE_URL = "https://lcaa.xyz/v1"
 DEFAULT_MODEL = "gpt-5.5"
 MAX_PROMPT_CHARS = 12000
+MAX_AI_IMAGES_PER_TURN = 4
+MAX_AI_WORKFLOW_FILES_PER_TURN = 2
+MAX_WORKFLOW_AI_IMAGES = 12
+MAX_AI_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_AI_WORKFLOW_FILE_BYTES = 8 * 1024 * 1024
+MAX_RESOURCE_TEXT_CHARS = 8000
+IMAGE_ONLY_PROMPT = "请识别图片。"
+FILE_ONLY_PROMPT = "请检查这份上传的工作流是否格式正确。格式有误就进行修复。"
+WORKFLOW_IMAGES_PROMPT = "下面是当前工作流引用的图片，顺序与「工作流资源」中的附图编号一致。"
+_RESOURCE_KIND_LABELS = {
+    "image": "图片",
+    "dict": "字库",
+    "model": "模型",
+    "audio": "声音",
+    "replay": "回放",
+    "component": "组件",
+}
+_WORKFLOW_IMAGE_CONVERT_EXTS = {".bmp", ".tif", ".tiff"}
+AI_IMAGE_MIMES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+AI_IMAGE_MIME_SET = frozenset(AI_IMAGE_MIMES.values())
+AI_WORKFLOW_EXTS = frozenset({".json", ".lca"})
 MAX_WORKFLOW_CONTEXT_CHARS = 32000
 MAX_PARAM_VALUE_CHARS = 6000
 CAPABILITY_DOC_NAME = "WORKFLOW_AND_SCRIPTS.md"
-KNOWLEDGE_DOC_NAME = "AI_ASSISTANT_KNOWLEDGE.md"
 _SKIP_PARAM_TYPES = {"separator", "hidden", "button"}
 _LINE_TYPE_LABELS = {
     "sequential": "顺序",
@@ -51,39 +78,95 @@ _CACHE_LOCK = threading.RLock()
 _RESPONSE_CACHE: Dict[str, tuple[float, str]] = {}
 AI_CACHE_TTL_SECONDS = 900
 AI_CACHE_MAX_ENTRIES = 64
-AI_CACHE_SCHEMA_VERSION = "2"
+AI_CACHE_SCHEMA_VERSION = "4"
 _CACHE_HITS = 0
 _CACHE_MISSES = 0
-_KNOWLEDGE_HEADER = (
-    "本文列出 LCA 全部现行卡片参数和全部自定义脚本命令，以及工作流规则。"
-    "查阅卡片、参数、端口和脚本命令时，只使用本文及后面的运行时目录；"
-    "不要编造已删除的卡片名、参数名、命令或旧别名。"
-)
+AI_TOOL_ROUNDS = 20
+STOP_SEARCH_PROMPT = "不要再调用工具。根据已经查阅的开源仓库源码给出审查结论。"
+SEARCH_LIMIT_REPLY = "已停止继续搜索开源仓库。下面是本次查阅过程，请据此继续提问。"
+AI_REPO_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_repo",
+            "description": "在 LCA 开源仓库中搜索文件路径或源码。审查卡片、参数、端口和脚本命令时必须先搜索。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索词，例如卡片名、参数名、命令名或文件名",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_repo_file",
+            "description": "读取开源仓库中的一个源码或文档文件。路径相对于仓库根目录。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "仓库内路径，例如 tasks/delay_task.py",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+]
 _CHAT_SYSTEM_PROMPT = (
-    "你是 LCA 的 AI 助手。下面是产品说明文档。"
+    "你是 LCA 的 AI 助手。"
+    "卡片参数、端口、脚本命令和现行格式以开源仓库的现行源码为准，不要使用过时说明或记忆。"
+    "卡片、参数和脚本命令以本机缓存的开源仓库源码为准。"
+    "search_repo 和 read_repo_file 只读本机缓存，不会每次对话都重新下载仓库。"
+    "需要核对现行实现时再调用它们；同一轮对话里已经查过的内容不要再搜。"
+    "寒暄或与卡片、脚本无关的问题不要搜仓库。"
+    "仓库里没有的能力就是没有，直接失败或标成未知。不要编造已删除的卡片名、参数名、命令或旧别名。"
     "若附有「当前正在编辑的工作流」，那是用户当前画布上的现行内容，包含未保存修改；"
-    "回答当前流程、当前卡片或当前脚本的问题时必须以这份快照为准。"
-    "用户要求审查或修正时，按说明文档检查结构、连线、卡片参数和自定义脚本，先用中文说明问题和改法。"
+    "回答当前流程、当前卡片或当前脚本的问题时必须以这份快照为准，并用仓库源码核对参数和命令。"
+    "用户消息可能附带图片；请直接根据图片内容回答。"
+    "用户消息可能附带 .json 或 .lca 工作流文件，会作为「用户上传的工作流」给出；"
+    "检查或修复上传文件时以这份快照为准，不要和当前画布搞混。"
+    "当前工作流引用的文件会作为「工作流资源」给出，其中已读取的文本是文件原文；"
+    "已附图的图片与用户消息前的工作流附图编号一致。"
+    "用户要求审查或修正时，按缓存的开源仓库源码检查结构、连线、卡片参数和自定义脚本，先用中文说明问题和改法。"
+    "上传的工作流格式有误时，按「用户上传的工作流」给出修正；点应用后写入当前正在编辑的工作流。"
     "需要改画布时，必须输出一个语言标记为 工作流 的代码块，内容是只含 ops 数组的 JSON；"
     "未改动的卡片不要写进 ops。不要编造已删除的卡片名、参数名、命令或旧别名。"
     "禁止把卡片输出连到自己；循环必须经过另一张有输入口的卡片再连回来。"
     "用户点击「应用」后才会写入当前正在编辑的工作流；未点击前画布不变。"
+    "用户点击「下载」会把修正后的工作流存成 .lca 文件，不改磁盘上的原文件，也不写入画布。"
 )
 REVIEW_WORKFLOW_PROMPT = (
     "请审查当前正在编辑的工作流。"
-    "指出结构、连线、卡片参数和自定义脚本中的问题，并说明原因。"
-    "若可以修正，先用中文说明改了什么，再给出一个完整的 ```工作流 JSON 代码块供我点应用。"
+    "用本机缓存的开源仓库源码核对现行卡片、参数和脚本，指出结构、连线、卡片参数和自定义脚本中的问题，并说明原因。"
+    "若可以修正，先用中文说明改了什么，再给出一个完整的 ```工作流 JSON 代码块供我点应用或下载。"
     "没有问题时明确说没有发现问题，不要输出工作流代码块。"
 )
 _WORKFLOW_CONTEXT_HEADER = "## 当前正在编辑的工作流"
+_UPLOADED_WORKFLOW_HEADER = "## 用户上传的工作流"
+_UPLOADED_KIND_LABELS = {
+    "current": "现行 LCA 工程",
+    "json": "JSON 工作流",
+    "legacy_lca1": "旧版加密工程",
+    "plain_zip": "旧版明文工程",
+}
+_UNSUPPORTED_WORKFLOW_FILE = "只支持上传 .json 或 .lca 工作流文件"
 
 
-def _cache_key(config: AIProviderConfig, messages: Iterable[Mapping[str, str]]) -> str:
+def _cache_key(config: AIProviderConfig, messages: Iterable[Mapping[str, Any]]) -> str:
     payload = {
         "schema": AI_CACHE_SCHEMA_VERSION,
         "endpoint": config.endpoint(),
         "model": str(config.model or DEFAULT_MODEL),
-        "messages": [dict(item) for item in messages],
+        "tools": [str(item["function"]["name"]) for item in AI_REPO_TOOLS],
+        "messages": [_api_chat_message(item) for item in messages],
     }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -190,22 +273,397 @@ def model_supports_temperature(model: str) -> bool:
     return not name.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
+def attachable_image_mime(path: str = "", *, mime: str = "") -> str:
+    """Return a vision-API mime type, or raise if the file/type is not allowed."""
+    text = str(mime or "").strip().lower()
+    if text == "image/jpg":
+        text = "image/jpeg"
+    if text:
+        if text not in AI_IMAGE_MIME_SET:
+            raise ValueError("不支持的图片格式。请使用 PNG、JPG、WEBP 或 GIF。")
+        return text
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    mapped = AI_IMAGE_MIMES.get(ext)
+    if not mapped:
+        raise ValueError(f"不支持的图片格式：{ext or '未知'}。请使用 PNG、JPG、WEBP 或 GIF。")
+    return mapped
+
+
+def attachable_workflow_suffix(path: str = "") -> str:
+    """Return .json or .lca, or raise if the file is not an allowed workflow upload."""
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext not in AI_WORKFLOW_EXTS:
+        raise ValueError(_UNSUPPORTED_WORKFLOW_FILE)
+    return ext
+
+
+def _decode_uploaded_text(blob: bytes) -> str:
+    return bytes(blob).decode("utf-8-sig")
+
+
+def _uploaded_format_note(kind: str) -> str:
+    label = _UPLOADED_KIND_LABELS.get(kind, kind or "未知")
+    if kind == "current":
+        return f"原始格式：{label}。"
+    return f"原始格式：{label}。已在内存中转成现行格式，未改磁盘上的原文件。"
+
+
+def _unwrap_uploaded_workflow(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    from task_workflow.workflow_payload import workflow_body
+
+    body = workflow_body(payload)
+    if not isinstance(body.get("cards"), list) or not isinstance(body.get("connections"), list):
+        raise ValueError("工作流缺少卡片列表或连线列表")
+    return body
+
+
+def inspect_uploaded_workflow_bytes(blob: bytes, *, name: str) -> Dict[str, Any]:
+    """Inspect an uploaded .json/.lca in memory. Does not write or convert the original file."""
+    filename = str(name or "").strip() or "未命名"
+    ext = attachable_workflow_suffix(filename)
+    data = bytes(blob or b"")
+    result: Dict[str, Any] = {
+        "status": "error",
+        "name": filename,
+        "filepath": filename,
+        "size": len(data),
+        "kind": "",
+        "error": "",
+        "raw_text": "",
+        "workflow": None,
+    }
+    if not data:
+        result["error"] = "工作流文件是空的"
+        return result
+    if len(data) > MAX_AI_WORKFLOW_FILE_BYTES:
+        result["error"] = (
+            f"工作流文件太大，单个不能超过 {MAX_AI_WORKFLOW_FILE_BYTES // (1024 * 1024)} MB"
+        )
+        return result
+
+    from app_core.lca_format.container import LcaFormatError
+    from app_core.lca_format.legacy_convert import convert_project_bytes, inspect_project_bytes
+    from app_core.lca_format.project_io import workflow_from_embedded_bytes
+
+    try:
+        kind = inspect_project_bytes(data)
+    except LcaFormatError as exc:
+        result["error"] = str(exc) or "不是有效的工作流文件"
+        if ext == ".json":
+            try:
+                result["raw_text"] = _truncate_context_text(
+                    _decode_uploaded_text(data),
+                    MAX_RESOURCE_TEXT_CHARS,
+                )
+            except UnicodeDecodeError:
+                result["raw_text"] = ""
+        return result
+    result["kind"] = kind
+    try:
+        converted = convert_project_bytes(data, display_name=os.path.splitext(filename)[0])
+        workflow = _unwrap_uploaded_workflow(workflow_from_embedded_bytes(converted))
+    except LcaFormatError as exc:
+        result["error"] = str(exc) or "无法转换成现行工作流"
+        if ext == ".json":
+            try:
+                result["raw_text"] = _truncate_context_text(
+                    _decode_uploaded_text(data),
+                    MAX_RESOURCE_TEXT_CHARS,
+                )
+            except UnicodeDecodeError:
+                result["raw_text"] = ""
+        return result
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        result["error"] = str(exc) or "无法读取工作流内容"
+        if ext == ".json":
+            try:
+                result["raw_text"] = _truncate_context_text(
+                    _decode_uploaded_text(data),
+                    MAX_RESOURCE_TEXT_CHARS,
+                )
+            except UnicodeDecodeError:
+                result["raw_text"] = ""
+        return result
+    result["status"] = "ok"
+    result["workflow"] = workflow
+    result["format_note"] = _uploaded_format_note(kind)
+    return result
+
+
+def inspect_uploaded_workflow_file(path: str, *, display_name: str = "") -> Dict[str, Any]:
+    filename = str(display_name or "").strip() or os.path.basename(str(path or ""))
+    attachable_workflow_suffix(filename or str(path or ""))
+    if not path or not os.path.isfile(path):
+        return {
+            "status": "error",
+            "name": filename or "未命名",
+            "filepath": filename or "未命名",
+            "size": 0,
+            "kind": "",
+            "error": "找不到上传的工作流文件",
+            "raw_text": "",
+            "workflow": None,
+        }
+    size = os.path.getsize(path)
+    if size <= 0:
+        return {
+            "status": "error",
+            "name": filename,
+            "filepath": filename,
+            "size": 0,
+            "kind": "",
+            "error": "工作流文件是空的",
+            "raw_text": "",
+            "workflow": None,
+        }
+    if size > MAX_AI_WORKFLOW_FILE_BYTES:
+        return {
+            "status": "error",
+            "name": filename,
+            "filepath": filename,
+            "size": size,
+            "kind": "",
+            "error": (
+                f"工作流文件太大，单个不能超过 {MAX_AI_WORKFLOW_FILE_BYTES // (1024 * 1024)} MB"
+            ),
+            "raw_text": "",
+            "workflow": None,
+        }
+    try:
+        with open(path, "rb") as handle:
+            blob = handle.read()
+    except OSError:
+        return {
+            "status": "error",
+            "name": filename,
+            "filepath": filename,
+            "size": 0,
+            "kind": "",
+            "error": "找不到上传的工作流文件",
+            "raw_text": "",
+            "workflow": None,
+        }
+    return inspect_uploaded_workflow_bytes(blob, name=filename)
+
+
+def format_uploaded_workflows_context(files: Optional[Sequence[Mapping[str, Any]]] = None) -> str:
+    """Text snapshot of user-uploaded .json/.lca files for the chat system prompt."""
+    items = list(files or [])
+    if not items:
+        return ""
+    if len(items) > MAX_AI_WORKFLOW_FILES_PER_TURN:
+        raise ValueError(f"一次最多上传 {MAX_AI_WORKFLOW_FILES_PER_TURN} 个工作流文件")
+    blocks = [_UPLOADED_WORKFLOW_HEADER]
+    for item in items:
+        path = str(item.get("path") or "").strip()
+        name = str(item.get("name") or "").strip() or os.path.basename(path) or "未命名"
+        snapshot = inspect_uploaded_workflow_file(path, display_name=name)
+        size = int(snapshot.get("size") or 0)
+        size_text = _format_file_size(size) if size > 0 else ""
+        heading = f"### {snapshot.get('name') or name}"
+        if size_text:
+            heading += f"（{size_text}）"
+        blocks.append("")
+        blocks.append(heading)
+        if snapshot.get("status") != "ok":
+            error = str(snapshot.get("error") or "未知错误").strip() or "未知错误"
+            blocks.append(f"格式：无效。{error}")
+            raw_text = str(snapshot.get("raw_text") or "")
+            if raw_text:
+                blocks.append("原文：")
+                blocks.append("```json")
+                blocks.append(raw_text.rstrip("\n"))
+                blocks.append("```")
+            continue
+        note = str(snapshot.get("format_note") or "").strip()
+        if note:
+            blocks.append(note)
+        blocks.append(
+            format_editor_workflow_context(
+                {
+                    "status": "ok",
+                    "name": snapshot.get("name") or name,
+                    "filepath": snapshot.get("filepath") or name,
+                    "workflow": snapshot.get("workflow"),
+                },
+                resources=[],
+                header="",
+            )
+        )
+    text = "\n".join(part for part in blocks if part is not None)
+    if len(text) <= MAX_WORKFLOW_CONTEXT_CHARS:
+        return text
+    return _truncate_context_text(text, MAX_WORKFLOW_CONTEXT_CHARS)
+
+
+def uploaded_workflow_for_apply(files: Optional[Sequence[Mapping[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """Return the first uploaded workflow as an ops source. Missing file fails."""
+    items = list(files or [])
+    if not items:
+        return None
+    path = str(items[0].get("path") or "").strip()
+    name = str(items[0].get("name") or "").strip() or os.path.basename(path) or "未命名"
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError("找不到上传的工作流文件")
+    snapshot = inspect_uploaded_workflow_file(path, display_name=name)
+    if snapshot.get("status") == "ok" and isinstance(snapshot.get("workflow"), dict):
+        return dict(snapshot["workflow"])
+    return {"cards": [], "connections": []}
+
+
+def proposal_source_workflow(
+    main_window: Any = None,
+    files: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Source dict for applying or downloading a 工作流 ops block."""
+    items = list(files or [])
+    if items:
+        source = uploaded_workflow_for_apply(items)
+        name = str(items[0].get("name") or "").strip() or os.path.basename(
+            str(items[0].get("path") or "")
+        ) or "工作流"
+        stem = os.path.splitext(name)[0].strip() or "工作流"
+        if source is None:
+            raise RuntimeError("找不到上传的工作流文件")
+        return source, stem
+    snapshot = collect_editor_workflow_snapshot(main_window)
+    if snapshot.get("status") == "empty":
+        raise RuntimeError("当前没有打开的工作流")
+    if snapshot.get("status") == "error":
+        error = str(snapshot.get("error") or "未知错误").strip() or "未知错误"
+        raise RuntimeError(f"无法读取当前工作流：{error}")
+    workflow = snapshot.get("workflow")
+    if not isinstance(workflow, dict):
+        raise RuntimeError("当前工作流数据不是字典")
+    name = str(snapshot.get("name") or "").strip() or "工作流"
+    return dict(workflow), name
+
+
+def editor_task_types(main_window: Any = None) -> List[str]:
+    view, _task = _current_editor_view(main_window)
+    modules = getattr(view, "task_modules", None) if view is not None else None
+    if isinstance(modules, dict) and modules:
+        return [str(name).strip() for name in modules.keys() if str(name).strip()]
+    from tasks import PRIMARY_TASK_MODULES
+
+    return [str(name).strip() for name in PRIMARY_TASK_MODULES.keys() if str(name).strip()]
+
+
+def encode_ai_image_file(path: str) -> str:
+    mime = attachable_image_mime(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"找不到图片文件：{path}")
+    size = os.path.getsize(path)
+    if size <= 0:
+        raise ValueError("图片文件是空的")
+    if size > MAX_AI_IMAGE_BYTES:
+        raise ValueError(f"图片太大，单张不能超过 {MAX_AI_IMAGE_BYTES // (1024 * 1024)} MB")
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    return f"data:{mime};base64,{base64.standard_b64encode(raw).decode('ascii')}"
+
+
+def encode_image_for_chat(path: str) -> str:
+    """Encode a workflow or chat image. Convert BMP/TIFF to PNG for the vision API."""
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext in AI_IMAGE_MIMES:
+        return encode_ai_image_file(path)
+    if ext not in _WORKFLOW_IMAGE_CONVERT_EXTS:
+        raise ValueError(f"不支持的图片格式：{ext or '未知'}。请使用 PNG、JPG、WEBP、GIF、BMP 或 TIF。")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"找不到图片文件：{path}")
+    size = os.path.getsize(path)
+    if size <= 0:
+        raise ValueError("图片文件是空的")
+    if size > MAX_AI_IMAGE_BYTES:
+        raise ValueError(f"图片太大，单张不能超过 {MAX_AI_IMAGE_BYTES // (1024 * 1024)} MB")
+    from PIL import Image
+
+    with Image.open(path) as image:
+        image.load()
+        converted = image.convert("RGBA") if image.mode in {"RGBA", "LA", "P"} else image.convert("RGB")
+        buffer = io.BytesIO()
+        converted.save(buffer, format="PNG")
+        raw = buffer.getvalue()
+    if not raw:
+        raise ValueError("图片文件是空的")
+    if len(raw) > MAX_AI_IMAGE_BYTES:
+        raise ValueError(f"图片太大，单张不能超过 {MAX_AI_IMAGE_BYTES // (1024 * 1024)} MB")
+    return f"data:image/png;base64,{base64.standard_b64encode(raw).decode('ascii')}"
+
+
+def build_user_message_content(
+    text: str,
+    images: Optional[Sequence[Mapping[str, Any]]] = None,
+    *,
+    max_images: int = MAX_AI_IMAGES_PER_TURN,
+) -> Any:
+    body = str(text or "")[:MAX_PROMPT_CHARS]
+    files = list(images or [])
+    if not files:
+        return body
+    limit = max(1, int(max_images))
+    if len(files) > limit:
+        raise ValueError(f"一次最多发送 {limit} 张图片")
+    parts: List[Dict[str, Any]] = [
+        {"type": "text", "text": body.strip() or IMAGE_ONLY_PROMPT},
+    ]
+    for item in files:
+        url = str(item.get("data_url") or "").strip()
+        if not url:
+            url = encode_image_for_chat(str(item.get("path") or ""))
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": url},
+            }
+        )
+    return parts
+
+
+def _api_chat_message(item: Mapping[str, Any]) -> Dict[str, Any]:
+    role = str(item.get("role") or "user")
+    if role == "tool":
+        return {
+            "role": "tool",
+            "tool_call_id": str(item.get("tool_call_id") or ""),
+            "content": str(item.get("content") or ""),
+        }
+    message: Dict[str, Any] = {"role": role}
+    tool_calls = item.get("tool_calls")
+    content = item.get("content")
+    if tool_calls:
+        message["tool_calls"] = list(tool_calls)
+        if content in (None, ""):
+            message["content"] = None
+        elif isinstance(content, list):
+            message["content"] = content
+        else:
+            message["content"] = str(content)
+        return message
+    if isinstance(content, list):
+        message["content"] = content
+        return message
+    message["content"] = str(content or "")
+    return message
+
+
 def build_chat_payload(
     config: AIProviderConfig,
-    messages: Iterable[Mapping[str, str]],
+    messages: Iterable[Mapping[str, Any]],
     *,
     include_temperature: Optional[bool] = None,
+    tools: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     model = str(config.model or DEFAULT_MODEL).strip()
     payload: Dict[str, Any] = {
         "model": model,
-        "messages": [
-            {"role": str(item.get("role") or "user"), "content": str(item.get("content") or "")}
-            for item in messages
-        ],
+        "messages": [_api_chat_message(item) for item in messages],
     }
     if include_temperature if include_temperature is not None else model_supports_temperature(model):
         payload["temperature"] = 0.2
+    if tools:
+        payload["tools"] = list(tools)
     return payload
 
 
@@ -291,48 +749,172 @@ def _post_chat_request(
 
 
 def _parse_chat_completion(raw: str) -> str:
+    parsed = _parse_chat_message(raw)
+    if parsed["tool_calls"]:
+        raise RuntimeError("AI 服务响应包含未处理的工具调用")
+    return parsed["content"]
+
+
+def _text_from_parts(parts: Any, *, kinds: Sequence[str]) -> str:
+    chunks: List[str] = []
+    if not isinstance(parts, list):
+        return ""
+    allowed = {str(item) for item in kinds}
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = str(part.get("type") or "text").strip() or "text"
+        if kind not in allowed:
+            continue
+        piece = str(part.get("text") or part.get("content") or part.get("thinking") or "")
+        if piece.strip():
+            chunks.append(piece)
+    return "\n".join(chunks).strip()
+
+
+def _message_reasoning(message: Mapping[str, Any]) -> str:
+    for key in ("reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            text = str(value.get("text") or value.get("content") or "").strip()
+            if text:
+                return text
+        if isinstance(value, list):
+            text = _text_from_parts(value, kinds=("text", "output_text", "reasoning", "thinking"))
+            if text:
+                return text
+    content = message.get("content")
+    return _text_from_parts(content, kinds=("reasoning", "thinking"))
+
+
+def _parse_chat_message(raw: str) -> Dict[str, Any]:
     try:
         data = json.loads(raw)
-        content = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("AI 服务响应不是有效的 chat-completions 格式") from exc
+    if not isinstance(message, dict):
+        raise RuntimeError("AI 服务响应不是有效的 chat-completions 格式")
+    content = message.get("content")
     if isinstance(content, list):
-        content = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
-    text = str(content or "").strip()
-    if not text:
+        text = _text_from_parts(content, kinds=("text", "output_text"))
+    else:
+        text = str(content or "").strip()
+    reasoning = _message_reasoning(message)
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+    tool_calls = [item for item in tool_calls if isinstance(item, dict)]
+    if not text and not tool_calls:
         raise RuntimeError("AI 返回了空内容")
-    return text
+    return {"content": text, "reasoning": reasoning, "tool_calls": tool_calls}
 
 
-def chat_completion(
+def _tool_arguments(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and str(raw).strip():
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("工具参数不是有效 JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("工具参数必须是 JSON 对象")
+        return payload
+    raise ValueError("工具参数无效")
+
+
+_TOOL_RESULT_LOCK = threading.RLock()
+_TOOL_RESULTS: Dict[str, str] = {}
+_TOOL_RESULT_MAX = 64
+
+
+def _tool_result_key(name: str, payload: Mapping[str, Any]) -> str:
+    from app_core.ai_repo import cached_snapshot_id
+
+    return json.dumps(
+        {"sha": cached_snapshot_id(), "name": name, "args": dict(payload)},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def execute_ai_tool(name: str, arguments: Any) -> str:
+    payload = _tool_arguments(arguments)
+    cache_key = _tool_result_key(name, payload)
+    with _TOOL_RESULT_LOCK:
+        cached = _TOOL_RESULTS.get(cache_key)
+        if cached is not None:
+            return cached
+    if name == "search_repo":
+        keyword = str(payload.get("query") or "").strip()
+        if not keyword:
+            raise ValueError("缺少参数：query")
+        from app_core.ai_repo import search_source_repository
+
+        result = search_source_repository(keyword)
+    elif name == "read_repo_file":
+        path = str(payload.get("path") or "").strip()
+        if not path:
+            raise ValueError("缺少参数：path")
+        from app_core.ai_repo import read_source_repository_file
+
+        result = read_source_repository_file(path)
+    else:
+        raise ValueError(f"未知工具：{name}")
+    with _TOOL_RESULT_LOCK:
+        _TOOL_RESULTS[cache_key] = result
+        while len(_TOOL_RESULTS) > _TOOL_RESULT_MAX:
+            _TOOL_RESULTS.pop(next(iter(_TOOL_RESULTS)))
+    return result
+
+
+def _run_tool_call(call: Mapping[str, Any]) -> str:
+    function = call.get("function") if isinstance(call.get("function"), Mapping) else call
+    name = str((function or {}).get("name") or "").strip()
+    arguments = (function or {}).get("arguments")
+    try:
+        return execute_ai_tool(name, arguments)
+    except Exception as exc:
+        return str(exc)
+
+
+def describe_tool_call(call: Mapping[str, Any]) -> str:
+    function = call.get("function") if isinstance(call.get("function"), Mapping) else call
+    name = str((function or {}).get("name") or "").strip()
+    try:
+        payload = _tool_arguments((function or {}).get("arguments"))
+    except Exception:
+        payload = {}
+    if name == "search_repo":
+        query = str(payload.get("query") or "").strip()
+        return f"搜索开源仓库：{query}" if query else "搜索开源仓库"
+    if name == "read_repo_file":
+        path = str(payload.get("path") or "").strip()
+        return f"读取仓库文件：{path}" if path else "读取仓库文件"
+    return f"调用工具：{name or '未知'}"
+
+
+def _post_chat_round(
     config: AIProviderConfig,
-    messages: Iterable[Mapping[str, str]],
+    messages: Sequence[Mapping[str, Any]],
     *,
-    opener: Optional[Callable[..., Any]] = None,
-    use_cache: bool = True,
-) -> str:
-    """Call an OpenAI-compatible endpoint and return its text content."""
-    if not str(config.api_key or "").strip():
-        raise ValueError("请先填写 API Key")
-    message_list = list(messages)
-    # 注入 opener 通常用于测试或切换传输通道；不能复用另一通道的缓存，
-    # 否则网络失败会被旧响应掩盖，也会让重试行为不可测。
-    key = _cache_key(config, message_list) if (use_cache and opener is None) else ""
-    if key:
-        global _CACHE_HITS, _CACHE_MISSES
-        with _CACHE_LOCK:
-            cached = _RESPONSE_CACHE.get(key)
-            if cached and time.time() - cached[0] < AI_CACHE_TTL_SECONDS:
-                _CACHE_HITS += 1
-                return cached[1]
-            _CACHE_MISSES += 1
-            _RESPONSE_CACHE.pop(key, None)
-    timeout = max(5, int(config.timeout))
-    post = opener or urllib.request.urlopen
-    include_temperature = model_supports_temperature(str(config.model or DEFAULT_MODEL))
+    timeout: int,
+    post: Callable[..., Any],
+    include_temperature: bool,
+    tools: Optional[Sequence[Mapping[str, Any]]] = AI_REPO_TOOLS,
+) -> Tuple[Dict[str, Any], bool]:
     last_error: Optional[BaseException] = None
+    temperature = include_temperature
     for attempt in range(AI_REQUEST_ATTEMPTS):
-        payload = build_chat_payload(config, message_list, include_temperature=include_temperature)
+        payload = build_chat_payload(
+            config,
+            messages,
+            include_temperature=temperature,
+            tools=tools,
+        )
         request = urllib.request.Request(
             config.endpoint(),
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -340,18 +922,13 @@ def chat_completion(
             method="POST",
         )
         try:
-            result = _parse_chat_completion(_post_chat_request(request, timeout, post))
-            if key:
-                with _CACHE_LOCK:
-                    _RESPONSE_CACHE[key] = (time.time(), result)
-                    while len(_RESPONSE_CACHE) > AI_CACHE_MAX_ENTRIES:
-                        _RESPONSE_CACHE.pop(next(iter(_RESPONSE_CACHE)))
-            return result
+            parsed = _parse_chat_message(_post_chat_request(request, timeout, post))
+            return parsed, temperature
         except urllib.error.HTTPError as exc:
             last_error = exc
             detail = _read_http_error_detail(exc)
-            if include_temperature and _temperature_rejected(exc.code, detail):
-                include_temperature = False
+            if temperature and _temperature_rejected(exc.code, detail):
+                temperature = False
                 continue
             if is_retryable_ai_error(exc) and attempt + 1 < AI_REQUEST_ATTEMPTS:
                 time.sleep(_RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)])
@@ -364,6 +941,147 @@ def chat_completion(
                 continue
             raise RuntimeError(format_ai_transport_error(exc)) from exc
     raise RuntimeError(format_ai_transport_error(last_error or RuntimeError("未知网络错误")))
+
+
+def _apply_tool_calls(
+    working: List[Mapping[str, Any]],
+    parsed: Mapping[str, Any],
+    *,
+    progress: Optional[Callable[[str], None]],
+    thinking: List[str],
+) -> None:
+    reasoning = str(parsed.get("reasoning") or "").strip()
+    if reasoning:
+        thinking.append(reasoning)
+        if progress:
+            progress(reasoning.splitlines()[0][:80])
+    content = str(parsed.get("content") or "").strip()
+    if content:
+        thinking.append(content)
+    assistant: Dict[str, Any] = {
+        "role": "assistant",
+        "content": parsed.get("content") or None,
+        "tool_calls": list(parsed.get("tool_calls") or []),
+    }
+    working.append(assistant)
+    for call in list(parsed.get("tool_calls") or []):
+        call_id = str(call.get("id") or "").strip()
+        if not call_id:
+            raise RuntimeError("AI 工具调用缺少 id")
+        line = describe_tool_call(call)
+        thinking.append(line)
+        if progress:
+            progress(line)
+        working.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": _run_tool_call(call),
+            }
+        )
+
+
+def complete_ai_chat(
+    config: AIProviderConfig,
+    messages: Iterable[Mapping[str, Any]],
+    *,
+    opener: Optional[Callable[..., Any]] = None,
+    use_cache: bool = True,
+    progress: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str]:
+    """Call chat-completions, run repo tools, and return (answer, thinking)."""
+    if not str(config.api_key or "").strip():
+        raise ValueError("请先填写 API Key")
+    message_list = list(messages)
+    key = _cache_key(config, message_list) if (use_cache and opener is None) else ""
+    if key:
+        global _CACHE_HITS, _CACHE_MISSES
+        with _CACHE_LOCK:
+            cached = _RESPONSE_CACHE.get(key)
+            if cached and time.time() - cached[0] < AI_CACHE_TTL_SECONDS:
+                _CACHE_HITS += 1
+                text = cached[1]
+                thinking = cached[2] if len(cached) > 2 else ""
+                return text, str(thinking or "")
+            _CACHE_MISSES += 1
+            _RESPONSE_CACHE.pop(key, None)
+    timeout = max(5, int(config.timeout))
+    post = opener or urllib.request.urlopen
+    include_temperature = model_supports_temperature(str(config.model or DEFAULT_MODEL))
+    if opener is None:
+        from app_core.ai_repo import ensure_source_repository, repo_snapshot_ready
+
+        if not repo_snapshot_ready() and progress:
+            progress("正在下载开源仓库缓存…")
+        ensure_source_repository()
+    working: List[Mapping[str, Any]] = list(message_list)
+    thinking: List[str] = []
+    tool_rounds = 0
+    while True:
+        parsed, include_temperature = _post_chat_round(
+            config,
+            working,
+            timeout=timeout,
+            post=post,
+            include_temperature=include_temperature,
+            tools=AI_REPO_TOOLS,
+        )
+        tool_calls = parsed["tool_calls"]
+        if not tool_calls:
+            reasoning = str(parsed.get("reasoning") or "").strip()
+            if reasoning:
+                thinking.append(reasoning)
+            result = parsed["content"]
+            packed = "\n".join(item for item in thinking if item).strip()
+            if key:
+                with _CACHE_LOCK:
+                    _RESPONSE_CACHE[key] = (time.time(), result, packed)
+                    while len(_RESPONSE_CACHE) > AI_CACHE_MAX_ENTRIES:
+                        _RESPONSE_CACHE.pop(next(iter(_RESPONSE_CACHE)))
+            return result, packed
+        _apply_tool_calls(working, parsed, progress=progress, thinking=thinking)
+        tool_rounds += 1
+        if tool_rounds < AI_TOOL_ROUNDS:
+            continue
+        if progress:
+            progress("正在根据已查阅的源码给出结论…")
+        working.append({"role": "user", "content": STOP_SEARCH_PROMPT})
+        parsed, include_temperature = _post_chat_round(
+            config,
+            working,
+            timeout=timeout,
+            post=post,
+            include_temperature=include_temperature,
+            tools=None,
+        )
+        reasoning = str(parsed.get("reasoning") or "").strip()
+        if reasoning:
+            thinking.append(reasoning)
+        result = str(parsed.get("content") or "").strip() or SEARCH_LIMIT_REPLY
+        packed = "\n".join(item for item in thinking if item).strip()
+        if key:
+            with _CACHE_LOCK:
+                _RESPONSE_CACHE[key] = (time.time(), result, packed)
+                while len(_RESPONSE_CACHE) > AI_CACHE_MAX_ENTRIES:
+                    _RESPONSE_CACHE.pop(next(iter(_RESPONSE_CACHE)))
+        return result, packed
+
+
+def chat_completion(
+    config: AIProviderConfig,
+    messages: Iterable[Mapping[str, Any]],
+    *,
+    opener: Optional[Callable[..., Any]] = None,
+    use_cache: bool = True,
+) -> str:
+    """Call an OpenAI-compatible endpoint and return its text content."""
+    text, _thinking = complete_ai_chat(
+        config,
+        messages,
+        opener=opener,
+        use_cache=use_cache,
+    )
+    return text
 
 
 def resolve_capability_document_path() -> Optional[str]:
@@ -534,9 +1252,6 @@ _SCRIPT_PARAM_ALIASES = {
     "终点纵坐标": "y2",
     "text": "文本",
 }
-_SCRIPT_COMMAND_PARAM_ALIASES = {
-    "相对移动": {"x": "偏移x", "y": "偏移y", "偏移横坐标": "偏移x", "偏移纵坐标": "偏移y"},
-}
 _SCRIPT_KWARGS_FORWARD = {
     "等图": ("找图", ()),
     "等图消失": ("找图", ()),
@@ -656,10 +1371,7 @@ def _format_script_default(value: Any) -> str:
     return str(value)
 
 
-def _public_param_name(path: str, name: str) -> str:
-    mapped = _SCRIPT_COMMAND_PARAM_ALIASES.get(path, {}).get(name)
-    if mapped:
-        return mapped
+def _public_param_name(name: str) -> str:
     return _SCRIPT_PARAM_ALIASES.get(name, name)
 
 
@@ -850,7 +1562,7 @@ def _runtime_param_entries(path: str, runtime_map: Mapping[str, Any]) -> Tuple[L
         if variadic:
             has_varargs = True
             continue
-        public = _public_param_name(path, name)
+        public = _public_param_name(name)
         if not public or public in seen:
             continue
         if public == "目标" and path.startswith("窗口.") and default is None:
@@ -968,36 +1680,6 @@ def format_script_command_catalog() -> str:
     return "\n".join(lines)
 
 
-def build_ai_knowledge_document(task_modules: Optional[Mapping[str, Any]] = None) -> str:
-    """Full assistant knowledge: rules doc plus live card and script catalogs."""
-    parts = [
-        _KNOWLEDGE_HEADER,
-        load_capability_document(),
-        format_card_capability_catalog(task_modules),
-        format_script_command_catalog(),
-    ]
-    text = "\n\n".join(part.strip() for part in parts if str(part or "").strip())
-    if text and not text.endswith("\n"):
-        return f"{text}\n"
-    return text
-
-
-def write_ai_knowledge_document(path: Optional[str] = None) -> str:
-    """Write the knowledge document as UTF-8 and return the path."""
-    if path:
-        target = path
-    else:
-        from utils.app_paths import get_app_root
-
-        target = os.path.join(get_app_root(), "docs", KNOWLEDGE_DOC_NAME)
-    directory = os.path.dirname(target)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(target, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(build_ai_knowledge_document())
-    return target
-
-
 def _truncate_context_text(text: str, limit: int) -> str:
     value = str(text or "")
     if len(value) <= limit:
@@ -1056,6 +1738,237 @@ def _current_editor_view(main_window: Any) -> Tuple[Any, Any]:
     return view, task
 
 
+def editor_resource_dirs(main_window: Any = None) -> Dict[str, str]:
+    from task_workflow.resource_context import current_resource_dirs, resource_dirs_from_mapping
+
+    current = current_resource_dirs()
+    _view, task = _current_editor_view(main_window)
+    if task is None:
+        return current
+    bound = resource_dirs_from_mapping(task)
+    return {key: str(bound.get(key) or "") or current[key] for key in current}
+
+
+def _workflow_resource_kind(path: str) -> str:
+    from task_workflow.script_resources import resource_kind
+
+    kind = resource_kind(path)
+    if kind:
+        return kind
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext in AI_IMAGE_MIMES or ext in _WORKFLOW_IMAGE_CONVERT_EXTS:
+        return "image"
+    if ext == ".txt":
+        return "dict"
+    return ""
+
+
+def _iter_resource_strings(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        if "\n" in value or ";" in value:
+            for part in value.replace(";", "\n").splitlines():
+                part = part.strip()
+                if part:
+                    yield part
+            return
+        text = value.strip()
+        if text:
+            yield text
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_resource_strings(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_resource_strings(item)
+
+
+def _format_file_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} 字节"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def _read_resource_text(path: str, kind: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if kind == "image" or kind in {"model", "audio"}:
+        return ""
+    if kind == "component" and ext != ".py":
+        return ""
+    if kind not in {"dict", "replay"} and not (kind == "component" and ext == ".py"):
+        return ""
+    with open(path, "r", encoding="utf-8") as handle:
+        return _truncate_context_text(handle.read(), MAX_RESOURCE_TEXT_CHARS)
+
+
+def _inspect_workflow_file(path: str, kind: str) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "size": os.path.getsize(path),
+        "width": 0,
+        "height": 0,
+        "text": "",
+        "data_url": "",
+        "error": "",
+        "attach": False,
+    }
+    if kind == "image":
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                info["width"], info["height"] = image.size
+        except Exception:
+            pass
+        try:
+            info["data_url"] = encode_image_for_chat(path)
+            info["attach"] = True
+        except Exception as exc:
+            info["error"] = str(exc)
+        return info
+    try:
+        info["text"] = _read_resource_text(path, kind)
+    except UnicodeDecodeError:
+        info["error"] = "不是 UTF-8 文本"
+    except OSError as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def collect_workflow_resources(
+    workflow: Optional[Mapping[str, Any]],
+    dirs: Optional[Mapping[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    from task_workflow.script_resources import list_script_resources, resolve_resource_path
+
+    if not isinstance(workflow, Mapping):
+        return []
+    cards = workflow.get("cards")
+    if not isinstance(cards, list):
+        return []
+    dir_map = dict(dirs or {})
+    dir_kwargs = {
+        "images_dir": str(dir_map.get("images_dir") or ""),
+        "sounds_dir": str(dir_map.get("sounds_dir") or ""),
+        "dicts_dir": str(dir_map.get("dicts_dir") or ""),
+        "yolo_dir": str(dir_map.get("yolo_dir") or ""),
+        "replays_dir": str(dir_map.get("replays_dir") or ""),
+        "plugins_dir": str(dir_map.get("plugins_dir") or ""),
+    }
+    found: Dict[str, Dict[str, Any]] = {}
+
+    def add(raw_path: str, card_id: Any, abs_path: str = "") -> None:
+        text = str(raw_path or "").replace("\\", "/").strip()
+        if not text:
+            return
+        kind = _workflow_resource_kind(text)
+        if not kind:
+            return
+        resolved = str(abs_path or "").strip() or resolve_resource_path(text, **dir_kwargs)
+        exists = bool(resolved and os.path.isfile(resolved))
+        key = os.path.normcase(os.path.abspath(resolved)) if resolved else f"{kind}:{text.lower()}"
+        item = found.get(key)
+        if item is None:
+            item = {
+                "kind": kind,
+                "path": text,
+                "abs_path": resolved,
+                "exists": exists,
+                "card_ids": [],
+                "size": 0,
+                "width": 0,
+                "height": 0,
+                "text": "",
+                "data_url": "",
+                "error": "",
+                "attach": False,
+                "attach_index": 0,
+            }
+            if exists:
+                item.update(_inspect_workflow_file(resolved, kind))
+                item["exists"] = True
+            found[key] = item
+        if card_id is not None and card_id not in item["card_ids"]:
+            item["card_ids"].append(card_id)
+
+    for card in cards:
+        if not isinstance(card, Mapping):
+            continue
+        card_id = card.get("id")
+        parameters = card.get("parameters")
+        if not isinstance(parameters, Mapping):
+            continue
+        source = parameters.get("script_source")
+        if isinstance(source, str) and source.strip():
+            for resource in list_script_resources(source, **dir_kwargs):
+                add(str(resource.get("path") or ""), card_id, str(resource.get("abs_path") or ""))
+        for key, value in parameters.items():
+            if key == "script_source":
+                continue
+            for raw in _iter_resource_strings(value):
+                add(raw, card_id)
+
+    items = list(found.values())
+    items.sort(key=lambda item: (item["card_ids"][:1] or [10**9], item["kind"], item["path"].lower()))
+    attach_index = 0
+    for item in items:
+        if not item.get("attach"):
+            continue
+        if attach_index >= MAX_WORKFLOW_AI_IMAGES:
+            item["attach"] = False
+            item["data_url"] = ""
+            continue
+        attach_index += 1
+        item["attach_index"] = attach_index
+    return items
+
+
+def _format_workflow_resources(resources: Sequence[Mapping[str, Any]]) -> List[str]:
+    if not resources:
+        return []
+    lines = [
+        "",
+        "### 工作流资源",
+        "下列文件已按工作流引用读取。图片若标明已附图，编号与随后的工作流附图一致。",
+    ]
+    for item in resources:
+        kind = str(item.get("kind") or "")
+        label = _RESOURCE_KIND_LABELS.get(kind, kind or "文件")
+        path = str(item.get("path") or "")
+        card_ids = item.get("card_ids") or []
+        loc = f"（卡片 {'、'.join(str(card_id) for card_id in card_ids)}）" if card_ids else ""
+        if not item.get("exists"):
+            lines.append(f"- {label} `{path}`{loc}：不存在")
+            continue
+        parts = [f"- {label} `{path}`{loc}：存在"]
+        width = int(item.get("width") or 0)
+        height = int(item.get("height") or 0)
+        if width > 0 and height > 0:
+            parts.append(f"{width}×{height}")
+        size = int(item.get("size") or 0)
+        if size > 0:
+            parts.append(_format_file_size(size))
+        attach_index = int(item.get("attach_index") or 0)
+        if attach_index:
+            parts.append(f"已附图 {attach_index}")
+        elif kind == "image":
+            parts.append("未附图")
+        if kind in {"model", "audio"} or (kind == "component" and not item.get("text")):
+            parts.append("二进制，不作为文本展开")
+        error = str(item.get("error") or "").strip()
+        if error:
+            parts.append(error)
+        lines.append("，".join(parts))
+        text = str(item.get("text") or "")
+        if text:
+            lines.append("```")
+            lines.append(text.rstrip("\n"))
+            lines.append("```")
+    return lines
+
+
 def collect_editor_workflow_snapshot(main_window: Any = None) -> Dict[str, Any]:
     """Read the active editor canvas. Missing editor is empty; read failure is error."""
     view, task = _current_editor_view(main_window)
@@ -1077,35 +1990,49 @@ def collect_editor_workflow_snapshot(main_window: Any = None) -> Dict[str, Any]:
     }
 
 
-def format_editor_workflow_context(snapshot: Optional[Mapping[str, Any]] = None) -> str:
+def format_editor_workflow_context(
+    snapshot: Optional[Mapping[str, Any]] = None,
+    *,
+    resources: Optional[Sequence[Mapping[str, Any]]] = None,
+    resource_dirs: Optional[Mapping[str, str]] = None,
+    header: Optional[str] = None,
+) -> str:
     """Compact text of the active editor workflow for the chat system prompt."""
-    header = _WORKFLOW_CONTEXT_HEADER
+    header = _WORKFLOW_CONTEXT_HEADER if header is None else str(header)
     if not isinstance(snapshot, Mapping) or snapshot.get("status") == "empty":
-        return f"{header}\n当前没有打开的工作流。"
+        return f"{header}\n当前没有打开的工作流。" if header else "当前没有打开的工作流。"
     if snapshot.get("status") == "error":
         error = str(snapshot.get("error") or "未知错误").strip() or "未知错误"
-        return f"{header}\n无法读取当前工作流：{error}"
+        message = f"无法读取当前工作流：{error}"
+        return f"{header}\n{message}" if header else message
     workflow = snapshot.get("workflow")
     if not isinstance(workflow, Mapping):
-        return f"{header}\n无法读取当前工作流：工作流数据不是字典"
+        message = "无法读取当前工作流：工作流数据不是字典"
+        return f"{header}\n{message}" if header else message
 
     cards = workflow.get("cards")
     connections = workflow.get("connections")
     if not isinstance(cards, list):
-        return f"{header}\n无法读取当前工作流：卡片列表无效"
+        message = "无法读取当前工作流：卡片列表无效"
+        return f"{header}\n{message}" if header else message
     if not isinstance(connections, list):
-        return f"{header}\n无法读取当前工作流：连线列表无效"
+        message = "无法读取当前工作流：连线列表无效"
+        return f"{header}\n{message}" if header else message
 
     name = str(snapshot.get("name") or "").strip() or "未命名"
     filepath = str(snapshot.get("filepath") or "").strip() or "尚未保存到文件"
-    saved = "未保存" if snapshot.get("modified") else "已保存"
-    lines = [
-        header,
-        f"名称：{name}",
-        f"文件：{filepath}",
-        f"保存状态：{saved}",
-        f"卡片数：{len(cards)}；连线数：{len(connections)}",
-    ]
+    lines: List[str] = []
+    if header:
+        lines.append(header)
+    lines.append(f"名称：{name}")
+    lines.append(f"文件：{filepath}")
+    if "modified" in snapshot:
+        saved = "未保存" if snapshot.get("modified") else "已保存"
+        lines.append(f"保存状态：{saved}")
+    note = str(snapshot.get("format_note") or "").strip()
+    if note:
+        lines.append(note)
+    lines.append(f"卡片数：{len(cards)}；连线数：{len(connections)}")
     export_cards: List[Dict[str, Any]] = []
     export_connections: List[Dict[str, Any]] = []
 
@@ -1169,6 +2096,9 @@ def format_editor_workflow_context(snapshot: Optional[Mapping[str, Any]] = None)
                 "type": raw_type,
             })
 
+    resource_items = list(resources) if resources is not None else collect_workflow_resources(workflow, resource_dirs)
+    lines.extend(_format_workflow_resources(resource_items))
+
     metadata = workflow.get("metadata")
     if isinstance(metadata, Mapping) and metadata:
         try:
@@ -1200,33 +2130,79 @@ def format_editor_workflow_context(snapshot: Optional[Mapping[str, Any]] = None)
     return _truncate_context_text(text, MAX_WORKFLOW_CONTEXT_CHARS)
 
 
+def editor_workflow_bundle(main_window: Any = None) -> Tuple[str, List[Dict[str, Any]]]:
+    snapshot = collect_editor_workflow_snapshot(main_window)
+    dirs = editor_resource_dirs(main_window)
+    workflow = snapshot.get("workflow") if isinstance(snapshot, Mapping) else None
+    resources = collect_workflow_resources(workflow if isinstance(workflow, Mapping) else None, dirs)
+    text = format_editor_workflow_context(snapshot, resources=resources)
+    images = [
+        {"path": str(item.get("abs_path") or ""), "data_url": str(item.get("data_url") or "")}
+        for item in resources
+        if int(item.get("attach_index") or 0) > 0
+    ]
+    return text, images
+
+
 def editor_workflow_context(main_window: Any = None) -> str:
-    return format_editor_workflow_context(collect_editor_workflow_snapshot(main_window))
+    text, _images = editor_workflow_bundle(main_window)
+    return text
 
 
 def chat_system_prompt(
     task_modules: Optional[Mapping[str, Any]] = None,
     *,
     workflow_context: Optional[str] = None,
+    uploaded_workflow_context: Optional[str] = None,
 ) -> str:
-    parts = [_CHAT_SYSTEM_PROMPT, build_ai_knowledge_document(task_modules)]
+    from app_core.app_config import APP_SOURCE_REPOSITORY, app_source_url
+
+    parts = [
+        _CHAT_SYSTEM_PROMPT,
+        f"开源仓库：{APP_SOURCE_REPOSITORY}（{app_source_url()}）。",
+    ]
     context = str(workflow_context or "").strip()
     if context:
         parts.append(context)
+    uploaded = str(uploaded_workflow_context or "").strip()
+    if uploaded:
+        parts.append(uploaded)
     return "\n\n".join(parts)
 
 
 def build_ai_chat_messages(
     system: str,
-    history: Iterable[Mapping[str, str]],
-) -> list[dict[str, str]]:
-    """System + recent turns."""
-    messages = [{"role": "system", "content": str(system or "")}]
+    history: Iterable[Mapping[str, Any]],
+    *,
+    extra_images: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """System + recent turns. Image turns become OpenAI vision content parts."""
+    messages: list[dict[str, Any]] = [{"role": "system", "content": str(system or "")}]
     for item in history:
         role = str(item.get("role") or "user")
         if role not in {"user", "assistant"}:
             continue
-        content = str(item.get("content") or "")[:MAX_PROMPT_CHARS]
-        if content:
-            messages.append({"role": role, "content": content})
+        text = str(item.get("content") or "")[:MAX_PROMPT_CHARS]
+        images = item.get("images") or []
+        if images:
+            content = build_user_message_content(text, images)
+        else:
+            content = text
+        if content == "" or content == []:
+            continue
+        messages.append({"role": role, "content": content})
+    extras = list(extra_images or [])
+    if extras:
+        payload = {
+            "role": "user",
+            "content": build_user_message_content(
+                WORKFLOW_IMAGES_PROMPT,
+                extras,
+                max_images=MAX_WORKFLOW_AI_IMAGES,
+            ),
+        }
+        if len(messages) > 1 and messages[-1].get("role") == "user":
+            messages.insert(-1, payload)
+        else:
+            messages.append(payload)
     return messages

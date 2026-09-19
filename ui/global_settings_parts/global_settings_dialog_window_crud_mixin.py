@@ -411,6 +411,7 @@ class GlobalSettingsDialogWindowCrudMixin:
                 self.bound_windows.pop(current_index)
                 next_index = current_index if current_index < len(self.bound_windows) else len(self.bound_windows) - 1
                 logger.debug(f"窗口已从列表移除: {window_title}")
+                self._register_windows_to_handle_manager()
             except Exception as e:
                 logger.error(f"从列表移除窗口失败: {e}")
                 raise

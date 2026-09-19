@@ -69,6 +69,8 @@ class WorkflowViewCardLayoutMixin:
         # --------------------------
         self.cards[current_id] = card 
         self._update_card_render_cache_policy()
+        if not getattr(self, "_loading_workflow", False):
+            self._refresh_viewport_animations()
         debug_print(f"添加卡片实例到场景: 类型='{task_type}', ID={current_id} at ({x}, {y})") # Updated log message
         
         # --- REMOVED: Instance-level signal check --- 

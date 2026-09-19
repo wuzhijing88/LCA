@@ -11,7 +11,13 @@ from task_workflow.sub_workflow_path import resolve_sub_workflow_path
 from task_workflow.workflow_payload import workflow_body
 from task_workflow.workflow_sanitize import sanitize_workflow_data
 from task_workflow.workspace import resolve_runtime_resource_dirs
-from task_workflow.script_resources import IMAGE_EXTS, list_script_resources, resource_kind, rewrite_resource_literal
+from task_workflow.script_resources import (
+    DICT_TEXT_EXTS,
+    IMAGE_EXTS,
+    list_script_resources,
+    resource_kind,
+    rewrite_resource_literal,
+)
 from utils.app_paths import (
     get_images_dir,
     get_sounds_dir,
@@ -91,6 +97,7 @@ def _package_file(
     raw_path: object,
     *,
     parent_workflow_file: str = "",
+    kind: str = "",
 ) -> tuple[str, Optional[bytes]]:
     logical = str(raw_path or "").strip().replace("\\", "/")
     if logical.startswith("memory://"):
@@ -101,6 +108,24 @@ def _package_file(
         candidates.append(f"assets/{logical}")
     if logical.startswith("sounds/"):
         candidates.append(f"assets/{logical}")
+    if logical.startswith("dicts/"):
+        candidates.append(f"assets/{logical}")
+    if logical.startswith("assets/dicts/"):
+        candidates.append(logical[len("assets/") :])
+    if str(kind or "").strip() == "dict" or _is_packaged_dict_path(logical):
+        name = Path(logical).name
+        if name:
+            candidates.extend(
+                (
+                    f"dicts/{name}",
+                    f"assets/dicts/{name}",
+                    f"assets/images/dicts/{name}",
+                    f"images/dicts/{name}",
+                    f"assets/images/{name}",
+                    f"images/{name}",
+                    name,
+                )
+            )
     parent = str(parent_workflow_file or "").replace("\\", "/")
     if parent and not os.path.isabs(parent):
         folder = str(Path(parent).parent).replace("\\", "/")
@@ -157,7 +182,7 @@ def _unique_relpath(used: Set[str], kind: str, source_path: str) -> str:
         "audio": "assets/sounds",
         "model": "assets/yolo",
         "replay": "assets/replays",
-        "dict": "assets/images/dicts",
+        "dict": "assets/dicts",
         "component": "assets/components",
         "workflow": "workflows/subs",
     }.get(kind, "assets/misc")
@@ -259,30 +284,25 @@ def collect_workflow_package(
     return result
 
 
-def _collect_gallery_tree(
+def _is_packaged_dict_path(normalized: str) -> bool:
+    lowered = str(normalized or "").replace("\\", "/").lower().lstrip("/")
+    suffix = Path(lowered).suffix
+    if suffix == ".dict":
+        return True
+    return "/dicts/" in f"/{lowered}" or lowered.startswith(("dicts/", "assets/dicts/"))
+
+
+def _collect_disk_gallery(
     result: CollectionResult,
-    images_dir: str,
+    root: str,
     used_relpaths: Set[str],
-    package_files: Mapping[str, bytes],
+    *,
+    dicts_tree: bool,
 ) -> None:
-    for logical_path, data in package_files.items():
-        normalized = logical_path.replace("\\", "/").lstrip("/")
-        if not normalized.startswith(("assets/images/", "images/")):
-            continue
-        if Path(normalized).suffix.lower() not in IMAGE_EXTS:
-            continue
-        kind = "dict" if "/dicts/" in f"/{normalized}" else "image"
-        _register_asset(
-            result,
-            kind,
-            f"memory://{normalized}",
-            used_relpaths,
-            content=data,
-        )
-    root = str(images_dir or "").strip()
-    if not root or not os.path.isdir(root):
+    base = str(root or "").strip()
+    if not base or not os.path.isdir(base):
         return
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = [
             name
             for name in dirnames
@@ -290,11 +310,56 @@ def _collect_gallery_tree(
         ]
         for filename in filenames:
             ext = os.path.splitext(filename)[1].lower()
-            if ext not in IMAGE_EXTS:
-                continue
             abs_path = os.path.abspath(os.path.join(dirpath, filename))
-            kind = "dict" if "dicts" in Path(dirpath).parts else "image"
+            is_dict = dicts_tree or "dicts" in Path(dirpath).parts or ext == ".dict"
+            if is_dict:
+                if ext not in DICT_TEXT_EXTS and ext not in IMAGE_EXTS:
+                    continue
+                kind = "dict"
+            elif ext not in IMAGE_EXTS:
+                continue
+            else:
+                kind = "image"
             _register_asset(result, kind, abs_path, used_relpaths)
+
+
+def _collect_gallery_tree(
+    result: CollectionResult,
+    images_dir: str,
+    used_relpaths: Set[str],
+    package_files: Mapping[str, bytes],
+    dicts_dir: str = "",
+) -> None:
+    for logical_path, data in package_files.items():
+        normalized = logical_path.replace("\\", "/").lstrip("/")
+        if not normalized.startswith(("assets/images/", "images/", "assets/dicts/", "dicts/")):
+            continue
+        suffix = Path(normalized).suffix.lower()
+        if _is_packaged_dict_path(normalized):
+            if suffix not in DICT_TEXT_EXTS and suffix not in IMAGE_EXTS:
+                continue
+            kind = "dict"
+        elif suffix not in IMAGE_EXTS:
+            continue
+        else:
+            kind = "image"
+        _register_asset(
+            result,
+            kind,
+            f"memory://{normalized}",
+            used_relpaths,
+            content=data,
+        )
+    images_root = str(images_dir or "").strip()
+    _collect_disk_gallery(result, images_root, used_relpaths, dicts_tree=False)
+    dicts_root = str(dicts_dir or "").strip()
+    if not dicts_root or not os.path.isdir(dicts_root):
+        return
+    images_key = os.path.normcase(os.path.abspath(images_root)) if images_root else ""
+    dicts_key = os.path.normcase(os.path.abspath(dicts_root))
+    if images_key and (dicts_key == images_key or dicts_key.startswith(images_key + os.sep)):
+        return
+    _collect_disk_gallery(result, dicts_root, used_relpaths, dicts_tree=True)
 
 
 def _collect_workflow(
@@ -407,7 +472,13 @@ def _collect_workflow(
                 result.errors.append(
                     f"卡片 {card.get('id')} 的 YOLO 模型文件不存在: yolo/yolov8n.onnx"
                 )
-    _collect_gallery_tree(result, local_images, used_relpaths, package_files)
+    _collect_gallery_tree(
+        result,
+        local_images,
+        used_relpaths,
+        package_files,
+        dicts_dir=local_dicts,
+    )
 
 
 def _collect_script_resources(
@@ -448,7 +519,7 @@ def _collect_script_resources(
         abs_path = str(item.get("abs_path") or "")
         if kind == "model":
             result.has_yolo = True
-        logical_path, package_data = _package_file(package_files, raw_path)
+        logical_path, package_data = _package_file(package_files, raw_path, kind=kind)
         if package_data is not None:
             relpath = _register_asset(
                 result,
@@ -633,10 +704,12 @@ def _collect_parameter_files(
         rewritten: List[str] = []
         for raw_path in paths:
             kind = resource_kind(raw_path) or ("audio" if "sound" in key or "audio" in key else "image")
-            if key == "model_path" or kind == "model":
+            if key in {"dict_file", "dict_path"} or kind == "dict":
+                kind = "dict"
+            elif key == "model_path" or kind == "model":
                 kind = "model"
                 result.has_yolo = True
-            logical_path, package_data = _package_file(package_files, raw_path)
+            logical_path, package_data = _package_file(package_files, raw_path, kind=kind)
             if package_data is not None:
                 relpath = _register_asset(
                     result,

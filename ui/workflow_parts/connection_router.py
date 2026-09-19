@@ -295,17 +295,40 @@ def interior_cells_along_polyline(points: Sequence[Point]) -> Set[Cell]:
     return cells
 
 
-def _finalize_path(points: Sequence[Point]) -> List[Point]:
-    """去掉重合点后做正交化简，避免口边留下重复顶点。"""
-    cleaned: List[Point] = []
+def _unique_polyline(points: Sequence[Point]) -> List[Point]:
+    unique: List[Point] = []
     for raw in points:
         point = _as_point(raw)
-        if cleaned and _same_point(cleaned[-1], point):
+        if unique and _same_point(unique[-1], point):
             continue
-        cleaned.append(point)
+        unique.append(point)
+    return unique
+
+
+def _coincident_port_path(port: Point) -> List[Point]:
+    """输出口和输入口重合时画一小段正交回路，避免零长度折线。"""
+    x, y = _as_point(port)
+    stub = PORT_STUB
+    return [
+        (x, y),
+        (x + stub, y),
+        (x + stub, y + stub),
+        (x, y + stub),
+        (x, y),
+    ]
+
+
+def _finalize_path(points: Sequence[Point]) -> List[Point]:
+    """去掉重合点后做正交化简，避免口边留下重复顶点。"""
+    cleaned = _unique_polyline(points)
     if len(cleaned) < 2:
-        return [_as_point(p) for p in points[:2]] if len(points) >= 2 else cleaned
-    return simplify_orthogonal(cleaned)
+        if not cleaned:
+            raise ValueError("连线路径点不足")
+        return _coincident_port_path(cleaned[0])
+    simplified = simplify_orthogonal(cleaned)
+    if len(_unique_polyline(simplified)) < 2:
+        return _coincident_port_path(cleaned[0])
+    return simplified
 
 
 def simplify_orthogonal(points: Sequence[Point]) -> List[Point]:
@@ -462,6 +485,8 @@ def preview_drag_connection(
     start_pt = _as_point(start)
     end_pt = _as_point(end)
     del incoming, end_face_x
+    if _same_point(start_pt, end_pt):
+        return _coincident_port_path(start_pt)
     points = [start_pt]
     dx = end_pt[0] - start_pt[0]
     dy = end_pt[1] - start_pt[1]
@@ -617,7 +642,7 @@ def _direct_route_usable(
     occupied_cells: Set[Cell],
     existing_paths: Sequence[Sequence[Point]],
 ) -> bool:
-    if len(path) < 2:
+    if len(_unique_polyline(path)) < 2:
         return False
     if path[1][0] < path[0][0] - _EPS:
         return False

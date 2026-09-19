@@ -44,7 +44,7 @@ def _kind_suffix(path: str, folder: str) -> str:
     packaged = {
         "images": ("assets/images/",),
         "sounds": ("assets/sounds/",),
-        "dicts": ("assets/images/dicts/", "assets/dicts/"),
+        "dicts": ("assets/dicts/", "assets/images/dicts/"),
         "yolo": ("assets/yolo/", "assets/models/"),
         "replays": ("assets/replays/",),
         "plugins": ("assets/components/",),
@@ -61,6 +61,9 @@ IMAGE_EXTS = {".bmp", ".png", ".jpg", ".jpeg", ".webp"}
 MODEL_EXTS = {".onnx"}
 AUDIO_EXTS = {".wav", ".mp3", ".wma", ".m4a", ".ogg", ".flac"}
 COMPONENT_EXTS = {".dll", ".exe", ".py"}
+DICT_EXTS = {".dict"}
+DICT_TEXT_EXTS = {".txt", ".dict"}
+_DICT_SCRIPT_CALLS = ("找字库", "点字库", "等字库", "等字库消失")
 _MODULE_OFFSET_EXTS = {".exe", ".dll", ".sys"}
 _PLUGIN_MODULE_PREFIXES = ("plugins/", "assets/components/")
 
@@ -168,7 +171,11 @@ def resource_kind(path: str) -> str:
     if lowered.endswith(".replay.json") or lowered.startswith(("replays/", "assets/replays/")):
         return "replay"
     ext = os.path.splitext(text)[1].lower()
-    if lowered.startswith(("dicts/", "assets/images/dicts/", "assets/dicts/")):
+    if (
+        ext in DICT_EXTS
+        or lowered.startswith(("dicts/", "assets/dicts/", "assets/images/dicts/", "images/dicts/"))
+        or "/dicts/" in f"/{lowered}"
+    ):
         return "dict"
     if ext in MODEL_EXTS or lowered.startswith(("yolo/", "assets/yolo/", "assets/models/")):
         return "model"
@@ -324,7 +331,7 @@ def resolve_resource_path(
         candidates.append(os.path.abspath(text))
     if lowered.startswith(("images/", "assets/images/")) and not lowered.startswith(
         ("assets/images/dicts/", "images/dicts/")
-    ):
+    ) and "/dicts/" not in f"/{lowered}":
         suffix = _kind_suffix(text, "images")
         candidates.append(os.path.join(root, suffix))
         parent = os.path.dirname(root)
@@ -342,13 +349,16 @@ def resolve_resource_path(
                 os.path.join(app_root, "sounds", os.path.basename(text)),
             )
         )
-    if lowered.startswith("dicts/") or os.path.splitext(lowered)[1] == ".txt":
+    if (
+        lowered.startswith(("dicts/", "assets/dicts/", "images/dicts/", "assets/images/dicts/"))
+        or os.path.splitext(lowered)[1] in DICT_TEXT_EXTS
+    ):
         suffix = _kind_suffix(text, "dicts")
         candidates.extend(
             (
                 os.path.join(dirs["dicts_dir"], suffix),
                 os.path.join(dirs["dicts_dir"], os.path.basename(text)),
-                os.path.join(root, "dicts", os.path.basename(text)),
+                os.path.join(app_root, f"dicts/{suffix}"),
             )
         )
     if not _is_module_offset_literal(text) and (
@@ -486,6 +496,8 @@ def constrain_script_path(
             projected = os.path.abspath(os.path.join(dirs["sounds_dir"], normalized[7:]))
         elif lowered.startswith("dicts/"):
             projected = os.path.abspath(os.path.join(dirs["dicts_dir"], normalized[6:]))
+        elif lowered.startswith("assets/dicts/"):
+            projected = os.path.abspath(os.path.join(dirs["dicts_dir"], normalized[len("assets/dicts/") :]))
         elif lowered.startswith("yolo/") or lowered.endswith(".onnx"):
             projected = os.path.abspath(os.path.join(dirs["yolo_dir"], _kind_suffix(normalized, "yolo")))
         elif lowered.startswith("replays/") or lowered.endswith(".replay.json"):
@@ -539,6 +551,8 @@ def script_path_for_file(
         return _relative_kind_path(absolute, dirs["sounds_dir"], "sounds")
     if detected == "component":
         return _relative_kind_path(absolute, dirs["plugins_dir"], "plugins")
+    if detected == "dict":
+        return _relative_kind_path(absolute, dirs["dicts_dir"], "dicts")
     root = os.path.abspath(dirs["images_dir"] or get_images_dir("LCA"))
     root_prefix = os.path.normcase(root) + os.sep
     if os.path.normcase(absolute) == os.path.normcase(root):
@@ -549,7 +563,7 @@ def script_path_for_file(
     return normalize_workflow_image_path(text)
 
 
-def list_card_files(images_dir: str, card_id: Optional[int], workflow_token: str = "") -> List[str]:
+def list_card_files(images_dir: str, card_id: Optional[int] = None, workflow_token: str = "") -> List[str]:
     root = str(images_dir or "").strip()
     if not root or not os.path.isdir(root):
         return []
@@ -583,6 +597,15 @@ def list_script_resources(
         if call.startswith("大漠内存.") or call.startswith("大漠汇编."):
             continue
         kind = resource_kind(value)
+        if call in _DICT_SCRIPT_CALLS:
+            lowered_value = value.replace("\\", "/").lower()
+            ext = os.path.splitext(lowered_value)[1]
+            if (
+                ext in DICT_TEXT_EXTS
+                or lowered_value.startswith(("dicts/", "assets/dicts/", "images/dicts/", "assets/images/dicts/"))
+                or "/dicts/" in f"/{lowered_value}"
+            ):
+                kind = "dict"
         if not kind:
             continue
         key = value.replace("\\", "/")
@@ -690,6 +713,8 @@ def import_resource_file(
         directory = dirs["sounds_dir"]
     elif detected == "component":
         directory = dirs["plugins_dir"]
+    elif detected == "dict":
+        directory = dirs["dicts_dir"]
     else:
         directory = dirs["images_dir"]
     os.makedirs(directory, exist_ok=True)

@@ -241,9 +241,11 @@ class ImagePathResolver:
             return ()
         index = 0
         first = str(parts[0]).lower()
-        if first == "assets" and len(parts) >= 2 and str(parts[1]).lower() == "images":
-            index = 2
-        elif first == "images":
+        if first == "assets" and len(parts) >= 2:
+            second = str(parts[1]).lower()
+            if second in {"images", "dicts", "sounds", "yolo", "replays"}:
+                index = 2
+        elif first in {"images", "dicts", "sounds", "yolo", "replays"}:
             index = 1
         if index >= len(parts):
             return ()

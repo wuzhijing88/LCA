@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import html
+import os
 import re
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 FENCE_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?P<mark>`{3,}|~{3,})(?P<info>[^\n]*)\n"
@@ -377,6 +378,9 @@ def _block_html(index: int, language: str, body: str, colors: Dict[str, str]) ->
         actions.append(
             f"<a href='apply:{index}' style='color:{accent}; text-decoration:none;'>应用</a>"
         )
+        actions.append(
+            f"<a href='download:{index}' style='color:{accent}; text-decoration:none;'>下载</a>"
+        )
     actions.append(
         f"<a href='copy:{index}' style='color:{accent}; text-decoration:none;'>复制</a>"
     )
@@ -420,22 +424,120 @@ def format_ai_message_html(
     return "".join(parts), payloads
 
 
+AI_IMAGE_THUMB_MAX = 96
+
+
+def _file_url(path: str) -> str:
+    normalized = os.path.abspath(path).replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return "file:///" + normalized
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return "file://" + normalized
+
+
+def thumbnail_size(path: str, max_side: int = AI_IMAGE_THUMB_MAX) -> Tuple[int, int]:
+    limit = max(1, int(max_side))
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+    except Exception:
+        return limit, limit
+    if width <= 0 or height <= 0:
+        return limit, limit
+    scale = min(limit / width, limit / height, 1.0)
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def _images_html(images: Any, colors: Dict[str, str], image_paths: List[str]) -> str:
+    if not isinstance(images, list) or not images:
+        return ""
+    parts: List[str] = []
+    border = colors["border"]
+    muted = colors["muted"]
+    for item in images:
+        if not isinstance(item, Mapping):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            parts.append(
+                f"<p style='margin-top:0px; margin-bottom:8px; color:{muted};'>（图片已丢失）</p>"
+            )
+            continue
+        index = len(image_paths)
+        image_paths.append(path)
+        width, height = thumbnail_size(path)
+        url = html.escape(_file_url(path), quote=True)
+        parts.append(
+            f"<p style='margin-top:0px; margin-bottom:8px;'>"
+            f"<a href='image:{index}'>"
+            f"<img src='{url}' width='{width}' height='{height}' "
+            f"style='border:1px solid {border};' />"
+            f"</a></p>"
+        )
+    return "".join(parts)
+
+
+def _files_html(files: Any, colors: Dict[str, str]) -> str:
+    if not isinstance(files, list) or not files:
+        return ""
+    parts: List[str] = []
+    muted = colors["muted"]
+    text = colors["text"]
+    border = colors["border"]
+    for item in files:
+        if not isinstance(item, Mapping):
+            continue
+        path = str(item.get("path") or "").strip()
+        name = str(item.get("name") or "").strip() or os.path.basename(path) or "工作流文件"
+        if not path or not os.path.isfile(path):
+            parts.append(
+                f"<p style='margin-top:0px; margin-bottom:8px; color:{muted};'>"
+                f"（工作流文件已丢失：{html.escape(name)}）</p>"
+            )
+            continue
+        parts.append(
+            f"<p style='margin-top:0px; margin-bottom:8px; color:{text}; "
+            f"border:1px solid {border}; padding:6px 8px;'>"
+            f"附件：{html.escape(name)}</p>"
+        )
+    return "".join(parts)
+
+
+def format_ai_thinking_html(text: str, colors: Dict[str, str], *, live: bool = False) -> str:
+    if not live:
+        return ""
+    muted = colors["muted"]
+    return (
+        f"<p style='margin-top:0px; margin-bottom:8px; color:{muted};'>"
+        f"{html.escape('正在查阅开源仓库…')}</p>"
+    )
+
+
 def format_ai_transcript_html(
-    messages: Sequence[Dict[str, str]],
+    messages: Sequence[Mapping[str, Any]],
     colors: Dict[str, str],
-) -> Tuple[str, List[str]]:
+) -> Tuple[str, List[str], List[str]]:
     if not messages:
         muted = colors["muted"]
         return (
             f"<p style='color:{muted};'>还没有对话。在下方输入问题后点发送。</p>",
             [],
+            [],
         )
     payloads: List[str] = []
+    image_paths: List[str] = []
     blocks = [f"<div style='color:{colors['text']};'>"]
     for item in messages:
         role = str(item.get("role") or "")
         label = "你" if role == "user" else "AI"
         color = colors["user"] if role == "user" else colors["assistant"]
+        images_html = _images_html(item.get("images"), colors, image_paths)
+        files_html = _files_html(item.get("files"), colors)
         body_html, copied = format_ai_message_html(
             str(item.get("content") or ""),
             colors,
@@ -445,7 +547,7 @@ def format_ai_transcript_html(
         blocks.append(
             f"<div style='margin:0 0 18px 0;'>"
             f"<p style='margin:0 0 8px 0;'><b style='color:{color};'>{html.escape(label)}</b></p>"
-            f"{body_html}</div>"
+            f"{images_html}{files_html}{body_html}</div>"
         )
     blocks.append("</div>")
-    return "".join(blocks), payloads
+    return "".join(blocks), payloads, image_paths

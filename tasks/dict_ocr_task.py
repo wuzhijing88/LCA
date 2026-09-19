@@ -53,15 +53,24 @@ def _window_title(hwnd: Optional[int]) -> str:
         return f"HWND_{hwnd}"
 
 
-def _load_library(params: Dict[str, Any]):
+def _load_library(params: Dict[str, Any], **kwargs):
     from services.dict_ocr_service import load_dict_library
-
+    from task_workflow.resource_context import current_resource_dirs, workflow_resource_scope
     from task_workflow.resource_path import unwrap_resource_path
 
     dict_file = unwrap_resource_path(params.get("dict_file")) or ""
     if not dict_file:
         raise ValueError("未选择字库文件")
-    return load_dict_library(dict_file)
+    current = current_resource_dirs()
+    with workflow_resource_scope(
+        images_dir=str(kwargs.get("images_dir") or current["images_dir"] or ""),
+        sounds_dir=str(kwargs.get("sounds_dir") or current["sounds_dir"] or ""),
+        dicts_dir=str(kwargs.get("dicts_dir") or current["dicts_dir"] or ""),
+        yolo_dir=str(kwargs.get("yolo_dir") or current["yolo_dir"] or ""),
+        replays_dir=str(kwargs.get("replays_dir") or current["replays_dir"] or ""),
+        plugins_dir=str(kwargs.get("plugins_dir") or current["plugins_dir"] or ""),
+    ):
+        return load_dict_library(dict_file)
 
 
 def _recognize_region(roi_image, params: Dict[str, Any], library) -> List[Dict[str, Any]]:
@@ -175,7 +184,7 @@ def execute_task(
         return fail("截图引擎不可用")
 
     try:
-        library = _load_library(params)
+        library = _load_library(params, **kwargs)
     except Exception as exc:
         return fail(str(exc))
 
@@ -447,7 +456,7 @@ def test_dict_ocr_output(params: Dict[str, Any], **kwargs) -> bool:
             logger.error("[字库OCR测试] 截图引擎不可用")
             return False
 
-        library = _load_library(params)
+        library = _load_library(params, **kwargs)
         region_mode, region_x, region_y, region_width, region_height = _resolve_region_params(params)
         full_image = _capture_window_for_ocr(int(target_hwnd), timeout=4.0)
         if full_image is None:

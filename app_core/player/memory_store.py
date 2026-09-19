@@ -110,10 +110,11 @@ def load_files_into_memory(files: Mapping[str, bytes]) -> None:
     # 额外用 basename 和分类前缀索引，兼容卡片/脚本只存文件名或 images/replays/... 路径
     for key, data in list(files.items()):
         norm = _normalize_key(key)
-        if norm.startswith("assets/images/dicts/"):
-            rest = norm[len("assets/images/dicts/") :]
+        if norm.startswith("assets/dicts/"):
+            rest = norm[len("assets/dicts/") :]
             put_player_memory_file("dicts/" + rest, data)
-            put_player_memory_file("images/dicts/" + rest, data)
+            put_player_memory_file(norm.rsplit("/", 1)[-1], data)
+        elif norm.startswith("dicts/"):
             put_player_memory_file(norm.rsplit("/", 1)[-1], data)
         elif norm.startswith("assets/images/"):
             put_player_memory_file("images/" + norm[len("assets/images/") :], data)

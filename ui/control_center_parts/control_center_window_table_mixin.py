@@ -405,15 +405,10 @@ class ControlCenterWindowTableMixin:
                 self.selection_label.setText(f"已选择 {len(selected_rows)} 个窗口：{preview}{suffix}")
             else:
                 self.selection_label.setText(f"已选择 {len(selected_rows)} 个窗口")
-            self.start_all_btn.setToolTip("启动已选窗口中已分配工作流的任务；未选择时启动全部")
-            self.stop_all_btn.setToolTip("停止已选窗口中正在运行的任务；未选择时停止全部")
-            self.pause_all_btn.setToolTip("暂停/恢复已选窗口中正在运行的任务；未选择时作用于全部 (F11)")
         else:
             self.selection_label.setText("未选择")
-            self.start_all_btn.setToolTip("启动所有已分配工作流的窗口")
-            self.stop_all_btn.setToolTip("通过主程序停止所有正在运行的工作流")
-            self.pause_all_btn.setToolTip("暂停/恢复所有正在运行的工作流 (F11)")
 
+        self._apply_hotkey_button_tooltips()
         self._sync_pause_all_button_text()
 
     def _show_window_detail(self, row: int):

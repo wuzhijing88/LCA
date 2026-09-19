@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""点阵字库制作：框选、点字取色、提取点阵、标注后保存为大漠/OP 文本字库。"""
+"""点阵字库制作：框选、点字取色、排除单个像素、提取点阵、标注后保存为大漠/OP 文本字库。"""
 
 from __future__ import annotations
 
@@ -8,13 +8,25 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QImage, QMouseEvent, QPixmap
+from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
     QFrame,
+    QGraphicsScene,
+    QGraphicsView,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -22,14 +34,18 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from themes import theme_color
+from themes import get_theme_manager, theme_color
 from utils.window.window_coordinate_common import clamp_preferred_window_size, get_available_geometry_for_widget
+
+_SOURCE_ZOOM_STEP = 1.15
+_SOURCE_MAX_SCALE = 64.0
 
 logger = logging.getLogger(__name__)
 
@@ -85,18 +101,233 @@ def _pixel_preview_pixmap(bitmap: np.ndarray, max_w: int = 80, max_h: int = 52) 
     )
 
 
+class _SourceImageView(QGraphicsView):
+    pick_requested = Signal(int, int, object)
+    exclude_toggled = Signal(int, int)
+
+    def __init__(self, placeholder: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("dictSourceView")
+        self._placeholder = placeholder
+        self._image: Optional[np.ndarray] = None
+        self._item = None
+        self._excluded: set = set()
+        self._fitted = True
+        self._panning = False
+        self._pan_last: Optional[QPointF] = None
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(240, 140)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
+        self.setMouseTracking(False)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.apply_theme()
+        self._rebuild_scene()
+
+    def apply_theme(self) -> None:
+        border = theme_color("border", "#3e3e3e")
+        background = theme_color("canvas", "#252525")
+        self.setStyleSheet(
+            f"QGraphicsView#dictSourceView {{ border: 1px solid {border}; background: {background}; border-radius: 4px; }}"
+        )
+
+    def refresh_theme(self) -> None:
+        self.apply_theme()
+        self._rebuild_scene()
+        if self._fitted:
+            self.fit_image()
+
+    def set_image(self, image: Optional[np.ndarray], *, reset_view: bool = True) -> None:
+        self._image = image
+        if reset_view:
+            self._excluded = set()
+        self._rebuild_scene()
+        if self._item is None:
+            self._fitted = True
+            self.resetTransform()
+            return
+        if reset_view:
+            self._fitted = True
+            self.fit_image()
+
+    def set_excluded_pixels(self, pixels) -> None:
+        self._excluded = {(int(x), int(y)) for x, y in pixels}
+        self._rebuild_scene()
+
+    def current_scale(self) -> float:
+        return abs(self.transform().m11())
+
+    def fit_image(self) -> None:
+        if self._item is None:
+            return
+        self.resetTransform()
+        self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+        self._fitted = True
+
+    def zoom_by(self, factor: float) -> None:
+        if self._item is None or factor <= 0:
+            return
+        fit = self._fit_scale()
+        current = self.current_scale()
+        if current <= 0:
+            return
+        target = min(_SOURCE_MAX_SCALE, max(fit, current * factor))
+        applied = target / current
+        if abs(applied - 1.0) < 1e-6:
+            return
+        self.scale(applied, applied)
+        self._fitted = abs(target - fit) <= 1e-4
+
+    def _fit_scale(self) -> float:
+        if self._item is None:
+            return 1.0
+        view_rect = self.viewport().rect()
+        source = self._item.boundingRect()
+        if source.width() <= 0 or source.height() <= 0 or view_rect.width() <= 0 or view_rect.height() <= 0:
+            return 1.0
+        return min(view_rect.width() / source.width(), view_rect.height() / source.height())
+
+    def _rebuild_scene(self) -> None:
+        self._scene.clear()
+        self._item = None
+        if self._image is None or self._image.size == 0:
+            self._show_placeholder()
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        pixmap = _bgr_to_pixmap(self._image)
+        if pixmap.isNull():
+            self._show_placeholder()
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        item = self._scene.addPixmap(pixmap)
+        item.setTransformationMode(Qt.TransformationMode.FastTransformation)
+        self._item = item
+        self._scene.setSceneRect(item.boundingRect())
+        self._draw_exclusions()
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+
+    def _show_placeholder(self) -> None:
+        text = self._scene.addSimpleText(self._placeholder)
+        text.setBrush(QBrush(QColor(theme_color("text_secondary", "#888888"))))
+        self._scene.setSceneRect(text.boundingRect())
+        self.resetTransform()
+
+    def _draw_exclusions(self) -> None:
+        if self._item is None or not self._excluded:
+            return
+        color = QColor(theme_color("error", "#e81123"))
+        color.setAlpha(180)
+        brush = QBrush(color)
+        pen = QPen(Qt.PenStyle.NoPen)
+        height, width = self._image.shape[:2]
+        for x, y in self._excluded:
+            if 0 <= x < width and 0 <= y < height:
+                mark = self._scene.addRect(float(x), float(y), 1.0, 1.0)
+                mark.setPen(pen)
+                mark.setBrush(brush)
+                mark.setZValue(1)
+
+    def _image_pos(self, event: QMouseEvent) -> Optional[Tuple[int, int]]:
+        if self._image is None or self._item is None:
+            return None
+        scene_pos = self.mapToScene(event.position().toPoint())
+        image_x = int(scene_pos.x() // 1)
+        image_y = int(scene_pos.y() // 1)
+        height, width = self._image.shape[:2]
+        if 0 <= image_x < width and 0 <= image_y < height:
+            return image_x, image_y
+        return None
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if self._item is None:
+            event.ignore()
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        self.zoom_by(_SOURCE_ZOOM_STEP if delta > 0 else 1.0 / _SOURCE_ZOOM_STEP)
+        event.accept()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._fitted:
+            self.fit_image()
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_last = event.position()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        pos = self._image_pos(event)
+        if pos is None:
+            return super().mousePressEvent(event)
+        image_x, image_y = pos
+        pixel = self._image[image_y, image_x]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.pick_requested.emit(image_x, image_y, pixel)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.exclude_toggled.emit(image_x, image_y)
+            event.accept()
+            return
+        return super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self._panning and self._pan_last is not None:
+            delta = event.position() - self._pan_last
+            self._pan_last = event.position()
+            horizontal = self.horizontalScrollBar()
+            vertical = self.verticalScrollBar()
+            horizontal.setValue(horizontal.value() - int(delta.x()))
+            vertical.setValue(vertical.value() - int(delta.y()))
+            event.accept()
+            return
+        return super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.MiddleButton and self._panning:
+            self._panning = False
+            self._pan_last = None
+            cursor = Qt.CursorShape.CrossCursor if self._item is not None else Qt.CursorShape.ArrowCursor
+            self.viewport().setCursor(cursor)
+            event.accept()
+            return
+        return super().mouseReleaseEvent(event)
+
+
 class _ClickImageLabel(QLabel):
-    def __init__(self, on_click, placeholder: str, parent=None):
+    def __init__(self, on_click, placeholder: str, parent=None, on_right_click=None):
         super().__init__(parent)
         self._on_click = on_click
+        self._on_right_click = on_right_click
         self._image: Optional[np.ndarray] = None
         self._scale = 1.0
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(240, 140)
         self.setText(placeholder)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
         border = theme_color("border", "#3e3e3e")
+        muted = theme_color("text_secondary", "#888888")
+        background = theme_color("canvas", "#252525")
         self.setStyleSheet(
-            f"QLabel {{ border: 1px solid {border}; background: #111111; color: #888888; border-radius: 4px; }}"
+            f"QLabel {{ border: 1px solid {border}; background: {background}; color: {muted}; border-radius: 4px; }}"
         )
 
     def set_image(self, image: Optional[np.ndarray]) -> None:
@@ -117,7 +348,15 @@ class _ClickImageLabel(QLabel):
             self.set_image(self._image)
 
     def mousePressEvent(self, event: QMouseEvent):
-        if event.button() != Qt.MouseButton.LeftButton or self._image is None:
+        if self._image is None:
+            return super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            handler = self._on_click
+        elif event.button() == Qt.MouseButton.RightButton:
+            handler = self._on_right_click
+        else:
+            return super().mousePressEvent(event)
+        if handler is None:
             return super().mousePressEvent(event)
         pixmap = self.pixmap()
         if pixmap is None or pixmap.isNull():
@@ -132,7 +371,7 @@ class _ClickImageLabel(QLabel):
         image_y = int(local_y / max(self._scale, 1e-6))
         height, width = self._image.shape[:2]
         if 0 <= image_x < width and 0 <= image_y < height:
-            self._on_click(image_x, image_y, self._image[image_y, image_x])
+            handler(image_x, image_y, self._image[image_y, image_x])
 
 
 class _GlyphRow(QFrame):
@@ -217,6 +456,7 @@ class DictMakerDialog(QDialog):
         self._dicts_dir_value = str(dicts_dir or "").strip()
         self._roi: Optional[np.ndarray] = None
         self._binary: Optional[np.ndarray] = None
+        self._excluded_pixels: set = set()
         self._region: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._glyphs: List[Any] = []
         self._rows: List[_GlyphRow] = []
@@ -227,6 +467,7 @@ class DictMakerDialog(QDialog):
         self.saved_color_format = ""
         self._build_ui()
         self._load_initial_state()
+        self._register_theme_callback()
 
     def _build_ui(self) -> None:
         available = get_available_geometry_for_widget(self.parentWidget() or self)
@@ -290,11 +531,18 @@ class DictMakerDialog(QDialog):
         sample_layout.setContentsMargins(10, 8, 10, 10)
         sample_layout.setSpacing(6)
 
-        self.source_label = _ClickImageLabel(self._on_preview_click, "框选后显示原图，点文字取色", self)
-        self.source_label.setToolTip("在文字上点一下取样颜色")
-        self.binary_label = _ClickImageLabel(self._on_binary_click, "二值预览", self)
-        self.binary_label.setToolTip("点绿框可选中对应点阵")
-        sample_layout.addWidget(self._titled("原图", self.source_label), 1)
+        self.source_view = _SourceImageView("框选后显示原图，左键取色，右键排除像素，滚轮放大", self)
+        self.source_view.setToolTip("滚轮放大；左键取色；右键排除单个像素（再点一次取消）；中键拖动平移")
+        self.source_view.pick_requested.connect(self._on_preview_click)
+        self.source_view.exclude_toggled.connect(self._toggle_excluded_pixel)
+        self.binary_label = _ClickImageLabel(
+            self._on_binary_click,
+            "二值预览",
+            self,
+            on_right_click=self._on_binary_exclude,
+        )
+        self.binary_label.setToolTip("左键点绿框选中点阵；右键排除单个像素")
+        sample_layout.addWidget(self._titled("原图", self.source_view), 1)
         sample_layout.addWidget(self._titled("二值", self.binary_label), 1)
 
         color_row = QHBoxLayout()
@@ -379,6 +627,30 @@ class DictMakerDialog(QDialog):
         layout.addLayout(bottom)
         self._apply_styles()
 
+    def _register_theme_callback(self) -> None:
+        try:
+            get_theme_manager().register_theme_change_callback(self._on_theme_changed)
+        except Exception:
+            return
+        self.destroyed.connect(self._forget_theme_callback)
+
+    def _forget_theme_callback(self, _=None) -> None:
+        try:
+            get_theme_manager().unregister_theme_change_callback(self._on_theme_changed)
+        except Exception:
+            pass
+
+    def done(self, result: int) -> None:
+        self._forget_theme_callback()
+        super().done(int(result))
+
+    def closeEvent(self, event) -> None:
+        self._forget_theme_callback()
+        super().closeEvent(event)
+
+    def _on_theme_changed(self, _theme=None) -> None:
+        self._apply_styles()
+
     def _titled(self, title: str, widget: QWidget) -> QWidget:
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
@@ -419,6 +691,8 @@ class DictMakerDialog(QDialog):
             """
         )
         self.status_label.setStyleSheet(f"color: {muted};")
+        self.source_view.refresh_theme()
+        self.binary_label.apply_theme()
 
     def _load_initial_state(self) -> None:
         from task_workflow.resource_path import unwrap_resource_path
@@ -513,12 +787,16 @@ class DictMakerDialog(QDialog):
             QMessageBox.warning(self, "制作字库", "截到的区域是空的")
             return
         self._region = (final_x, final_y, final_w, final_h)
+        self._set_sample_image(roi)
+        self.status_label.setText(f"已截图 {desc}")
+
+    def _set_sample_image(self, roi: np.ndarray) -> None:
         self._roi = roi
+        self._excluded_pixels.clear()
         self._glyphs = []
         self._reload_glyphs()
-        self.source_label.set_image(roi)
+        self.source_view.set_image(roi)
         self._refresh_binary()
-        self.status_label.setText(f"已截图 {desc}")
 
     def _on_preview_click(self, _x: int, _y: int, pixel) -> None:
         from services.dict_ocr_service import merge_damo_colors, rgb_to_damo_color
@@ -531,13 +809,42 @@ class DictMakerDialog(QDialog):
         color = rgb_to_damo_color(red, green, blue, self.delta_spin.value())
         self.color_edit.setText(merge_damo_colors(self.color_edit.text(), color))
 
+    def _toggle_excluded_pixel(self, x: int, y: int) -> None:
+        if self._roi is None:
+            return
+        height, width = self._roi.shape[:2]
+        image_x = int(x)
+        image_y = int(y)
+        if not (0 <= image_x < width and 0 <= image_y < height):
+            return
+        key = (image_x, image_y)
+        if key in self._excluded_pixels:
+            self._excluded_pixels.discard(key)
+        else:
+            self._excluded_pixels.add(key)
+        self.source_view.set_excluded_pixels(self._excluded_pixels)
+        self._refresh_binary()
+        count = len(self._excluded_pixels)
+        self.status_label.setText(f"已排除 {count} 个像素" if count else "已取消排除")
+
+    def _apply_pixel_exclusions(self, binary: np.ndarray) -> np.ndarray:
+        if binary is None or not self._excluded_pixels:
+            return binary
+        height, width = binary.shape[:2]
+        for image_x, image_y in self._excluded_pixels:
+            if 0 <= image_x < width and 0 <= image_y < height:
+                binary[image_y, image_x] = 0
+        return binary
+
     def _refresh_binary(self) -> None:
         if self._roi is None:
             return
         from services.dict_ocr_service import binarize_image
 
         try:
-            self._binary = binarize_image(self._roi, self.color_edit.text().strip())
+            self._binary = self._apply_pixel_exclusions(
+                binarize_image(self._roi, self.color_edit.text().strip())
+            )
         except Exception as exc:
             logger.warning("二值化失败: %s", exc)
             self._binary = None
@@ -575,6 +882,9 @@ class DictMakerDialog(QDialog):
             QMessageBox.information(self, "制作字库", "没有提取到点阵。再点一下文字颜色，或把框选收紧到只有字。")
         elif mode == "multiple" and len(self._glyphs) > 8:
             self.status_label.setText(f"提取到 {len(self._glyphs)} 个，切碎了就加大列距")
+
+    def _on_binary_exclude(self, x: int, y: int, _pixel) -> None:
+        self._toggle_excluded_pixel(x, y)
 
     def _on_binary_click(self, x: int, y: int, _pixel) -> None:
         if not self._glyphs:

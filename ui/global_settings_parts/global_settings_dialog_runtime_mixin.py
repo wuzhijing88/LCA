@@ -135,32 +135,36 @@ class GlobalSettingsDialogRuntimeMixin:
         except Exception as e:
             logger.error(f"预注册OCR服务异常: {e}", exc_info=True)
     def _register_windows_to_handle_manager(self):
-        """将绑定的窗口注册到句柄管理器"""
+        """按当前绑定列表同步句柄管理器，已移除的窗口立即注销。"""
         try:
             from utils.window.window_handle_manager import get_window_handle_manager
             handle_manager = get_window_handle_manager()
-            # 启用自动监控，检测窗口句柄变化
-            handle_manager.start_monitoring(interval=10.0)
-            # 添加用户通知回调
             handle_manager.add_user_notification_callback(self._handle_window_invalid_notification)
-            logger.info("窗口句柄管理器已注册并启动自动监控（间隔10秒）")
+            keep_keys = set()
             for i, window_info in enumerate(self.bound_windows):
                 hwnd = window_info.get('hwnd')
                 title = window_info.get('title', '')
                 if hwnd and title:
-                    # 注册窗口
                     key = f"bound_window_{i}"
+                    keep_keys.add(key)
                     handle_manager.register_window(
                         key=key,
                         hwnd=hwnd,
                         title=title
                     )
-                    # 添加更新回调
                     handle_manager.add_update_callback(
                         key,
                         lambda old_hwnd, new_hwnd, idx=i: self._handle_window_hwnd_update(idx, old_hwnd, new_hwnd)
                     )
                     logger.info(f"注册窗口到句柄管理器: {title} (HWND: {hwnd})")
+            for key in list(handle_manager.get_all_registered_windows()):
+                if key not in keep_keys:
+                    handle_manager.unregister_window(key)
+            if keep_keys:
+                handle_manager.start_monitoring(interval=10.0)
+                logger.info("窗口句柄管理器已注册并启动自动监控（间隔10秒）")
+            else:
+                logger.info("已注销全部绑定窗口的句柄监控")
         except Exception as e:
             logger.error(f"注册窗口到句柄管理器失败: {e}")
     def _handle_window_hwnd_update(self, window_index: int, old_hwnd: int, new_hwnd: int):
@@ -253,7 +257,7 @@ class GlobalSettingsDialogRuntimeMixin:
                 old_hwnd = window_info.get('hwnd')
                 if old_hwnd:
                     # 检查窗口是否仍然有效
-                    new_hwnd = handle_manager.get_current_hwnd(key)
+                    new_hwnd = handle_manager.get_window_hwnd(key)
                     if new_hwnd and new_hwnd != old_hwnd:
                         logger.info(f"检测到窗口句柄变化: {window_info.get('title')} -> {old_hwnd} => {new_hwnd}")
                         # 直接更新，不触发回调避免UI阻塞

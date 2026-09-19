@@ -61,10 +61,6 @@ class WindowHandleManager:
             logger.error(f"注册窗口失败: {e}")
             return False
     
-    def get_current_hwnd(self, key: str) -> Optional[int]:
-        """兼容旧调用名，效果与 get_window_hwnd 相同。"""
-        return self.get_window_hwnd(key)
-
     def get_window_hwnd(self, key: str) -> Optional[int]:
         """获取窗口句柄"""
         with self._lock:
@@ -162,6 +158,9 @@ class WindowHandleManager:
         # 在锁外检查窗口有效性（避免长时间持锁）
         for key, window_info in windows_snapshot:
             try:
+                with self._lock:
+                    if key not in self._window_registry:
+                        continue
                 if not self._is_window_valid(window_info.hwnd):
                     logger.warning(f"检测到窗口句柄失效: {key} -> HWND:{window_info.hwnd}，尝试按窗口特征重连")
                     new_hwnd = self._find_window_by_info(window_info)
@@ -175,25 +174,27 @@ class WindowHandleManager:
     def _notify_user_rebind_needed(self, key: str, window_info):
         """通知用户需要手动重新绑定窗口"""
         try:
+            with self._lock:
+                if key not in self._window_registry:
+                    return
+                callbacks = list(self._user_notification_callbacks)
             window_title = window_info.title if hasattr(window_info, 'title') else '未知窗口'
             logger.warning(f"窗口句柄失效通知: '{window_title}' (绑定键: {key})")
 
-            # 触发UI通知回调
-            if hasattr(self, '_user_notification_callbacks') and self._user_notification_callbacks:
-                for callback in self._user_notification_callbacks:
-                    try:
-                        callback(key, window_info)
-                    except Exception as e:
-                        logger.error(f"执行用户通知回调失败: {e}")
+            for callback in callbacks:
+                try:
+                    callback(key, window_info)
+                except Exception as e:
+                    logger.error(f"执行用户通知回调失败: {e}")
 
-            # 记录失效的窗口，供UI查询
-            if not hasattr(self, '_invalid_windows'):
-                self._invalid_windows = {}
-            self._invalid_windows[key] = {
-                'window_info': window_info,
-                'invalid_time': time.time(),
-                'notified': True
-            }
+            with self._lock:
+                if key not in self._window_registry:
+                    return
+                self._invalid_windows[key] = {
+                    'window_info': window_info,
+                    'invalid_time': time.time(),
+                    'notified': True
+                }
 
         except Exception as e:
             logger.error(f"通知用户重新绑定失败: {e}")
@@ -340,9 +341,8 @@ class WindowHandleManager:
             if key in self._window_registry:
                 del self._window_registry[key]
                 logger.info(f"注销窗口: {key}")
-            
-            if key in self._update_callbacks:
-                del self._update_callbacks[key]
+            self._update_callbacks.pop(key, None)
+            self._invalid_windows.pop(key, None)
     
     def get_all_registered_windows(self) -> Dict[str, WindowInfo]:
         """获取所有注册的窗口"""

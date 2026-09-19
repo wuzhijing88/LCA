@@ -395,14 +395,31 @@ def _snapshot_sort_key(snapshot: WindowSnapshot) -> Tuple[int, int, int]:
     return (left, top, as_hwnd(snapshot.get("hwnd")))
 
 
-def _fingerprint_key(window_info: Dict[str, Any]) -> Tuple[str, str, str, str]:
+def _fingerprint_key(window_info: Dict[str, Any]) -> Tuple[str, str, str]:
     identity = _identity_from_window_info(window_info)
     return (
         identity.get("title", ""),
         _normalize_key(identity.get("class_name")),
         _normalize_key(identity.get("process_name")),
-        _normalize_key(identity.get("instance_key")),
     )
+
+
+def _fill_snapshot_instance_keys(snapshots: Sequence[WindowSnapshot]) -> None:
+    """只给缺实例键的候选补启动参数。枚举全桌面时不采这个字段，避免 cmdline 探测拖慢。"""
+    pid_cache: Dict[int, Dict[str, str]] = {}
+    for item in snapshots:
+        if not isinstance(item, dict) or _normalize_text(item.get("instance_key")):
+            continue
+        handle = as_hwnd(item.get("hwnd"))
+        if handle == 0:
+            continue
+        _process_name, instance_key = _get_window_process_info(
+            handle,
+            pid_cache,
+            include_instance_key=True,
+        )
+        if instance_key:
+            item["instance_key"] = instance_key
 
 
 def _assign_identical_windows(
@@ -416,6 +433,13 @@ def _assign_identical_windows(
     assigned: Dict[int, int] = {}
     if not bindings or not unused:
         return assigned
+
+    needs_instance_key = any(
+        _normalize_key(_identity_from_window_info(binding).get("instance_key"))
+        for binding in bindings
+    )
+    if needs_instance_key and any(not _normalize_text(item.get("instance_key")) for item in unused):
+        _fill_snapshot_instance_keys(unused)
 
     claimed_candidates: set[int] = set()
     for binding in bindings:
@@ -452,8 +476,6 @@ def _same_fingerprint(snapshot: WindowSnapshot, identity: Dict[str, str], *, req
         return False
     if identity.get("process_name") and _normalize_key(snapshot.get("process_name")) != _normalize_key(identity["process_name"]):
         return False
-    if identity.get("instance_key") and _normalize_key(snapshot.get("instance_key")) != _normalize_key(identity["instance_key"]):
-        return False
     if require_title and identity.get("title"):
         return _sanitize_title(snapshot.get("title")) == identity["title"]
     return True
@@ -471,7 +493,9 @@ def hwnd_matches_identity(hwnd: Any, window_info: Optional[Dict[str, Any]]) -> b
         return False
     if identity["process_name"] and _normalize_key(live.get("process_name")) != _normalize_key(identity["process_name"]):
         return False
-    if identity.get("instance_key") and _normalize_key(live.get("instance_key")) != _normalize_key(identity["instance_key"]):
+    identity_key = _normalize_key(identity.get("instance_key"))
+    live_key = _normalize_key(live.get("instance_key"))
+    if identity_key and live_key and identity_key != live_key:
         return False
     if identity["title"]:
         if _sanitize_title(live.get("title")) == identity["title"]:

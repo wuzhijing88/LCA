@@ -10,6 +10,7 @@ from ..control_center_parts.control_center_timer_mixin import ControlCenterTimer
 from ..control_center_parts.control_center_pause_timer_mixin import ControlCenterPauseTimerMixin
 from ..control_center_parts.control_center_timer_dialog_mixin import ControlCenterTimerDialogMixin
 from ..control_center_parts.control_center_ui_layout_mixin import ControlCenterUiLayoutMixin
+from ..control_center_parts.control_center_multi_instance_mixin import ControlCenterMultiInstanceMixin
 from ..control_center_parts.control_center_window_lifecycle_mixin import ControlCenterWindowLifecycleMixin
 from ..control_center_parts.control_center_window_table_mixin import (
     ControlCenterWindowTableMixin,
@@ -22,7 +23,7 @@ from ..control_center_parts.control_center_batch_ops_mixin import ControlCenterB
 from utils.window.window_coordinate_common import get_available_geometry_for_widget, clamp_preferred_window_size
 
 
-class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, ControlCenterPauseTimerMixin, ControlCenterTimerDialogMixin, ControlCenterUiLayoutMixin, ControlCenterWindowLifecycleMixin, ControlCenterWindowTableMixin, ControlCenterWorkflowRuntimeMixin, ControlCenterWorkflowAssignmentMixin, ControlCenterWindowTaskMixin, ControlCenterBatchOpsMixin, QMainWindow):
+class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, ControlCenterPauseTimerMixin, ControlCenterTimerDialogMixin, ControlCenterUiLayoutMixin, ControlCenterMultiInstanceMixin, ControlCenterWindowLifecycleMixin, ControlCenterWindowTableMixin, ControlCenterWorkflowRuntimeMixin, ControlCenterWorkflowAssignmentMixin, ControlCenterWindowTaskMixin, ControlCenterBatchOpsMixin, QMainWindow):
     """中控软件主窗口 - 多窗口工作流管理"""
 
     def __init__(self, bound_windows: List[Dict], task_modules: Dict[str, Any], parent=None):

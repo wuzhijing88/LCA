@@ -732,23 +732,32 @@ def build_click_params(
 
 
 def build_move_params(
-    x: Any,
-    y: Any,
-    last: Optional[Dict[str, Any]] = None,
+    start_x: Any,
+    start_y: Any,
+    end_x: Any,
+    end_y: Any,
     defaults: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     params = dict(defaults or {})
-    payload = last or {}
-    start_x = payload.get("x")
-    start_y = payload.get("y")
-    if start_x is None or start_y is None:
-        start_x, start_y = x, y
     params["operation_mode"] = "鼠标移动"
     params["move_mode"] = "绝对移动"
     params["move_start_position"] = f"{int(start_x)},{int(start_y)}"
-    params["move_end_position"] = f"{int(x)},{int(y)}"
-    params["move_duration_mode"] = "固定持续时间"
-    params["move_duration"] = 0.2
+    params["move_end_position"] = f"{int(end_x)},{int(end_y)}"
+    params["move_enable_click"] = False
+    return params
+
+
+def build_relative_move_params(
+    offset_x: Any,
+    offset_y: Any,
+    defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    params = dict(defaults or {})
+    params["operation_mode"] = "鼠标移动"
+    params["move_mode"] = "相对移动"
+    params["move_offset_mode"] = "固定偏移"
+    params["move_offset_x"] = _as_int(offset_x, 0)
+    params["move_offset_y"] = _as_int(offset_y, 0)
     params["move_enable_click"] = False
     return params
 
@@ -1700,10 +1709,17 @@ class CommandHost:
         target = resolve_xy(x, y, 横坐标, 纵坐标, 目标)
         if target is None:
             raise ValueError("移动缺少横坐标、纵坐标")
-        x, y = target
+        end_x, end_y = target
+        from tasks.mouse_action_task import _resolve_relative_move_start
+
+        execution_mode = self._resolve_input_mode(模式, self.context.get("execution_mode", "foreground"))
+        start_x, start_y = _resolve_relative_move_start(
+            execution_mode,
+            int(self.context.get("target_hwnd") or 0),
+        )
         return self._run(
             "模拟鼠标操作",
-            build_move_params(x, y, self.store.last(), self._defaults("模拟鼠标操作")),
+            build_move_params(start_x, start_y, end_x, end_y, self._defaults("模拟鼠标操作")),
             模式=模式,
         )
 
@@ -3069,13 +3085,11 @@ class CommandHost:
             pass
         return ScriptResult(payload)
 
-    def 相对移动(self, 偏移横坐标: Any = 0, 偏移纵坐标: Any = 0, x: Any = None, y: Any = None) -> bool:
-        dx = 偏移横坐标 if x is None else x
-        dy = 偏移纵坐标 if y is None else y
-        pos = self.鼠标位置()
-        if not pos:
-            raise ValueError("移动缺少横坐标、纵坐标")
-        return self.移动(int(pos.横坐标) + int(dx or 0), int(pos.纵坐标) + int(dy or 0))
+    def 相对移动(self, 偏移x: Any = 0, 偏移y: Any = 0) -> bool:
+        return self._run(
+            "模拟鼠标操作",
+            build_relative_move_params(偏移x, 偏移y, self._defaults("模拟鼠标操作")),
+        )
 
     def 客户区尺寸(self) -> Tuple[int, int]:
         hwnd = int(self.context.get("target_hwnd") or 0)

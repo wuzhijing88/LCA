@@ -209,8 +209,7 @@ class WorkflowViewConnectionMixin:
             end_card.connections.remove(connection)
         self.connections.remove(connection)
         self.scene.removeItem(connection)
-        connection.start_item = None
-        connection.end_item = None
+        connection.cleanup()
 
     def _card_scene_rect_tuple(self, card: TaskCard):
         rect = card.mapRectToScene(card.boundingRect())
@@ -250,6 +249,7 @@ class WorkflowViewConnectionMixin:
                     app is not None
                     and index > 0
                     and index % _REROUTE_YIELD_EVERY == 0
+                    and not getattr(self, "_loading_workflow", False)
                 ):
                     if updates_were_enabled:
                         self.setUpdatesEnabled(True)

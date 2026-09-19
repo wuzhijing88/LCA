@@ -141,6 +141,152 @@ def _normalize_member(path: object) -> str:
     return str(path or "").replace("\\", "/").lstrip("/")
 
 
+_DICT_SCRIPT_CALLS = ("找字库", "点字库", "等字库", "等字库消失")
+_DICT_FILE_SUFFIXES = {".txt", ".dict"}
+
+
+def _workflow_cards(workflow: Mapping[str, object]) -> list:
+    cards = workflow.get("cards")
+    if isinstance(cards, list):
+        return cards
+    nested = workflow.get("workflow")
+    if isinstance(nested, dict):
+        nested_cards = nested.get("cards")
+        if isinstance(nested_cards, list):
+            return nested_cards
+    return []
+
+
+def _iter_dict_literals(workflow: Mapping[str, object]) -> list[str]:
+    from task_workflow.script_resources import enclosing_call_name, extract_string_literals
+
+    refs: list[str] = []
+    for card in _workflow_cards(workflow):
+        if not isinstance(card, dict):
+            continue
+        parameters = card.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        for key in ("dict_file", "dict_path"):
+            value = parameters.get(key)
+            if isinstance(value, str) and value.strip():
+                refs.append(value.strip())
+        source = str(parameters.get("script_source") or "")
+        for literal, start, _end in extract_string_literals(source):
+            if enclosing_call_name(source, start) in _DICT_SCRIPT_CALLS and literal.strip():
+                refs.append(literal.strip())
+    return refs
+
+
+def _rewrite_dict_literals(workflow: dict, mapping: Mapping[str, str]) -> bool:
+    from task_workflow.script_resources import rewrite_resource_literal
+
+    changed = False
+    for card in _workflow_cards(workflow):
+        if not isinstance(card, dict):
+            continue
+        parameters = card.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        for key in ("dict_file", "dict_path"):
+            value = parameters.get(key)
+            if not isinstance(value, str):
+                continue
+            replacement = mapping.get(value.strip().replace("\\", "/").lstrip("/"))
+            if replacement and replacement != value:
+                parameters[key] = replacement
+                changed = True
+        source = str(parameters.get("script_source") or "")
+        rewritten = source
+        for old, new in mapping.items():
+            rewritten = rewrite_resource_literal(rewritten, old, new)
+        if rewritten != source:
+            from tasks.script_task import script_source_hash
+
+            parameters["script_source"] = rewritten
+            if parameters.get("script_source_sha256"):
+                parameters["script_source_sha256"] = script_source_hash(rewritten)
+            changed = True
+    return changed
+
+
+def _relocate_dict_assets(files: Mapping[str, bytes]) -> Dict[str, bytes]:
+    result = {
+        _normalize_member(path): bytes(data)
+        for path, data in files.items()
+        if _normalize_member(path)
+    }
+    original = dict(result)
+    path_map: Dict[str, str] = {}
+
+    def take(name: str) -> str:
+        return f"assets/dicts/{name}"
+
+    for path, data in list(result.items()):
+        rest = ""
+        if path.startswith("assets/images/dicts/"):
+            rest = path[len("assets/images/dicts/") :]
+        elif path.startswith("images/dicts/"):
+            rest = path[len("images/dicts/") :]
+        if not rest:
+            continue
+        destination = take(rest)
+        if destination not in result:
+            result[destination] = data
+        if path != destination:
+            del result[path]
+        path_map[path] = f"dicts/{rest}"
+        path_map[f"dicts/{rest}"] = f"dicts/{rest}"
+        path_map[f"assets/dicts/{rest}"] = f"dicts/{rest}"
+
+    workflow_raw = result.get(ENTRY_WORKFLOW)
+    if workflow_raw:
+        try:
+            workflow = json.loads(workflow_raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            workflow = None
+        if isinstance(workflow, dict):
+            for ref in _iter_dict_literals(workflow):
+                logical = ref.replace("\\", "/").lstrip("/")
+                name = Path(logical).name
+                if not name or Path(name).suffix.lower() not in _DICT_FILE_SUFFIXES:
+                    continue
+                source = ""
+                payload = None
+                for candidate in (
+                    logical,
+                    f"assets/dicts/{name}",
+                    f"dicts/{name}",
+                    f"assets/images/dicts/{name}",
+                    f"images/dicts/{name}",
+                    f"assets/images/{name}",
+                    f"images/{name}",
+                    name,
+                ):
+                    if candidate in result:
+                        source = candidate
+                        payload = result[candidate]
+                        break
+                if payload is None:
+                    continue
+                destination = take(name)
+                if source != destination:
+                    if destination not in result:
+                        result[destination] = payload
+                    image_like = source.startswith("assets/images/") and "/dicts/" not in f"/{source}"
+                    nested_old = source.startswith(("assets/images/dicts/", "images/dicts/"))
+                    if image_like or nested_old:
+                        del result[source]
+                path_map[ref] = f"dicts/{name}"
+                path_map[logical] = f"dicts/{name}"
+            if _rewrite_dict_literals(workflow, path_map):
+                result[ENTRY_WORKFLOW] = _json_bytes(workflow)
+
+    if result == original:
+        return dict(files)
+    return result
+
+
 def convert_project_bytes(blob: bytes, *, display_name: str = "") -> bytes:
     kind = inspect_project_bytes(blob)
     if kind == KIND_CURRENT:
@@ -148,15 +294,16 @@ def convert_project_bytes(blob: bytes, *, display_name: str = "") -> bytes:
         from app_core.lca_format.project_io import inline_nested_workflow_assets
 
         inlined = inline_nested_workflow_assets(files)
-        if inlined is files:
+        relocated = _relocate_dict_assets(inlined)
+        if inlined is files and relocated == dict(files):
             return blob
-        return seal_lca_bytes(inlined)
+        return seal_lca_bytes(relocated)
     if kind == KIND_LEGACY_LCA1:
         files = _unseal_lca1_blob(blob)
-        return seal_lca_bytes(_convert_nested_members(files))
+        return seal_lca_bytes(_relocate_dict_assets(_convert_nested_members(files)))
     if kind == KIND_PLAIN_ZIP:
         files = _zip_bytes_to_files(blob)
-        return seal_lca_bytes(_convert_nested_members(files))
+        return seal_lca_bytes(_relocate_dict_assets(_convert_nested_members(files)))
     payload = _parse_json_bytes(blob)
     if payload is None:
         raise LcaFormatError(USER_ERROR_CONVERT)

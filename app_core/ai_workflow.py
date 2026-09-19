@@ -5,6 +5,9 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from task_workflow.thread_window_binding import is_valid_thread_window_limit_connection
@@ -201,6 +204,66 @@ def _require_card(cards: Mapping[int, Dict[str, Any]], card_id: int) -> Dict[str
     return card
 
 
+def build_workflow_from_proposal(
+    proposal_text: str,
+    source_workflow: Mapping[str, Any],
+    *,
+    known_task_types: Iterable[str],
+) -> Dict[str, Any]:
+    """Apply a ```工作流 ops block to a source dict. Does not write the editor or disk."""
+    ops = parse_workflow_proposal(proposal_text)
+    if not isinstance(source_workflow, Mapping) or isinstance(source_workflow, (str, bytes)):
+        raise ValueError("工作流数据不是字典")
+    base = copy.deepcopy(dict(source_workflow))
+    if not isinstance(base.get("cards"), list):
+        base["cards"] = []
+    if not isinstance(base.get("connections"), list):
+        base["connections"] = []
+    return apply_workflow_ops(base, ops, known_task_types=known_task_types)
+
+
+def write_workflow_lca(
+    path: str | Path,
+    workflow: Mapping[str, Any],
+    *,
+    display_name: str = "",
+) -> Path:
+    """Write a current-format .lca. Does not convert or replace the original file."""
+    from app_core.lca_format.constants import LCA_EXTENSION
+    from app_core.lca_format.legacy_convert import convert_json_payload
+
+    if not isinstance(workflow, Mapping) or isinstance(workflow, (str, bytes)):
+        raise ValueError("工作流数据不是字典")
+    destination = Path(path)
+    if not str(destination).strip():
+        raise ValueError("保存路径无效")
+    if destination.suffix.lower() != LCA_EXTENSION:
+        destination = destination.with_suffix(LCA_EXTENSION)
+    blob = convert_json_payload(dict(workflow), display_name=str(display_name or destination.stem))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=str(destination.parent),
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            handle.write(blob)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+    finally:
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+    return destination
+
+
 def apply_workflow_ops(
     workflow: Mapping[str, Any],
     ops: Sequence[Mapping[str, Any]],
@@ -382,8 +445,13 @@ def _close_editor_overlays(main_window: Any) -> None:
             closer()
 
 
-def apply_editor_workflow(main_window: Any, proposal_text: str) -> Dict[str, Any]:
-    """Validate ops against the live canvas, then load the result into the editor."""
+def apply_editor_workflow(
+    main_window: Any,
+    proposal_text: str,
+    *,
+    source_workflow: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Validate ops against the live canvas or an uploaded workflow, then load the result."""
     from app_core.ai_assistant import _current_editor_view
 
     ops = parse_workflow_proposal(proposal_text)
@@ -408,9 +476,19 @@ def apply_editor_workflow(main_window: Any, proposal_text: str) -> Dict[str, Any
         raise RuntimeError(f"无法读取当前工作流：{exc}") from exc
     if not isinstance(current, dict):
         raise RuntimeError("当前工作流数据不是字典")
+    if source_workflow is None:
+        base = current
+    else:
+        if not isinstance(source_workflow, Mapping) or isinstance(source_workflow, (str, bytes)):
+            raise ValueError("上传的工作流数据不是字典")
+        base = copy.deepcopy(dict(source_workflow))
+        if not isinstance(base.get("cards"), list):
+            base["cards"] = []
+        if not isinstance(base.get("connections"), list):
+            base["connections"] = []
 
     prepared = bind_proposal_camera(
-        apply_workflow_ops(current, ops, known_task_types=modules.keys()),
+        apply_workflow_ops(base, ops, known_task_types=modules.keys()),
         current,
     )
     try:

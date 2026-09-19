@@ -29,7 +29,7 @@ _BASENAME_SOURCE_PREFIXES = (
     "assets/images/",
     "assets/sounds/",
     "assets/replays/",
-    "assets/images/dicts/",
+    "assets/dicts/",
     "assets/models/",
     "assets/yolo/",
     "assets/components/",

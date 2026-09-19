@@ -33,7 +33,7 @@ PLAYER_WIDGET_TYPES = (
     "progress",
     "schedule",
 )
-PLAYER_BUTTON_ACTIONS = ("start", "pause", "stop", "bind", "settings")
+PLAYER_BUTTON_ACTIONS = ("start", "pause", "stop", "bind", "settings", "control_center")
 PLAYER_TEXT_ALIGNS = ("left", "center", "right")
 UI_ASSETS_DIRNAME = "ui_assets"
 
@@ -125,8 +125,7 @@ def _new_widget_id() -> str:
 
 
 def default_window_size() -> Dict[str, int]:
-    # Wide enough for script_list + log toolbar ("运行日志/清空/复制/目录") side by side.
-    return {"width": 480, "height": 360}
+    return {"width": 640, "height": 400}
 
 
 def _theme_default(key: str) -> str:
@@ -147,28 +146,14 @@ def default_background() -> Dict[str, Any]:
 
 
 def default_player_widgets(app_name: str = "") -> List[Dict[str, Any]]:
-    """接近旧版固定布局的默认控件集，供设计器与一键导出使用。"""
-    title = _text(app_name) or "独立程序"
+    """默认运行界面：状态、五按钮、脚本列表、日志、底栏进度。"""
     return [
-        {
-            "id": "label_title",
-            "type": "label",
-            "text": title,
-            "x": 20,
-            "y": 16,
-            "w": 440,
-            "h": 28,
-            "font_size": 14,
-            "color": _theme_default("text"),
-            "z": 10,
-            "visible": True,
-        },
         {
             "id": "status_main",
             "type": "status",
-            "x": 20,
-            "y": 52,
-            "w": 440,
+            "x": 16,
+            "y": 12,
+            "w": 608,
             "h": 24,
             "font_size": 12,
             "color": _theme_default("text"),
@@ -180,9 +165,9 @@ def default_player_widgets(app_name: str = "") -> List[Dict[str, Any]]:
             "type": "button",
             "action": "start",
             "text": "开始",
-            "x": 20,
-            "y": 90,
-            "w": 100,
+            "x": 16,
+            "y": 44,
+            "w": 112,
             "h": 36,
             "z": 20,
             "visible": True,
@@ -192,9 +177,9 @@ def default_player_widgets(app_name: str = "") -> List[Dict[str, Any]]:
             "type": "button",
             "action": "pause",
             "text": "暂停",
-            "x": 130,
-            "y": 90,
-            "w": 100,
+            "x": 140,
+            "y": 44,
+            "w": 112,
             "h": 36,
             "z": 21,
             "visible": True,
@@ -204,9 +189,9 @@ def default_player_widgets(app_name: str = "") -> List[Dict[str, Any]]:
             "type": "button",
             "action": "stop",
             "text": "停止",
-            "x": 240,
-            "y": 90,
-            "w": 100,
+            "x": 264,
+            "y": 44,
+            "w": 112,
             "h": 36,
             "z": 22,
             "visible": True,
@@ -216,21 +201,33 @@ def default_player_widgets(app_name: str = "") -> List[Dict[str, Any]]:
             "type": "button",
             "action": "bind",
             "text": "绑定窗口",
-            "x": 350,
-            "y": 90,
-            "w": 90,
+            "x": 388,
+            "y": 44,
+            "w": 112,
             "h": 36,
             "z": 23,
+            "visible": True,
+        },
+        {
+            "id": "btn_control_center",
+            "type": "button",
+            "action": "control_center",
+            "text": "中控",
+            "x": 512,
+            "y": 44,
+            "w": 112,
+            "h": 36,
+            "z": 24,
             "visible": True,
         },
         {
             "id": "scripts_main",
             "type": "script_list",
             "title": "脚本",
-            "x": 20,
-            "y": 136,
-            "w": 200,
-            "h": 188,
+            "x": 16,
+            "y": 92,
+            "w": 296,
+            "h": 248,
             "items": [],
             "group_loops": 1,
             "z": 16,
@@ -239,11 +236,22 @@ def default_player_widgets(app_name: str = "") -> List[Dict[str, Any]]:
         {
             "id": "log_main",
             "type": "log",
-            "x": 230,
-            "y": 136,
-            "w": 230,
-            "h": 188,
+            "x": 324,
+            "y": 92,
+            "w": 300,
+            "h": 248,
             "z": 15,
+            "visible": True,
+        },
+        {
+            "id": "progress_main",
+            "type": "progress",
+            "title": "进度",
+            "x": 16,
+            "y": 352,
+            "w": 608,
+            "h": 32,
+            "z": 12,
             "visible": True,
         },
     ]
@@ -397,7 +405,7 @@ def _normalize_widget(raw: Any) -> Optional[Dict[str, Any]]:
     if kind == "button":
         action = _text(raw.get("action"), "start").lower()
         if action not in PLAYER_BUTTON_ACTIONS:
-            action = "start"
+            return None
         widget["action"] = action
         defaults = {
             "start": "开始",
@@ -405,6 +413,7 @@ def _normalize_widget(raw: Any) -> Optional[Dict[str, Any]]:
             "stop": "停止",
             "bind": "绑定窗口",
             "settings": "设置",
+            "control_center": "中控",
         }
         widget["text"] = _text(raw.get("text"), defaults[action])
         widget["bg_color"] = _normalize_bg_color(raw.get("bg_color"))

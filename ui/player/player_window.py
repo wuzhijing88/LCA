@@ -115,6 +115,11 @@ class PlayerWindow(QMainWindow):
         self._player_tray = None
         self._quit_on_close = bool(quit_on_close)
         self._persist_binding = bool(persist_binding)
+        self.control_center = None
+        self._control_center_shutdown = None
+        self._control_center_shutdown_timer = None
+        self._orphaned_control_center_threads = []
+        self._player_shortcuts = []
         self._exit_on_finish = bool(self._ui.get("exit_on_finish"))
         self._notify_on_finish = bool(self._ui.get("notify_on_finish", True))
         self._is_running = False
@@ -170,6 +175,23 @@ class PlayerWindow(QMainWindow):
     @property
     def package(self) -> PlayerPackage:
         return self._package
+
+    @property
+    def bound_windows(self) -> list:
+        windows = self._config.get("bound_windows")
+        if not isinstance(windows, list):
+            windows = []
+            self._config["bound_windows"] = windows
+        return windows
+
+    @property
+    def window_binding_mode(self) -> str:
+        return str(self._config.get("window_binding_mode") or "single")
+
+    @window_binding_mode.setter
+    def window_binding_mode(self, value) -> None:
+        self._config["window_binding_mode"] = str(value or "single")
+        self.config = self._config
 
     def _resolve_ui_dark(self) -> bool:
         """Use package theme first so chrome matches light/dark even if host theme differs."""
@@ -359,6 +381,209 @@ class PlayerWindow(QMainWindow):
         self._install_hotkeys()
         self._append_log("信息", "设置已保存")
 
+    def _is_any_workflow_running(self) -> bool:
+        return bool(self._is_running)
+
+    def control_center_resource_dirs(self) -> dict:
+        from app_core.player.runtime import _player_package_resource_dirs
+
+        return _player_package_resource_dirs(self._package)
+
+    def pick_control_center_workflow_entries(self, host, title: str) -> list:
+        from ui.player.player_control_center import pick_player_workflow_entries
+
+        return pick_player_workflow_entries(host, self._package, title)
+
+    def load_control_center_workflow_entry(self, file_path: str, name: str = "") -> dict | None:
+        from ui.player.player_control_center import load_player_workflow_entry
+
+        return load_player_workflow_entry(self._package, file_path, name=name)
+
+    def _store_runtime_bound_windows_to_config(self) -> None:
+        self._config["bound_windows"] = self.bound_windows
+        self.config = self._config
+        self._runtime.update_config(self._config)
+
+    def _save_config_silent(self) -> None:
+        if not self._persist_binding:
+            return
+        from app_core.config_store import save_config
+
+        try:
+            save_config(self._config)
+        except Exception:
+            logger.warning("保存独立程序绑定窗口失败", exc_info=True)
+
+    def save_config_func(self, config: dict) -> None:
+        if isinstance(config, dict) and config is not self._config:
+            self._config.update(config)
+            windows = self._config.get("bound_windows")
+            if not isinstance(windows, list):
+                windows = self.bound_windows
+                self._config["bound_windows"] = windows
+        self.config = self._config
+        self._runtime.update_config(self._config)
+        self._save_config_silent()
+
+    def _sync_control_center_action_enabled(self) -> None:
+        return
+
+    def _on_control_center_closed(self) -> None:
+        self.control_center = None
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self._update_hotkeys()
+        except Exception:
+            logger.debug("关闭中控后恢复独立程序热键失败", exc_info=True)
+
+    def _is_control_center_runner_alive(self, runner) -> bool:
+        try:
+            from shiboken6 import isValid as _qt_is_valid
+
+            if not _qt_is_valid(runner):
+                return False
+        except Exception:
+            pass
+        try:
+            return bool(runner.isRunning())
+        except Exception:
+            return False
+
+    def _begin_control_center_shutdown(self, session) -> None:
+        from ui.control_center_parts.control_center_shutdown import CONTROL_CENTER_SHUTDOWN_POLL_MS
+
+        previous = getattr(self, "_control_center_shutdown", None)
+        if previous is not None and getattr(previous, "active", False):
+            session.orphans = list(getattr(previous, "orphans", []) or []) + list(session.orphans)
+        self._control_center_shutdown = session
+        timer = getattr(self, "_control_center_shutdown_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(CONTROL_CENTER_SHUTDOWN_POLL_MS)
+            timer.timeout.connect(self._poll_control_center_shutdown)
+            self._control_center_shutdown_timer = timer
+        if not timer.isActive():
+            timer.start()
+        self._sync_control_center_action_enabled()
+        self._poll_control_center_shutdown()
+
+    def _poll_control_center_shutdown(self) -> None:
+        from ui.control_center_parts.control_center_shutdown import (
+            cleanup_control_center_shared_runtime,
+            decide_shutdown_completion,
+            filter_alive_runners,
+        )
+
+        session = getattr(self, "_control_center_shutdown", None)
+        if session is None or not getattr(session, "active", False):
+            timer = getattr(self, "_control_center_shutdown_timer", None)
+            if timer is not None and timer.isActive():
+                timer.stop()
+            return
+
+        session.orphans = filter_alive_runners(session.orphans, self._is_control_center_runner_alive)
+        decision = decide_shutdown_completion(len(session.orphans), session.elapsed_ms)
+        if decision == "wait":
+            return
+
+        timer = getattr(self, "_control_center_shutdown_timer", None)
+        if timer is not None:
+            timer.stop()
+
+        if decision == "finished_clean":
+            cleanup_control_center_shared_runtime()
+            logger.info("独立程序中控关闭收尾完成，共享运行时已清理")
+        else:
+            leftovers = list(session.orphans)
+            existing = list(getattr(self, "_orphaned_control_center_threads", []) or [])
+            self._orphaned_control_center_threads = existing + leftovers
+            logger.error("独立程序中控关闭超时，仍有 %s 个线程未退出，已保留引用", len(leftovers))
+
+        session.mark_finished()
+        self._sync_control_center_action_enabled()
+
+    def open_control_center(self) -> None:
+        from ui.control_center_parts.control_center_policy import (
+            CONTROL_CENTER_FOREGROUND_BLOCK_MESSAGE,
+            control_center_allows_execution_mode,
+            resolve_control_center_execution_mode,
+        )
+        from ui.control_center_parts.control_center_shutdown import (
+            CONTROL_CENTER_SHUTDOWN_BLOCK_MESSAGE,
+            shutdown_blocks_execution,
+        )
+        from utils.window.window_activation_utils import show_and_activate_overlay
+        from utils.window.window_coordinate_common import center_window_on_widget_screen
+
+        execution_mode = resolve_control_center_execution_mode(self)
+        if not control_center_allows_execution_mode(execution_mode):
+            logger.warning("前台模式禁止打开中控: mode=%s", execution_mode)
+            QMessageBox.warning(self, "无法打开中控", CONTROL_CENTER_FOREGROUND_BLOCK_MESSAGE)
+            return
+        if shutdown_blocks_execution(getattr(self, "_control_center_shutdown", None)):
+            logger.warning("拒绝打开中控: 关闭收尾尚未完成")
+            QMessageBox.warning(self, "无法打开中控", CONTROL_CENTER_SHUTDOWN_BLOCK_MESSAGE)
+            return
+        existing = getattr(self, "control_center", None)
+        if existing is not None:
+            center_window_on_widget_screen(existing, self)
+            show_and_activate_overlay(existing, log_prefix="中控窗口", focus=True)
+            return
+        try:
+            from utils.window.window_identity import refresh_bound_windows
+
+            refresh_bound_windows(self.bound_windows)
+        except Exception as refresh_error:
+            logger.warning("打开中控前刷新绑定句柄失败: %s", refresh_error)
+        invalid_windows = []
+        try:
+            import win32gui
+            from utils.window.hwnd_utils import as_hwnd
+
+            for window_info in self.bound_windows:
+                if not isinstance(window_info, dict):
+                    continue
+                title = str(window_info.get("title") or "未知窗口")
+                hwnd = as_hwnd(window_info.get("hwnd"))
+                try:
+                    if not hwnd or not win32gui.IsWindow(hwnd):
+                        invalid_windows.append(title)
+                except Exception:
+                    invalid_windows.append(title)
+        except Exception:
+            logger.warning("打开中控前验证窗口句柄失败", exc_info=True)
+        if invalid_windows:
+            reply = QMessageBox.warning(
+                self,
+                "窗口句柄验证警告",
+                "以下窗口句柄已失效：\n\n"
+                + "\n".join(f"  • {name}" for name in invalid_windows)
+                + "\n\n请先重新绑定这些窗口后再打开中控。\n\n是否仍要打开中控？（可能导致操作失败）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            from tasks import get_task_modules
+            from ui.control_center_parts.control_center import ControlCenterWindow
+
+            self.control_center = ControlCenterWindow(
+                bound_windows=self.bound_windows,
+                task_modules=get_task_modules(),
+                parent=self,
+            )
+            center_window_on_widget_screen(self.control_center, self)
+            show_and_activate_overlay(self.control_center, log_prefix="中控窗口", focus=True)
+            self._disable_main_window_hotkeys()
+            self.control_center.destroyed.connect(self._on_control_center_closed)
+            logger.info("独立程序中控已启动")
+        except Exception as exc:
+            self.control_center = None
+            logger.error("启动独立程序中控失败: %s", exc, exc_info=True)
+            QMessageBox.warning(self, "错误", f"启动中控软件失败: {exc}")
+
     def _elapsed_text(self) -> str:
         if self._run_started_at <= 0:
             return "0:00"
@@ -440,6 +665,7 @@ class PlayerWindow(QMainWindow):
             on_stop=self.safe_stop_tasks,
             on_bind=self.open_window_binding_dialog,
             on_settings=self.open_settings_dialog,
+            on_control_center=self.open_control_center,
             on_scripts_changed=self._on_scripts_changed,
             on_loops_changed=self._schedule_persist_ui_state,
             on_open_log_dir=self.open_userdata_dir,
@@ -594,6 +820,29 @@ class PlayerWindow(QMainWindow):
         hotkey_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(hotkey_label)
 
+    def _clear_player_shortcuts(self) -> None:
+        for shortcut in list(getattr(self, "_player_shortcuts", []) or []):
+            try:
+                shortcut.setEnabled(False)
+                shortcut.setParent(None)
+                shortcut.deleteLater()
+            except RuntimeError:
+                pass
+        self._player_shortcuts = []
+
+    def _disable_main_window_hotkeys(self) -> None:
+        session = self._hotkey_session
+        self._hotkey_session = None
+        if session is not None:
+            try:
+                session.release()
+            except Exception:
+                logger.debug("打开中控时注销独立程序热键失败", exc_info=True)
+        self._clear_player_shortcuts()
+
+    def _update_hotkeys(self) -> None:
+        self._install_hotkeys()
+
     def _install_hotkeys(self):
         old = self._hotkey_session
         self._hotkey_session = None
@@ -602,6 +851,7 @@ class PlayerWindow(QMainWindow):
                 old.release()
             except Exception:
                 logger.debug("重装热键前注销失败", exc_info=True)
+        self._clear_player_shortcuts()
         mapping = {
             "start": (self._ui.get("start_hotkey"), self.safe_start_tasks),
             "stop": (self._ui.get("stop_hotkey"), self.safe_stop_tasks),
@@ -629,6 +879,7 @@ class PlayerWindow(QMainWindow):
                 else Qt.ShortcutContext.WindowShortcut
             )
             shortcut.activated.connect(callback)
+            self._player_shortcuts.append(shortcut)
 
     def _install_bind_button(self) -> None:
         """自定义界面未画「绑定窗口」按钮时，在内容区左下角补一个入口。"""
@@ -659,10 +910,24 @@ class PlayerWindow(QMainWindow):
         from ui.player.player_window_binding_dialog import open_player_window_binding_dialog
 
         def _on_saved(updated: dict) -> None:
+            incoming = [
+                dict(item)
+                for item in (updated.get("bound_windows") or [])
+                if isinstance(item, dict)
+            ]
+            current = self.bound_windows
+            current[:] = incoming
             self._config = dict(updated or {})
+            self._config["bound_windows"] = current
             self.config = self._config
             self._runtime.update_config(self._config)
             self._update_bind_status_hint()
+            center = getattr(self, "control_center", None)
+            if center is not None:
+                center.bound_windows = current
+                populate = getattr(center, "populate_window_table", None)
+                if callable(populate):
+                    populate()
 
         from app_core.player.window_resolution import required_client_size
 
@@ -1191,19 +1456,43 @@ class PlayerWindow(QMainWindow):
             self._win_controls.reposition(self._body)
             self._win_controls.raise_()
 
+    def _can_drag_move(self, widget) -> bool:
+        from PySide6.QtWidgets import (
+            QAbstractItemView,
+            QAbstractSpinBox,
+            QCheckBox,
+            QComboBox,
+            QLineEdit,
+            QProgressBar,
+            QTabBar,
+            QToolButton,
+        )
+
+        blocked = (
+            QPushButton,
+            QCheckBox,
+            QAbstractSpinBox,
+            QTextEdit,
+            QAbstractItemView,
+            QToolButton,
+            QTabBar,
+            QProgressBar,
+            QLineEdit,
+            QComboBox,
+        )
+        current = widget
+        while current is not None and current is not self:
+            if isinstance(current, blocked):
+                return False
+            current = current.parentWidget()
+        return True
+
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
-            # 无边框窗口：空白处拖拽移动
             child = self.childAt(event.position().toPoint())
-            from ui.player.player_chrome import PlayerWindowControls
-
-            if child is None or isinstance(child, (QLabel,)) and child.objectName() in ("PlayerBg", "PlayerBgFill", ""):
+            if self._can_drag_move(child):
                 self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 event.accept()
-                return
-            if isinstance(child, PlayerWindowControls):
-                self._drag_offset = None
-                super().mousePressEvent(event)
                 return
         self._drag_offset = None
         super().mousePressEvent(event)
@@ -1232,12 +1521,32 @@ class PlayerWindow(QMainWindow):
         self._closing = True
         self._progress_timer.stop()
         self._schedule_timer.stop()
+        center = getattr(self, "control_center", None)
+        if center is not None:
+            try:
+                center.close()
+            except RuntimeError:
+                pass
+        try:
+            self._poll_control_center_shutdown()
+        except Exception:
+            logger.debug("关闭独立程序时收尾中控失败", exc_info=True)
+        session = getattr(self, "_control_center_shutdown", None)
+        if session is not None and getattr(session, "active", False):
+            leftovers = list(getattr(session, "orphans", []) or [])
+            if leftovers:
+                existing = list(getattr(self, "_orphaned_control_center_threads", []) or [])
+                self._orphaned_control_center_threads = existing + leftovers
+        timer = getattr(self, "_control_center_shutdown_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
         try:
             self._persist_ui_state()
         except Exception:
             logger.debug("关闭前保存 UI 状态失败", exc_info=True)
         self._cleanup_player_tray()
         self._clear_script_queue()
+        self._clear_player_shortcuts()
         session = self._hotkey_session
         self._hotkey_session = None
         if session is not None:

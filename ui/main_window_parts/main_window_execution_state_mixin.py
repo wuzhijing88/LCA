@@ -48,7 +48,7 @@ class MainWindowExecutionStateMixin:
 
         self.run_action.setIcon(create_media_control_icon('stop', 22))
 
-        self.run_action.setToolTip("停止所有任务执行 (F10)") # Add F10 hint
+        self.run_action.setToolTip(self._tooltip_with_hotkey("停止所有任务执行", "stop"))
 
         # 修改：连接到停止所有任务的方法
 
@@ -1069,7 +1069,7 @@ class MainWindowExecutionStateMixin:
         self.run_action.setEnabled(True)
         self.run_action.setText("停止多窗口执行")
         self.run_action.setIcon(create_media_control_icon('stop', 22))
-        self.run_action.setToolTip("停止所有窗口的执行 (F10)")
+        self.run_action.setToolTip(self._tooltip_with_hotkey("停止所有窗口的执行", "stop"))
         self.run_action.triggered.connect(self.safe_stop_tasks)
 
     def _set_button_to_paused_state(self):
@@ -1085,7 +1085,7 @@ class MainWindowExecutionStateMixin:
         logging.debug("设置按钮为停止状态")
         self.run_action.setEnabled(True)
         self.run_action.setText("运行所有任务")
-        self.run_action.setToolTip("开始执行所有工作流 (F9)")
+        self.run_action.setToolTip(self._tooltip_with_hotkey("开始执行所有工作流", "start"))
         self.run_action.setIcon(create_media_control_icon('play', 22))
 
     def _set_button_to_running_state(self):
@@ -1093,7 +1093,7 @@ class MainWindowExecutionStateMixin:
         logging.debug("设置按钮为运行状态")
         self.run_action.setEnabled(True)
         self.run_action.setText("停止")
-        self.run_action.setToolTip("停止所有任务执行 (F10)")
+        self.run_action.setToolTip(self._tooltip_with_hotkey("停止所有任务执行", "stop"))
         self.run_action.setIcon(create_media_control_icon('stop', 22))
 
     def _set_toolbar_to_stop_state(self):

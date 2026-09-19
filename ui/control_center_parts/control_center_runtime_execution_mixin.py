@@ -159,6 +159,13 @@ class WindowTaskRunnerExecutionMixin:
                 workflow_filepath=str(getattr(self, "workflow_file_path", "") or ""),
             )
             runtime_dirs = resource_runtime_kwargs(resource_dirs)
+            from task_workflow.resource_context import RESOURCE_DIR_KEYS
+
+            config = self._runtime_config or {}
+            for key in RESOURCE_DIR_KEYS:
+                value = str(config.get(key) or "").strip()
+                if value:
+                    runtime_dirs[key] = value
 
             self.executor, self.executor_thread = create_coordinated_workflow_runtime(
                 source=ExecutionSource.CONTROL_CENTER,

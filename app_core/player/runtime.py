@@ -19,20 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 def _player_package_resource_dirs(package: PlayerPackage) -> dict[str, str]:
+    userdata = package.userdata_dir
     images = package.assets_images_dir or ""
-    sounds = package.assets_sounds_dir or ""
-    dicts = package.assets_dicts_dir or ""
-    yolo = package.assets_yolo_dir or ""
-    replays = package.assets_replays_dir or ""
+    sounds = package.assets_sounds_dir or os.path.join(userdata, "sounds")
+    dicts = package.assets_dicts_dir or os.path.join(userdata, "dicts")
+    yolo = package.assets_yolo_dir or os.path.join(userdata, "yolo")
+    replays = package.assets_replays_dir or os.path.join(userdata, "replays")
     from utils.app_paths import get_plugin_dir
 
     plugins = package.assets_plugins_dir or get_plugin_dir()
-    if not images:
-        userdata = package.userdata_dir
-        sounds = sounds or os.path.join(userdata, "sounds")
-        dicts = dicts or os.path.join(userdata, "dicts")
-        replays = replays or os.path.join(userdata, "replays")
-        yolo = yolo or os.path.join(userdata, "yolo")
     return {
         "images_dir": images,
         "sounds_dir": sounds,
@@ -41,6 +36,27 @@ def _player_package_resource_dirs(package: PlayerPackage) -> dict[str, str]:
         "replays_dir": replays,
         "plugins_dir": plugins,
     }
+
+
+def _player_workflow_resource_dirs(
+    package: PlayerPackage,
+    workflow_data: Mapping[str, Any],
+    workflow_filepath: str = "",
+) -> dict[str, str]:
+    package_dirs = _player_package_resource_dirs(package)
+    from task_workflow.workspace import resolve_runtime_resource_dirs
+
+    runtime = resolve_runtime_resource_dirs(
+        workflow_data,
+        workflow_filepath=str(workflow_filepath or package.entry_workflow_path or ""),
+        default_images_dir=str(package_dirs.get("images_dir") or ""),
+    )
+    result = dict(package_dirs)
+    for key in ("images_dir", "sounds_dir", "dicts_dir", "yolo_dir", "replays_dir"):
+        candidate = str(runtime.get(key) or "").strip()
+        if candidate and os.path.isdir(candidate):
+            result[key] = candidate
+    return result
 
 
 class PlayerRuntimeController:
@@ -191,7 +207,11 @@ class PlayerRuntimeController:
         workflow_filepath = self._resolve_workflow_path(sid)
         from task_workflow.resource_context import bind_resource_dirs
 
-        resource_dirs = _player_package_resource_dirs(self._package)
+        resource_dirs = _player_workflow_resource_dirs(
+            self._package,
+            payload,
+            workflow_filepath,
+        )
         bind_resource_dirs(resource_dirs)
         self.executor, self.executor_thread = create_coordinated_workflow_runtime(
             source=ExecutionSource.PLAYER,

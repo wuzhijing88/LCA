@@ -144,14 +144,11 @@ def load_workflow_package(
     *,
     parent_workflow_file: str | Path | None = None,
 ):
-    from app_core.lca_format.container import LcaFormatError
     from app_core.lca_format.project_io import load_lca_from_bytes
 
     path_text = str(path)
     if path_text.startswith("memory://"):
         return load_lca_from_bytes(_memory_workflow_bytes(path_text, parent_workflow_file))
-    if not is_lca_path(path_text):
-        raise LcaFormatError("工作流必须是 .lca 工程")
     return load_lca_project(path_text)
 
 
@@ -168,8 +165,12 @@ def load_workflow_file(
     if not path_text.startswith("memory://"):
         from app_core.lca_format.session import activate, register
 
-        register(path_text, session)
-        activate(path_text)
+        source = Path(path_text)
+        register_path = (
+            source.with_suffix(LCA_EXTENSION) if source.suffix.lower() == ".json" else source
+        )
+        register(register_path, session)
+        activate(register_path)
     return payload
 
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, Set
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QMouseEvent, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -13,8 +15,52 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
+    QWidget,
 )
+
+
+class _CatalogCheckRow(QWidget):
+    def __init__(self, title: str, path: str, *, checked: bool, parent=None):
+        super().__init__(parent)
+        self.check = QCheckBox(self)
+        self.check.setChecked(bool(checked))
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        text = str(title or "").strip() or "工作流"
+        if str(path or "").strip():
+            text = f"{text}\n{path}"
+        self._label = QLabel(text, self)
+        self._label.setWordWrap(False)
+        self._label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        fm = self._label.fontMetrics()
+        lines = [line for line in text.split("\n") if line] or [""]
+        self._label.setMinimumHeight(fm.height() * len(lines) + fm.leading() * max(0, len(lines) - 1))
+        layout.addWidget(self.check, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self._label, 1)
+
+    def sizeHint(self) -> QSize:
+        fm = self._label.fontMetrics()
+        lines = [line for line in str(self._label.text() or "").split("\n") if line] or [""]
+        text_h = fm.height() * len(lines) + fm.leading() * max(0, len(lines) - 1)
+        margins = self.layout().contentsMargins() if self.layout() is not None else None
+        extra = (margins.top() + margins.bottom()) if margins else 16
+        check_h = self.check.sizeHint().height()
+        width = super().sizeHint().width()
+        return QSize(max(width, 200), max(text_h, check_h) + extra)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            local = self.check.mapFrom(self, pos)
+            if not self.check.rect().contains(local):
+                self.check.toggle()
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
 
 class WorkspaceExportPickerDialog(QDialog):
@@ -39,7 +85,9 @@ class WorkspaceExportPickerDialog(QDialog):
         layout.addWidget(hint)
 
         self._list = QListWidget(self)
-        self._list.itemChanged.connect(lambda *_: self._refresh_ok())
+        self._list.setObjectName("WorkspaceExportPickerList")
+        self._list.setUniformItemSizes(False)
+        self._list.setSpacing(2)
         layout.addWidget(self._list, 1)
 
         row = QHBoxLayout()
@@ -57,7 +105,8 @@ class WorkspaceExportPickerDialog(QDialog):
             parent=self,
         )
         self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
-        self._ok_btn.setText("继续")
+        self._ok_btn.setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -66,7 +115,6 @@ class WorkspaceExportPickerDialog(QDialog):
         self._refresh_ok()
 
     def _populate(self) -> None:
-        self._list.blockSignals(True)
         self._list.clear()
         for entry in self._catalog:
             sid = str(entry.get("id") or "").strip()
@@ -74,42 +122,61 @@ class WorkspaceExportPickerDialog(QDialog):
                 continue
             title = str(entry.get("title") or sid).strip() or sid
             path = str(entry.get("filepath") or "").strip()
-            label = title if not path else f"{title}\n{path}"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, sid)
-            item.setFlags(
-                item.flags()
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-            )
             if self._preselected is None:
                 checked = True
             else:
                 checked = sid in self._preselected
-            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            item = QListWidgetItem()
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            item.setData(Qt.ItemDataRole.UserRole, sid)
+            row = _CatalogCheckRow(title, path, checked=checked, parent=self._list)
+            row.check.toggled.connect(lambda *_: self._refresh_ok())
             self._list.addItem(item)
-        self._list.blockSignals(False)
+            self._list.setItemWidget(item, row)
+            item.setSizeHint(row.sizeHint())
+        self._sync_row_heights()
+
+    def _sync_row_heights(self) -> None:
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            row = self._row_at(i)
+            if item is None or row is None:
+                continue
+            item.setSizeHint(row.sizeHint())
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._sync_row_heights()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._sync_row_heights()
+
+    def _row_at(self, index: int) -> Optional[_CatalogCheckRow]:
+        item = self._list.item(index)
+        widget = self._list.itemWidget(item) if item is not None else None
+        return widget if isinstance(widget, _CatalogCheckRow) else None
 
     def _select_all(self) -> None:
-        self._list.blockSignals(True)
         for i in range(self._list.count()):
-            self._list.item(i).setCheckState(Qt.CheckState.Checked)
-        self._list.blockSignals(False)
+            row = self._row_at(i)
+            if row is not None:
+                row.check.setChecked(True)
         self._refresh_ok()
 
     def _select_none(self) -> None:
-        self._list.blockSignals(True)
         for i in range(self._list.count()):
-            self._list.item(i).setCheckState(Qt.CheckState.Unchecked)
-        self._list.blockSignals(False)
+            row = self._row_at(i)
+            if row is not None:
+                row.check.setChecked(False)
         self._refresh_ok()
 
     def _checked_ids(self) -> List[str]:
         ids: List[str] = []
         for i in range(self._list.count()):
             item = self._list.item(i)
-            if item is None or item.checkState() != Qt.CheckState.Checked:
+            row = self._row_at(i)
+            if item is None or row is None or not row.check.isChecked():
                 continue
             sid = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
             if sid:

@@ -204,7 +204,6 @@ DATA_FILE_SPECS = (
     ("AutoHotkey/AutoHotkey64.exe", "AutoHotkey/AutoHotkey64.exe"),
     ("resources/icon.ico", "resources/icon.ico"),
     ("docs/WORKFLOW_AND_SCRIPTS.md", "docs/WORKFLOW_AND_SCRIPTS.md"),
-    ("docs/AI_ASSISTANT_KNOWLEDGE.md", "docs/AI_ASSISTANT_KNOWLEDGE.md"),
 )
 
 ONNXRUNTIME_GPU_DLL_PATTERNS = (

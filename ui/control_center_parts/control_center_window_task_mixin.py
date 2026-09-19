@@ -356,6 +356,16 @@ class ControlCenterWindowTaskMixin:
         workflow_name = workflow_info["name"]
         get_parent_config = getattr(self, "_get_parent_config", None)
         runtime_config = get_parent_config() if callable(get_parent_config) else None
+        runtime_config = dict(runtime_config) if isinstance(runtime_config, dict) else {}
+        parent = getattr(self, "parent_window", None)
+        resource_dirs = getattr(parent, "control_center_resource_dirs", None) if parent else None
+        if callable(resource_dirs):
+            extra = resource_dirs()
+            if isinstance(extra, dict):
+                for key, value in extra.items():
+                    text = str(value or "").strip()
+                    if text:
+                        runtime_config[key] = text
         runner = WindowTaskRunner(
             window_info,
             workflow_data,

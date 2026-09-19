@@ -86,6 +86,7 @@ class WorkflowTabWidget(QTabWidget):
         self._is_auto_loading = False
         # 标志：导入时是否自动激活新标签页
         self._activate_new_tab_on_add = True
+        self._task_add_error = None
 
         # 记录每个工作流路径对应的画布视图状态（缩放 + 视图中心）
         self._persisted_view_states: Dict[str, Dict[str, List[float]]] = self._load_persisted_view_states()
@@ -455,6 +456,7 @@ class WorkflowTabWidget(QTabWidget):
                 task_id = self.task_manager.add_task(name, filepath, workflow_data)
             finally:
                 self._activate_new_tab_on_add = previous_activate_flag
+            self._require_created_task_view(task_id)
             # 加载已经通过严格校验的跳转配置
             task = self.task_manager.get_task(task_id)
             if task and jump_config is not None:
@@ -658,6 +660,7 @@ class WorkflowTabWidget(QTabWidget):
 
             # 添加任务到管理器
             task_id = self.task_manager.add_task(name, filepath, workflow_data)
+            self._require_created_task_view(task_id)
 
             task = self.task_manager.get_task(task_id)
             if task:
@@ -741,6 +744,7 @@ class WorkflowTabWidget(QTabWidget):
             workflow_data = blank_workflow_data(project_dir)
 
             task_id = self.task_manager.add_task(name, default_filepath, workflow_data)
+            self._require_created_task_view(task_id)
             self.workflow_imported.emit(task_id)
 
             return task_id
@@ -777,7 +781,7 @@ class WorkflowTabWidget(QTabWidget):
 
         # 强制初始化WorkflowView的交互属性
         from PySide6.QtWidgets import QGraphicsView
-        from PySide6.QtCore import Qt
+        from PySide6.QtCore import Qt, QTimer
 
         workflow_view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         workflow_view.setInteractive(True)
@@ -791,17 +795,59 @@ class WorkflowTabWidget(QTabWidget):
         logger.info(f"   enabled: {workflow_view.isEnabled()}")
         logger.info(f"   focusPolicy: {workflow_view.focusPolicy()}")
 
-        # 加载工作流数据（优先应用退出时持久化的视图状态）
-        workflow_data_for_load = self._get_workflow_data_with_persisted_view(task)
-        workflow_view.load_workflow(workflow_data_for_load)
-        # 导入校验后全局状态仍可能变化；内部加载可完成，但运行期间的新视图必须保持只读。
-        workflow_view.editing_enabled = not self._global_runtime_blocks_import()
+        from .connection_line import set_line_animation_paused
 
-        # 加载后再次确保拖拽模式正确（加载可能会改变设置）
+        set_line_animation_paused("workflow_tab_insert", True)
+        workflow_view.setUpdatesEnabled(False)
+        try:
+            workflow_data_for_load = self._get_workflow_data_with_persisted_view(task)
+            workflow_view.load_workflow(workflow_data_for_load)
+            self._finish_task_view_setup(task_id, task, workflow_view)
+        except Exception as exc:
+            logger.error("加载工作流画布失败: %s", exc, exc_info=True)
+            self._task_add_error = exc
+            self._discard_failed_task_view(task_id, workflow_view)
+            set_line_animation_paused("workflow_tab_insert", False)
+            return
+        workflow_view.setUpdatesEnabled(True)
+        QTimer.singleShot(0, lambda view=workflow_view: self._resume_task_view_insert(view))
+
+    def _resume_task_view_insert(self, workflow_view) -> None:
+        from shiboken6 import isValid
+
+        from .connection_line import set_line_animation_paused
+
+        set_line_animation_paused("workflow_tab_insert", False)
+        if workflow_view is None or not isValid(workflow_view):
+            return
+        try:
+            workflow_view._refresh_viewport_animations()
+        except Exception:
+            pass
+
+    def _discard_failed_task_view(self, task_id: int, workflow_view) -> None:
+        self.task_views.pop(task_id, None)
+        try:
+            tab_index = self.indexOf(workflow_view)
+            if tab_index >= 0:
+                self.removeTab(tab_index)
+        except RuntimeError:
+            pass
+        try:
+            self._rebuild_mappings()
+        except Exception:
+            pass
+        self._dispose_workflow_widget(workflow_view)
+        if self.task_manager.get_task(task_id) is not None:
+            self.task_manager.remove_task(task_id)
+
+    def _finish_task_view_setup(self, task_id: int, task, workflow_view) -> None:
+        from PySide6.QtWidgets import QGraphicsView
+
+        workflow_view.editing_enabled = not self._global_runtime_blocks_import()
         workflow_view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         logger.info(f"   加载后dragMode: {workflow_view.dragMode()}")
 
-        # 应用网格/卡片吸附设置
         try:
             main_win = self.window()
             if main_win and hasattr(main_win, 'config'):
@@ -812,19 +858,14 @@ class WorkflowTabWidget(QTabWidget):
         except Exception:
             pass
 
-        # 连接WorkflowView的信号，标记任务为已修改
         workflow_view.card_added.connect(lambda: self._mark_task_modified(task_id))
         workflow_view.card_deleted.connect(lambda: self._mark_task_modified(task_id))
-        # 【修复】连线修改时也立即更新workflow_data（原本就有，但确认一下）
         workflow_view.connection_added.connect(lambda start_card, end_card, conn_type: self._mark_task_modified(task_id))
         workflow_view.connection_deleted.connect(lambda conn: self._mark_task_modified(task_id))
         workflow_view.card_moved.connect(lambda: self._mark_task_modified(task_id))
-        # 【新增】连接变化时刷新参数面板（用于随机跳转等动态参数）
-        # 注意：connection_deleted信号发出时，conn.start_item可能已被清空，需要在连接前保存
         workflow_view.connection_added.connect(lambda start_card, end_card, conn_type: self._on_connection_changed(start_card))
         workflow_view.connection_deleted.connect(lambda conn: self._on_connection_deleted_for_random_jump(conn, task_id))
 
-        # 测试入口直接连接主窗口处理器；没有连接时菜单点击只会发射信号而不会执行。
         main_window = self.window()
         if main_window is None:
             raise RuntimeError("创建工作流视图时未找到主窗口，无法绑定测试执行入口")
@@ -836,11 +877,8 @@ class WorkflowTabWidget(QTabWidget):
             main_window._handle_test_flow_execution,
             Qt.ConnectionType.QueuedConnection,
         )
-        # 连接子工作流打开信号
         workflow_view.open_sub_workflow_requested.connect(self.open_sub_workflow)
 
-        # 连接任务的卡片状态信号到WorkflowView
-        # 使用默认连接方式（AutoConnection），让Qt自动选择最佳连接类型
         task.card_executing.connect(
             self._on_task_card_executing,
             Qt.ConnectionType.QueuedConnection
@@ -851,35 +889,33 @@ class WorkflowTabWidget(QTabWidget):
         )
         self._task_runtime_signal_tasks[task_id] = task
 
-        # 插入标签页（在"+"之前）
-        insert_index = self.count() - 1  # "+"标签页的索引
+        insert_index = self.count() - 1
         tab_index = self.insertTab(insert_index, workflow_view, task.name)
-
-        # 设置自定义关闭按钮（带X图标）
         self._set_custom_close_button(tab_index)
-
         logger.info(f"标签页插入: insert_index={insert_index}, 返回tab_index={tab_index}")
 
-        # 关键修复：insertTab后需要重建映射，因为所有索引都可能改变
-        # 先将新view记录到task_views
         self.task_views[task_id] = workflow_view
-
-        # 重建所有映射关系
         self._rebuild_mappings()
-
         logger.info("映射关系重建完成:")
         logger.info(f"   tab_to_task: {self.tab_to_task}")
         logger.info(f"   task_to_tab: {self.task_to_tab}")
 
-        # 切换到新标签页
         if self._activate_new_tab_on_add:
             self.setCurrentIndex(tab_index)
             self._activate_current_task_session()
 
-        # 更新标签页状态
         self._update_tab_status(task_id)
-
         logger.debug(f"标签页已添加: task_id={task_id}, tab_index={tab_index}, name='{task.name}'")
+
+    def _require_created_task_view(self, task_id: int) -> None:
+        if task_id in self.task_views and self.task_manager.get_task(task_id) is not None:
+            self._task_add_error = None
+            return
+        error = self._task_add_error
+        self._task_add_error = None
+        if error is not None:
+            raise error
+        raise RuntimeError("工作流画布创建失败")
 
     def _set_custom_close_button(self, tab_index: int):
         """为标签页设置自定义关闭按钮"""

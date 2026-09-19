@@ -260,12 +260,12 @@ def _attach_workflow_graph(payload: Dict[str, Any], workflow_data: Dict[str, Any
     elif isinstance(raw_cards, dict):
         cards_data = raw_cards
     else:
-        raise ValueError("workflow reference cards must be a list or dictionary")
+        raise ValueError("工作流引用的卡片必须是列表或字典")
     if not cards_data:
-        raise ValueError("workflow reference cards missing")
+        raise ValueError("工作流引用缺少卡片")
     connections_data = workflow_data.get("connections") or []
     if not isinstance(connections_data, list):
-        raise ValueError("workflow reference connections must be a list")
+        raise ValueError("工作流引用的连线必须是列表")
     materialized = dict(payload)
     materialized["cards_data"] = cards_data
     materialized["connections_data"] = connections_data
@@ -492,6 +492,12 @@ def run_workflow_worker_standalone(port: int) -> int:
                 executor_obj = _create_executor(payload)
             except Exception as exc:
                 logger.exception("工作流子进程创建执行器失败: %s", exc)
+                try:
+                    if not bridge.send_execution_finished(False, f"创建执行器失败: {exc}"):
+                        return 9
+                except Exception as finish_exc:
+                    logger.error("创建执行器失败后无法发送完成信号: %s", finish_exc)
+                    return 9
                 return 7
 
             stop_event.clear()

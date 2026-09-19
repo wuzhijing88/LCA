@@ -27,6 +27,8 @@ class SystemTrayManager(QObject):
         self.main_window = None
         self._task_state_signal = None
         self._task_state_slot = None
+        self._tray_start_action = None
+        self._tray_stop_action = None
 
     def attach_task_state_binding(self, signal_obj, slot_obj):
         """记录任务状态信号绑定，供 cleanup 时精确断连。"""
@@ -92,13 +94,15 @@ class SystemTrayManager(QObject):
 
         tray_menu.addSeparator()
 
-        start_action = QAction("启动任务 (F9)", self)
+        start_action = QAction(self._start_action_text(), self)
         start_action.triggered.connect(self._on_start_requested)
         tray_menu.addAction(start_action)
+        self._tray_start_action = start_action
 
-        stop_action = QAction("停止任务 (F10)", self)
+        stop_action = QAction(self._stop_action_text(), self)
         stop_action.triggered.connect(self._on_stop_requested)
         tray_menu.addAction(stop_action)
+        self._tray_stop_action = stop_action
 
         tray_menu.addSeparator()
 
@@ -149,6 +153,37 @@ class SystemTrayManager(QObject):
         except Exception as exc:
             logging.error(f"清除关闭记住选择失败: {exc}")
 
+    def _hotkey_display(self, hotkey_type: str) -> str:
+        from app_core.config_sections import DEFAULT_HOTKEYS
+        from app_core.hotkey_spec import display_hotkey
+
+        field = "start_task_hotkey" if hotkey_type == "start" else "stop_task_hotkey"
+        main_window = self.main_window
+        getter = getattr(main_window, "_get_hotkey_value", None)
+        if callable(getter):
+            return display_hotkey(getter(hotkey_type))
+        config = getattr(main_window, "config", None)
+        raw = config.get(field) if isinstance(config, dict) else None
+        return display_hotkey(raw or DEFAULT_HOTKEYS[field])
+
+    def _start_action_text(self) -> str:
+        return f"启动任务 ({self._hotkey_display('start')})"
+
+    def _stop_action_text(self) -> str:
+        return f"停止任务 ({self._hotkey_display('stop')})"
+
+    def refresh_hotkey_labels(self):
+        try:
+            start_action = self._tray_start_action
+            if start_action is not None:
+                start_action.setText(self._start_action_text())
+            stop_action = self._tray_stop_action
+            if stop_action is not None:
+                stop_action.setText(self._stop_action_text())
+        except RuntimeError:
+            self._tray_start_action = None
+            self._tray_stop_action = None
+
     def _tray_app_name(self):
         try:
             from utils.instance_runtime import get_instance_display_name
@@ -183,6 +218,8 @@ class SystemTrayManager(QObject):
                 finally:
                     self._task_state_signal = None
                     self._task_state_slot = None
+            self._tray_start_action = None
+            self._tray_stop_action = None
             if self.tray_icon:
                 self.tray_icon.hide()
                 for signal in (self.start_requested, self.stop_requested, self.show_window_requested):

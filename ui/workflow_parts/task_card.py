@@ -95,6 +95,52 @@ class TaskCard(QGraphicsObject):
             pass
 
     @classmethod
+    def refresh_gradient_animation_state(cls):
+        if cls._force_overview_mode or not cls._gradient_cards:
+            try:
+                if cls._gradient_timer is not None and cls._gradient_timer.isActive():
+                    cls._gradient_timer.stop()
+            except Exception:
+                pass
+            return
+        cls._ensure_gradient_timer()
+
+    @classmethod
+    def sync_viewport_animations(cls, view) -> None:
+        """按当前视口装入/卸下卡片动画，视口外的卡片不跑动画。"""
+        cards_map = getattr(view, "cards", None)
+        if not isinstance(cards_map, dict):
+            cls.refresh_gradient_animation_state()
+            return
+        viewport_rect_cache: Dict[Any, Any] = {}
+        scene_views_cache: Dict[Any, Any] = {}
+        visible_idle = []
+        for card in list(cards_map.values()):
+            try:
+                in_view = cls._is_card_in_viewport(card, viewport_rect_cache, scene_views_cache)
+                hovering = getattr(card, "hovered_port_side", None) is not None
+                executing = getattr(card, "execution_state", "idle") != "idle"
+                if hovering or executing:
+                    if in_view:
+                        card._register_gradient_animation()
+                    else:
+                        card._unregister_gradient_animation()
+                    continue
+                if in_view and card._should_animate_idle_ports():
+                    visible_idle.append(card)
+                else:
+                    card._unregister_gradient_animation()
+            except RuntimeError:
+                cls._gradient_cards.discard(card)
+        if len(visible_idle) > IDLE_PORT_ANIMATION_CARD_THRESHOLD:
+            for card in visible_idle:
+                card._unregister_gradient_animation()
+        else:
+            for card in visible_idle:
+                card._register_gradient_animation()
+        cls.refresh_gradient_animation_state()
+
+    @classmethod
     def get_gradient_animation_stats(cls) -> Dict[str, Any]:
         timer_active = False
         if cls._gradient_timer is not None:
@@ -153,8 +199,10 @@ class TaskCard(QGraphicsObject):
         for card in list(cls._gradient_cards):
             try:
                 if not card.isVisible():
+                    cls._gradient_cards.discard(card)
                     continue
                 if not cls._is_card_in_viewport(card, viewport_rect_cache, scene_views_cache):
+                    cls._gradient_cards.discard(card)
                     continue
                 allow_zoom_animation = True
                 should_animate_by_zoom = getattr(card, "_should_animate_by_zoom", None)
@@ -262,7 +310,7 @@ class TaskCard(QGraphicsObject):
 
                 cached_visible_rect = viewport_rect_cache.get(view)
                 if cached_visible_rect is None:
-                    return True
+                    continue
 
                 if card_rect.intersects(cached_visible_rect):
                     return True
@@ -281,6 +329,32 @@ class TaskCard(QGraphicsObject):
             return TaskCard._is_card_in_viewport(self, {})
         except Exception:
             return False
+
+    def _needs_gradient_animation(
+        self,
+        viewport_rect_cache: Optional[Dict[Any, Any]] = None,
+        scene_views_cache: Optional[Dict[Any, Any]] = None,
+    ) -> bool:
+        if self.scene() is None:
+            return False
+        cache = {} if viewport_rect_cache is None else viewport_rect_cache
+        if not TaskCard._is_card_in_viewport(self, cache, scene_views_cache):
+            return False
+        if getattr(self, "hovered_port_side", None) is not None:
+            return True
+        if getattr(self, "execution_state", "idle") != "idle":
+            return True
+        return self._should_animate_idle_ports()
+
+    def _sync_gradient_animation_registration(
+        self,
+        viewport_rect_cache: Optional[Dict[Any, Any]] = None,
+        scene_views_cache: Optional[Dict[Any, Any]] = None,
+    ) -> None:
+        if self._needs_gradient_animation(viewport_rect_cache, scene_views_cache):
+            self._register_gradient_animation()
+            return
+        self._unregister_gradient_animation()
 
     def _register_gradient_animation(self):
         try:
@@ -427,6 +501,8 @@ class TaskCard(QGraphicsObject):
         """Decide whether shadow creation should be delayed on init."""
         try:
             view = getattr(self, "view", None)
+            if view is not None and getattr(view, "_loading_workflow", False):
+                return False
             if view is None:
                 return True
             cards = getattr(view, "cards", None)
@@ -548,7 +624,7 @@ class TaskCard(QGraphicsObject):
         self.title_color = self._get_theme_text_color()
         self.port_radius = 4.8
         self.port_border_width = 1.2
-        self.port_idle_color = QColor(180, 180, 180) 
+        self.port_idle_color = QColor(180, 180, 180)
         self.port_hit_radius = 12.0 # Keep hit radius large
         self.text_padding = 8 # Padding around the content area
         self.param_padding = 5 # Internal padding within the content layout
@@ -614,12 +690,9 @@ class TaskCard(QGraphicsObject):
         # --- END ADDED ---
 
 
-    # --- ADDED boundingRect method (Required by QGraphicsObject) --- 
     def boundingRect(self) -> QRectF:
         """Returns the bounding rectangle of the item."""
-        # Use stored width/height
-        return QRectF(0, 0, self._width, self._height) 
-    # -------------------------------------------------------------
+        return QRectF(0, 0, self._width, self._height)
 
     def _get_size_grid_unit(self) -> float:
         """返回当前画布的尺寸对齐网格。"""
@@ -1260,7 +1333,6 @@ class TaskCard(QGraphicsObject):
     def shape(self) -> QPainterPath:
         """Define the precise shape for collision detection and painting."""
         path = QPainterPath()
-        # Use the bounding rectangle which already includes potential padding
         path.addRoundedRect(self.boundingRect(), self.border_radius, self.border_radius)
         return path
 
@@ -1271,7 +1343,7 @@ class TaskCard(QGraphicsObject):
                 self._unregister_gradient_animation()
                 self._release_drag_check_timer()
                 self.stop_flash()
-            else:
+            elif not getattr(self.view, "_loading_workflow", False) and self._needs_gradient_animation():
                 self._register_gradient_animation()
 
         # Handle selection change for shadow effect
@@ -1282,6 +1354,8 @@ class TaskCard(QGraphicsObject):
         result = super().itemChange(change, value)
 
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            if not getattr(self, "_is_dragging", False) and not getattr(self, "_multi_dragging_member", False):
+                self._sync_gradient_animation_registration()
             if getattr(self, '_multi_dragging_member', False) or getattr(self, '_dragging_multi_selection', False):
                 return result
             view = self.view
@@ -1555,6 +1629,7 @@ class TaskCard(QGraphicsObject):
             self._original_border_pen_before_flash = self._cached_border_pen
             if not self._flash_border_on:
                 self._current_border_pen = self._cached_border_pen
+        self._sync_gradient_animation_registration()
         self.update()
         return True
 
@@ -1585,12 +1660,14 @@ class TaskCard(QGraphicsObject):
         if new_hovered_side != self.hovered_port_side or new_hovered_type != self.hovered_port_type:
             self.hovered_port_side = new_hovered_side
             self.hovered_port_type = new_hovered_type
-            self.update() 
+            self._sync_gradient_animation_registration()
+            self.update()
     def hoverLeaveEvent(self, event: QGraphicsSceneHoverEvent):
         """Handle mouse leaving the card area."""
         if self.hovered_port_side is not None or self.hovered_port_type is not None:
             self.hovered_port_side = None
             self.hovered_port_type = None
+            self._sync_gradient_animation_registration()
             self.update()
 
         # --- ADDED: Call super for other potential hover leave handling ---

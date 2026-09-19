@@ -319,7 +319,13 @@ class MainWindowUiSetupMixin:
         # 自动加载最近打开的工作流
         if not hasattr(self, '_workflows_auto_loaded'):
             self._workflows_auto_loaded = True
-            QTimer.singleShot(200, self._auto_load_recent_workflows)
+            QTimer.singleShot(200, self._auto_load_recent_workflows_when_ready)
+
+    def _auto_load_recent_workflows_when_ready(self):
+        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
+            QTimer.singleShot(50, self._auto_load_recent_workflows_when_ready)
+            return
+        self._auto_load_recent_workflows()
     def _apply_force_down_popup_to_widget(self, widget):
         """No-op: legacy popup adjustment removed."""
         return

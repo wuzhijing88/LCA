@@ -58,7 +58,7 @@ class MainWindowActionsMixin:
         self.export_standalone_action.setVisible(self.file_actions_visible)
 
         self.run_action = QAction(create_media_control_icon("play", icon_size), "运行所有任务", self)
-        self.run_action.setToolTip("开始执行所有工作流 (F9)")
+        self.run_action.setToolTip(self._tooltip_with_hotkey("开始执行所有工作流", "start"))
         self.run_action.triggered.connect(self._on_run_stop_button_clicked)
         self.run_action.setEnabled(True)
         self.run_action.setVisible(True)

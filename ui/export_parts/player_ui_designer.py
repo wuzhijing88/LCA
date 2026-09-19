@@ -1615,6 +1615,7 @@ class PlayerUiDesignerDialog(QDialog):
             ("停止按钮", lambda: self._add_button("stop")),
             ("绑定窗口按钮", lambda: self._add_button("bind")),
             ("设置按钮", lambda: self._add_button("settings")),
+            ("中控按钮", lambda: self._add_button("control_center")),
             ("进度条", self._add_progress),
             ("定时执行", self._add_schedule),
         ):
@@ -2766,8 +2767,16 @@ class PlayerUiDesignerDialog(QDialog):
             "stop": "停止",
             "bind": "绑定窗口",
             "settings": "设置",
+            "control_center": "中控",
         }
-        widths = {"start": 120, "pause": 120, "stop": 120, "bind": 100, "settings": 90}
+        widths = {
+            "start": 120,
+            "pause": 120,
+            "stop": 120,
+            "bind": 100,
+            "settings": 90,
+            "control_center": 90,
+        }
         if self._has_action(action):
             QMessageBox.information(self, "提示", f"「{labels.get(action, action)}」按钮已存在")
             return

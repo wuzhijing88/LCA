@@ -165,7 +165,7 @@ def get_images_dir(app_name: str = "LCA") -> str:
 
 
 def get_dicts_dir(app_name: str = "LCA") -> str:
-    return _ensure_dir(os.path.join(get_images_dir(app_name), "dicts"))
+    return _ensure_dir(os.path.join(get_user_data_dir(app_name), "dicts"))
 
 
 def get_sounds_dir(app_name: str = "LCA") -> str:

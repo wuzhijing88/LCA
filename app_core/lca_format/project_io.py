@@ -142,22 +142,26 @@ def _path_values(value: object) -> Sequence[str]:
 
 
 def _kind_for_path(raw_path: str, key: str = "") -> str:
-    normalized = raw_path.replace("\\", "/").lower()
-    extension = Path(normalized).suffix
-    if extension in IMAGE_EXTENSIONS or normalized.startswith(("images/", "assets/images/")):
-        return "image"
-    if extension in AUDIO_EXTENSIONS or normalized.startswith(("sounds/", "assets/sounds/")):
-        return "audio"
-    if extension in MODEL_EXTENSIONS or normalized.startswith(("yolo/", "assets/yolo/", "assets/models/")):
-        return "model"
-    lowered_key = key.lower()
-    if "sound" in lowered_key or "audio" in lowered_key:
-        return "audio"
+    from task_workflow.script_resources import resource_kind
+
+    lowered_key = str(key or "").lower()
     if "dict" in lowered_key:
         return "dict"
+    kind = resource_kind(raw_path)
+    if kind:
+        return kind
+    if "sound" in lowered_key or "audio" in lowered_key:
+        return "audio"
     if key in PATH_PARAM_KEYS:
         return "image"
     return ""
+
+
+def _workflow_resource_path(kind: str, packaged_path: str) -> str:
+    name = Path(str(packaged_path or "").replace("\\", "/")).name
+    if kind == "dict" and name:
+        return f"dicts/{name}"
+    return packaged_path
 
 
 class _ProjectCollector:
@@ -348,6 +352,7 @@ class _ProjectCollector:
             packaged_path = self._collect_asset(
                 raw_path,
                 key="script_source",
+                kind=str(item.get("kind") or ""),
                 source_dir=source_dir,
                 source_session=source_session,
                 images_dir=images_dir,
@@ -376,14 +381,35 @@ class _ProjectCollector:
         replays_dir: Optional[Path] = None,
         plugins_dir: Optional[Path] = None,
         dicts_dir: Optional[Path] = None,
+        kind: str = "",
     ) -> str:
-        kind = _kind_for_path(raw_path, key) or "other"
-        package_data = source_session.get_bytes(raw_path) if source_session is not None else None
+        kind = str(kind or "").strip() or _kind_for_path(raw_path, key) or "other"
+        package_data = None
+        package_key = raw_path
+        if source_session is not None:
+            package_data = source_session.get_bytes(raw_path)
+            if package_data is None and kind == "dict":
+                basename = Path(str(raw_path or "").replace("\\", "/")).name
+                for candidate in (
+                    f"dicts/{basename}",
+                    f"assets/dicts/{basename}",
+                    f"assets/images/dicts/{basename}",
+                    f"images/dicts/{basename}",
+                    f"assets/images/{basename}",
+                    f"images/{basename}",
+                    basename,
+                ):
+                    package_data = source_session.get_bytes(candidate)
+                    if package_data is not None:
+                        package_key = candidate
+                        break
         if package_data is not None:
-            identity = ("session", id(source_session), raw_path.replace("\\", "/").lower())
-            source_hint = raw_path
-            filename = Path(raw_path.replace("\\", "/")).name
-            return self._register_asset(identity, package_data, filename, kind, source_hint)
+            identity = ("session", id(source_session), package_key.replace("\\", "/").lower())
+            filename = Path(package_key.replace("\\", "/")).name
+            return _workflow_resource_path(
+                kind,
+                self._register_asset(identity, package_data, filename, kind, package_key),
+            )
 
         resolved = self._resolve_disk_file(
             raw_path,
@@ -400,12 +426,15 @@ class _ProjectCollector:
             self._missing.add(raw_path)
             return raw_path
         identity = ("disk", os.path.normcase(str(resolved.resolve())))
-        return self._register_asset(
-            identity,
-            resolved.read_bytes(),
-            resolved.name,
+        return _workflow_resource_path(
             kind,
-            raw_path,
+            self._register_asset(
+                identity,
+                resolved.read_bytes(),
+                resolved.name,
+                kind,
+                raw_path,
+            ),
         )
 
     def _collect_sub_workflow(
@@ -606,7 +635,7 @@ class _ProjectCollector:
             "audio": "assets/sounds",
             "model": "assets/yolo",
             "replay": "assets/replays",
-            "dict": "assets/images/dicts",
+            "dict": "assets/dicts",
             "component": "assets/components",
         }.get(kind, "assets/other")
         logical_path = self._unique_path(folder, filename or "asset")

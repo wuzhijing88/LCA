@@ -437,13 +437,8 @@ def load_player_package(package_dir: Path | str) -> PlayerPackage:
     images_dir.mkdir(parents=True, exist_ok=True)
     sounds_dir.mkdir(parents=True, exist_ok=True)
     replays_dir.mkdir(parents=True, exist_ok=True)
-    images_dicts_dir = images_dir / "dicts"
-    assets_dicts_dir = assets_root / "dicts"
-    if images_dicts_dir.is_dir():
-        dicts_dir = images_dicts_dir
-    else:
-        assets_dicts_dir.mkdir(parents=True, exist_ok=True)
-        dicts_dir = assets_dicts_dir
+    dicts_dir = assets_root / "dicts"
+    dicts_dir.mkdir(parents=True, exist_ok=True)
     yolo_dir = assets_root / "yolo"
     if not yolo_dir.is_dir() and (assets_root / "models").is_dir():
         yolo_dir = assets_root / "models"
@@ -491,11 +486,12 @@ def prepare_player_search_paths(package: PlayerPackage) -> None:
     materialize_player_dicts(package.userdata_dir)
     materialize_player_yolo(package.userdata_dir)
     materialize_player_components(package.userdata_dir)
-    if package.assets_images_dir:
-        from utils.image_paths import get_image_path_resolver
+    from utils.image_paths import get_image_path_resolver
 
-        resolver = get_image_path_resolver()
-        resolver.add_search_path(package.assets_images_dir, priority=0)
+    resolver = get_image_path_resolver()
+    for search_dir in (package.assets_images_dir, package.assets_dicts_dir):
+        if search_dir:
+            resolver.add_search_path(search_dir, priority=0)
     sounds_dir = package.assets_sounds_dir
     if sounds_dir and os.path.isdir(sounds_dir):
         userdata_sounds = os.path.join(package.userdata_dir, "sounds")

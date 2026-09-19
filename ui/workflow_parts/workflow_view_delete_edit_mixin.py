@@ -232,9 +232,7 @@ class WorkflowViewDeleteEditMixin:
                                 debug_print("      Removing from scene...")
                                 self.scene.removeItem(connection)
                                 debug_print("      Removed from scene")
-                                connection.start_item = None
-                                connection.end_item = None
-                                connection.clear_path()
+                                connection.cleanup()
                     except RuntimeError:
                         logger.warning("[DELETE] 从场景移除连接时对象已无效")
 

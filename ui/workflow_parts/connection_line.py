@@ -10,14 +10,16 @@ from PySide6.QtGui import QColor, QPainterPath, QPainterPathStroker, QPen
 from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsPathItem
 from shiboken6 import isValid as _is_valid_qt_object
 
+from ..workflow_parts.connection_router import _coincident_port_path
 from ..workflow_parts.task_card import PORT_TYPE_RANDOM, PORT_TYPE_SEQUENTIAL
 
 
 _VALID_LINE_TYPES = frozenset(("sequential", "success", "failure", "random"))
 _DASH_PATTERN = (12.0, 8.0)
 _DASH_UNITS_PER_SECOND = 20.0
-_ANIMATION_INTERVAL_MS = 16
+_ANIMATION_INTERVAL_MS = 50
 _OVERVIEW_ZOOM_THRESHOLD = 0.45
+_LINE_ANIMATION_VIEWPORT_MARGIN = 40.0
 _CORNER_FILLET = 8.0
 _CORNER_FILLET_MIN_SEGMENT = _CORNER_FILLET * 2.0
 _POINT_EPS = 1e-9
@@ -26,6 +28,7 @@ _animation_timer = None
 _animated_lines = weakref.WeakSet()
 _animated_lines_lock = threading.Lock()
 _animation_pause_reasons = set()
+_animation_pause_counts = {}
 _animation_pause_lock = threading.Lock()
 _dash_phase = 0.0
 _last_animation_tick_s = None
@@ -39,23 +42,50 @@ def _snapshot_registered_lines():
         return list(_animated_lines)
 
 
-def _line_is_animatable(line) -> bool:
+def _view_visible_scene_rect(view, viewport_rect_cache=None):
+    if viewport_rect_cache is not None and view in viewport_rect_cache:
+        return viewport_rect_cache[view]
+    visible = None
+    viewport = view.viewport()
+    if viewport is not None and viewport.isVisible() and not viewport.rect().isEmpty():
+        visible = view.mapToScene(viewport.rect()).boundingRect()
+    if viewport_rect_cache is not None:
+        viewport_rect_cache[view] = visible
+    return visible
+
+
+def _line_is_animatable(line, viewport_rect_cache=None) -> bool:
     if line is None or not _is_valid_qt_object(line) or not line.isVisible():
         return False
     scene = line.scene()
     if scene is None:
         return False
+    try:
+        line_rect = line.sceneBoundingRect()
+    except RuntimeError:
+        return False
+    if line_rect.isEmpty():
+        return False
     for view in scene.views():
         if not _is_valid_qt_object(view) or not view.isVisible():
             continue
-        viewport = view.viewport()
-        if viewport is not None and viewport.isVisible() and not viewport.rect().isEmpty():
+        visible = _view_visible_scene_rect(view, viewport_rect_cache)
+        if visible is None:
+            continue
+        anim_rect = visible.adjusted(
+            -_LINE_ANIMATION_VIEWPORT_MARGIN,
+            -_LINE_ANIMATION_VIEWPORT_MARGIN,
+            _LINE_ANIMATION_VIEWPORT_MARGIN,
+            _LINE_ANIMATION_VIEWPORT_MARGIN,
+        )
+        if line_rect.intersects(anim_rect):
             return True
     return False
 
 
 def _has_animatable_lines() -> bool:
-    return any(_line_is_animatable(line) for line in _snapshot_registered_lines())
+    viewport_rect_cache = {}
+    return any(_line_is_animatable(line, viewport_rect_cache) for line in _snapshot_registered_lines())
 
 
 def _is_animation_paused() -> bool:
@@ -130,9 +160,15 @@ def set_line_animation_paused(reason: str, paused: bool) -> None:
     normalized_reason = _normalize_pause_reason(reason)
     with _animation_pause_lock:
         if paused:
+            _animation_pause_counts[normalized_reason] = _animation_pause_counts.get(normalized_reason, 0) + 1
             _animation_pause_reasons.add(normalized_reason)
         else:
-            _animation_pause_reasons.discard(normalized_reason)
+            remaining = _animation_pause_counts.get(normalized_reason, 0) - 1
+            if remaining <= 0:
+                _animation_pause_counts.pop(normalized_reason, None)
+                _animation_pause_reasons.discard(normalized_reason)
+            else:
+                _animation_pause_counts[normalized_reason] = remaining
     refresh_line_animation_state()
 
 
@@ -145,8 +181,9 @@ def resume_line_animation(reason: str = "default") -> None:
 
 
 def _repaint_registered_lines() -> None:
+    viewport_rect_cache = {}
     for line in _snapshot_registered_lines():
-        if _is_valid_qt_object(line):
+        if _is_valid_qt_object(line) and _line_is_animatable(line, viewport_rect_cache):
             line.update()
 
 
@@ -177,10 +214,15 @@ def set_force_overview_mode(enabled: bool) -> None:
 def get_line_animation_stats():
     timer = _get_animation_timer(create=False)
     lines = _snapshot_registered_lines()
+    with _animation_pause_lock:
+        pause_reasons = sorted(_animation_pause_reasons)
+        pause_counts = dict(_animation_pause_counts)
     return {
         "registered_lines": len(lines),
         "animatable_lines": sum(1 for line in lines if _line_is_animatable(line)),
-        "paused": _is_animation_paused(),
+        "paused": bool(pause_reasons),
+        "pause_reasons": pause_reasons,
+        "pause_counts": pause_counts,
         "timer_active": bool(timer is not None and timer.isActive()),
         "interval_ms": _ANIMATION_INTERVAL_MS,
     }
@@ -205,11 +247,12 @@ def animate_all_lines() -> None:
     _dash_phase = (_dash_phase + elapsed_s * _DASH_UNITS_PER_SECOND) % sum(_DASH_PATTERN)
     updated_count = 0
     stale_lines = []
+    viewport_rect_cache = {}
     for line in lines:
         if not _is_valid_qt_object(line):
             stale_lines.append(line)
             continue
-        if not _line_is_animatable(line) or line.path().isEmpty():
+        if not _line_is_animatable(line, viewport_rect_cache) or line.path().isEmpty():
             continue
         line.dash_offset = _dash_phase
         line.update()
@@ -255,7 +298,7 @@ def painter_path_from_points(points: list) -> QPainterPath:
             continue
         converted.append((x, y))
     if len(converted) < 2:
-        raise ValueError("连线路径点不足")
+        converted = _coincident_port_path(converted[0] if converted else (0.0, 0.0))
     path = QPainterPath(QPointF(converted[0][0], converted[0][1]))
     last_index = len(converted) - 1
     for index in range(1, last_index):
@@ -306,6 +349,7 @@ class ConnectionLine(QGraphicsPathItem):
         self.pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         self.pen.setCosmetic(False)
         self.setPen(self.pen)
+        self._paint_pen = QPen(self.pen)
         self.setBrush(Qt.BrushStyle.NoBrush)
         self.setZValue(5)
         self.setCacheMode(QGraphicsPathItem.CacheMode.NoCache)
@@ -370,14 +414,25 @@ class ConnectionLine(QGraphicsPathItem):
             if not math.isfinite(x) or not math.isfinite(y):
                 raise ValueError("连线路由点必须是有限数字")
             scene_points.append((x, y))
-        if len(self._route_points) == len(scene_points) and all(
+        unique_scene: list[tuple[float, float]] = []
+        for point in scene_points:
+            if (
+                unique_scene
+                and abs(unique_scene[-1][0] - point[0]) < _POINT_EPS
+                and abs(unique_scene[-1][1] - point[1]) < _POINT_EPS
+            ):
+                continue
+            unique_scene.append(point)
+        if len(unique_scene) < 2:
+            unique_scene = _coincident_port_path(unique_scene[0] if unique_scene else scene_points[0])
+        if len(self._route_points) == len(unique_scene) and all(
             abs(old[0] - new[0]) < _POINT_EPS and abs(old[1] - new[1]) < _POINT_EPS
-            for old, new in zip(self._route_points, scene_points)
+            for old, new in zip(self._route_points, unique_scene)
         ):
             return False
-        origin = scene_points[0]
-        local_points = [(x - origin[0], y - origin[1]) for x, y in scene_points]
-        self._route_points = scene_points
+        origin = unique_scene[0]
+        local_points = [(x - origin[0], y - origin[1]) for x, y in unique_scene]
+        self._route_points = unique_scene
         self.setPos(QPointF(origin[0], origin[1]))
         self._set_path(painter_path_from_points(local_points))
         self.update()
@@ -409,19 +464,21 @@ class ConnectionLine(QGraphicsPathItem):
         if path.isEmpty() or self.scene() is None:
             return
         painter.setRenderHint(painter.RenderHint.Antialiasing, True)
-        draw_pen = QPen(self.pen)
-        draw_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        draw_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         if _overview_mode_enabled or _force_overview_mode:
+            draw_pen = QPen(self.pen)
+            draw_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            draw_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             draw_pen.setStyle(Qt.PenStyle.SolidLine)
             zoom = max(0.05, _last_zoom_level)
             zoom_ratio = min(1.0, zoom / _OVERVIEW_ZOOM_THRESHOLD)
             draw_pen.setWidthF(max(self._normal_width * (0.75 + 0.15 * zoom_ratio), 0.55 / zoom))
+            painter.setPen(draw_pen)
         else:
-            draw_pen.setStyle(Qt.PenStyle.DashLine)
-            draw_pen.setDashPattern(list(_DASH_PATTERN))
+            draw_pen = self._paint_pen
+            draw_pen.setColor(self.pen.color())
+            draw_pen.setWidthF(self.pen.widthF())
             draw_pen.setDashOffset(-self.dash_offset)
-        painter.setPen(draw_pen)
+            painter.setPen(draw_pen)
         painter.drawPath(path)
 
     def shape(self):

@@ -35,7 +35,7 @@ _PACKAGE_LOGICAL_ALIASES = (
     ("yolo/", "assets/yolo/"),
     ("models/", "assets/yolo/"),
     ("replays/", "assets/replays/"),
-    ("dicts/", "assets/images/dicts/"),
+    ("dicts/", "assets/dicts/"),
     ("plugins/", "assets/components/"),
 )
 
@@ -112,7 +112,7 @@ class LcaPackageSession:
         dirs = {
             "images_dir": os.path.join(root, "assets", "images"),
             "sounds_dir": os.path.join(root, "assets", "sounds"),
-            "dicts_dir": os.path.join(root, "assets", "images", "dicts"),
+            "dicts_dir": os.path.join(root, "assets", "dicts"),
             "yolo_dir": os.path.join(root, "assets", "yolo"),
             "replays_dir": os.path.join(root, "assets", "replays"),
             "plugins_dir": os.path.join(root, "assets", "components"),

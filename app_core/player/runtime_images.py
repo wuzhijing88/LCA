@@ -76,7 +76,7 @@ def materialize_player_dicts(userdata_dir: str) -> int:
     return _materialize_memory_tree(
         userdata_dir,
         "dicts",
-        ("assets/images/dicts/", "dicts/"),
+        ("assets/dicts/", "dicts/"),
         lambda _rel: True,
     )
 

@@ -78,31 +78,43 @@ class ControlCenterWorkflowAssignmentMixin:
         self._refresh_overview_metrics()
         return success_rows, failed_rows
 
+    def _collect_workflow_entries_for_assign(self, title: str):
+        parent = getattr(self, "parent_window", None)
+        picker = getattr(parent, "pick_control_center_workflow_entries", None) if parent else None
+        if callable(picker):
+            entries = picker(self, title)
+            if not entries:
+                return None
+            return list(entries), []
+        file_paths = self._select_workflow_files(title)
+        if not file_paths:
+            return None
+        return self._load_workflow_entries(file_paths)
+
     def _assign_workflow_files_to_rows(self, rows: List[int], title: str, scope_desc: str):
         if not rows:
             QMessageBox.information(self, "提示", "请先选择目标窗口")
             return False
 
-        file_paths = self._select_workflow_files(title)
-        if not file_paths:
+        collected = self._collect_workflow_entries_for_assign(title)
+        if collected is None:
+            return False
+        workflow_entries, error_files = collected
+        if not workflow_entries:
+            QMessageBox.warning(self, "错误", "所有工作流导入失败")
+            self.log_message("工作流导入失败")
             return False
 
         if len(rows) > 1:
             reply = QMessageBox.question(
                 self,
                 "确认批量分配",
-                f"是否向 {len(rows)} 个窗口追加 {len(file_paths)} 个工作流？",
+                f"是否向 {len(rows)} 个窗口追加 {len(workflow_entries)} 个工作流？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return False
-
-        workflow_entries, error_files = self._load_workflow_entries(file_paths)
-        if not workflow_entries:
-            QMessageBox.warning(self, "错误", "所有工作流导入失败")
-            self.log_message("工作流导入失败")
-            return False
 
         success_count, failed_rows = self._apply_workflow_entries_to_rows(rows, workflow_entries)
         if success_count > 0:
@@ -324,10 +336,17 @@ class ControlCenterWorkflowAssignmentMixin:
         loaded = []
         if not isinstance(workflows_info, list):
             return loaded
+        parent = getattr(self, "parent_window", None)
+        loader = getattr(parent, "load_control_center_workflow_entry", None) if parent else None
         for wf_info in workflows_info:
             if not isinstance(wf_info, dict):
                 continue
             file_path = wf_info.get("file_path", "")
+            if callable(loader):
+                entry = loader(file_path, name=wf_info.get("name", ""))
+                if entry:
+                    loaded.append(entry)
+                    continue
             if not file_path or not os.path.exists(file_path):
                 if file_path:
                     logger.warning(f"工作流文件不存在: {file_path}")

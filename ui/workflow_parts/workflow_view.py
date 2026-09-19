@@ -134,13 +134,13 @@ class WorkflowView(
         self.cards: Dict[int, TaskCard] = {}
         self._cache_policy_cache_disabled: Optional[bool] = None
         self._cache_policy_shadow_disabled: Optional[bool] = None
+        self._card_cache_zoom: Optional[float] = None
         self._render_cache_guard_timer: Optional[QTimer] = None
         self._dragging_item = None
         self._line_start_item: Optional[TaskCard] = None
         self._connection_type_to_draw: ConnectionType = ConnectionType.SUCCESS
 
         try:
-            # Keep Qt render caches in a bounded loop during long-running animation sessions.
             self._render_cache_guard_timer = QTimer(self)
             self._render_cache_guard_timer.setInterval(15000)
             self._render_cache_guard_timer.timeout.connect(self._on_render_cache_guard_tick)

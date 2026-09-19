@@ -46,6 +46,29 @@ class MainWindowHotkeyMixin:
         except Exception as exc:
             logger.error("更新快捷键失败: %s", exc)
             logger.debug("快捷键更新错误详情", exc_info=True)
+        self._refresh_run_action_hotkey_tooltip()
+        tray = getattr(self, "system_tray_manager", None)
+        refresh_tray = getattr(tray, "refresh_hotkey_labels", None)
+        if callable(refresh_tray):
+            refresh_tray()
+
+    def _tooltip_with_hotkey(self, text: str, hotkey_type: str) -> str:
+        return f"{text} ({display_hotkey(self._get_hotkey_value(hotkey_type))})"
+
+    def _refresh_run_action_hotkey_tooltip(self):
+        action = getattr(self, "run_action", None)
+        if action is None:
+            return
+        label = (action.text() or "").strip()
+        if label == "恢复":
+            return
+        if label == "停止多窗口执行":
+            action.setToolTip(self._tooltip_with_hotkey("停止所有窗口的执行", "stop"))
+            return
+        if "停止" in label:
+            action.setToolTip(self._tooltip_with_hotkey("停止所有任务执行", "stop"))
+            return
+        action.setToolTip(self._tooltip_with_hotkey("开始执行所有工作流", "start"))
 
     def _get_hotkey_value(self, hotkey_type: str) -> str:
         """获取标准化后的热键值。"""

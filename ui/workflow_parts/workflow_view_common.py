@@ -3,7 +3,7 @@ from typing import Optional, Any, Dict, List # Import Dict for type hinting
 from .workflow_debug_utils import debug_print
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QApplication, QPushButton, QVBoxLayout, QWidget, QGraphicsLineItem, QGraphicsPathItem, QMenu, QInputDialog, QMessageBox, QDialog, QFileDialog, QGraphicsEllipseItem, QComboBox, QFrame, QGraphicsItem # Removed QResizeEvent, QShowEvent
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QLineF, QTimer # <<< ADDED QTimer
-from PySide6.QtGui import QPainter, QWheelEvent, QColor, QBrush, QMouseEvent, QPen, QAction, QTransform, QResizeEvent, QShowEvent, QCursor, QPixmapCache # <<< ADDED QResizeEvent, QShowEvent HERE
+from PySide6.QtGui import QPainter, QWheelEvent, QColor, QBrush, QMouseEvent, QPen, QAction, QTransform, QResizeEvent, QShowEvent, QHideEvent, QCursor, QPixmapCache # <<< ADDED QResizeEvent, QShowEvent HERE
 import os
 # Import json module
 import json

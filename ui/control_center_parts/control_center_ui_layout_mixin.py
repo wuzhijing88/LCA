@@ -132,9 +132,15 @@ class ControlCenterUiLayoutMixin:
             "移除全部窗口已分配的工作流",
             self.remove_workflows_from_all,
         )
+        self.multi_instance_btn = self._make_toolbar_button(
+            "多开器",
+            "启动多个程序实例，用于游戏或软件多开",
+            self.open_multi_instance_dialog,
+        )
         toolbar.addWidget(self.assign_btn)
         toolbar.addWidget(self.assign_all_btn)
         toolbar.addWidget(self.remove_assign_btn)
+        toolbar.addWidget(self.multi_instance_btn)
         toolbar.addStretch(1)
 
         self.start_all_btn = self._make_toolbar_button(
@@ -240,18 +246,33 @@ class ControlCenterUiLayoutMixin:
             display_hotkey(hotkeys["pause"]),
         )
 
-    def _apply_hotkey_button_tooltips(self, hotkeys):
+    def _apply_hotkey_button_tooltips(self, hotkeys=None):
         from app_core.hotkey_spec import display_hotkey
+        from .control_center_hotkeys import resolve_control_center_hotkeys
 
+        if hotkeys is None:
+            get_parent_config = getattr(self, "_get_parent_config", None)
+            config = get_parent_config() if callable(get_parent_config) else None
+            hotkeys = resolve_control_center_hotkeys(config)
         start_hint = display_hotkey(hotkeys.get("start"))
         stop_hint = display_hotkey(hotkeys.get("stop"))
         pause_hint = display_hotkey(hotkeys.get("pause"))
+        getter = getattr(self, "_get_selected_rows", None)
+        has_selection = bool(getter()) if callable(getter) else False
+        if has_selection:
+            start_tip = f"启动已选窗口中已分配工作流的任务；未选择时启动全部 ({start_hint})"
+            stop_tip = f"停止已选窗口中正在运行的任务；未选择时停止全部 ({stop_hint})"
+            pause_tip = f"暂停/恢复已选窗口中正在运行的任务；未选择时作用于全部 ({pause_hint})"
+        else:
+            start_tip = f"启动已分配工作流的窗口；有选中时只启动选中 ({start_hint})"
+            stop_tip = f"停止正在运行的窗口；有选中时只停止选中 ({stop_hint})"
+            pause_tip = f"暂停或恢复正在运行的窗口 ({pause_hint})"
         if hasattr(self, "start_all_btn") and self.start_all_btn is not None:
-            self.start_all_btn.setToolTip(f"启动已分配工作流的窗口；有选中时只启动选中 ({start_hint})")
+            self.start_all_btn.setToolTip(start_tip)
         if hasattr(self, "stop_all_btn") and self.stop_all_btn is not None:
-            self.stop_all_btn.setToolTip(f"停止正在运行的窗口；有选中时只停止选中 ({stop_hint})")
+            self.stop_all_btn.setToolTip(stop_tip)
         if hasattr(self, "pause_all_btn") and self.pause_all_btn is not None:
-            self.pause_all_btn.setToolTip(f"暂停或恢复正在运行的窗口 ({pause_hint})")
+            self.pause_all_btn.setToolTip(pause_tip)
 
     def _release_control_center_hotkeys(self):
         session = getattr(self, "_cc_hotkey_session", None)

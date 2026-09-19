@@ -75,24 +75,16 @@ class WorkflowViewRenderMixin:
             return 96
         return max(20, min(5000, threshold))
 
-    def _has_active_connection_animation(self) -> bool:
+    def _should_suppress_canvas_effects(self) -> bool:
+        if getattr(self, "_loading_workflow", False):
+            return True
         try:
             from ..workflow_parts.connection_line import get_line_animation_stats
 
-            stats = get_line_animation_stats() or {}
-            return bool(stats.get("timer_active")) and int(stats.get("registered_lines") or 0) > 0
+            reasons = set((get_line_animation_stats() or {}).get("pause_reasons") or [])
         except Exception:
             return False
-
-    def _has_active_card_animation(self) -> bool:
-        try:
-            stats = TaskCard.get_gradient_animation_stats() or {}
-            return bool(stats.get("timer_active")) and int(stats.get("registered_cards") or 0) > 0
-        except Exception:
-            return False
-
-    def _has_active_ui_animation(self) -> bool:
-        return self._has_active_connection_animation() or self._has_active_card_animation()
+        return bool(reasons & {"workflow_load", "workflow_tab_insert"})
 
     def _set_drag_preview_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
@@ -146,6 +138,7 @@ class WorkflowViewRenderMixin:
                 pass
             self._drag_preview_saved_state = {}
             self._update_card_render_cache_policy()
+            self._refresh_viewport_animations()
 
         try:
             self.viewport().update()
@@ -154,47 +147,70 @@ class WorkflowViewRenderMixin:
 
     def _on_render_cache_guard_tick(self) -> None:
         try:
-            self._update_card_render_cache_policy()
-            if self._has_active_ui_animation():
-                QPixmapCache.clear()
+            if not self.isVisible():
+                return
+            self._sync_scene_rect_to_content()
+            self._refresh_viewport_animations()
         except Exception:
             pass
 
     def _update_card_render_cache_policy(self) -> None:
         """
-        根据卡片数量动态调整渲染缓存策略，平衡性能与内存占用。
+        根据卡片数量和是否在视口内调整缓存与阴影，画面外的卡片卸掉图形资源。
         """
         try:
             card_count = len(self.cards)
         except Exception:
             return
 
+        suppress_effects = self._should_suppress_canvas_effects()
         disable_cache = card_count >= self._get_card_cache_disable_threshold()
-        if self._has_active_ui_animation():
+        if suppress_effects:
             disable_cache = True
         disable_shadow = card_count >= self._get_card_shadow_disable_threshold()
-        target_mode = (
-            QGraphicsItem.CacheMode.NoCache
-            if disable_cache
-            else QGraphicsItem.CacheMode.DeviceCoordinateCache
-        )
+        if suppress_effects:
+            disable_shadow = True
 
+        try:
+            zoom = float(self.transform().m11())
+        except Exception:
+            zoom = 1.0
+        last_zoom = getattr(self, "_card_cache_zoom", None)
+        rebuild_cache = last_zoom is not None and abs(zoom - last_zoom) > 1e-4
+        self._card_cache_zoom = zoom
+
+        viewport_rect_cache = {}
+        scene_views_cache = {}
         for card in list(self.cards.values()):
+            in_view = False
             try:
-                if card.cacheMode() != target_mode:
-                    card.setCacheMode(target_mode)
+                in_view = TaskCard._is_card_in_viewport(card, viewport_rect_cache, scene_views_cache)
             except Exception:
-                continue
+                in_view = False
+            card_disable_shadow = disable_shadow or not in_view
+            # 设备坐标缓存按当前像素烘焙，视图缩放不会自动重建；再叠阴影会裁切或看起来像另一种缩放。
+            card_disable_cache = disable_cache or not in_view or not card_disable_shadow
+            target_mode = (
+                QGraphicsItem.CacheMode.NoCache
+                if card_disable_cache
+                else QGraphicsItem.CacheMode.DeviceCoordinateCache
+            )
+            shadow_changed = False
+            try:
+                target_shadow_enabled = not card_disable_shadow
+                current_shadow_enabled = bool(getattr(card, "_shadow_rendering_enabled", True))
+                shadow_changed = current_shadow_enabled != target_shadow_enabled
+                if shadow_changed:
+                    card.set_shadow_rendering_enabled(target_shadow_enabled)
+            except Exception:
+                shadow_changed = False
 
             try:
-                target_shadow_enabled = not disable_shadow
-                if hasattr(card, "set_shadow_rendering_enabled"):
-                    current_shadow_enabled = bool(getattr(card, "_shadow_rendering_enabled", True))
-                    if current_shadow_enabled != target_shadow_enabled:
-                        card.set_shadow_rendering_enabled(target_shadow_enabled)
-                elif hasattr(card, "shadow") and card.shadow is not None:
-                    if bool(card.shadow.isEnabled()) != target_shadow_enabled:
-                        card.shadow.setEnabled(target_shadow_enabled)
+                self._apply_card_cache_mode(
+                    card,
+                    target_mode,
+                    rebuild=rebuild_cache or shadow_changed,
+                )
             except Exception:
                 continue
 
@@ -209,12 +225,30 @@ class WorkflowViewRenderMixin:
                 QPixmapCache.clear()
             except Exception:
                 pass
+        if getattr(self, "_drag_preview_mode", False):
+            return
         try:
-            viewport_mode = QGraphicsView.ViewportUpdateMode.FullViewportUpdate
+            viewport_mode = (
+                QGraphicsView.ViewportUpdateMode.FullViewportUpdate
+                if suppress_effects
+                else QGraphicsView.ViewportUpdateMode.SmartViewportUpdate
+            )
             if self.viewportUpdateMode() != viewport_mode:
                 self.setViewportUpdateMode(viewport_mode)
         except Exception:
             pass
+
+    def _apply_card_cache_mode(self, card, target_mode, *, rebuild: bool) -> None:
+        no_cache = QGraphicsItem.CacheMode.NoCache
+        current = card.cacheMode()
+        if target_mode == no_cache:
+            if current != no_cache:
+                card.setCacheMode(no_cache)
+            return
+        if current != target_mode or rebuild:
+            if current != no_cache:
+                card.setCacheMode(no_cache)
+            card.setCacheMode(target_mode)
 
     def drawBackground(self, painter: QPainter, rect: QRectF):
         """绘制背景网格。"""
@@ -418,34 +452,13 @@ class WorkflowViewRenderMixin:
             debug_print(f"  [LOAD_DEBUG] Error getting center BEFORE call: {pre_e}")
 
         try:
-            debug_print("  [LOAD_DEBUG] Calling self.scene.update() before centerOn.")
             scene.update()
-            QApplication.processEvents()
-            scene = self._scene_alive_for_center()
-            if scene is None:
-                return
-            debug_print("  [LOAD_DEBUG] Finished scene update and processEvents.")
-
             self.centerOn(center_point)
-            try:
-                post_center_vp_center = self.viewport().rect().center()
-                post_center_scene_center = self.mapToScene(post_center_vp_center)
-                debug_print(f"  [LOAD_DEBUG] Center IMMEDIATELY AFTER centerOn call: {post_center_scene_center}")
-            except Exception as post_e:
-                debug_print(f"  [LOAD_DEBUG] Error getting center IMMEDIATELY AFTER call: {post_e}")
-
-            debug_print("  [LOAD_DEBUG] Calling processEvents...")
-            QApplication.processEvents()
-            if self._scene_alive_for_center() is None:
-                return
-            debug_print("  [LOAD_DEBUG] Finished processEvents.")
-            current_viewport_center_view = self.viewport().rect().center()
-            actual_scene_center = self.mapToScene(current_viewport_center_view)
-            debug_print(f"  [LOAD_DEBUG] VERIFY (Deferred - AFTER processEvents): Actual scene center: {actual_scene_center}")
+            self._refresh_viewport_animations()
         except RuntimeError:
             if self._scene_alive_for_center() is None:
                 return
-            raise
+            logger.error("延迟居中失败", exc_info=True)
         except Exception as deferred_center_e:
              logger.error(f"Error during deferred centerOn or verification: {deferred_center_e}", exc_info=True)
 
@@ -457,6 +470,7 @@ class WorkflowViewRenderMixin:
             debug_print(f"  [VIEW_DEBUG] resizeEvent: Current scene center = {center_point}")
         except Exception as e:
             debug_print(f"  [VIEW_DEBUG] resizeEvent: Error getting center point: {e}")
+        self._refresh_viewport_animations()
 
     def showEvent(self, event: QShowEvent):
         """Logs the view center when the view is shown."""
@@ -466,12 +480,11 @@ class WorkflowViewRenderMixin:
             debug_print(f"  [VIEW_DEBUG] showEvent: Current scene center = {center_point}")
         except Exception as e:
             debug_print(f"  [VIEW_DEBUG] showEvent: Error getting center point: {e}")
-        from ..workflow_parts.connection_line import refresh_line_animation_state
-        refresh_line_animation_state()
-        try:
-            self._update_card_render_cache_policy()
-        except Exception:
-            pass
+        self._refresh_viewport_animations()
+
+    def hideEvent(self, event: QHideEvent):
+        super().hideEvent(event)
+        self._refresh_viewport_animations(force=True)
 
     def zoomIn(self):
         self.scale(self.zoom_factor_base, self.zoom_factor_base)
@@ -487,6 +500,7 @@ class WorkflowViewRenderMixin:
         """通知连线动画系统当前缩放级别。"""
         from ..workflow_parts.connection_line import update_zoom_level
         update_zoom_level(self.transform().m11())
+        self._refresh_viewport_animations()
 
     def refresh_all_cards_theme(self):
         """刷新所有卡片的主题颜色"""
@@ -501,47 +515,67 @@ class WorkflowViewRenderMixin:
         except Exception as e:
             logging.error(f"[THEME_REFRESH] 刷新卡片主题时出错: {e}", exc_info=True)
 
+    def _sync_scene_rect_to_content(self) -> None:
+        """把场景矩形限制在卡片范围加两屏边距，避免长时间平移把场景撑得无限大。"""
+        if self._is_panning or getattr(self, "_drag_preview_mode", False):
+            return
+        if getattr(self, "_loading_workflow", False) or getattr(self, "_rerouting_connections", False):
+            return
+        scene = getattr(self, "scene", None)
+        if scene is None:
+            return
+        viewport = self.viewport()
+        if viewport is None or viewport.width() <= 0 or viewport.height() <= 0:
+            return
+        visible = self.mapToScene(viewport.rect()).boundingRect()
+        vw = max(float(visible.width()), 1.0)
+        vh = max(float(visible.height()), 1.0)
+        items = scene.itemsBoundingRect()
+        if items.isNull() or not items.isValid() or items.width() <= 0 or items.height() <= 0:
+            target = QRectF(
+                visible.center().x() - vw,
+                visible.center().y() - vh,
+                vw * 2.0,
+                vh * 2.0,
+            )
+        else:
+            target = items.adjusted(-vw * 2.0, -vh * 2.0, vw * 2.0, vh * 2.0)
+        current = scene.sceneRect()
+        if (
+            abs(current.x() - target.x()) < 1.0
+            and abs(current.y() - target.y()) < 1.0
+            and abs(current.width() - target.width()) < 1.0
+            and abs(current.height() - target.height()) < 1.0
+        ):
+            return
+        scene.setSceneRect(target)
+
+    def _refresh_viewport_animations(self, *, force: bool = False) -> None:
+        """按当前视口装入动画和图形资源：看得见的才动，看不见的卸掉。"""
+        if not force and getattr(self, "_loading_workflow", False):
+            return
+        if not force and getattr(self, "_drag_preview_mode", False):
+            return
+        try:
+            TaskCard.sync_viewport_animations(self)
+        except Exception:
+            pass
+        from ..workflow_parts.connection_line import refresh_line_animation_state
+        refresh_line_animation_state()
+        try:
+            self._update_card_render_cache_policy()
+        except Exception:
+            pass
+
     def _handle_scroll_change(self, value: int):
-        """Called when scroll bars change. Checks if view is near scene edge and expands if needed."""
+        """滚动后同步场景范围，并按可见区域开关动画。"""
+        del value
         if self._is_panning or self._drag_preview_mode:
             return
-        # 注释已清理（原注释编码损坏）
-        margin = 50.0
-
-        # Get visible rect in scene coordinates
-        visible_rect_scene = self.mapToScene(self.viewport().rect()).boundingRect()
-        current_scene_rect = self.sceneRect()
-
-        new_scene_rect = QRectF(current_scene_rect)
-        expanded = False
-
-        # 注释已清理（原注释编码损坏）
-        # Check and expand left boundary
-        overflow_left = (current_scene_rect.left() + margin) - visible_rect_scene.left()
-        if overflow_left > 0:
-            new_scene_rect.setLeft(current_scene_rect.left() - overflow_left - margin)
-            expanded = True
-
-        # Check and expand top boundary
-        overflow_top = (current_scene_rect.top() + margin) - visible_rect_scene.top()
-        if overflow_top > 0:
-            new_scene_rect.setTop(current_scene_rect.top() - overflow_top - margin)
-            expanded = True
-
-        # Check and expand right boundary
-        overflow_right = visible_rect_scene.right() - (current_scene_rect.right() - margin)
-        if overflow_right > 0:
-            new_scene_rect.setRight(current_scene_rect.right() + overflow_right + margin)
-            expanded = True
-
-        # Check and expand bottom boundary
-        overflow_bottom = visible_rect_scene.bottom() - (current_scene_rect.bottom() - margin)
-        if overflow_bottom > 0:
-            new_scene_rect.setBottom(current_scene_rect.bottom() + overflow_bottom + margin)
-            expanded = True
-
-        if expanded:
-            self.scene.setSceneRect(new_scene_rect)
+        if getattr(self, "_loading_workflow", False) or getattr(self, "_rerouting_connections", False):
+            return
+        self._sync_scene_rect_to_content()
+        self._refresh_viewport_animations()
 
     def _handle_card_clicked(self, clicked_card_id: int):
         """点击卡片后仅闪烁与其直接相连的卡片。"""
