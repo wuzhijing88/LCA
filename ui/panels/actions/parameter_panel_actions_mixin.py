@@ -244,11 +244,11 @@ class ParameterPanelActionsMixin:
     _BACKGROUND_ACTIONS = {
         'test_ocr_output',
         'test_dict_ocr_output',
-        'test_image_recognition',
-        'test_color_recognition',
+        'preview_image_recognition',
+        'preview_color_recognition',
     }
 
-    _HIDE_WINDOW_ACTIONS = {'test_image_recognition', 'test_color_recognition'}
+    _HIDE_WINDOW_ACTIONS = {'preview_image_recognition', 'preview_color_recognition'}
 
     def _handle_button_click(self, name: str, param_def: Dict[str, Any]):
         """Handle button click."""

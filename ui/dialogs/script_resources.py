@@ -19,6 +19,7 @@ from task_workflow.script_resources import (
     extract_string_literals,
     import_resource_file,
     is_allowed_script_path,
+    is_managed_resource_file,
     list_card_files,
     list_script_resources,
     rename_resource_file,
@@ -35,7 +36,7 @@ from ui.dialogs.script_capture_text import apply_script_capture, script_string_l
 _MODEL_HOSTS = ("检测", "持续检测", "等检测", "等检测消失")
 _AUDIO_HOSTS = ("播放",)
 _REPLAY_HOSTS = ("回放",)
-_COMPONENT_HOSTS = ("组件.加载", "组件.运行", "进程.启动")
+_COMPONENT_HOSTS = ("组件.加载", "组件.运行", "进程.启动", "进程.关闭")
 _IMAGE_REWRITE_HOSTS = ("等图", "等图消失", "持续找图", "找所有图")
 _DICT_HOSTS = ("找字库", "点字库", "等字库", "等字库消失")
 _DM_ADDR_HOSTS = (
@@ -67,6 +68,7 @@ __all__ = [
     "extract_string_literals",
     "import_resource_file",
     "is_allowed_script_path",
+    "is_managed_resource_file",
     "list_card_files",
     "list_script_resources",
     "plan_insert_resource",
@@ -287,7 +289,7 @@ def _rewrite_component_arg(line: str, literal: str, path: str) -> Optional[str]:
     name, open_index, close_index = found
     args = _split_top_level(line[open_index + 1 : close_index])
     ext = os.path.splitext(path)[1].lower()
-    component_type = "python" if ext == ".py" else "process" if ext == ".exe" else "dll"
+    component_type = "python" if ext == ".py" else "process" if ext in {".exe", ".com"} else "dll"
     type_literal = script_string_literal(component_type)
 
     def _is_path_arg(token: str) -> bool:
@@ -298,7 +300,7 @@ def _rewrite_component_arg(line: str, literal: str, path: str) -> Optional[str]:
             return True
         if raw.startswith(("'", '"')) and len(raw) >= 2:
             inner = raw[1:-1]
-            return _looks_like_resource_value(inner) or inner.endswith((".dll", ".exe", ".py"))
+            return _looks_like_resource_value(inner) or inner.endswith((".dll", ".exe", ".com", ".py"))
         return False
 
     replaced = False
@@ -383,9 +385,9 @@ def plan_insert_resource(
         if updated is not None:
             return {"mode": "replace", "line": safe_index, "text": updated}
         ext = os.path.splitext(path)[1].lower()
-        component_type = "python" if ext == ".py" else "process" if ext == ".exe" else "dll"
+        component_type = "python" if ext == ".py" else "process" if ext in {".exe", ".com"} else "dll"
         snippet = (
-            f"结果 = 组件.运行({literal})"
+            f"结果 = 进程.启动({literal})"
             if component_type == "process"
             else f'插件 = 组件.加载("{component_type}", {literal})'
         )

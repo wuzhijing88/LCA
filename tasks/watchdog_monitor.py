@@ -7,6 +7,7 @@
 import logging
 import time
 from typing import Dict, Any, Optional, Tuple
+from tasks.click_param_resolver import safe_integer
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,11 @@ TASK_NAME = "附加条件"
 # 全局监控状态存储
 # 格式: {workflow_id: {condition_card_id: {target_card_id: {count, first_time, last_check_time, monitoring_type, triggered_count}}}}
 _MONITOR_STATES = {}
+
+
+def clear_workflow_monitor_states(workflow_id: str) -> None:
+    """本轮执行收尾时释放监控记录，避免复用子进程时串入下一轮。"""
+    _MONITOR_STATES.pop(workflow_id, None)
 
 
 
@@ -83,7 +89,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "type": "int",
             "widget_hint": "card_selector",
             "default": None,
-            "tooltip": "监控触发后，被监控卡片将跳转到此卡片\n如果不设置，监控触发时将终止工作流",
+            "tooltip": "监控触发后，被监控卡片将跳转到此卡片\n跳转目标必须有效，未设置或无效时工作流执行失败",
             "condition": {"param": "action_on_trigger", "value": "跳转到指定卡片"}
         },
 
@@ -311,11 +317,13 @@ def register_monitor(card_id: int, parameters: Dict[str, Any], context: Any, **k
         # 获取参数
         monitor_type = parameters.get("monitor_type", "监控失败")
         monitor_mode = parameters.get("monitor_mode", "按次数")
-        from task_workflow.card_payload import coerce_number
-
-        count_threshold = int(coerce_number(parameters.get("count_threshold", 5), 5, as_float=False))
-        duration_threshold = int(coerce_number(parameters.get("duration_threshold", 60), 60, as_float=False))
+        count_threshold = safe_integer(parameters.get("count_threshold", 5))
+        duration_threshold = safe_integer(parameters.get("duration_threshold", 60))
+        if count_threshold < 1 or duration_threshold < 1:
+            raise ValueError("附加条件的次数和持续时间阈值必须为正整数")
         duration_unit = parameters.get("duration_unit", "秒")
+        if duration_unit not in ("秒", "分钟"):
+            raise ValueError(f"无效的附加条件时间单位：{duration_unit}")
 
         # 将时间阈值转换为秒
         if duration_unit == "分钟":
@@ -336,7 +344,7 @@ def register_monitor(card_id: int, parameters: Dict[str, Any], context: Any, **k
         logger.info(f"[附加条件 {card_id}] 时间阈值: {duration_threshold}{duration_unit} ({duration_threshold_seconds}秒)")
 
         # 获取工作流ID
-        workflow_id = str(context.workflow_id) if hasattr(context, 'workflow_id') else "default"
+        workflow_id = str(context.workflow_id)
 
         # 【新架构】构建监控配置对象，传递给执行器
         monitor_config = {
@@ -359,8 +367,6 @@ def register_monitor(card_id: int, parameters: Dict[str, Any], context: Any, **k
         }
 
         # 将监控配置注册到上下文中
-        if not hasattr(context, '_monitor_configs'):
-            context._monitor_configs = {}
         context._monitor_configs[target_card_id] = monitor_config
 
         logger.info(f"[附加条件 {card_id}] 已注册监控配置到被监控卡片 {target_card_id}")
@@ -388,32 +394,36 @@ def check_monitor_trigger(monitor_config: Dict[str, Any], target_card_result: bo
         否则返回 None
     """
     try:
-        # 【闪退修复】使用.get()方法替代直接访问，防止KeyError闪退
         condition_card_id = monitor_config.get("monitor_card_id")
         target_card_id = monitor_config.get("target_card_id")
         monitor_type = monitor_config.get("monitor_type")
         monitor_mode = monitor_config.get("monitor_mode")
 
-        # 【闪退修复】添加必填字段验证，防止None值导致后续错误
         if condition_card_id is None or target_card_id is None or not monitor_type or not monitor_mode:
-            logger.error(f"[附加条件检查] 监控配置缺少必填字段: monitor_card_id={condition_card_id}, target_card_id={target_card_id}, monitor_type={monitor_type}, monitor_mode={monitor_mode}")
-            return None
+            raise ValueError("附加条件配置缺少监控卡片、目标卡片、监控类型或监控模式")
+        if monitor_type not in ("监控成功", "监控失败"):
+            raise ValueError(f"无效的附加条件监控类型：{monitor_type}")
+        if monitor_mode not in ("按次数", "按持续时间", "按次数和时间"):
+            raise ValueError(f"无效的附加条件监控模式：{monitor_mode}")
 
-        # 修复：确保count_threshold和duration_threshold是整数类型
         count_threshold_raw = monitor_config.get("count_threshold", 1)
         duration_threshold_raw = monitor_config.get("duration_threshold", 60)
-        from task_workflow.card_payload import coerce_number, publish_card_payload
+        from task_workflow.card_payload import publish_card_payload
 
-        count_threshold = int(coerce_number(count_threshold_raw, 1, as_float=False))
-        duration_threshold = int(coerce_number(duration_threshold_raw, 60, as_float=False))
+        count_threshold = safe_integer(count_threshold_raw)
+        duration_threshold = safe_integer(duration_threshold_raw)
+        if count_threshold < 1 or duration_threshold < 1:
+            raise ValueError("附加条件的次数和持续时间阈值必须为正整数")
 
-        action_on_trigger = monitor_config.get("action_on_trigger", "stop_workflow")
+        action_on_trigger = monitor_config.get("action_on_trigger", "停止工作流")
+        if action_on_trigger not in ("停止工作流", "跳转到指定卡片"):
+            raise ValueError(f"无效的附加条件触发动作：{action_on_trigger}")
         jump_target_card_id = monitor_config.get("jump_target_card_id")
         reset_after_trigger = monitor_config.get("reset_after_trigger", False)
         enable_trigger_limit = monitor_config.get("enable_trigger_limit", False)
-        max_trigger_count = monitor_config.get("max_trigger_count", 1)
+        max_trigger_count = safe_integer(monitor_config.get("max_trigger_count", 1))
         enable_counter_reset = monitor_config.get("enable_counter_reset", False)
-        counter_reset_value = monitor_config.get("counter_reset_value", 0)
+        counter_reset_value = safe_integer(monitor_config.get("counter_reset_value", 0))
         show_log = True
         workflow_id = monitor_config.get("workflow_id", 0)
         duration_unit = monitor_config.get("duration_unit", "秒")
@@ -497,9 +507,11 @@ def check_monitor_trigger(monitor_config: Dict[str, Any], target_card_result: bo
 
             # 重置计数器（如果启用）
             if enable_counter_reset:
-                if hasattr(context, 'reset_counter'):
-                    context.reset_counter(target_card_id, counter_reset_value)
-                    logger.info(f"[附加条件触发] 已重置卡片 {target_card_id} 的计数器到 {counter_reset_value}")
+                reset_counter = getattr(context, 'reset_counter', None)
+                if not callable(reset_counter):
+                    raise RuntimeError("当前工作流上下文不支持重置计数器")
+                reset_counter(target_card_id, counter_reset_value)
+                logger.info(f"[附加条件触发] 已重置卡片 {target_card_id} 的计数器到 {counter_reset_value}")
 
             # 返回触发动作
             if action_on_trigger == "停止工作流":
@@ -509,18 +521,17 @@ def check_monitor_trigger(monitor_config: Dict[str, Any], target_card_result: bo
                 }
             else:  # 跳转到指定卡片
                 # 修复: 确保jump_target_card_id是有效的整数,不能是None
-                if jump_target_card_id is not None and isinstance(jump_target_card_id, int) and jump_target_card_id >= 0:
+                if type(jump_target_card_id) is int and jump_target_card_id >= 0:
                     return {
                         "action": "jump",
                         "target_card_id": jump_target_card_id,
                         "reason": trigger_reason
                     }
                 else:
-                    logger.warning(f"[附加条件触发] 跳转目标无效或未设置: {jump_target_card_id}，不执行跳转")
-                    return None
+                    raise ValueError(f"附加条件跳转目标无效：{jump_target_card_id}")
 
         return None
 
     except Exception as e:
         logger.error(f"检查附加条件触发时失败: {e}", exc_info=True)
-        return None
+        raise

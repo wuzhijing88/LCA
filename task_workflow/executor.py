@@ -42,6 +42,14 @@ class _ThreadErrorCaptureHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            if bool(getattr(record, "lca_execution_log", False)):
+                same_thread = getattr(record, "thread", None) == self._thread_id
+                same_executor = getattr(record, "lca_execution_owner_id", None) == id(self._owner)
+                if not same_thread and not same_executor:
+                    return
+                if getattr(self._owner, "_capture_card_issue_logs", False):
+                    self._owner._on_custom_script_log(record.getMessage())
+                return
             if getattr(record, "thread", None) != self._thread_id:
                 return
             if int(getattr(record, "levelno", 0)) < logging.INFO:
@@ -53,13 +61,9 @@ class _ThreadErrorCaptureHandler(logging.Handler):
         except Exception:
             return
 
-# 安全导入 win32gui
-try:
-    import win32gui
-    WIN32GUI_AVAILABLE = True
-except ImportError:
-    WIN32GUI_AVAILABLE = False
-    logger.warning("win32gui 不可用，部分窗口激活功能将被禁用")
+import win32gui
+
+WIN32GUI_AVAILABLE = True
 
 
 class WorkflowExecutor(QObject):
@@ -127,18 +131,29 @@ class WorkflowExecutor(QObject):
             infinite_loop_guard_enabled: 是否启用无出口循环逻辑保护
             parent: 父对象
         """
+        if not isinstance(cards_data, dict):
+            raise TypeError("执行器卡片数据必须是字典")
+        if not isinstance(connections_data, list):
+            raise TypeError("执行器连线数据必须是列表")
+        if not isinstance(task_modules, dict):
+            raise TypeError("执行器任务模块必须是字典")
+        if not isinstance(execution_mode, str) or not execution_mode.strip():
+            raise ValueError("执行器必须指定有效的执行模式")
+        for card_id, card in cards_data.items():
+            parameters = card['parameters'] if isinstance(card, dict) else card.parameters
+            if not isinstance(parameters, dict):
+                raise TypeError(f"卡片 {card_id} 的参数必须是字典")
         super().__init__(parent)
 
-        # 【修复闪退】确保传入的数据不为 None，防止后续调用 .items()/.get() 时闪退
-        self.cards_data = cards_data if cards_data is not None else {}
-        self.connections_data = connections_data if connections_data is not None else []
-        self.task_modules = task_modules if task_modules is not None else {}
+        self.cards_data = cards_data
+        self.connections_data = connections_data
+        self.task_modules = task_modules
         self.target_hwnd = target_hwnd  # 目标窗口句柄（主要使用）
         self.target_window_title = target_window_title  # 窗口标题（仅用于日志显示）
         self.bound_windows = []
         self.custom_width = 0
         self.custom_height = 0
-        self.execution_mode = execution_mode or 'foreground'  # 【修复闪退】确保执行模式不为 None
+        self.execution_mode = execution_mode
         self.window_adapter = get_window_adapter(
             str(os.getenv("LCA_WINDOW_ADAPTER", "default") or "default")
         )
@@ -416,11 +431,10 @@ class WorkflowExecutor(QObject):
                 logger.info(f"[自动注册] 执行附加条件卡片 {card_id}")
 
                 # 获取卡片参数
-                # 【修复闪退】确保 card_params 不为 None，防止调用 .get() 时闪退
                 if hasattr(card, 'parameters'):
-                    card_params = card.parameters if card.parameters is not None else {}
+                    card_params = card.parameters
                 else:
-                    card_params = card.get('parameters', {}) or {}
+                    card_params = card['parameters']
 
                 logger.info(f"[自动注册] 卡片 {card_id} 参数: monitor_type={card_params.get('monitor_type')}, count_threshold={card_params.get('count_threshold')}, monitor_mode={card_params.get('monitor_mode')}")
 
@@ -463,44 +477,61 @@ class WorkflowExecutor(QObject):
 
         # 获取上下文中的监控配置
         if not hasattr(self, '_workflow_context') or self._workflow_context is None:
-            logger.warning("[附加条件检查] 工作流上下文不存在，跳过监控检查")
-            return None
+            raise RuntimeError("附加条件检查失败：工作流上下文不存在")
 
-        # 【修复闪退】检查 _monitor_configs 属性是否存在且不为 None
         if not hasattr(self._workflow_context, '_monitor_configs') or self._workflow_context._monitor_configs is None:
-            logger.warning("[附加条件检查] 没有监控配置属性或为空，跳过监控检查")
-            return None
+            raise RuntimeError("附加条件检查失败：监控配置不存在")
 
         logger.info(f"[附加条件检查] 所有监控配置: {self._workflow_context._monitor_configs.keys()}")
 
         monitor_config = self._workflow_context._monitor_configs.get(target_card_id)
         if monitor_config is None:
-            logger.warning(f"[附加条件检查] 卡片 {target_card_id} 没有监控配置")
-            logger.warning(f"[附加条件检查] 可用的配置键: {list(self._workflow_context._monitor_configs.keys())}")
-            return None
+            raise RuntimeError(f"附加条件检查失败：卡片 {target_card_id} 没有监控配置")
 
         logger.info(f"[附加条件检查] 找到监控配置: {monitor_config}")
 
         # 调用监控检查函数
-        try:
-            from tasks.watchdog_monitor import check_monitor_trigger
-            result = check_monitor_trigger(monitor_config, target_card_result, self._workflow_context)
-            if result:
-                logger.warning(f"[附加条件触发] 附加条件 {monitor_card_id} 触发: {result}")
-            return result
-        except ImportError as e:
-            logger.error(f"[附加条件检查] 无法导入 watchdog_monitor 模块: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"[附加条件检查] 检查触发时发生错误: {e}", exc_info=True)
-            return None
+        from tasks.watchdog_monitor import check_monitor_trigger
+        result = check_monitor_trigger(monitor_config, target_card_result, self._workflow_context)
+        if result:
+            logger.warning(f"[附加条件触发] 附加条件 {monitor_card_id} 触发: {result}")
+        return result
 
     def _build_step_log_details(self, card_id: int, card_params: Dict[str, Any], include_results: bool) -> str:
         """
-        构建步骤日志详情，用于悬浮窗显示
-        只显示核心信息：卡片ID
+        构建步骤日志详情，用于执行日志显示。
         """
-        return f"卡片ID={card_id}"
+        card = self._get_card_object(card_id)
+        card_name = ""
+        if isinstance(card, dict):
+            card_name = str(card.get("custom_name") or "").strip()
+        else:
+            card_name = str(getattr(card, "custom_name", "") or "").strip()
+        if not card_name and isinstance(card_params, dict):
+            card_name = str(card_params.get("name") or card_params.get("description") or "").strip()
+
+        details = [f"卡片ID：{card_id}"]
+        if card_name:
+            details.append(f"卡片名称：{card_name}")
+        return " | ".join(details)
+
+    def _emit_step_result_log(
+        self,
+        card_id: Any,
+        task_type: str,
+        card_params: Dict[str, Any],
+        success: bool,
+        task_detail: Any = "",
+        next_card_id: Any = None,
+    ) -> None:
+        details = self._build_step_log_details(card_id, card_params, include_results=True)
+        clean_detail = str(task_detail or "").strip()
+        if clean_detail:
+            details = f"{details} | 结果：{clean_detail}"
+        if next_card_id not in (None, "STOP_WORKFLOW", "工作流执行完成"):
+            details = f"{details} | 下一步：{next_card_id}"
+        status_text = "执行成功" if success else "执行失败"
+        self.emit_step_log(task_type, f"{status_text} | {details}", success)
 
     def _get_card_object(self, card_id: Any) -> Any:
         return find_card_by_id(self.cards_data, card_id)
@@ -909,6 +940,24 @@ class WorkflowExecutor(QObject):
             del issue_logs[0:len(issue_logs) - 8]
 
         self._refresh_current_card_error_detail()
+
+    def _on_custom_script_log(self, message: str) -> None:
+        text = re.sub(r"^\[自定义脚本\]\s*", "", str(message or "")).strip()
+        if not text or self._current_card_id is None:
+            return
+        card = self._get_card_object(self._current_card_id)
+        if isinstance(card, dict):
+            task_type = str(card.get("task_type") or "自定义脚本").strip()
+            card_params = card.get("parameters") or {}
+        else:
+            task_type = str(getattr(card, "task_type", "自定义脚本") or "自定义脚本").strip()
+            card_params = getattr(card, "parameters", {}) or {}
+        details = self._build_step_log_details(
+            self._current_card_id,
+            card_params if isinstance(card_params, dict) else {},
+            include_results=False,
+        )
+        self.emit_step_log(task_type, f"自定义日志：{text} | {details}", True)
 
     def _attach_error_capture_handler(self) -> None:
         if self._error_capture_handler is not None:
@@ -1382,9 +1431,7 @@ class WorkflowExecutor(QObject):
 
         logger.info("开始执行工作流")
         # 在前台模式下激活目标窗口
-        # [闪退修复] 标准化执行模式以支持新的模式
-        # 【修复闪退】确保 execution_mode 不为 None，防止调用 .startswith() 时闪退
-        exec_mode = self.execution_mode or 'foreground'
+        exec_mode = self.execution_mode
         normalized_mode = exec_mode
         if exec_mode.startswith('foreground'):
             normalized_mode = 'foreground'
@@ -1445,6 +1492,9 @@ class WorkflowExecutor(QObject):
                 logger.debug(f"发射execution_finished信号失败（对象可能已销毁）: {signal_err}")
         finally:
             self._detach_error_capture_handler()
+            from tasks.watchdog_monitor import clear_workflow_monitor_states
+
+            clear_workflow_monitor_states(self.workflow_id)
 
             # 工作流结束时释放所有按键
             self._release_all_keys()
@@ -1478,15 +1528,7 @@ class WorkflowExecutor(QObject):
                     logger.warning(f"恢复执行线程上下文失败: {restore_exc}")
             self._is_running = False
 
-            # 工具 修复：主动请求线程退出
-            logger.debug(f"WorkflowExecutor执行完成，请求线程退出: {self.target_window_title}")
-            # 【修复闪退】安全地请求线程退出，避免访问已销毁的QThread对象
-            try:
-                current_thread = self.thread()
-                if current_thread is not None and current_thread.isRunning():
-                    current_thread.quit()
-            except (RuntimeError, AttributeError) as e:
-                logger.debug(f"请求线程退出时发生异常（可忽略）: {e}")
+            # 执行线程由创建者通过 execution_finished 连接退出；执行器不退出所属的任意线程。
 
     def request_stop(self, force: bool = False):
         """请求停止执行
@@ -1616,103 +1658,8 @@ class WorkflowExecutor(QObject):
             else:
                 logger.debug("多线程会话仍有活跃线程，延迟本线程全局输入释放")
 
-            # 释放找色任务可能按下的移动按键
-            find_color_key = self._persistent_counters.get('__find_color_last_pressed_key__')
-            if find_color_key:
-                logger.info(f"工作流停止，释放找色任务按键: {find_color_key}")
-
-                # 标准化执行模式
-                # 【修复闪退】确保 execution_mode 不为 None，防止调用 .startswith() 时闪退
-                exec_mode = self.execution_mode or 'foreground'
-                normalized_mode = exec_mode
-                if exec_mode.startswith('background'):
-                    normalized_mode = 'background'
-                elif exec_mode.startswith('foreground'):
-                    normalized_mode = 'foreground'
-
-                if normalized_mode == 'background' and self.target_hwnd:
-                    # 后台模式释放按键
-                    self._release_key_background(find_color_key)
-                elif normalized_mode == 'foreground':
-                    # 前台模式释放按键
-                    # 【修复闪退】安全导入 pyautogui
-                    try:
-                        import pyautogui
-                    except ImportError as e:
-                        logger.warning(f"前台释放按键失败: pyautogui 不可用: {e}")
-                        return
-
-                    if "+" in find_color_key:
-                        # 处理组合键
-                        keys = find_color_key.split("+")
-                        for key in keys:
-                            key = key.strip()
-                            try:
-                                pyautogui.keyUp(key)
-                                logger.debug(f"  释放组合键: {key}")
-                            except Exception as e:
-                                logger.warning(f"释放按键 {key} 失败: {e}")
-                    else:
-                        # 单个按键
-                        try:
-                            pyautogui.keyUp(find_color_key)
-                            logger.debug(f"  释放按键: {find_color_key}")
-                        except Exception as e:
-                            logger.warning(f"释放按键 {find_color_key} 失败: {e}")
-
-                # 清除按键状态
-                self._persistent_counters['__find_color_last_pressed_key__'] = None
-                logger.info("找色任务按键状态已清除")
-
-            # 可以在这里添加其他任务的按键释放逻辑
-
         except Exception as e:
             logger.error(f"释放按键时发生错误: {e}")
-
-    def _release_key_background(self, key_str: str):
-        """后台模式释放按键"""
-        # 【修复闪退】检查 key_str 是否为 None 或空字符串
-        if not key_str:
-            return
-
-        try:
-            # 【修复闪退】安全导入 win32api 和 win32con
-            try:
-                import win32api
-                import win32con
-            except ImportError as e:
-                logger.warning(f"后台释放按键失败: win32api/win32con 不可用: {e}")
-                return
-
-            # 简单的按键映射
-            key_map = {
-                'w': 0x57, 's': 0x53, 'a': 0x41, 'd': 0x44,
-                'up': win32con.VK_UP, 'down': win32con.VK_DOWN,
-                'left': win32con.VK_LEFT, 'right': win32con.VK_RIGHT,
-                'space': win32con.VK_SPACE, 'enter': win32con.VK_RETURN,
-                'shift': win32con.VK_SHIFT, 'ctrl': win32con.VK_CONTROL,
-                'alt': win32con.VK_MENU
-            }
-
-            if "+" in key_str:
-                # 处理组合键
-                keys = key_str.split("+")
-                for key in keys:
-                    key = key.strip().lower()
-                    if key in key_map:
-                        vk_code = key_map[key]
-                        win32api.PostMessage(self.target_hwnd, win32con.WM_KEYUP, vk_code, 0)
-                        logger.debug(f"  后台释放组合键: {key}")
-            else:
-                # 单个按键
-                key = key_str.strip().lower()
-                if key in key_map:
-                    vk_code = key_map[key]
-                    win32api.PostMessage(self.target_hwnd, win32con.WM_KEYUP, vk_code, 0)
-                    logger.debug(f"  后台释放按键: {key}")
-
-        except Exception as e:
-            logger.warning(f"后台释放按键 {key_str} 失败: {e}")
 
     def _invalidate_stale_capture(self, *hwnds: Any) -> None:
         """窗口重建后清掉旧截图会话和插件绑定，避免继续抓失效画面。"""
@@ -2079,13 +2026,17 @@ class WorkflowExecutor(QObject):
                     task_type = current_card.task_type
                     # 【修复闪退】安全获取 parameters，防止为 None 时调用 .copy() 失败
                     params = current_card.parameters
-                    card_params = dict(params) if isinstance(params, dict) else {}
+                    if not isinstance(params, dict):
+                        raise TypeError(f"卡片 {current_card_id} 的参数必须是字典")
+                    card_params = dict(params)
                 else:
                     # 字典格式
                     # 【修复闪退】确保 card_params 不为 None
                     task_type = current_card.get('task_type', '未知')
-                    raw_parameters = current_card.get('parameters', {}) or {}
-                    card_params = dict(raw_parameters) if isinstance(raw_parameters, dict) else {}
+                    raw_parameters = current_card['parameters']
+                    if not isinstance(raw_parameters, dict):
+                        raise TypeError(f"卡片 {current_card_id} 的参数必须是字典")
+                    card_params = dict(raw_parameters)
 
                 if self._disallowed_task_types and str(task_type or "").strip() in self._disallowed_task_types:
                     error_msg = f"当前工作流禁止执行任务类型: {task_type}"
@@ -2153,6 +2104,14 @@ class WorkflowExecutor(QObject):
                 if next_card_id == '工作流执行完成':
                     logger.info("任务返回停止工作流")
                     if not success:
+                        self._emit_step_result_log(
+                            current_card_id,
+                            task_type,
+                            card_params,
+                            False,
+                            task_detail,
+                            next_card_id,
+                        )
                         return False, self._compose_failure_message(
                             f"工作流在步骤 {current_card_id} ({task_type}) 处失败并停止"
                         )
@@ -2167,6 +2126,14 @@ class WorkflowExecutor(QObject):
                 # 处理特殊返回值
                 if next_card_id == 'STOP_WORKFLOW':
                     if not success:
+                        self._emit_step_result_log(
+                            current_card_id,
+                            task_type,
+                            card_params,
+                            False,
+                            task_detail,
+                            next_card_id,
+                        )
                         return False, self._compose_failure_message(
                             f"工作流在步骤 {current_card_id} ({task_type}) 处失败并停止"
                         )
@@ -2177,6 +2144,13 @@ class WorkflowExecutor(QObject):
                 if self.test_mode == 'single_card' and current_card_id >= 0:
                     logger.info(f"[测试卡片] 卡片 {current_card_id} 执行完成，测试结束")
                     self.card_finished.emit(current_card_id, success)
+                    self._emit_step_result_log(
+                        current_card_id,
+                        task_type,
+                        card_params,
+                        success,
+                        task_detail,
+                    )
                     # 【修复】等待一小段时间确保主线程能处理card_finished信号并更新UI
                     time.sleep(0.05)  # 等待50ms让UI完成状态更新
                     logger.info("[测试卡片] card_finished信号已发送并等待UI更新")
@@ -2187,6 +2161,14 @@ class WorkflowExecutor(QObject):
                     logger.info(f"[附加条件快速跳转] 直接跳转到 {next_card_id}，跳过UI信号发送")
                     # 只发送被监控卡片的完成信号（显示原始状态），不发送step_details
                     self.card_finished.emit(current_card_id, success)
+                    self._emit_step_result_log(
+                        current_card_id,
+                        task_type,
+                        card_params,
+                        success,
+                        task_detail,
+                        next_card_id,
+                    )
                     self._maybe_hot_reset_ocr_by_next_card(current_card_id, task_type, next_card_id)
                     current_card_id = next_card_id
                     retry_counts[current_card_id] = 0  # 重置目标卡片的重试计数
@@ -2225,12 +2207,14 @@ class WorkflowExecutor(QObject):
                                 task_type=task_type,
                             )
                         )
-                        # 发送浮动窗口日志
-                        details = self._build_step_log_details(current_card_id, card_params, include_results=True)
-                        log_message = "执行成功"
-                        if details:
-                            log_message = f"{log_message} | {details}"
-                        self.emit_step_log(task_type, log_message, True)
+                        self._emit_step_result_log(
+                            current_card_id,
+                            task_type,
+                            card_params,
+                            True,
+                            task_detail,
+                            next_card_id,
+                        )
                     else:
                         self.step_details.emit(
                             self._format_step_detail_for_card(
@@ -2240,12 +2224,14 @@ class WorkflowExecutor(QObject):
                                 task_type=task_type,
                             )
                         )
-                        # 发送浮动窗口日志
-                        details = self._build_step_log_details(current_card_id, card_params, include_results=True)
-                        log_message = "执行失败"
-                        if details:
-                            log_message = f"{log_message} | {details}"
-                        self.emit_step_log(task_type, log_message, False)
+                        self._emit_step_result_log(
+                            current_card_id,
+                            task_type,
+                            card_params,
+                            False,
+                            task_detail,
+                            next_card_id,
+                        )
 
                     # 【UI响应优化】发送信号后等待一小段时间，确保UI能处理完成信号
                     # 特别是对于起点等快速执行的卡片，需要确保UI有足够时间从蓝色切换到绿色
@@ -2258,9 +2244,7 @@ class WorkflowExecutor(QObject):
                 # 【修复】如果已经确定要循环回自己，跳过失败处理逻辑
                 if not success and not will_loop_to_self:
                     # 【修复闪退】安全获取失败时的操作设置，防止 card_params 为 None
-                    failure_action = '执行下一步'
-                    if card_params is not None:
-                        failure_action = card_params.get('on_failure', '执行下一步')
+                    failure_action = card_params.get('on_failure', '执行下一步')
 
                     if failure_action == '停止工作流':
                         logger.info(f"{task_type} 执行失败，停止工作流")
@@ -2269,9 +2253,7 @@ class WorkflowExecutor(QObject):
                         )
                     elif failure_action == '跳转到步骤':
                         # 【修复闪退】安全获取跳转目标，防止 card_params 为 None
-                        jump_target = None
-                        if card_params is not None:
-                            jump_target = card_params.get('failure_jump_target_id')
+                        jump_target = card_params.get('failure_jump_target_id')
                         if jump_target is not None and jump_target != "" and next_card_id is None:
                             logger.info(f"{task_type} 执行失败，跳转到步骤 {jump_target}")
                             next_card_id = jump_target
@@ -2302,16 +2284,10 @@ class WorkflowExecutor(QObject):
                         retry_counts[current_card_id] = current_retry_count + 1
 
                         # 【修复闪退】安全获取重试间隔设置，防止 card_params 为 None
-                        workflow_retry_interval = 0.1  # 默认100ms
-                        if card_params is not None:
-                            workflow_retry_interval = card_params.get('workflow_retry_interval',
-                                                                   card_params.get('retry_interval', 0.1))
-
-                        # 确保转换为浮点数
-                        try:
-                            workflow_retry_interval = float(workflow_retry_interval)
-                        except (ValueError, TypeError):
-                            workflow_retry_interval = 0.1  # 默认100ms
+                        from tasks.click_param_resolver import safe_non_negative_float
+                        workflow_retry_interval = safe_non_negative_float(
+                            card_params.get('workflow_retry_interval', 0.1)
+                        )
 
                         logger.info(f"{task_type} 任务内部重试已完成，开始工作流级重试 (第 {retry_counts[current_card_id]} 次)")
 

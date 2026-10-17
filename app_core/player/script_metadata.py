@@ -17,9 +17,7 @@ def workflow_sha256(workflow: Mapping[str, Any]) -> str:
 
 
 def validate_release_metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
-    """Validate present release metadata; partial fields are an error."""
-    if "version" not in metadata and "workflow_sha256" not in metadata:
-        return {}
+    """Validate required release metadata."""
     version = metadata.get("version")
     digest = metadata.get("workflow_sha256")
     if not isinstance(version, str) or not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
@@ -35,5 +33,5 @@ def build_release_metadata(workflow: Mapping[str, Any], version: str = "1.0.0") 
 
 def verify_release_workflow(metadata: Mapping[str, Any], workflow: Mapping[str, Any]) -> None:
     checked = validate_release_metadata(metadata)
-    if checked and checked["workflow_sha256"] != workflow_sha256(workflow):
+    if checked["workflow_sha256"] != workflow_sha256(workflow):
         raise ValueError(f"发布脚本工作流完整性校验失败: {metadata.get('id', '')}")

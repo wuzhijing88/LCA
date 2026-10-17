@@ -1,7 +1,8 @@
 from PySide6.QtWidgets import (QApplication, QDialog, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-                               QWidget, QTextEdit)
-from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
-from PySide6.QtCore import Qt, QSize
+                               QWidget, QTextEdit, QStyle)
+from PySide6.QtCore import Qt
+
+from ui.dialogs.dialog_manager import exec_dialog
 
 from utils.log_message_translator import translate_log_message
 
@@ -39,27 +40,9 @@ class ErrorMessageBox:
         # 图标
         icon_label = QLabel()
         
-        # 创建红色圆形X图标（与截图一致）
         if icon_type == 'critical':
-            icon_size = QSize(48, 48)
-            pixmap = QPixmap(icon_size)
-            pixmap.fill(Qt.GlobalColor.transparent)
-            
-            painter = QPainter(pixmap)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            
-            # 绘制红色圆形
-            painter.setBrush(QColor("#E95439")) # 更暖的红色
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(4, 4, 40, 40)
-            
-            # 绘制白色X
-            painter.setPen(QPen(Qt.GlobalColor.white, 3))
-            painter.drawLine(16, 16, 36, 36)
-            painter.drawLine(36, 16, 16, 36)
-            painter.end()
-            
-            icon_label.setPixmap(pixmap)
+            icon = dialog.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxCritical)
+            icon_label.setPixmap(icon.pixmap(48, 48))
         
         content_layout.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignTop)
         
@@ -71,10 +54,7 @@ class ErrorMessageBox:
         
         # 标题
         title_label = QLabel(text)
-        title_font = QFont()
-        title_font.setBold(True)
-        title_font.setPixelSize(16)
-        title_label.setFont(title_font)
+        title_label.setObjectName("errorMessageHeading")
         title_label.setWordWrap(True)
         text_layout.addWidget(title_label)
         
@@ -133,14 +113,6 @@ class ErrorMessageBox:
         # 设置最小宽度，确保其与截图一致
         dialog.setMinimumWidth(400)
         
-        # 不再使用硬编码样式，让全局主题控制对话框样式
-        dialog.setStyleSheet("""
-            QPushButton {
-                padding: 5px 10px;
-                min-height: 25px;
-            }
-        """)
-        
         return dialog
     
     @staticmethod
@@ -155,7 +127,7 @@ class ErrorMessageBox:
             detailed_text=detailed_text,
             icon_type='critical'
         )
-        return dialog.exec()
+        return exec_dialog(dialog)
 
 
 # 错误包装类，用于替换系统错误对话框确保使用中文显示

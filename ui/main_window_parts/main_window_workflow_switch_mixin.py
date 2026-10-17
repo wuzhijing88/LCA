@@ -57,6 +57,10 @@ class MainWindowWorkflowSwitchMixin:
         dirs = resource_dirs_from_mapping(current_task)
         if not dirs.get("images_dir"):
             dirs["images_dir"] = str(getattr(self, "images_dir", "") or "")
+        if not dirs.get("dicts_dir"):
+            images = str(dirs.get("images_dir") or "").strip()
+            if images:
+                dirs["dicts_dir"] = os.path.join(os.path.dirname(os.path.abspath(images)), "dicts")
         bind_resource_dirs(dirs)
         images_dir = dirs.get("images_dir") or ""
         sounds_dir = dirs.get("sounds_dir") or ""

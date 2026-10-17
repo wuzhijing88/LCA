@@ -1,7 +1,12 @@
+from contextlib import ExitStack
+
 from .workflow_view_common import *
 from .workflow_view_card_layout_mixin import WorkflowViewCardLayoutMixin
 from .workflow_view_clipboard_undo_mixin import WorkflowViewClipboardUndoMixin
 from .workflow_view_connection_mixin import WorkflowViewConnectionMixin
+from .workflow_view_canvas_mixin import WorkflowViewCanvasMixin
+from .connection_controller import ConnectionController
+from .connection_gesture import ConnectionGesture
 from .workflow_view_delete_edit_mixin import WorkflowViewDeleteEditMixin
 from .workflow_view_identity_mixin import WorkflowViewIdentityMixin
 from .workflow_view_io_mixin import WorkflowViewIoMixin
@@ -12,6 +17,7 @@ class WorkflowView(
     WorkflowViewRenderMixin,
     WorkflowViewCardLayoutMixin,
     WorkflowViewConnectionMixin,
+    WorkflowViewCanvasMixin,
     WorkflowViewIoMixin,
     WorkflowViewClipboardUndoMixin,
     WorkflowViewDeleteEditMixin,
@@ -109,26 +115,10 @@ class WorkflowView(
 
         self.zoom_factor_base = 1.15
 
-        # Line Dragging State
         self.connections: List[ConnectionLine] = []
-        self.is_dragging_line = False
-        self.drag_start_card: Optional[TaskCard] = None
-        self.drag_start_port_type: Optional[str] = None
-        self.temp_line: Optional[QGraphicsPathItem] = None
-        self.temp_line_pen = QPen(Qt.GlobalColor.black, 1.0, Qt.PenStyle.DashLine) # Dashed line for temp
-        self.temp_line_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-        self.temp_line_pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-        self.temp_line_pen.setDashPattern([6, 4])
-        self.temp_line_pen.setCosmetic(True)
-        self.temp_line_snap_pen = QPen(QColor(0, 120, 215), 2.0, Qt.PenStyle.DashLine) # Blue, thicker when snapping
-        self.temp_line_snap_pen.setCapStyle(Qt.PenCapStyle.FlatCap)
-        self.temp_line_snap_pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-        self.temp_line_snap_pen.setDashPattern([6, 4])
-        self.temp_line_snap_pen.setCosmetic(True)
-
-        # Snapping state
-        self.is_snapped = False
-        self.snapped_target_card: Optional[TaskCard] = None
+        self._connection_controller = ConnectionController(self)
+        self._connection_gesture = ConnectionGesture(self)
+        self._canvas_connections_paused = False
 
         # Store cards for easy access
         self.cards: Dict[int, TaskCard] = {}
@@ -137,16 +127,10 @@ class WorkflowView(
         self._card_cache_zoom: Optional[float] = None
         self._render_cache_guard_timer: Optional[QTimer] = None
         self._dragging_item = None
-        self._line_start_item: Optional[TaskCard] = None
-        self._connection_type_to_draw: ConnectionType = ConnectionType.SUCCESS
 
-        try:
-            self._render_cache_guard_timer = QTimer(self)
-            self._render_cache_guard_timer.setInterval(15000)
-            self._render_cache_guard_timer.timeout.connect(self._on_render_cache_guard_tick)
-            self._render_cache_guard_timer.start()
-        except Exception:
-            self._render_cache_guard_timer = None
+        self._render_cache_guard_timer = QTimer(self)
+        self._render_cache_guard_timer.setInterval(15000)
+        self._render_cache_guard_timer.timeout.connect(self._on_render_cache_guard_tick)
 
         # --- Demo Setup Removed --- 
         # The user will add cards manually now
@@ -184,3 +168,51 @@ class WorkflowView(
         self._grid_spacing = 20  # 网格点间距
         self._grid_dot_size = 1.4  # 网格点大小
         self._card_snap_enabled = True  # 卡片间吸附（卡片对齐）开关
+
+        # 页面可能由外部直接关闭（例如窗口退出或标签页容器被销毁），
+        # 不能只依赖 WorkflowTabWidget 的关闭路径来释放场景资源。
+        self._resources_cleaned_up = False
+        # 主窗口关闭不会向子视图递送 closeEvent，应用退出必须主动卸载。
+        QApplication.instance().aboutToQuit.connect(self.dispose_resources)
+
+    def clear_workflow(self):
+        if not self._loading_workflow and self._is_workflow_running():
+            return False
+        self._cancel_canvas_panning()
+        self._cleanup_drag_state()
+        self._clear_all_snap_guide_lines(commit=False)
+        self.set_canvas_drag_paused(False)
+        result = WorkflowViewCardLayoutMixin.clear_workflow(self)
+        self.flashing_card_ids.clear()
+        self._sync_scene_rect_to_content()
+        return result
+
+    def dispose_resources(self):
+        """关闭与清空共用资源卸载入口，关闭时不受运行状态限制。"""
+        if self._resources_cleaned_up:
+            return
+        self._resources_cleaned_up = True
+        # 清场失败仍释放其余资源，异常由调用方接收，不静默吞掉。
+        with ExitStack() as cleanup:
+            cleanup.callback(self._connection_controller.dispose)
+            cleanup.callback(self.set_canvas_drag_paused, False)
+            cleanup.callback(self._release_render_cache_guard)
+            cleanup.callback(self._connection_gesture.dispose)
+            QApplication.instance().aboutToQuit.disconnect(self.dispose_resources)
+            loading = self._loading_workflow
+            self._loading_workflow = True
+            try:
+                self.clear_workflow()
+            finally:
+                self._loading_workflow = loading
+
+    def _release_render_cache_guard(self):
+        timer, self._render_cache_guard_timer = self._render_cache_guard_timer, None
+        if timer is not None:
+            timer.stop()
+            timer.timeout.disconnect(self._on_render_cache_guard_tick)
+            timer.deleteLater()
+
+    def closeEvent(self, event):
+        self.dispose_resources()
+        super().closeEvent(event)

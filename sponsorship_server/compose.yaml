@@ -1,0 +1,33 @@
+services:
+  sponsorship:
+    build:
+      context: ..
+      dockerfile: sponsorship_server/Dockerfile
+    env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - sponsorship_data:/data
+    restart: unless-stopped
+    stop_grace_period: 15s
+    mem_limit: 256m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  sponsorship_data:

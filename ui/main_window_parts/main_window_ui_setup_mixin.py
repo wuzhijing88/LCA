@@ -45,7 +45,7 @@ class MainWindowUiSetupMixin:
         else:
             initial_x, initial_y = 100, 100
         self.setGeometry(initial_x, initial_y, initial_width, initial_height) # Slightly larger window
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         # 使用不透明背景，避免输入控件/弹出层在透明窗口下渲染异常
         # Store corner radius for consistent use
         self._corner_radius = 10.0
@@ -150,7 +150,7 @@ class MainWindowUiSetupMixin:
         self.main_layout.setSpacing(0)
         # --- Custom Title Bar ---
         # Create the list of actions AFTER _create_actions has run
-        title_bar_actions = [self.toggle_action, self.save_action, self.load_action, self.new_workflow_action, self.export_standalone_action, self.ai_workflow_action, self.run_action, self.debug_run_action, self.timer_action, self.global_settings_action]
+        title_bar_actions = [self.toggle_action, self.save_action, self.load_action, self.new_workflow_action, self.export_standalone_action, self.ai_workflow_action, self.run_action, self.debug_run_action, self.child_session_action, self.timer_action, self.global_settings_action]
         self.title_bar = CustomTitleBar(self, actions=title_bar_actions)
         self.main_layout.addWidget(self.title_bar)
         self.title_bar.set_file_actions_visible(self.file_actions_visible)
@@ -165,6 +165,7 @@ class MainWindowUiSetupMixin:
             getattr(self, "ai_workflow_action", None),
             getattr(self, "run_action", None),
             getattr(self, "debug_run_action", None),
+            getattr(self, "child_session_action", None),
             getattr(self, "timer_action", None),
             getattr(self, "global_settings_action", None),
         ):
@@ -254,8 +255,8 @@ class MainWindowUiSetupMixin:
         # --- 设置全局快捷键 ---
         self._update_hotkeys()
         # ---------------------
-        # --- 初始化浮动状态窗口 ---
-        self._init_floating_status_window()
+        # --- 初始化执行日志面板 ---
+        self._init_execution_log_panel()
         # -------------------------
         # 首次启动提示：显示多任务系统使用提示
         QTimer.singleShot(500, self._show_welcome_hint)
@@ -286,9 +287,13 @@ class MainWindowUiSetupMixin:
             if hasattr(self, 'parameter_panel'):
                 logger.debug(f"[主窗口] 调用 parameter_panel.sync_window_state({self.windowState()})")
                 self.parameter_panel.sync_window_state(self.windowState())
-            # 更新浮动窗口可见性
-            if hasattr(self, '_floating_controller') and self._floating_controller:
-                self._floating_controller.on_main_window_state_changed(self.isMinimized())
+            # 更新执行日志面板状态
+            if hasattr(self, '_execution_log_panel') and self._execution_log_panel:
+                self._execution_log_panel.on_main_window_state_changed(self.isMinimized())
+            # 桌面分身窗口跟随主窗口最小化与恢复
+            child_session_window = getattr(self, "child_session_window", None)
+            if child_session_window is not None:
+                child_session_window._follow_main_window_minimized(self.isMinimized())
         elif event.type() == QEvent.Type.ActivationChange:
             if self.isActiveWindow():
                 self._refresh_native_rounded_corners()
@@ -319,11 +324,11 @@ class MainWindowUiSetupMixin:
         # 自动加载最近打开的工作流
         if not hasattr(self, '_workflows_auto_loaded'):
             self._workflows_auto_loaded = True
-            QTimer.singleShot(200, self._auto_load_recent_workflows_when_ready)
+            QTimer.singleShot(200, self, self._auto_load_recent_workflows_when_ready)
 
     def _auto_load_recent_workflows_when_ready(self):
         if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
-            QTimer.singleShot(50, self._auto_load_recent_workflows_when_ready)
+            QTimer.singleShot(50, self, self._auto_load_recent_workflows_when_ready)
             return
         self._auto_load_recent_workflows()
     def _apply_force_down_popup_to_widget(self, widget):

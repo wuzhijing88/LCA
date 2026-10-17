@@ -61,9 +61,11 @@ def _read_env_int(name: str, default: int, min_value: int, max_value: int) -> in
         return default
     try:
         value = int(str(raw_value).strip())
-    except Exception:
-        value = default
-    return max(min_value, min(max_value, value))
+    except ValueError as exc:
+        raise ValueError(f"截图配置{name}必须是整数") from exc
+    if not min_value <= value <= max_value:
+        raise ValueError(f"截图配置{name}必须在{min_value}到{max_value}之间")
+    return value
 
 
 _WGC_REQUEST_FRAME_TIMEOUT_MS = _read_env_int(
@@ -893,14 +895,18 @@ class WGC_HWND_Capturer:
             return None
 
         # 【修复闪退】在获取帧前检查窗口是否仍然有效
-        if WIN32_AVAILABLE:
-            try:
-                if not win32gui.IsWindow(self.hwnd):
-                    self._set_last_failure_reason("invalid_hwnd")
-                    logger.error(f"[获取帧] 窗口已失效 (HWND: {self.hwnd})")
-                    return None
-            except Exception as e:
-                logger.warning(f"[获取帧] 检查窗口有效性失败: {e}")
+        if not WIN32_AVAILABLE:
+            self._set_last_failure_reason("window_validation_unavailable")
+            raise RuntimeError("缺少pywin32，无法验证WGC捕获窗口")
+        try:
+            valid_window = win32gui.IsWindow(self.hwnd)
+        except Exception as e:
+            self._set_last_failure_reason("window_validation_failed")
+            raise RuntimeError(f"检查WGC捕获窗口有效性失败：{e}") from e
+        if not valid_window:
+            self._set_last_failure_reason("invalid_hwnd")
+            logger.error(f"[获取帧] 窗口已失效 (HWND: {self.hwnd})")
+            return None
 
         # 等待新帧
         timeout_seconds = timeout_ms / 1000.0
@@ -1713,7 +1719,13 @@ class OptimizedWGCCapture:
                 if frame is None:
                     self._set_last_capture_failure_reason("crop_failed")
                     logger.error(f"裁剪客户区失败 (HWND: {hwnd})")
-                    # 【关键修复】裁剪失败也不清理捕获器，可能只是临时问题
+                    try:
+                        pending_stop = None
+                        with self.lock:
+                            pending_stop = self._pop_capturer(capture_key)
+                        self._stop_detached_capturer(pending_stop)
+                    except Exception as exc:
+                        logger.debug("[WGC] 裁剪失败后清理捕获器失败: hwnd=%s err=%s", hwnd, exc)
                     return None
 
             # 更新缓存

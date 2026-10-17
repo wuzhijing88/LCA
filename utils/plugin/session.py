@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Dict, Optional
@@ -43,11 +44,10 @@ INPUT_BIND_DISPLAYS = ("normal", "gdi", "gdi2")
 
 
 def _client_key(hwnd: Optional[int] = None) -> int:
-    try:
-        value = int(hwnd or 0)
-    except (TypeError, ValueError):
-        value = 0
-    return value if value > 0 else 0
+    value = 0 if hwnd is None else int(hwnd)
+    if value < 0:
+        raise ValueError("插件窗口句柄无效")
+    return value
 
 
 def _create_plugin_client() -> PluginClient:
@@ -93,10 +93,9 @@ def get_shared_plugin_client(hwnd: Optional[int] = None) -> "PluginSession":
 
 def wait_for_plugin_host_cleanup(timeout: float = 2.0) -> bool:
     """等待超时恢复中的插件宿主清理完成，避免紧接着的重绑收到瞬时失败。"""
-    try:
-        wait_seconds = max(0.0, float(timeout))
-    except (TypeError, ValueError):
-        wait_seconds = 2.0
+    wait_seconds = float(timeout)
+    if not math.isfinite(wait_seconds) or wait_seconds < 0:
+        raise ValueError("插件清理等待时间必须是大于等于零的有限数字")
     deadline = time.monotonic() + wait_seconds
     while True:
         with _HOST_CLEANUP_LOCK:
@@ -197,10 +196,24 @@ def plugin_bind_extras(config=None) -> tuple[str, bool]:
 
         config = get_runtime_config()
     values = dict(config or {})
+    ime = values.get("plugin_text_ime", False)
+    fake_active = values.get("plugin_fake_active", False)
+    if not isinstance(ime, bool) or not isinstance(fake_active, bool):
+        raise ValueError("插件输入法和后台假激活配置必须是布尔值")
     options = list(normalize_plugin_public(values.get("plugin_public")))
-    if bool(values.get("plugin_text_ime", False)):
+    if ime:
         options.append(PLUGIN_IME_PUBLIC_OPTION)
-    return "|".join(options), bool(values.get("plugin_fake_active", False))
+    return "|".join(options), fake_active
+
+
+def _binding_timeout_seconds(timeout: float) -> float:
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("插件绑定超时必须是大于零的有限数字") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("插件绑定超时必须是大于零的有限数字")
+    return seconds
 
 
 def restore_plugin_bind_windows(*hwnds: int) -> None:
@@ -314,11 +327,10 @@ class PluginSession:
         bind_extras: Optional[tuple[str, bool]] = None,
     ) -> bool:
         display_target = int(display_hwnd or 0)
-        try:
-            input_target = int(input_hwnd or 0)
-        except (TypeError, ValueError):
-            input_target = 0
-        if input_target <= 0:
+        input_target = int(input_hwnd or 0)
+        if input_target < 0:
+            raise ValueError("插件输入窗口句柄无效")
+        if input_target == 0:
             input_target = display_target
         client = self._ensure_client()
         transport_retried = False
@@ -378,10 +390,7 @@ class PluginSession:
         timeout: float,
         bind_extras: Optional[tuple[str, bool]] = None,
     ) -> Optional[bool]:
-        try:
-            wait_seconds = max(0.05, float(timeout))
-        except Exception:
-            wait_seconds = 8.0
+        wait_seconds = _binding_timeout_seconds(timeout)
         deadline = time.monotonic() + wait_seconds
         box: dict = {}
 
@@ -466,16 +475,12 @@ class PluginSession:
         preferred = str(display or "").strip()
         if target <= 0 or not preferred:
             return None
-        try:
-            input_target = int(input_hwnd or 0)
-        except (TypeError, ValueError):
-            input_target = 0
-        if input_target <= 0:
+        input_target = int(input_hwnd or 0)
+        if input_target < 0:
+            raise ValueError("插件输入窗口句柄无效")
+        if input_target == 0:
             input_target = target
-        try:
-            wait_seconds = max(0.05, float(timeout))
-        except Exception:
-            wait_seconds = 4.0
+        wait_seconds = _binding_timeout_seconds(timeout)
         if bind_params is None:
             mouse, keypad, requested_mode = self._capture_bind_params()
         else:
@@ -516,16 +521,12 @@ class PluginSession:
         preferred = str(display or "").strip()
         if target <= 0 or not preferred:
             return False
-        try:
-            input_target = int(input_hwnd or 0)
-        except (TypeError, ValueError):
-            input_target = 0
-        if input_target <= 0:
+        input_target = int(input_hwnd or 0)
+        if input_target < 0:
+            raise ValueError("插件输入窗口句柄无效")
+        if input_target == 0:
             input_target = target
-        try:
-            wait_seconds = max(0.05, float(timeout))
-        except Exception:
-            wait_seconds = 4.0
+        wait_seconds = _binding_timeout_seconds(timeout)
         mouse, keypad, requested_mode = self._capture_bind_params()
         preferred_display = to_dm_display_mode(preferred)
         return bool(
@@ -560,10 +561,6 @@ class PluginSession:
         dm_display = resolve_input_bind_display(preferred)
         wanted_mouse = normalize_plugin_mouse(mouse)
         wanted_keypad = normalize_plugin_keypad(keypad)
-        try:
-            wait_seconds = max(0.05, float(timeout))
-        except Exception:
-            wait_seconds = 8.0
         requested_mode = normalize_plugin_bind_mode(mode)
         return bool(
             self._bind_with_timeout(
@@ -573,20 +570,14 @@ class PluginSession:
                 wanted_mouse,
                 wanted_keypad,
                 requested_mode,
-                wait_seconds,
+                timeout,
                 bind_extras=bind_extras,
             )
         )
 
     def last_error(self, hwnd: int = 0) -> int:
-        try:
-            return int(self._ensure_client().last_error(hwnd=int(hwnd or 0)) or 0)
-        except Exception:
-            return 0
+        return int(self._ensure_client().last_error(hwnd=_client_key(hwnd)))
 
     def is_window_bound(self, hwnd: int) -> bool:
         """向大漠核实该窗口是否仍在绑定中（窗口重建后宿主缓存可能已过期）。"""
-        try:
-            return bool(self._ensure_client().is_bind(int(hwnd or 0)))
-        except Exception:
-            return False
+        return self._ensure_client().is_bind(_client_key(hwnd))

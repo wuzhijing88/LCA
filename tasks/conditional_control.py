@@ -57,7 +57,7 @@ def _normalize_counter_reset_timing(value: Any) -> str:
     text = str(value or "").strip()
     if text in COUNTER_RESET_TIMINGS:
         return text
-    return "条件满足时"
+    raise ValueError(f"不支持的计数器重置时机: {value!r}")
 
 
 def _should_reset_counter(
@@ -67,13 +67,11 @@ def _should_reset_counter(
     on_success_action: str,
 ) -> bool:
     """根据参数决定计数器是否需要在本次执行后重置。"""
-    reset_enabled = params.get("enable_counter_reset")
+    reset_enabled = params.get("enable_counter_reset", True)
 
-    # 兼容旧工作流：未配置新参数时保持原有行为。
-    if reset_enabled is None:
-        return condition_met and on_success_action != "继续执行本步骤"
+    from task_workflow.script_parameters import boolean_parameter
 
-    if not coerce_bool(reset_enabled):
+    if not boolean_parameter(reset_enabled, "重置计数器"):
         return False
 
     reset_timing = _normalize_counter_reset_timing(
@@ -303,21 +301,10 @@ def clear_all_motion_cache():
         logger.debug("[内存清理] 清理移动状态失败: %s", exc)
 # -----------------------------------------------------------
 
-_REMOVED_EXPRESSION_PARAM_KEYS = (
-    "expr_left",
-    "expr_operator",
-    "expr_right",
-    "expr_advanced",
-)
-
-
 def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(params or {})
-    if normalized.get("condition_type") == "表达式判断":
-        logger.warning("条件类型“表达式判断”已移除，已回退为计数器判断")
-        normalized["condition_type"] = "计数器判断"
-    for key in _REMOVED_EXPRESSION_PARAM_KEYS:
-        normalized.pop(key, None)
+    if normalized.get("condition_type", "计数器判断") not in {"计数器判断", "移动检测", "时间判断"}:
+        raise ValueError("条件类型无效，请使用现行条件类型")
     return normalized
 
 
@@ -1169,10 +1156,10 @@ def _evaluate_time_condition(params: Dict[str, Any], counters: Dict[str, int], c
 
 
 
-def test_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
+def preview_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
     """测试图片识别功能，在绑定窗口上绘制找到的图片区域（使用统一测试模块）"""
     try:
-        from tasks.image_match_probe import test_image_recognition as unified_test
+        from tasks.image_match_probe import preview_image_recognition as unified_test
         unified_test(params, target_hwnd, main_window, parameter_panel)
     except Exception as e:
         logger.error(f"调用统一测试函数失败: {e}", exc_info=True)

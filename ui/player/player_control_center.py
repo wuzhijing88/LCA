@@ -172,6 +172,9 @@ def pick_player_workflow_entries(host, package: PlayerPackage, title: str) -> Li
         QMessageBox.warning(host, "无法分配", "当前独立程序没有可分配的工作流")
         return []
     dialog = PlayerWorkflowPickDialog(catalog, parent=host, title=title)
-    if dialog.exec() != QDialog.DialogCode.Accepted:
-        return []
-    return dialog.selected_entries()
+    from ui.dialogs.dialog_manager import exec_dialog
+
+    return exec_dialog(
+        dialog,
+        read_result=lambda result: dialog.selected_entries() if result == QDialog.DialogCode.Accepted else [],
+    )

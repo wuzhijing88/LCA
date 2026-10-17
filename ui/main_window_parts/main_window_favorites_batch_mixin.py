@@ -77,8 +77,8 @@ class MainWindowFavoritesBatchMixin:
             if self._random_pause_enabled:
                 self._start_random_pause_cycle()
                 logger.info("[random pause] started during batch execute")
-            if hasattr(self, '_floating_controller') and self._floating_controller:
-                self._floating_controller.on_workflow_started()
+            if hasattr(self, '_execution_log_panel') and self._execution_log_panel:
+                self._execution_log_panel.on_workflow_started()
         except Exception as e:
             logger.error(f"批量工作流执行失败：{e}")
     def _finish_batch_execute(self, success: bool = True, message: str = "Batch execute completed"):
@@ -102,8 +102,8 @@ class MainWindowFavoritesBatchMixin:
                     logger.info("批量队列结束且无活动任务，已确认全局停止状态")
                 except Exception as exc:
                     logger.warning("批量执行结束时恢复全局停止状态失败: %s", exc)
-        if hasattr(self, '_floating_controller') and self._floating_controller:
-            self._floating_controller.on_workflow_finished(success, message)
+        if hasattr(self, '_execution_log_panel') and self._execution_log_panel:
+            self._execution_log_panel.on_workflow_finished(success, message)
     def _execute_next_batch_workflow(self):
         """Execute the next workflow in the batch queue."""
         if not hasattr(self, '_batch_execute_queue') or not self._batch_execute_queue:
@@ -133,3 +133,4 @@ class MainWindowFavoritesBatchMixin:
         if tab_index is not None:
             self.workflow_tab_widget.setCurrentIndex(tab_index)
         QTimer.singleShot(100, lambda: task.execute_async())
+

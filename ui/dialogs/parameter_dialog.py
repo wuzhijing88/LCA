@@ -1080,16 +1080,22 @@ class ParameterDialog(QDialog):
 
                 options = param_def.get('options', [])
 
-                if isinstance(options, list):
+                if isinstance(options, dict):
+                    for value, display_text in options.items():
+                        combo_box.addItem(str(display_text), value)
+                    index = combo_box.findData(current_value)
+                    if index != -1:
+                        combo_box.setCurrentIndex(index)
+                elif isinstance(options, list):
                     combo_box.addItems(options)
-                # 工具 修复：正确处理当前值和默认值
-                param_default = param_def.get('default')
-                current_text = str(current_value) if current_value is not None else str(param_default) if param_default is not None else ""
-                index = combo_box.findText(current_text)
-                if index != -1:
-                    combo_box.setCurrentIndex(index)
-                elif options: # Default to first option if current not found
-                    combo_box.setCurrentIndex(0)
+                    # 工具 修复：正确处理当前值和默认值
+                    param_default = param_def.get('default')
+                    current_text = str(current_value) if current_value is not None else str(param_default) if param_default is not None else ""
+                    index = combo_box.findText(current_text)
+                    if index != -1:
+                        combo_box.setCurrentIndex(index)
+                    elif options: # Default to first option if current not found
+                        combo_box.setCurrentIndex(0)
                 widget = combo_box
                 interactive_widget = combo_box
                 
@@ -2730,7 +2736,10 @@ class ParameterDialog(QDialog):
                 if isinstance(widget, QLineEdit):
                     values[name] = widget.text()
                 elif isinstance(widget, QComboBox):
-                    values[name] = widget.currentText()
+                    if isinstance(param_def.get('options'), dict):
+                        values[name] = widget.currentData()
+                    else:
+                        values[name] = widget.currentText()
                 elif isinstance(widget, QCheckBox):
                     values[name] = widget.isChecked()
                 elif isinstance(widget, QPlainTextEdit): # <-- ADD getting value from QPlainTextEdit
@@ -2804,6 +2813,8 @@ class ParameterDialog(QDialog):
                     # <<< MODIFIED: Handle card_selector data retrieval >>>
                     if widget_hint in ('card_selector', 'thread_target_selector', 'workflow_card_selector', 'bound_window_selector'):
                         new_value = widget.currentData() # Get card ID (or None)
+                    elif isinstance(param_def.get('options'), dict):
+                        new_value = widget.currentData()
                     else:
                         new_value = widget.currentText()
                 elif isinstance(widget, QButtonGroup):

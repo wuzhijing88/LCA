@@ -63,20 +63,21 @@ class BindOutcome:
         if isinstance(result, cls):
             return result
         if isinstance(result, Mapping):
+            ok = result.get("ok")
+            registered = result.get("registered", False)
+            if not isinstance(ok, bool) or not isinstance(registered, bool):
+                raise ValueError("插件绑定结果必须包含有效的布尔状态")
             try:
-                last_error = int(result.get("last_error") or 0)
-            except (TypeError, ValueError):
-                last_error = 0
-            try:
-                registrations = int(result.get("registrations") or 0)
-            except (TypeError, ValueError):
-                registrations = 0
+                last_error = int(result.get("last_error", 0))
+                registrations = int(result.get("registrations", 0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("插件绑定结果中的错误码或注册次数无效") from exc
             return cls(
-                ok=bool(result.get("ok")),
+                ok=ok,
                 last_error=last_error,
                 error=str(result.get("error") or ""),
                 api=str(result.get("api") or ""),
-                registered=bool(result.get("registered")),
+                registered=registered,
                 registrations=registrations,
             )
         raise TypeError(f"bind 返回值必须是对象: {type(result).__name__}")
@@ -86,7 +87,7 @@ def describe_bind_error_code(last_error: int) -> str:
     try:
         code = int(last_error)
     except (TypeError, ValueError):
-        return ""
+        return f"GetLastError={last_error!r}：插件错误码无效"
     if code == 0:
         return ""
     text = BIND_ERROR_MESSAGES.get(code)

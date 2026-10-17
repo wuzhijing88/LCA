@@ -43,7 +43,10 @@ def prepare_main_window_start(
                     save_workspace_favorites_snapshot,
                 )
 
-                workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(favorites_config_path)
+                workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(
+                    favorites_config_path,
+                    rebuild=False,
+                )
                 if changed:
                     save_workspace_favorites_snapshot(
                         favorites_config_path,

@@ -1,17 +1,11 @@
 """Helpers for normalizing execution modes in native input paths."""
 
-import re
 from collections.abc import Mapping
 from typing import Optional, Tuple
 
 SUPPORTED_IB_DRIVERS = {
     "Logitech",
     "Razer",
-}
-
-_IB_DRIVER_ALIASES = {
-    "logitech": "Logitech",
-    "razer": "Razer",
 }
 
 SUPPORTED_FOREGROUND_BACKENDS = {
@@ -30,23 +24,13 @@ _DEFAULT_IB_DRIVER = "Logitech"
 
 
 def normalize_ib_driver_name(driver: Optional[str]) -> str:
-    raw = str(driver or "").strip()
-    if not raw:
-        return _DEFAULT_IB_DRIVER
-    if raw in SUPPORTED_IB_DRIVERS:
-        return raw
-    key = re.sub(r"[\s_\-]+", "", raw).lower()
-    mapped = _IB_DRIVER_ALIASES.get(key)
-    if mapped is None:
+    if driver not in SUPPORTED_IB_DRIVERS:
         raise ValueError(f"不支持的 IbInputSimulator 驱动: {driver!r}")
-    return mapped
+    return driver
 
 
 def _normalize_backend_token(value: object) -> str:
-    raw = str(value or "").strip().lower().replace("_", ".")
-    if raw in {"normal.hd", "normalhd", "normal.hd."}:
-        return "normal.hd"
-    return str(value or "").strip().lower()
+    return str(value).strip().lower()
 
 
 def require_foreground_backend(value: object) -> str:
@@ -58,10 +42,6 @@ def require_foreground_backend(value: object) -> str:
 
 def require_foreground_py_backend(value: object) -> str:
     backend = _normalize_backend_token(value)
-    if backend in {"", "pyautogui", "py", "python"}:
-        return "pyautogui"
-    if backend == "normal.hd":
-        return "normal.hd"
     if backend not in SUPPORTED_FOREGROUND_PY_BACKENDS:
         raise ValueError(f"不支持的前台二输入方式: {value!r}")
     return backend
@@ -69,12 +49,8 @@ def require_foreground_py_backend(value: object) -> str:
 
 def parse_foreground_backends(config: Optional[Mapping] = None) -> Tuple[str, str]:
     values = dict(config or {})
-    mouse_raw = values.get("foreground_mouse_driver_backend")
-    keyboard_raw = values.get("foreground_keyboard_driver_backend")
-    if mouse_raw is None or str(mouse_raw).strip() == "":
-        mouse_raw = _DEFAULT_FOREGROUND_BACKEND
-    if keyboard_raw is None or str(keyboard_raw).strip() == "":
-        keyboard_raw = _DEFAULT_FOREGROUND_BACKEND
+    mouse_raw = values.get("foreground_mouse_driver_backend", _DEFAULT_FOREGROUND_BACKEND)
+    keyboard_raw = values.get("foreground_keyboard_driver_backend", _DEFAULT_FOREGROUND_BACKEND)
     return (
         require_foreground_backend(mouse_raw),
         require_foreground_backend(keyboard_raw),
@@ -83,9 +59,7 @@ def parse_foreground_backends(config: Optional[Mapping] = None) -> Tuple[str, st
 
 def parse_foreground_py_backend(config: Optional[Mapping] = None) -> str:
     values = dict(config or {})
-    raw = values.get("foreground_py_backend")
-    if raw is None or str(raw).strip() == "":
-        return _DEFAULT_FOREGROUND_PY_BACKEND
+    raw = values.get("foreground_py_backend", _DEFAULT_FOREGROUND_PY_BACKEND)
     return require_foreground_py_backend(raw)
 
 
@@ -94,6 +68,47 @@ def _read_main_config() -> dict:
     from utils.runtime_config import get_runtime_config
 
     return get_runtime_config()
+
+
+def parse_background_options(config: Mapping) -> Tuple[bool, bool]:
+    """读取原生后台输入选项；显式无效值直接报错。"""
+    values = tuple(config.get(key, False) for key in (
+        "background_hierarchy_broadcast", "background_fake_active"
+    ))
+    if any(not isinstance(value, bool) for value in values):
+        raise ValueError("层级广播和后台假激活配置必须是布尔值")
+    return values
+
+
+def physical_mouse_block_targets(config: Mapping, hwnd: int, execution_mode: str) -> tuple:
+    """关闭或非原生后台时不读取绑定列表，也不进入屏蔽组件。"""
+    enabled = config.get("background_block_physical_mouse", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("屏蔽物理鼠标配置必须是布尔值")
+    if not enabled or execution_mode not in {"background_sendmessage", "background_postmessage"}:
+        return ()
+    if is_plugin_input_backend(config):
+        return ()
+    from utils.window.hwnd_utils import as_hwnd
+
+    windows = config.get("bound_windows", [])
+    if not isinstance(windows, list):
+        raise ValueError("屏蔽物理鼠标的绑定窗口必须是列表")
+    targets = set()
+    for window in windows:
+        if not isinstance(window, dict):
+            raise ValueError("屏蔽物理鼠标的绑定窗口记录必须是字典")
+        active = window.get("enabled", True)
+        if not isinstance(active, bool):
+            raise ValueError("屏蔽物理鼠标的绑定窗口启用状态必须是布尔值")
+        if active:
+            target = as_hwnd(window.get("hwnd"))
+            if not target:
+                raise ValueError("屏蔽物理鼠标的绑定窗口句柄无效")
+            targets.add(target)
+    if as_hwnd(hwnd) not in targets:
+        raise ValueError("屏蔽物理鼠标仅允许向已启用的绑定窗口输入")
+    return tuple(sorted(targets))
 
 
 def normalize_execution_mode(execution_mode: Optional[str]) -> str:
@@ -116,8 +131,11 @@ def is_background_mode(execution_mode: Optional[str]) -> bool:
 
 
 def is_plugin_input_backend(config: Optional[Mapping] = None) -> bool:
-    values = dict(config or {})
-    return str(values.get("input_backend") or "").strip().lower() == "plugin"
+    values = dict(_read_main_config() if config is None else config)
+    backend = values.get("input_backend")
+    if backend not in {"native", "plugin"}:
+        raise ValueError(f"输入后端缺失或无效：{backend!r}")
+    return backend == "plugin"
 
 
 # 大漠绑定后按窗口客户区坐标后台收发消息，前台驱动/激活/屏幕坐标换算都不适用

@@ -339,9 +339,12 @@ class PlayerWindow(QMainWindow):
         for alarm in alarms:
             if not alarm.get("enabled"):
                 continue
-            if int(alarm.get("hour") or -1) != now.tm_hour:
+            try:
+                hour = int(alarm.get("hour"))
+                minute = int(alarm.get("minute"))
+            except (TypeError, ValueError):
                 continue
-            if int(alarm.get("minute") or -1) != now.tm_min:
+            if hour != now.tm_hour or minute != now.tm_min:
                 continue
             self._last_schedule_fire = stamp
             self._append_log("信息", f"定时到达 {now.tm_hour:02d}:{now.tm_min:02d}，自动开始")
@@ -370,9 +373,14 @@ class PlayerWindow(QMainWindow):
         from PySide6.QtWidgets import QDialog
 
         dialog = PlayerSettingsDialog(self, ui=self._ui, state=self._ui_state)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        from ui.dialogs.dialog_manager import exec_dialog
+
+        payload = exec_dialog(
+            dialog,
+            read_result=lambda result: dialog.settings_payload() if result == QDialog.DialogCode.Accepted else None,
+        )
+        if payload is None:
             return
-        payload = dialog.settings_payload()
         self._ui = merge_settings_into_ui(self._ui, payload)
         self._exit_on_finish = bool(self._ui.get("exit_on_finish"))
         self._notify_on_finish = bool(self._ui.get("notify_on_finish", True))

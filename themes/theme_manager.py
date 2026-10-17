@@ -183,6 +183,11 @@ class ThemeManager:
     # 主题颜色映射
     THEME_COLORS = {
         'light': {
+            'connection_sequential': '#3984c6',
+            'connection_success': '#358b57',
+            'connection_failure': '#cb6269',
+            'connection_random': '#895cc4',
+            'connection_preview': '#8395a6',
             'background': '#ffffff',
             'surface': '#f5f5f5',
             'canvas': '#fafafa',
@@ -216,6 +221,11 @@ class ThemeManager:
             'picker_text_bg': '#000000',        # 文本背景：黑色
         },
         'dark': {
+            'connection_sequential': '#76b4e8',
+            'connection_success': '#79c992',
+            'connection_failure': '#ec9199',
+            'connection_random': '#bd9ae9',
+            'connection_preview': '#98a9bb',
             'background': '#1e1e1e',
             'surface': '#2d2d2d',
             'canvas': '#252525',
@@ -629,10 +639,3 @@ def get_theme_manager(config_path: Optional[str] = None) -> ThemeManager:
     if _theme_manager is None:
         _theme_manager = ThemeManager(config_path)
     return _theme_manager
-
-
-def reset_theme_manager():
-    """重置主题管理器（用于测试）"""
-    global _theme_manager
-    _theme_manager = None
-

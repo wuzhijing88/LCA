@@ -22,7 +22,7 @@ CARD_OVERVIEW_MAX_BORDER_SCENE_WIDTH = 3.5
 from PySide6.QtWidgets import (QApplication,
                                QGraphicsSceneMouseEvent,
                                QStyleOptionGraphicsItem, QGraphicsDropShadowEffect,
-                               QGraphicsSceneHoverEvent, QGraphicsObject, QGraphicsItem, QGraphicsLineItem)
+                               QGraphicsSceneHoverEvent, QGraphicsObject, QGraphicsItem, QGraphicsLineItem, QMessageBox)
 from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, Signal, QTimer # <-- ADD Signal & QTimer
 from PySide6.QtGui import QBrush, QPen, QColor, QPainter, QFont, QPainterPath, QConicalGradient, QRadialGradient
 
@@ -554,13 +554,20 @@ class TaskCard(QGraphicsObject):
         if timer is None:
             setattr(self, attr_name, None)
             return
-        timer.stop()
+        try:
+            timer.stop()
+        except (RuntimeError, TypeError):
+            pass
         try:
             timer.timeout.disconnect(timeout_slot)
         except (TypeError, RuntimeError):
             pass
-        timer.deleteLater()
-        setattr(self, attr_name, None)
+        try:
+            timer.deleteLater()
+        except (RuntimeError, TypeError):
+            pass
+        finally:
+            setattr(self, attr_name, None)
 
     def _release_drag_check_timer(self) -> None:
         self._cleanup_timer_attr("_drag_check_timer", self._check_drag_state)
@@ -613,8 +620,6 @@ class TaskCard(QGraphicsObject):
         self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
 
         # Drag-related throttling.
-        self._last_connection_update_time = 0.0
-        self._connection_update_interval = 0.033
         self._last_snap_guide_update_time = 0.0
         self._snap_guide_update_interval = 0.04
 
@@ -899,20 +904,14 @@ class TaskCard(QGraphicsObject):
         self._drag_start_card_pos_for_snap = self.pos()
         self._dragging_multi_selection = False
         self._is_dragging = True
-        self._last_connection_update_time = 0.0
         self._last_snap_guide_update_time = 0.0
 
         timer = getattr(self, "_drag_check_timer", None)
         if timer is None:
-            try:
-                timer = QTimer(self)
-                timer.timeout.connect(self._check_drag_state)
-                self._drag_check_timer = timer
-            except Exception:
-                self._drag_check_timer = None
-                timer = None
-        if timer is not None:
-            timer.start(100)
+            timer = QTimer(self)
+            timer.timeout.connect(self._check_drag_state)
+            self._drag_check_timer = timer
+        timer.start(100)
 
         if scene:
             selected_items = scene.selectedItems()
@@ -924,7 +923,6 @@ class TaskCard(QGraphicsObject):
                 for card in selected_cards:
                     card._is_dragging = True
                     card._multi_dragging_member = True
-                    card._last_connection_update_time = 0.0
                 self._dragging_multi_selection = True
             else:
                 self._other_selected_cards_start_positions = {}
@@ -935,7 +933,9 @@ class TaskCard(QGraphicsObject):
 
     def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent):
         """Handle mouse move for multi-selection dragging and snap guide lines."""
+        previous_positions = []
         if getattr(self, '_dragging_multi_selection', False) and getattr(self, '_other_selected_cards_start_positions', None):
+            previous_positions = [(card, card.pos()) for card in [self, *self._other_selected_cards_start_positions]]
             delta = event.scenePos() - self._drag_start_pos
 
             for card, start_pos in self._other_selected_cards_start_positions.items():
@@ -946,7 +946,7 @@ class TaskCard(QGraphicsObject):
             self._update_snap_guide_lines()
 
         super().mouseMoveEvent(event)
-        if getattr(self, '_dragging_multi_selection', False):
+        if any(card.pos() != position for card, position in previous_positions):
             self._refresh_dragged_connections()
 
     def _refresh_dragged_connections(self):
@@ -973,7 +973,8 @@ class TaskCard(QGraphicsObject):
 
         super().mouseReleaseEvent(event)
 
-        if start_pos is not None and not was_multi_dragging:
+        # 点击和双击也会经过释放事件；只有实际移动才允许吸附改变卡片坐标。
+        if start_pos is not None and self.pos() != start_pos and not was_multi_dragging:
             self._apply_grid_snap()
             self._apply_snap_alignment()
             did_preview = did_preview or bool(getattr(self, "_did_preview_connections", False))
@@ -990,24 +991,28 @@ class TaskCard(QGraphicsObject):
             card._multi_dragging_member = False
             card._did_preview_connections = False
 
-        moved_cards = []
-        if start_pos is not None and self.pos() != start_pos:
-            moved_cards.append(self)
-        for card, partner_start in partner_starts.items():
-            if card.pos() != partner_start:
-                moved_cards.append(card)
-        if moved_cards:
-            notify = getattr(self.view, "_notify_cards_moved", None)
-            if callable(notify):
-                notify(moved_cards)
-        if did_preview or moved_cards:
-            targets = moved_cards if moved_cards else [self] + partner_cards
-            self.view.reroute_connections(targets)
-        self.view.set_canvas_drag_paused(False)
+        start_positions = dict(partner_starts)
+        if start_pos is not None:
+            start_positions[self] = start_pos
+        try:
+            self._finish_drag_routing(start_positions, did_preview)
+        finally:
+            self.view.set_canvas_drag_paused(False)
 
+    def _finish_drag_routing(self, start_positions, did_preview):
+        """松手沿用拖动时的轨道规划，点击不更新路径。"""
+        moved = [card for card, position in start_positions.items() if card.pos() != position]
+        if moved or did_preview:
+            self.view.reroute_connections(moved if moved else list(start_positions))
+        if moved:
+            self.view._notify_cards_moved(moved)
 
-    def _cancel_drag_state(self):
+    def _cancel_drag_state(self, *, commit=True):
         """取消拖拽状态并清理辅助线，用于异常中断场景。"""
+        start_positions = dict(getattr(self, '_other_selected_cards_start_positions', {}) or {})
+        start_pos = getattr(self, '_drag_start_card_pos', None)
+        if start_pos is not None:
+            start_positions[self] = start_pos
         other_cards = getattr(self, '_other_selected_cards_start_positions', None)
         did_preview = bool(getattr(self, "_did_preview_connections", False))
         if other_cards:
@@ -1024,15 +1029,15 @@ class TaskCard(QGraphicsObject):
         self._drag_start_card_pos = None
         self._drag_start_card_pos_for_snap = None  # 清理吸附用的起始位置
         self._is_dragging = False
+        self._multi_dragging_member = False
         self._clear_snap_guide_lines()
         # 停止拖拽检测定时器
         self._release_drag_check_timer()
-        if did_preview:
-            targets = [self]
-            if other_cards:
-                targets.extend(other_cards.keys())
-            self.view.reroute_connections(targets)
-        self.view.set_canvas_drag_paused(False)
+        try:
+            if commit:
+                self._finish_drag_routing(start_positions, did_preview)
+        finally:
+            self.view.set_canvas_drag_paused(False)
 
 
     def mouseDoubleClickEvent(self, event: QGraphicsSceneMouseEvent):
@@ -1874,8 +1879,15 @@ class TaskCard(QGraphicsObject):
     def _ensure_flash_timer(self):
         existing_timer = getattr(self, "flash_toggle_timer", None)
         if existing_timer is not None:
-            existing_timer.isActive()
-            return existing_timer
+            try:
+                from shiboken6 import isValid
+
+                if isValid(existing_timer):
+                    existing_timer.isActive()
+                    return existing_timer
+            except (RuntimeError, TypeError):
+                pass
+            self.flash_toggle_timer = None
 
         timer = QTimer(self)
         timer.timeout.connect(self._toggle_flash_border)
@@ -1903,14 +1915,22 @@ class TaskCard(QGraphicsObject):
             return False
 
         timer = self.flash_toggle_timer
-        if timer is None:
-            raise RuntimeError(f"卡片 {self.card_id} 缺少关系闪烁定时器")
-        timer.stop()
+        if timer is not None:
+            try:
+                timer.stop()
+            except (RuntimeError, TypeError):
+                pass
         self._is_flashing = False
         self._flash_border_on = False
-        self._original_border_pen_before_flash = self.state_border_pens[self.execution_state]
+        self._original_border_pen_before_flash = self.state_border_pens.get(
+            self.execution_state,
+            self.state_border_pens["idle"],
+        )
         self._current_border_pen = self._original_border_pen_before_flash
-        self.update()
+        try:
+            self.update()
+        except RuntimeError:
+            pass
         return True
 
     def _toggle_flash_border(self):
@@ -1943,4 +1963,3 @@ class TaskCard(QGraphicsObject):
 
         self.update_selection_effect(self.isSelected())
         self.update()
-

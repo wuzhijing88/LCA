@@ -20,43 +20,21 @@ from typing import Any, Dict, Optional
 from services.socket_message_utils import recv_message_with_status, send_message
 
 
-MAX_RESULT_DEPTH = 8
-MAX_RESULT_ITEMS = 2000
-MAX_RESULT_TEXT = 1024 * 1024
-
-
 class ExternalComponentWorkerError(RuntimeError):
     pass
 
 
-_TYPE_ALIASES = {
-    "进程": "process",
-    "程序": "process",
-    "可执行文件": "process",
-    "process": "process",
-    "exe": "process",
-    "python": "python",
-    "py": "python",
-    "com": "com",
-    "activex": "com",
-    "dll": "dll",
-    "动态库": "dll",
-}
+_COMPONENT_TYPES = {"process", "python", "com", "dll"}
 
 _CTYPES = {
     "void": None,
-    "空": None,
     "bool": ctypes.c_bool,
-    "boolean": ctypes.c_bool,
     "int8": ctypes.c_int8,
     "uint8": ctypes.c_uint8,
-    "byte": ctypes.c_ubyte,
     "int16": ctypes.c_int16,
     "uint16": ctypes.c_uint16,
     "int32": ctypes.c_int32,
-    "int": ctypes.c_int32,
     "uint32": ctypes.c_uint32,
-    "uint": ctypes.c_uint32,
     "long": ctypes.c_long,
     "ulong": ctypes.c_ulong,
     "int64": ctypes.c_int64,
@@ -64,18 +42,10 @@ _CTYPES = {
     "float": ctypes.c_float,
     "double": ctypes.c_double,
     "str": ctypes.c_char_p,
-    "string": ctypes.c_char_p,
-    "字符串": ctypes.c_char_p,
     "wstr": ctypes.c_wchar_p,
-    "wstring": ctypes.c_wchar_p,
-    "宽字符串": ctypes.c_wchar_p,
     "bytes": ctypes.c_char_p,
-    "字节": ctypes.c_char_p,
     "ptr": ctypes.c_void_p,
-    "pointer": ctypes.c_void_p,
-    "指针": ctypes.c_void_p,
     "handle": ctypes.c_void_p,
-    "句柄": ctypes.c_void_p,
     "size_t": ctypes.c_size_t,
     "ssize_t": ctypes.c_ssize_t,
 }
@@ -83,14 +53,13 @@ _CTYPES = {
 
 def normalize_component_type(value: Any) -> str:
     key = str(value or "").strip().lower()
-    kind = _TYPE_ALIASES.get(key)
-    if not kind:
+    if key not in _COMPONENT_TYPES:
         raise ExternalComponentWorkerError(f"不支持的组件类型: {value}")
-    return kind
+    return key
 
 
 def resolve_ctype(value: Any, *, allow_void: bool = True):
-    key = str(value or "int32").strip().lower()
+    key = str(value).strip().lower()
     if key not in _CTYPES:
         raise ExternalComponentWorkerError(f"不支持的 DLL 类型: {value}")
     resolved = _CTYPES[key]
@@ -100,10 +69,13 @@ def resolve_ctype(value: Any, *, allow_void: bool = True):
 
 
 def parse_arg_types(value: Any) -> list[str]:
-    if value is None or value == "":
+    if value is None:
         return []
     if isinstance(value, str):
-        return [part.strip() for part in value.split(",") if part.strip()]
+        parts = [part.strip() for part in value.split(",")]
+        if not all(parts):
+            raise ExternalComponentWorkerError("参数类型不能包含空项")
+        return parts
     if isinstance(value, (list, tuple)):
         return [str(part).strip() for part in value]
     raise ExternalComponentWorkerError("参数类型请写成列表或逗号分隔文字")
@@ -153,30 +125,33 @@ def _pe_architecture(path: str) -> str:
     return {0x014C: "x86", 0x8664: "x64", 0xAA64: "arm64"}.get(machine, hex(machine))
 
 
-def normalize_result(value: Any, *, depth: int = 0) -> Any:
-    if depth > MAX_RESULT_DEPTH:
-        return repr(value)[:MAX_RESULT_TEXT]
+def normalize_result(value: Any, *, _seen: Optional[set[int]] = None) -> Any:
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
-        if isinstance(value, str) and len(value) > MAX_RESULT_TEXT:
-            return value[:MAX_RESULT_TEXT]
-        if isinstance(value, bytes) and len(value) > MAX_RESULT_TEXT:
-            return value[:MAX_RESULT_TEXT]
         return value
     if isinstance(value, Path):
         return str(value)
+    seen = _seen if _seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return repr(value)
+    seen.add(identity)
     if isinstance(value, dict):
-        return {
-            str(key): normalize_result(item, depth=depth + 1)
-            for key, item in list(value.items())[:MAX_RESULT_ITEMS]
-        }
+        result = {str(key): normalize_result(item, _seen=seen) for key, item in value.items()}
+        seen.remove(identity)
+        return result
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [normalize_result(item, depth=depth + 1) for item in list(value)[:MAX_RESULT_ITEMS]]
+        result = [normalize_result(item, _seen=seen) for item in value]
+        seen.remove(identity)
+        return result
     if hasattr(value, "value"):
         try:
-            return normalize_result(value.value, depth=depth + 1)
+            result = normalize_result(value.value, _seen=seen)
+            seen.remove(identity)
+            return result
         except Exception:
             pass
-    return repr(value)[:MAX_RESULT_TEXT]
+    seen.remove(identity)
+    return repr(value)
 
 
 class ComponentRegistry:
@@ -190,6 +165,9 @@ class ComponentRegistry:
             raise ExternalComponentWorkerError("缺少组件入口")
         settings = dict(options or {})
         component: Any
+        allowed = {"calling_convention"} if component_type == "dll" else set()
+        if set(settings).difference(allowed):
+            raise ExternalComponentWorkerError("调用约定只适用于 DLL 组件")
 
         if component_type == "process":
             component = entry
@@ -201,7 +179,12 @@ class ComponentRegistry:
                     raise ExternalComponentWorkerError(f"无法加载 Python 文件: {entry}")
                 component = importlib.util.module_from_spec(spec)
                 sys.modules[module_name] = component
-                spec.loader.exec_module(component)
+                try:
+                    spec.loader.exec_module(component)
+                except BaseException:
+                    sys.modules.pop(module_name, None)
+                    raise
+                settings["module_name"] = module_name
             else:
                 component = importlib.import_module(entry)
         elif component_type == "com":
@@ -211,15 +194,8 @@ class ComponentRegistry:
                 import win32com.client
 
                 component = win32com.client.Dispatch(entry)
-            except Exception as first_error:
-                try:
-                    import comtypes.client
-
-                    component = comtypes.client.CreateObject(entry, dynamic=True)
-                except Exception as second_error:
-                    raise ExternalComponentWorkerError(
-                        f"COM 组件加载失败: {second_error or first_error}"
-                    ) from second_error
+            except Exception as exc:
+                raise ExternalComponentWorkerError(f"COM 组件加载失败: {exc}") from exc
         else:
             absolute_entry = os.path.abspath(entry)
             file_entry = absolute_entry if os.path.isfile(absolute_entry) else ""
@@ -230,18 +206,23 @@ class ComponentRegistry:
                 raise ExternalComponentWorkerError(
                     f"DLL 位数不匹配: 组件={architecture}，当前宿主={host_architecture}；请使用对应位数的组件宿主"
                 )
-            convention = str(settings.get("calling_convention") or settings.get("调用约定") or "cdecl").strip().lower()
+            convention = str(settings.get("calling_convention", "cdecl")).strip().lower()
+            if convention not in {"cdecl", "stdcall"}:
+                raise ExternalComponentWorkerError(f"不支持的调用约定: {convention}")
             dll_directory = None
             if file_entry and os.name == "nt" and callable(getattr(os, "add_dll_directory", None)):
                 dll_directory = os.add_dll_directory(os.path.dirname(file_entry))
-            if convention in {"stdcall", "winapi", "windows"}:
-                if os.name != "nt":
-                    raise ExternalComponentWorkerError("stdcall DLL 仅支持 Windows")
-                component = ctypes.WinDLL(load_entry, use_last_error=True)
-            elif convention == "cdecl":
-                component = ctypes.CDLL(load_entry, use_errno=True)
-            else:
-                raise ExternalComponentWorkerError(f"不支持的调用约定: {convention}")
+            try:
+                if convention == "stdcall":
+                    if os.name != "nt":
+                        raise ExternalComponentWorkerError("stdcall DLL 仅支持 Windows")
+                    component = ctypes.WinDLL(load_entry, use_last_error=True)
+                else:
+                    component = ctypes.CDLL(load_entry, use_errno=True)
+            except BaseException:
+                if dll_directory is not None:
+                    dll_directory.close()
+                raise
             settings["calling_convention"] = convention
             settings["dll_directory"] = dll_directory
 
@@ -275,6 +256,24 @@ class ComponentRegistry:
         named = dict(kwargs or {})
         settings = dict(options or {})
 
+        action = str(settings.get("action", "call")).strip().lower()
+        if action not in {"call", "get", "set"}:
+            raise ExternalComponentWorkerError(f"不支持的调用动作: {action}")
+        if action != "call" and component_type not in {"python", "com"}:
+            raise ExternalComponentWorkerError("属性读取和写入只支持 Python 或 COM 组件")
+        allowed = {"action", "call_timeout"}
+        if component_type == "process":
+            allowed.update({"process_timeout", "stdin", "cwd", "env", "encoding"})
+            if str(member or "").strip() or named:
+                raise ExternalComponentWorkerError("进程组件不支持方法名或关键字参数")
+        elif component_type == "dll":
+            allowed.update({"arg_types", "return_type"})
+            if named:
+                raise ExternalComponentWorkerError("DLL 组件不支持关键字参数")
+        unsupported = sorted(set(settings).difference(allowed))
+        if unsupported:
+            raise ExternalComponentWorkerError(f"{component_type} 组件不支持选项: {'、'.join(unsupported)}")
+
         if component_type == "process":
             return self._run_process(component["object"], values, settings)
         if component_type == "dll":
@@ -286,12 +285,11 @@ class ComponentRegistry:
                     f"DLL 参数数量与参数类型不一致: {len(values)} != {len(arg_type_names)}"
                 )
             function.argtypes = [resolve_ctype(item, allow_void=False) for item in arg_type_names]
-            function.restype = resolve_ctype(settings.get("return_type") or "int32")
+            function.restype = resolve_ctype(settings.get("return_type", "int32"))
             converted = [_convert_dll_arg(value, arg_type_names[index]) for index, value in enumerate(values)]
             return function(*converted)
 
         owner, name = _resolve_member(component["object"], str(member or ""))
-        action = str(settings.get("action") or "call").strip().lower()
         if action == "get":
             if values or named:
                 raise ExternalComponentWorkerError("读取属性时不能传入参数")
@@ -320,8 +318,13 @@ class ComponentRegistry:
                 raise ExternalComponentWorkerError("进程环境变量必须是字典")
             env = os.environ.copy()
             env.update({str(key): str(value) for key, value in env_updates.items()})
-        encoding = str(settings.get("encoding") or "utf-8")
-        timeout = max(0.1, float(settings.get("process_timeout") or 30.0))
+        encoding = str(settings.get("encoding", "utf-8"))
+        import codecs
+
+        codecs.lookup(encoding)
+        from task_workflow.script_parameters import finite_seconds
+
+        timeout = finite_seconds(settings.get("process_timeout", settings.get("call_timeout", 30.0)), "进程超时", positive=True)
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         process = subprocess.Popen(
             command,
@@ -343,10 +346,19 @@ class ComponentRegistry:
 
             terminate_process_tree(process, wait_timeout=2.0, force=True)
             raise ExternalComponentWorkerError(f"外部进程执行超时: {timeout:g} 秒") from exc
+        except BaseException:
+            from app_core.runtime.process_tree import terminate_process_tree
+
+            terminate_process_tree(process, wait_timeout=2.0, force=True)
+            raise
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
         return {
             "exit_code": int(process.returncode or 0),
-            "stdout": str(stdout or "")[:MAX_RESULT_TEXT],
-            "stderr": str(stderr or "")[:MAX_RESULT_TEXT],
+            "stdout": str(stdout or ""),
+            "stderr": str(stderr or ""),
             "pid": int(process.pid or 0),
         }
 
@@ -355,25 +367,42 @@ class ComponentRegistry:
             count = len(self._components)
             components = list(self._components.values())
             self._components.clear()
+            errors = []
             for component in components:
-                directory = component.get("options", {}).get("dll_directory")
-                if directory is not None:
-                    try:
-                        directory.close()
-                    except Exception:
-                        pass
+                try:
+                    self._release_component(component)
+                except Exception as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise ExternalComponentWorkerError("组件释放失败：" + "；".join(errors))
             return count
         key = str(handle).strip()
         component = self._components.pop(key, None)
         if component is None:
             raise ExternalComponentWorkerError("组件句柄不存在或已经关闭")
-        directory = component.get("options", {}).get("dll_directory")
-        if directory is not None:
-            try:
-                directory.close()
-            except Exception:
-                pass
+        self._release_component(component)
         return 1
+
+    @staticmethod
+    def _release_component(component: Dict[str, Any]) -> None:
+        options = component.get("options", {})
+        module_name = options.get("module_name")
+        if module_name:
+            sys.modules.pop(module_name, None)
+        instance = component.pop("object")
+        directory = options.get("dll_directory")
+        try:
+            if component["type"] == "dll":
+                import _ctypes
+
+                if os.name == "nt":
+                    _ctypes.FreeLibrary(instance._handle)
+                else:
+                    _ctypes.dlclose(instance._handle)
+                instance._handle = 0
+        finally:
+            if directory is not None:
+                directory.close()
 
 
 def _response(request_id: Any, *, success: bool, **payload: Any) -> Dict[str, Any]:
@@ -390,7 +419,7 @@ def run_external_component_worker_standalone(port: int, token: str) -> int:
         if not send_message(sock, {"type": "ready", "token": str(token), "pid": os.getpid()}):
             return 3
         while True:
-            message, status = recv_message_with_status(sock, timeout=60.0)
+            message, status = recv_message_with_status(sock, timeout=60.0, max_message_bytes=0xFFFFFFFF)
             if status == "timeout":
                 continue
             if status != "ok" or message is None:
@@ -429,11 +458,10 @@ def run_external_component_worker_standalone(port: int, token: str) -> int:
                 if not send_message(sock, _response(request_id, success=False, error=error, details=details)):
                     return 5
     finally:
-        registry.close()
         try:
+            registry.close()
+        finally:
             sock.close()
-        except OSError:
-            pass
 
 
 def main(argv: Optional[list[str]] = None) -> int:

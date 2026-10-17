@@ -10,6 +10,7 @@ import time
 import copy
 import threading
 import numpy as np
+import cv2
 from typing import Dict, Any, Optional, Tuple, List
 from tasks.task_utils import (
     get_recorded_region_binding_mismatch_detail,
@@ -255,7 +256,7 @@ def _align_window_image_to_client_area(
     diag_prefix: str = "",
 ) -> Optional[np.ndarray]:
     """
-    统一对齐截图到客户区，保证测试与执行使用同一裁剪规则。
+    统一对齐截图到客户区坐标空间，保证测试与执行使用同一像素映射。
     """
     if window_image is None or target_hwnd is None or not PYWIN32_AVAILABLE:
         return window_image
@@ -266,14 +267,31 @@ def _align_window_image_to_client_area(
         client_w_logical = int(client_rect[2] - client_rect[0])
         client_h_logical = int(client_rect[3] - client_rect[1])
 
+        # GetClientRect 的宽高和点击链路使用的是同一客户区坐标空间。
+        # 优先用客户区两个端点的屏幕跨度，兼容线程 DPI 感知级别与窗口 DPI 不同的情况。
+        client_w = client_w_logical
+        client_h = client_h_logical
+        try:
+            client_start = win32gui.ClientToScreen(int(target_hwnd), (0, 0))
+            client_end = win32gui.ClientToScreen(
+                int(target_hwnd), (client_w_logical, client_h_logical)
+            )
+            span_w = int(client_end[0]) - int(client_start[0])
+            span_h = int(client_end[1]) - int(client_start[1])
+            if span_w > 0 and span_h > 0:
+                client_w = span_w
+                client_h = span_h
+        except Exception:
+            pass
+
         if diag_prefix:
             logger.info(f"{diag_prefix} WGC截图尺寸: {width} x {height}")
-            logger.info(f"{diag_prefix} GetClientRect尺寸: {client_w_logical} x {client_h_logical}")
+            logger.info(f"{diag_prefix} 客户区坐标尺寸: {client_w} x {client_h}")
 
-        if client_w_logical <= 0 or client_h_logical <= 0:
+        if client_w <= 0 or client_h <= 0:
             return window_image
 
-        if width == client_w_logical and height == client_h_logical:
+        if width == client_w and height == client_h:
             if diag_prefix:
                 logger.info(f"{diag_prefix} ✓ 截图尺寸与客户区一致")
             return window_image
@@ -281,24 +299,49 @@ def _align_window_image_to_client_area(
         if diag_prefix:
             logger.warning(
                 f"{diag_prefix} 截图尺寸与客户区不一致！差异: "
-                f"Δw={width - client_w_logical}, Δh={height - client_h_logical}"
+                f"Δw={width - client_w}, Δh={height - client_h}"
             )
 
-        if width > client_w_logical or height > client_h_logical:
-            wgc_offset_x = max(0, (width - client_w_logical) // 2)
-            wgc_offset_y = max(0, height - client_h_logical)
-            end_x = min(width, wgc_offset_x + client_w_logical)
-            end_y = min(height, wgc_offset_y + client_h_logical)
-
-            if diag_prefix:
-                logger.info(f"{diag_prefix} 计算偏移: X={wgc_offset_x}, Y={wgc_offset_y}")
-
-            if end_x > wgc_offset_x and end_y > wgc_offset_y:
-                cropped = window_image[wgc_offset_y:end_y, wgc_offset_x:end_x]
+        # 截图池要求 client_area_only=True，返回帧本身就是客户区；尺寸差异通常来自
+        # DPI/引擎像素比例。直接缩放到点击坐标空间，不能按中心或底部裁剪，
+        # 否则 OCR 框会指向截图中的另一处文字。
+        scale_x = float(width) / float(client_w)
+        scale_y = float(height) / float(client_h)
+        # 仅当宽高比例明显不同，才认为调用方误传了整窗帧；保留已有的整窗裁剪规则。
+        # 等比例差异属于 DPI 缩放，必须整幅缩放，不能截掉右侧或底部内容。
+        if width >= client_w and height >= client_h and abs(scale_x - scale_y) > 0.05:
+            crop_x = max(0, (width - client_w) // 2)
+            crop_y = max(0, height - client_h)
+            end_x = min(width, crop_x + client_w)
+            end_y = min(height, crop_y + client_h)
+            if end_x > crop_x and end_y > crop_y:
+                cropped = window_image[crop_y:end_y, crop_x:end_x]
                 if cropped is not None and cropped.size > 0:
                     if diag_prefix:
-                        logger.info(f"{diag_prefix} 已裁剪到客户区: {cropped.shape[1]} x {cropped.shape[0]}")
-                    return cropped
+                        logger.info(
+                            f"{diag_prefix} 检测到整窗帧，裁剪客户区: "
+                            f"({crop_x},{crop_y}) {cropped.shape[1]}x{cropped.shape[0]}"
+                        )
+                    if cropped.shape[1] == client_w and cropped.shape[0] == client_h:
+                        return cropped
+                    window_image = cropped
+                    height, width = cropped.shape[:2]
+                    scale_x = float(width) / float(client_w)
+                    scale_y = float(height) / float(client_h)
+        if width > 0 and height > 0:
+            normalized = cv2.resize(
+                window_image,
+                (int(client_w), int(client_h)),
+                interpolation=cv2.INTER_AREA if (scale_x > 1.0 or scale_y > 1.0) else cv2.INTER_LINEAR,
+            )
+            if normalized is not None and normalized.size > 0:
+                if diag_prefix:
+                    logger.info(
+                        f"{diag_prefix} 已按客户区坐标归一化: "
+                        f"{width}x{height} -> {client_w}x{client_h} "
+                        f"(缩放={scale_x:.4f}x{scale_y:.4f})"
+                    )
+                return normalized
 
     except Exception as e:
         if diag_prefix:
@@ -1549,7 +1592,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "min": 0.1,  # 最小100ms，防止设置为0导致CPU和内存压力
             "max": 5.0,
             "step": 0.1,
-            "tooltip": "【关键】选择'继续执行本步骤'时的工作流级重试间隔\n• 0.5秒=推荐（防止内存泄露）\n• 0.1-0.3秒=快速但可能导致内存压力\n• >1秒=降低CPU和内存占用\n\n[警告] 设置过小可能导致一分钟内闪退!"
+            "tooltip": "选择'继续执行本步骤'时的工作流级重试间隔。间隔越短，识别调用越频繁，CPU和内存压力可能越高；请按识别速度和响应需求设置。"
         },
 
 
@@ -1558,8 +1601,8 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
         "enable_next_step_delay": {
             "label": "启用下一步延迟执行",
             "type": "bool",
-            "default": True,  # 【关键】OCR卡片默认开启延迟，防止连续OCR导致闪退
-            "tooltip": "【推荐开启】执行完OCR后等待指定时间再执行下一步\n\n开启可防止连续OCR任务导致程序闪退"
+            "default": True,
+            "tooltip": "执行完OCR后等待指定时间再执行下一步，用于控制连续识别频率。延迟不能替代识别资源的正确释放。"
         },
         "delay_mode": {
             "label": "延迟模式",

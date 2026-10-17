@@ -327,6 +327,7 @@ class MultiProcessOCRPool:
 
         # 清理线程
         self._cleanup_thread = None
+        self._cleanup_stop_event = threading.Event()
         self._cleanup_interval = _read_float_env('OCR_POOL_CLEANUP_INTERVAL_SEC', 2.0, 1.0, 60.0)
         self._process_timeout = _read_float_env('OCR_POOL_PROCESS_IDLE_TIMEOUT_SEC', 10.0, 5.0, 3600.0)
         self._process_ready_timeout = _read_float_env('OCR_POOL_PROCESS_READY_TIMEOUT_SEC', 10.0, 1.0, 60.0)
@@ -360,9 +361,8 @@ class MultiProcessOCRPool:
     def _start_cleanup_thread(self):
         """启动清理线程"""
         def cleanup_worker():
-            while self._running:
+            while not self._cleanup_stop_event.wait(self._cleanup_interval):
                 try:
-                    time.sleep(self._cleanup_interval)
                     if self._running:
                         with self._pool_lock:
                             self._prune_window_request_times_unlocked()
@@ -1581,8 +1581,17 @@ class MultiProcessOCRPool:
         with self._process_available:
             self._is_shutdown = True
             self._running = False
+            self._cleanup_stop_event.set()
             self._process_available.notify_all()
 
+        # 先退出清理线程，避免它与全量关闭同时回收同一进程或 socket。
+        if self._cleanup_thread is not None:
+            if self._cleanup_thread is threading.current_thread():
+                raise OCRPoolError("不能在OCR清理线程中关闭进程池")
+            self._cleanup_thread.join(timeout=5)
+            if self._cleanup_thread.is_alive():
+                raise OCRPoolError("OCR清理线程未退出，进程池关闭未完成")
+            self._cleanup_thread = None
         self.cleanup_all_processes()
 
         with self._pool_lock:
@@ -1592,10 +1601,6 @@ class MultiProcessOCRPool:
             self._window_last_request_time.clear()
             self._resource_process_mapping.clear()
             self._resource_last_used.clear()
-
-        # 等待清理线程退出
-        if self._cleanup_thread and self._cleanup_thread.is_alive():
-            self._cleanup_thread.join(timeout=2)
 
         logger.info("多进程OCR池已关闭")
 

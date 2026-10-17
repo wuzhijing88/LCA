@@ -78,13 +78,15 @@ def build_dev_player_package(
         sid = str(item.get("id") or "").strip()
         if not sid:
             continue
-        payload_scripts.append(
+        payload_item = dict(item)
+        payload_item.update(
             {
                 "id": sid,
                 "title": str(item.get("title") or sid).strip() or sid,
                 "path": str(item.get("path") or f"workflows/scripts/{sid}.json").replace("\\", "/"),
             }
         )
+        payload_scripts.append(payload_item)
     if not payload_scripts and scripts:
         for sid in scripts:
             text = str(sid or "").strip()

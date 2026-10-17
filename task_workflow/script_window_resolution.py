@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from utils.window.hwnd_utils import as_hwnd
+from task_workflow.script_parameters import boolean_parameter, integer_parameter
 
 
 class ResolutionError(ValueError):
@@ -38,14 +39,14 @@ def _is_number(value: Any) -> bool:
 
 def _as_int(value: Any, label: str) -> int:
     try:
-        number = int(value)
+        number = integer_parameter(value, label)
     except (TypeError, ValueError) as exc:
         raise ResolutionError(f"{label}必须是整数") from exc
     return number
 
 
 def parse_resolution_args(*args: Any, 报错: Any = True) -> ResolutionCall:
-    raise_on_error = bool(报错)
+    raise_on_error = boolean_parameter(报错, "报错")
     if len(args) == 1 and _is_number(args[0]):
         raise ResolutionError("单独一个数字不允许，宽高请成对写，序号请放在第三个位置或列表里")
     if len(args) == 0:
@@ -130,9 +131,9 @@ def _match_one(windows: Sequence[Dict[str, Any]], current_hwnd: Any, item: Any) 
         return [_match_index(windows, _as_int(item, "序号"))]
     if isinstance(item, str):
         text = item.strip()
-        if text in {"当前", "current"}:
+        if text == "当前":
             return [_match_current(windows, current_hwnd)]
-        if text in {"全部", "所有", "all"}:
+        if text == "全部":
             if not windows:
                 raise ResolutionError("没有可调整的绑定窗口")
             return list(windows)

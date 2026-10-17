@@ -41,6 +41,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid
+
+from ui.dialogs.dialog_manager import exec_dialog, get_dialog_manager, retire_dialog
 
 from app_core.ai_assistant import (
     AI_IMAGE_MIMES,
@@ -119,15 +122,24 @@ class _AIWorker(QThread):
         self._messages = messages
 
     def run(self) -> None:
+        def progress(message):
+            if self.isInterruptionRequested():
+                raise InterruptedError("AI 请求已取消")
+            self.progressed.emit(message)
+
         try:
+            if self.isInterruptionRequested():
+                return
             text, thinking = complete_ai_chat(
                 self._config,
                 self._messages,
-                progress=self.progressed.emit,
+                progress=progress,
             )
-            self.completed.emit(text, thinking)
+            if not self.isInterruptionRequested():
+                self.completed.emit(text, thinking)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            if not self.isInterruptionRequested():
+                self.failed.emit(str(exc))
 
 
 class _AIPromptEnterFilter(QObject):
@@ -343,22 +355,12 @@ class AIImagePreviewDialog(QDialog):
         apply_native_window_corners(self)
 
     def _register_theme_callback(self) -> None:
-        try:
-            from themes import get_theme_manager
+        from themes import get_theme_manager
 
-            get_theme_manager().register_theme_change_callback(self._on_theme_changed)
-        except Exception:
-            return
-
-        def _forget(_=None, callback=self._on_theme_changed) -> None:
-            try:
-                from themes import get_theme_manager
-
-                get_theme_manager().unregister_theme_change_callback(callback)
-            except Exception:
-                pass
-
-        self.destroyed.connect(_forget)
+        manager = get_theme_manager()
+        callback = self._on_theme_changed
+        manager.register_theme_change_callback(callback)
+        self.destroyed.connect(lambda: manager.unregister_theme_change_callback(callback))
 
     def _on_theme_changed(self, _theme=None) -> None:
         widgets = [self, *self.findChildren(QWidget)]
@@ -371,40 +373,19 @@ class AIImagePreviewDialog(QDialog):
 
 
 def _widget_alive(widget) -> bool:
-    if widget is None:
-        return False
-    try:
-        from shiboken6 import isValid
-
-        return bool(isValid(widget))
-    except Exception:
-        try:
-            widget.objectName()
-            return True
-        except RuntimeError:
-            return False
+    return widget is not None and isValid(widget)
 
 
 def open_ai_assistant_dialog(main_window):
-    existing = getattr(main_window, "_ai_assistant_dialog", None) if main_window is not None else None
-    if _widget_alive(existing):
-        existing.refresh_for_main_window(main_window)
-        show_and_raise_widget(existing, log_prefix="AI 助手")
-        existing.activateWindow()
-        return existing
-    dialog = AIAssistantDialog(main_window)
-    if main_window is not None:
-        main_window._ai_assistant_dialog = dialog
+    def present(dialog):
+        dialog.refresh_for_main_window(main_window)
+        show_and_raise_widget(dialog, log_prefix="AI 助手")
+        dialog.activateWindow()
 
-        def _forget(_result=0, window=main_window, assistant=dialog) -> None:
-            if getattr(window, "_ai_assistant_dialog", None) is assistant:
-                window._ai_assistant_dialog = None
-
-        dialog.finished.connect(_forget)
-    dialog.show()
-    dialog.raise_()
-    dialog.activateWindow()
-    return dialog
+    return get_dialog_manager(main_window).show(
+        "ai_assistant", lambda: AIAssistantDialog(main_window),
+        present=present, dispose=lambda dialog: dialog.request_delete(),
+    )
 
 
 class AIAssistantDialog(QDialog):
@@ -476,10 +457,17 @@ class AIAssistantDialog(QDialog):
         self.settings_button.setCheckable(True)
         self.settings_button.setChecked(self._load_settings_visible())
         self.settings_button.clicked.connect(self._toggle_settings)
+        self.get_button = QPushButton("获取API")
+        self.get_button.setObjectName("aiAssistantGetButton")
+        self.get_button.clicked.connect(self._open_product_website)
         row.addWidget(title)
         row.addStretch(1)
+        row.addWidget(self.get_button)
         row.addWidget(self.settings_button)
         return row
+
+    def _open_product_website(self) -> None:
+        QDesktopServices.openUrl(QUrl("https://lcaa.xyz/"))
 
     def _build_settings_panel(self) -> QWidget:
         panel = QWidget()
@@ -605,22 +593,12 @@ class AIAssistantDialog(QDialog):
         return panel
 
     def _register_theme_callback(self) -> None:
-        try:
-            from themes import get_theme_manager
+        from themes import get_theme_manager
 
-            get_theme_manager().register_theme_change_callback(self._on_theme_changed)
-        except Exception:
-            return
-
-        def _forget(_=None, callback=self._on_theme_changed) -> None:
-            try:
-                from themes import get_theme_manager
-
-                get_theme_manager().unregister_theme_change_callback(callback)
-            except Exception:
-                pass
-
-        self.destroyed.connect(_forget)
+        manager = get_theme_manager()
+        callback = self._on_theme_changed
+        manager.register_theme_change_callback(callback)
+        self.destroyed.connect(lambda: manager.unregister_theme_change_callback(callback))
 
     def _on_theme_changed(self, _theme=None) -> None:
         widgets = [self, *self.findChildren(QWidget)]
@@ -631,11 +609,28 @@ class AIAssistantDialog(QDialog):
             widget.update()
         self._render_chat()
 
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def done(self, result) -> None:
         self._persist_sessions()
         self._save_provider_from_form()
         self._save_window_state()
-        super().closeEvent(event)
+        super().done(result)
+
+    def request_delete(self):
+        """关闭立即解绑 UI，网络请求收尾前保留工作线程的 Qt 父对象。"""
+        if self._image_preview is not None:
+            self._image_preview.close()
+            self._image_preview = None
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.requestInterruption()
+            for signal, slot in (
+                (worker.completed, self._on_reply),
+                (worker.failed, self._on_reply_failed),
+                (worker.progressed, self._on_reply_progress),
+                (worker.finished, self._on_reply_finished),
+            ):
+                signal.disconnect(slot)
+        retire_dialog(self, (worker,))
 
     def _load_settings_visible(self) -> bool:
         try:
@@ -817,24 +812,19 @@ class AIAssistantDialog(QDialog):
         if pixmap.isNull():
             QMessageBox.warning(self, "无法打开图片", "找不到图片文件。")
             return
-        existing = self._image_preview
-        if _widget_alive(existing):
-            existing.load_pixmap(pixmap)
-            existing.image_view.fit_image()
-            show_and_raise_widget(existing, log_prefix="图片")
-            existing.activateWindow()
-            return
-        dialog = AIImagePreviewDialog(pixmap, self)
-        self._image_preview = dialog
+        def present(dialog):
+            dialog.load_pixmap(pixmap)
+            dialog.image_view.fit_image()
+            show_and_raise_widget(dialog, log_prefix="图片")
+            dialog.activateWindow()
 
-        def _forget(_result=0, window=self, preview=dialog) -> None:
-            if getattr(window, "_image_preview", None) is preview:
-                window._image_preview = None
+        def forget(_dialog, _result):
+            self._image_preview = None
 
-        dialog.finished.connect(_forget)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
+        self._image_preview = get_dialog_manager(self).show(
+            "image_preview", lambda: AIImagePreviewDialog(pixmap, self),
+            present=present, on_finished=forget,
+        )
 
     def _apply_workflow_payload(self, index: int) -> None:
         if index < 0 or index >= len(self._copy_payloads):
@@ -849,13 +839,12 @@ class AIAssistantDialog(QDialog):
             return
         uploaded_files = latest_user_files(self._current_session())
         source_workflow = None
-        confirm = f"把这份修正写入当前正在编辑的工作流？共 {len(ops)} 项操作。此操作可撤销。"
+        confirm = f"是否覆盖当前正在编辑的工作流？共 {len(ops)} 项操作。"
         if uploaded_files:
             source_name = str(uploaded_files[0].get("name") or "工作流文件")
             confirm = (
-                f"把这份修正按上传的「{source_name}」写入当前正在编辑的工作流？"
-                f"共 {len(ops)} 项操作。当前画布会被替换成修正后的结果。"
-                "此操作可撤销，不会改磁盘上的原文件。"
+                f"按上传的「{source_name}」生成修正结果，是否覆盖当前正在编辑的工作流？"
+                f"共 {len(ops)} 项操作。不会改磁盘上的原文件。"
             )
             try:
                 source_workflow = uploaded_workflow_for_apply(uploaded_files)
@@ -863,29 +852,50 @@ class AIAssistantDialog(QDialog):
                 QMessageBox.warning(self, "无法应用", str(exc))
                 self._set_status(str(exc))
                 return
-        choice = QMessageBox.question(
-            self,
-            "应用工作流",
-            confirm,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if choice != QMessageBox.StandardButton.Yes:
+        mode = self._choose_workflow_apply_mode(confirm)
+        if mode is None:
             return
         try:
             result = apply_editor_workflow(
                 self.main_window,
                 body,
                 source_workflow=source_workflow,
+                mode=mode,
             )
         except Exception as exc:
             QMessageBox.warning(self, "应用失败", str(exc))
             self._set_status(str(exc))
             return
         self._set_status(
-            f"已应用到当前工作流：{result['ops']} 项操作，"
+            f"{'已覆盖当前工作流' if mode == 'replace' else '已保留原卡片并新增 AI 卡片'}：{result['ops']} 项操作，"
             f"现在有 {result['cards']} 张卡片、{result['connections']} 条连线。"
         )
+
+    def _choose_workflow_apply_mode(self, confirm: str) -> Optional[str]:
+        box = QMessageBox(self)
+        box.setWindowTitle("应用工作流")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(confirm)
+        box.setInformativeText(
+            "覆盖：用 AI 结果替换当前画布。\n"
+            "保留并新增：保留原卡片和连线，在旁边新增 AI 卡片。\n"
+            "两种方式均可撤销。"
+        )
+        replace_button = box.addButton("覆盖当前工作流", QMessageBox.ButtonRole.YesRole)
+        append_button = box.addButton("保留并新增", QMessageBox.ButtonRole.NoRole)
+        cancel_button = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+
+        def read_result(_result):
+            clicked = box.clickedButton()
+            if clicked is replace_button:
+                return "replace"
+            if clicked is append_button:
+                return "append"
+            return None
+
+        return exec_dialog(box, read_result=read_result)
 
     def _download_workflow_payload(self, index: int) -> None:
         if index < 0 or index >= len(self._copy_payloads):
@@ -1018,6 +1028,7 @@ class AIAssistantDialog(QDialog):
             self.file_button,
             self.file_strip,
             self.session_list,
+            self.get_button,
             self.settings_button,
             self.review_button,
             *self._session_buttons,

@@ -110,10 +110,10 @@ class WindowHandleManager:
                 del self._invalid_windows[key]
                 logger.debug(f"清除失效窗口记录: {key}")
     
-    def remove_update_callback(self, key: str):
+    def remove_update_callback(self, key: str, *, callback=None):
         """移除窗口句柄更新回调"""
         with self._lock:
-            if key in self._update_callbacks:
+            if key in self._update_callbacks and (callback is None or self._update_callbacks[key] is callback):
                 del self._update_callbacks[key]
                 logger.debug(f"移除窗口句柄更新回调: {key}")
     
@@ -121,6 +121,8 @@ class WindowHandleManager:
         """开始监控窗口句柄变化"""
         if self._monitoring:
             return
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            raise RuntimeError("上一次窗口监控线程尚未退出，不能重新启动")
         
         self._monitoring = True
         self._monitor_stop_event.clear()
@@ -145,7 +147,11 @@ class WindowHandleManager:
         self._monitoring = False
         self._monitor_stop_event.set()
         if self._monitor_thread:
+            if self._monitor_thread is threading.current_thread():
+                raise RuntimeError("不能在窗口监控线程中等待自身退出")
             self._monitor_thread.join(timeout=2.0)
+            if self._monitor_thread.is_alive():
+                raise RuntimeError("窗口监控线程未退出，停止监控未完成")
             self._monitor_thread = None
         logger.info("停止窗口句柄监控")
 

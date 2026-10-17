@@ -42,6 +42,11 @@ _standalone_exit_code = run_standalone_subprocess(sys.argv, STANDALONE_SUBPROCES
 if _standalone_exit_code is not None:
     sys.exit(_standalone_exit_code)
 
+if "--child-session-exit-watch" in sys.argv:
+    from utils.child_session.exit_watch import run_exit_watch
+
+    sys.exit(run_exit_watch(sys.argv))
+
 # --- 独立播放器隔离 ---
 _PLAYER_PACKAGE_DIR = None
 _PLAYER_STARTUP_ERROR = None
@@ -116,6 +121,13 @@ register_global_resource_cleanup()
 
 # --- 多开实例槽位与配置加载 ---
 if not _IS_SUBPROCESS:
+    try:
+        from utils.child_session.runtime import apply_child_session_launch_args
+
+        apply_child_session_launch_args(sys.argv)
+    except Exception as child_session_argv_error:
+        logging.error("桌面分身启动参数无效: %s", child_session_argv_error)
+        raise
     try:
         from utils.instance_runtime import claim_instance_slot, release_instance_slot
         import atexit

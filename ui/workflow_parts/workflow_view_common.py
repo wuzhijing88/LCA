@@ -27,18 +27,6 @@ logger = logging.getLogger(__name__) # <<< ADDED: Define module-level logger
 from ui.widgets.no_wheel_spinbox import NoWheelDoubleSpinBox, NoWheelSpinBox  # noqa: E402,F401
 
 
-class TempConnectionLine(QGraphicsPathItem):
-    """Temporary drag line with local antialiasing to reduce jagged edges."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setBrush(Qt.BrushStyle.NoBrush)
-
-    def paint(self, painter, option, widget=None):
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        super().paint(painter, option, widget)
-        painter.restore()
-
 # --- MOVED TaskCard import earlier for Signal definition ---
 from ..workflow_parts.task_card import TaskCard, PORT_TYPES # Import TaskCard and PORT_TYPES
 # ----------------------------------------------------------

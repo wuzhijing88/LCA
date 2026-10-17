@@ -402,12 +402,9 @@ def install_window_controls(
     dark: Optional[bool] = None,
 ) -> PlayerWindowControls:
     if dark is None:
-        try:
-            from themes import get_theme_manager
+        from themes import get_theme_manager
 
-            dark = get_theme_manager().is_dark_mode()
-        except Exception:
-            dark = False
+        dark = get_theme_manager().is_dark_mode()
     controls = PlayerWindowControls(host, show_minimize=show_minimize, dark=bool(dark))
     if on_minimize is not None:
         controls.minimize_clicked.connect(on_minimize)
@@ -419,7 +416,7 @@ def install_window_controls(
     # 布局完成后再贴一次，避免 host 尚未拿到最终宽度时跑偏
     from PySide6.QtCore import QTimer
 
-    QTimer.singleShot(0, lambda h=host, c=controls: c.reposition(h) if c is not None else None)
+    QTimer.singleShot(0, controls, lambda: controls.reposition(host))
     return controls
 
 

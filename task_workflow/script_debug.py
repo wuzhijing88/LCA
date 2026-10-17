@@ -23,9 +23,25 @@ class ScriptDebugController:
         self._running = False
         self._callback = event_callback
         self._started_at = 0.0
+        self._finished = False
+        self._variable_names: Optional[Set[str]] = None
 
     def set_callback(self, callback: Optional[Callable[[str, Dict[str, Any]], None]]) -> None:
         self._callback = callback
+
+    def set_variable_names(self, names: Optional[Iterable[str]]) -> None:
+        """设置脚本变量快照白名单。
+
+        ``run_script`` 的执行命名空间还包含命令、视图和运行时辅助对象；这些
+        对象不是用户变量，不能直接展示在调试面板中。未设置白名单时保留控制器
+        的通用行为，便于独立调用 ``before_line``。
+        """
+        if names is None:
+            normalized = None
+        else:
+            normalized = {str(name) for name in names if str(name) and not str(name).startswith("_")}
+        with self._condition:
+            self._variable_names = normalized
 
     def trace(self, frame, event, arg):
         """sys.settrace callback; safe to pass directly to ``sys.settrace``."""
@@ -72,17 +88,22 @@ class ScriptDebugController:
     def start(self) -> None:
         with self._condition:
             self._running, self._paused, self._step_once, self._stop = True, False, False, False
+            self._finished = False
             self._started_at = time.monotonic()
             self._condition.notify_all()
         self._emit("started", {})
 
     def pause(self) -> None:
         with self._condition:
+            if not self._running:
+                return
             self._paused = True
         self._emit("paused", {})
 
     def continue_run(self) -> None:
         with self._condition:
+            if self._finished:
+                return
             self._paused = False; self._step_once = False; self._condition.notify_all()
         self._emit("continued", {})
 
@@ -91,12 +112,19 @@ class ScriptDebugController:
 
     def step(self) -> None:
         with self._condition:
+            if self._finished:
+                return
             self._step_once = True; self._paused = False; self._condition.notify_all()
         self._emit("step", {})
 
     def stop(self) -> None:
         with self._condition:
+            was_active = self._running or self._paused
+            if self._stop and not was_active:
+                return
             self._stop = True; self._running = False; self._paused = False; self._condition.notify_all()
+        if not was_active:
+            return
         self._emit("stopped", {})
 
     def stopped(self) -> bool:
@@ -144,11 +172,13 @@ class ScriptDebugController:
                     return False
         return True
 
-    @staticmethod
-    def _snapshot_variables(locals_map: Dict[str, Any]) -> Dict[str, str]:
+    def _snapshot_variables(self, locals_map: Dict[str, Any]) -> Dict[str, str]:
+        with self._condition:
+            allowed = None if self._variable_names is None else set(self._variable_names)
         variables: Dict[str, str] = {}
         for name, value in locals_map.items():
-            if str(name).startswith("_"):
+            name_text = str(name)
+            if name_text.startswith("_") or (allowed is not None and name_text not in allowed):
                 continue
             try:
                 text = repr(value)
@@ -159,7 +189,12 @@ class ScriptDebugController:
 
     def finish(self, success: Optional[bool] = None, detail: str = "") -> None:
         with self._condition:
+            if self._finished:
+                return
             self._running = False
+            self._paused = False
+            self._step_once = False
+            self._finished = True
             payload = {"success": success, "detail": str(detail), "elapsed": max(0.0, time.monotonic() - self._started_at)}
             self._condition.notify_all()
         self._emit("finished", payload)

@@ -7,14 +7,12 @@ Interception DLL驱动模块
 import os
 import time
 import ctypes
+import math
 import logging
 import platform
 import subprocess
 import atexit
-try:
-    import winreg
-except ImportError:
-    winreg = None
+import winreg
 from threading import RLock
 from ctypes import wintypes, Structure, c_int, c_void_p, c_ushort, c_uint
 from typing import Optional, Tuple
@@ -36,10 +34,7 @@ def get_system_architecture() -> str:
         return 'x64'
     elif machine in ['i386', 'i686', 'x86']:
         return 'x86'
-    else:
-        # 默认使用64位，因为现代Windows大多是64位
-        logger.warning(f"未知系统架构: {machine}，默认使用x64")
-        return 'x64'
+    raise RuntimeError(f"不支持的系统架构：{machine!r}")
 
 # 根据架构选择DLL路径
 SYSTEM_ARCH = get_system_architecture()
@@ -217,10 +212,9 @@ class InterceptionDriver:
         self._keyboard_predicate = None
         self._mouse_predicate = None
         self._all_devices_predicate = None
-        # 保留成员以兼容旧代码路径；当前按住链路使用原子发送窗口，不再依赖预留时窗。
-        self._key_release_reserve_window = 0.0
         # 追踪按下未释放的按键，停止/退出时强制回收，避免残留按键状态。
         self._pressed_keys = set()
+        self._pressed_mouse_buttons = set()
 
     def initialize(self) -> bool:
         """初始化DLL驱动"""
@@ -310,27 +304,17 @@ class InterceptionDriver:
 
     @staticmethod
     def _read_upper_filters(class_guid: str) -> Tuple[str, ...]:
-        if winreg is None:
-            return tuple()
-
         key_path = fr"SYSTEM\CurrentControlSet\Control\Class\{class_guid}"
         try:
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
-                value, _ = winreg.QueryValueEx(key, "UpperFilters")
+                value, value_type = winreg.QueryValueEx(key, "UpperFilters")
         except FileNotFoundError:
             return tuple()
-        except OSError as e:
-            logger.warning(f"读取驱动注册表失败: {e}")
-            return tuple()
 
-        if isinstance(value, str):
-            filters = [value]
-        elif isinstance(value, (list, tuple)):
-            filters = list(value)
-        else:
-            return tuple()
+        if value_type != winreg.REG_MULTI_SZ or not isinstance(value, list):
+            raise ValueError("驱动过滤器注册表类型无效，必须是多字符串值")
 
-        return tuple(str(item).strip().lower() for item in filters if str(item).strip())
+        return tuple(item.strip().lower() for item in value if item.strip())
 
     @classmethod
     def _is_driver_registered(cls) -> bool:
@@ -628,8 +612,7 @@ class InterceptionDriver:
             )
 
         except Exception as e:
-            logger.warning(f"DPI缩放因子检测失败: {e}，使用默认值1.0")
-            self.relative_move_scale = 1.0
+            logger.error(f"DPI状态未知: {e}")
 
     def _get_process_dpi_awareness(self) -> Optional[int]:
         """获取当前进程DPI感知级别。"""
@@ -649,19 +632,6 @@ class InterceptionDriver:
         except Exception:
             pass
 
-        # 兼容旧系统
-        try:
-            user32 = ctypes.windll.user32
-            gdi32 = ctypes.windll.gdi32
-            LOGPIXELSX = 88
-            hdc = user32.GetDC(0)
-            if hdc:
-                dpi = int(gdi32.GetDeviceCaps(hdc, LOGPIXELSX))
-                user32.ReleaseDC(0, hdc)
-                if dpi > 0:
-                    return dpi
-        except Exception:
-            pass
         return None
 
     def _get_monitor_effective_dpi(self) -> Optional[int]:
@@ -692,10 +662,11 @@ class InterceptionDriver:
         """获取当前鼠标位置（像素坐标）"""
         try:
             point = wintypes.POINT()
-            ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+            if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+                raise RuntimeError("无法读取鼠标位置")
             return point.x, point.y
-        except Exception:
-            return 0, 0
+        except Exception as exc:
+            raise RuntimeError("无法读取鼠标位置") from exc
 
     def _wait_mouse_reach_target(
         self,
@@ -725,22 +696,19 @@ class InterceptionDriver:
         current_x, current_y = self._get_current_mouse_pos()
         return abs(current_x - int(target_x)) <= tolerance and abs(current_y - int(target_y)) <= tolerance
 
-    def _clip_cursor_to_point(self, target_x: int, target_y: int) -> bool:
-        """将系统光标临时限制在目标点，防止发键瞬间漂移。"""
-        tx = int(target_x)
-        ty = int(target_y)
-        rect = wintypes.RECT(tx, ty, tx + 1, ty + 1)
-        try:
-            return bool(ctypes.windll.user32.ClipCursor(ctypes.byref(rect)))
-        except Exception:
-            return False
+    def _clip_cursor_to_point(self, target_x: int, target_y: int):
+        user32 = ctypes.windll.user32
+        previous_clip = wintypes.RECT()
+        if not user32.GetClipCursor(ctypes.byref(previous_clip)):
+            return None
+        rect = wintypes.RECT(int(target_x), int(target_y), int(target_x) + 1, int(target_y) + 1)
+        if not user32.ClipCursor(ctypes.byref(rect)):
+            return None
+        return previous_clip
 
-    def _release_cursor_clip(self) -> None:
-        """释放系统光标限制。"""
-        try:
-            ctypes.windll.user32.ClipCursor(None)
-        except Exception:
-            pass
+    def _release_cursor_clip(self, previous_clip) -> None:
+        if not ctypes.windll.user32.ClipCursor(ctypes.byref(previous_clip)):
+            raise RuntimeError("无法恢复鼠标活动范围")
 
     @staticmethod
     def _is_mouse_down_state(button_state: int) -> bool:
@@ -775,46 +743,11 @@ class InterceptionDriver:
     def _is_mouse_button_pressed(self, button_state: int) -> bool:
         vk_code = self._mouse_button_vk_from_state(button_state)
         if vk_code is None:
-            return False
+            raise ValueError("不支持的鼠标按钮状态")
         try:
             return bool(ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000)
-        except Exception:
-            return False
-
-    def _prepare_button_release_for_click(
-        self,
-        down_state: int,
-        up_state: int,
-        target_x: int,
-        target_y: int,
-    ) -> None:
-        """
-        完整点击前做一次按钮状态归一化。
-        这里仅做“尽力释放”，不以系统按键状态作为失败判据，避免在游戏前台中误判。
-        """
-        tx = int(target_x)
-        ty = int(target_y)
-        if self._is_mouse_button_pressed(down_state):
-            try:
-                self._send_mouse_button_event_at_target_once(
-                    up_state,
-                    tx,
-                    ty,
-                    source="click_prepare_release",
-                    enforce_target=False,
-                )
-                _precise_sleep(0.002)
-                if self._is_mouse_button_pressed(down_state):
-                    self._send_mouse_button_event_at_target_once(
-                        up_state,
-                        tx,
-                        ty,
-                        source="click_prepare_release_retry",
-                        enforce_target=False,
-                    )
-            except Exception:
-                pass
-        _precise_sleep(_BUTTON_PRE_CLICK_RELEASE_SETTLE_SECONDS)
+        except Exception as exc:
+            raise RuntimeError("无法读取鼠标按钮状态") from exc
 
     @staticmethod
     def _is_vk_pressed(vk_code: Optional[int]) -> bool:
@@ -843,76 +776,10 @@ class InterceptionDriver:
 
     @staticmethod
     def _high_precision_hold_sleep(duration_seconds: float) -> None:
-        """高精度保持时长：粗睡眠+收口轮询，保持阶段临时提高计时精度和线程优先级。"""
-        try:
-            target_seconds = max(0.0, float(duration_seconds))
-        except Exception:
-            target_seconds = 0.0
-        if target_seconds <= 0:
-            return
-
-        timer_raised = False
-        thread_handle = None
-        has_original_priority = False
-        original_priority = 0
-        THREAD_PRIORITY_HIGHEST = 2
-        THREAD_PRIORITY_ERROR_RETURN = 2147483647
-
-        try:
-            try:
-                begin_result = ctypes.windll.winmm.timeBeginPeriod(1)
-                if int(begin_result) == 0:
-                    timer_raised = True
-            except Exception:
-                timer_raised = False
-
-            try:
-                thread_handle = ctypes.windll.kernel32.GetCurrentThread()
-                if thread_handle:
-                    current_priority = int(ctypes.windll.kernel32.GetThreadPriority(thread_handle))
-                    if current_priority != THREAD_PRIORITY_ERROR_RETURN:
-                        original_priority = current_priority
-                        has_original_priority = True
-                        if current_priority < THREAD_PRIORITY_HIGHEST:
-                            ctypes.windll.kernel32.SetThreadPriority(thread_handle, THREAD_PRIORITY_HIGHEST)
-            except Exception:
-                has_original_priority = False
-
-            end_ts = time.perf_counter() + target_seconds
-            while True:
-                remaining = end_ts - time.perf_counter()
-                if remaining <= 0:
-                    break
-
-                if remaining > 0.018:
-                    sleep_seconds = max(0.0, remaining - 0.012)
-                    sleep_ms = int(sleep_seconds * 1000.0)
-                    if sleep_ms > 0:
-                        try:
-                            ctypes.windll.kernel32.Sleep(sleep_ms)
-                        except Exception:
-                            _precise_sleep(sleep_seconds)
-                    else:
-                        try:
-                            ctypes.windll.kernel32.Sleep(0)
-                        except Exception:
-                            _precise_sleep(0.0)
-                elif remaining > 0.002:
-                    try:
-                        ctypes.windll.kernel32.Sleep(0)
-                    except Exception:
-                        _precise_sleep(0.0)
-        finally:
-            if has_original_priority and thread_handle:
-                try:
-                    ctypes.windll.kernel32.SetThreadPriority(thread_handle, int(original_priority))
-                except Exception:
-                    pass
-            if timer_raised:
-                try:
-                    ctypes.windll.winmm.timeEndPeriod(1)
-                except Exception:
-                    pass
+        duration = float(duration_seconds)
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError("保持时间必须是非负有限数值")
+        _precise_sleep(duration)
 
     def _log_mouse_down_snapshot(
         self,
@@ -952,55 +819,16 @@ class InterceptionDriver:
         tolerance: int = 0,
         stable_samples: int = 1,
     ) -> bool:
-        """统一到位复核：驱动移动 + 系统定位兜底，直到到位或超时。"""
-        tx = int(target_x)
-        ty = int(target_y)
-        tol = max(0, int(tolerance))
-        required_stable_samples = max(1, int(stable_samples))
-        deadline = time.perf_counter() + max(0.01, float(timeout))
-
-        while time.perf_counter() <= deadline:
-            if self._wait_mouse_reach_target(
-                tx,
-                ty,
-                timeout=0.008,
-                tolerance=tol,
-                poll_interval=0.001,
-                stable_samples=required_stable_samples,
-            ):
-                return True
-
-            try:
-                self._move_mouse_internal(tx, ty, absolute=True)
-            except Exception:
-                pass
-            if self._wait_mouse_reach_target(
-                tx,
-                ty,
-                timeout=0.02,
-                tolerance=tol,
-                poll_interval=0.001,
-                stable_samples=required_stable_samples,
-            ):
-                return True
-
-            try:
-                ctypes.windll.user32.SetCursorPos(tx, ty)
-            except Exception:
-                pass
-            if self._wait_mouse_reach_target(
-                tx,
-                ty,
-                timeout=0.02,
-                tolerance=tol,
-                poll_interval=0.001,
-                stable_samples=required_stable_samples,
-            ):
-                return True
-
-            _precise_sleep(0.001)
-
-        return self._is_mouse_at_target(tx, ty, tolerance=tol)
+        """仅使用所选驱动定位，移动或位置复核失败时直接失败。"""
+        tx, ty = int(target_x), int(target_y)
+        if self._is_mouse_at_target(tx, ty, tolerance=tolerance):
+            return True
+        if not self._move_mouse_internal(tx, ty, absolute=True):
+            return False
+        return self._wait_mouse_reach_target(
+            tx, ty, timeout=timeout, tolerance=tolerance,
+            stable_samples=stable_samples,
+        )
 
     def _prime_mouse_target_for_click(self, target_x: int, target_y: int) -> bool:
         """
@@ -1032,6 +860,11 @@ class InterceptionDriver:
         先确保光标到位，再发送“携带目标绝对坐标的按键事件”。
         严禁回退到无坐标按键事件，避免误点到当前鼠标位置。
         """
+        if not self._is_mouse_down_state(button_state):
+            released = self._send_mouse_event(0, 0, 0, button_state, 0)
+            if released:
+                self._pressed_mouse_buttons.discard(self._mouse_button_name_from_state(button_state))
+            return released
         tx = int(target_x)
         ty = int(target_y)
         self._log_mouse_down_snapshot(button_state, tx, ty, source=source)
@@ -1055,17 +888,8 @@ class InterceptionDriver:
         try:
             interception_x, interception_y = self._pixel_to_interception(tx, ty)
             coord_flags = INTERCEPTION_MOUSE_MOVE_ABSOLUTE | INTERCEPTION_MOUSE_VIRTUAL_DESKTOP
-            for _ in range(2):
-                if self._send_mouse_event(interception_x, interception_y, coord_flags, button_state, 0):
-                    return True
-                if not self._ensure_cursor_at_target(
-                    tx,
-                    ty,
-                    timeout=0.03,
-                    tolerance=1,
-                    stable_samples=1,
-                ):
-                    break
+            self._pressed_mouse_buttons.add(self._mouse_button_name_from_state(button_state))
+            return self._send_mouse_event(interception_x, interception_y, coord_flags, button_state, 0)
         except Exception:
             pass
         return False
@@ -1108,6 +932,8 @@ class InterceptionDriver:
                     cursor_clipped = self._clip_cursor_to_point(tx, ty)
                 except Exception:
                     cursor_clipped = False
+                if not cursor_clipped:
+                    return False
 
             try:
                 if is_down_event:
@@ -1123,21 +949,12 @@ class InterceptionDriver:
                     source="button_verified",
                     enforce_target=is_down_event,
                 )
-                if not result:
-                    _precise_sleep(0.003)
-                    result = self._send_mouse_button_event_at_target_once(
-                        button_state,
-                        tx,
-                        ty,
-                        source="button_retry",
-                        enforce_target=is_down_event,
-                    )
                 if result:
                     _precise_sleep(0.001)
                 return result
             finally:
                 if cursor_clipped:
-                    self._release_cursor_clip()
+                    self._release_cursor_clip(cursor_clipped)
 
     def _send_mouse_click_event_strict(
         self,
@@ -1155,6 +972,8 @@ class InterceptionDriver:
         ty = int(target_y)
 
         with InterceptionDriver._global_mouse_event_lock:
+            if self._pressed_mouse_buttons or self._is_mouse_button_pressed(down_state):
+                return False
             if not self._ensure_cursor_at_target(
                 tx,
                 ty,
@@ -1170,6 +989,8 @@ class InterceptionDriver:
                 cursor_clipped = self._clip_cursor_to_point(tx, ty)
             except Exception:
                 cursor_clipped = False
+            if not cursor_clipped:
+                return False
 
             try:
                 self._prime_mouse_target_for_click(tx, ty)
@@ -1184,13 +1005,7 @@ class InterceptionDriver:
                     return False
                 # 完整点击在同一发送窗口完成，避免并发事件插队导致漏点/点偏。
                 with InterceptionDriver._global_send_lock:
-                    self._prepare_button_release_for_click(
-                        down_state,
-                        up_state,
-                        tx,
-                        ty,
-                    )
-
+                    button_down_sent = True
                     down_ok = self._send_mouse_button_event_at_target_once(
                         down_state,
                         tx,
@@ -1198,15 +1013,6 @@ class InterceptionDriver:
                         source="click_down",
                         enforce_target=True,
                     )
-                    if not down_ok:
-                        _precise_sleep(0.002)
-                        down_ok = self._send_mouse_button_event_at_target_once(
-                            down_state,
-                            tx,
-                            ty,
-                            source="click_down_retry",
-                            enforce_target=True,
-                        )
                     if not down_ok:
                         return False
                     button_down_sent = True
@@ -1230,15 +1036,6 @@ class InterceptionDriver:
                         enforce_target=True,
                     )
                     if not up_ok:
-                        _precise_sleep(0.002)
-                        up_ok = self._send_mouse_button_event_at_target_once(
-                            up_state,
-                            tx,
-                            ty,
-                            source="click_up_retry",
-                            enforce_target=True,
-                        )
-                    if not up_ok:
                         return False
 
                 button_down_sent = False
@@ -1256,7 +1053,7 @@ class InterceptionDriver:
                     except Exception:
                         pass
                 if cursor_clipped:
-                    self._release_cursor_clip()
+                    self._release_cursor_clip(cursor_clipped)
 
     def _pixel_to_interception(self, x: int, y: int) -> Tuple[int, int]:
         """将像素坐标转换为内部坐标格式（支持多显示器）"""
@@ -1509,75 +1306,6 @@ class InterceptionDriver:
             self._pressed_keys.clear()
         return release_ok
     
-    def type_text(self, text: str, delay: float = 0.05, use_clipboard: bool = True) -> bool:
-        """输入文本
-
-        支持英文、中文、特殊符号等所有 Unicode 字符
-        优先使用剪贴板粘贴（支持所有字符），回退到按键模拟（仅支持英文字符）
-        """
-        # 方法1：优先使用剪贴板粘贴（支持所有字符包括中文）
-        if use_clipboard:
-            try:
-                import pyperclip
-
-                original_clipboard = None
-                try:
-                    original_clipboard = pyperclip.paste()
-                except Exception:
-                    pass
-
-                try:
-                    # 复制文本到剪贴板
-                    pyperclip.copy(text)
-                    _precise_sleep(0.1)
-
-                    # 发送粘贴快捷键 (Ctrl+V)
-                    if self.hotkey('ctrl', 'v'):
-                        _precise_sleep(0.2)
-
-                        # 恢复剪贴板
-                        if original_clipboard:
-                            try:
-                                pyperclip.copy(original_clipboard)
-                            except Exception:
-                                pass
-
-                        logger.debug(f"使用剪贴板粘贴输入文本: '{text[:50]}'...")
-                        return True
-                except Exception as clipboard_error:
-                    logger.debug(f"剪贴板粘贴失败: {clipboard_error}，回退到按键模拟")
-
-                    # 恢复剪贴板
-                    if original_clipboard:
-                        try:
-                            pyperclip.copy(original_clipboard)
-                        except Exception:
-                            pass
-            except ImportError:
-                logger.debug("pyperclip不可用，使用按键模拟")
-
-        # 方法2：回退到按键模拟（仅支持 KEY_CODES 中定义的字符）
-        logger.debug(f"使用按键模拟输入文本，仅支持英文字符: '{text[:50]}'...")
-
-        for char in text:
-            if char == ' ':
-                key = 'space'
-            elif char == '\n':
-                key = 'enter'
-            elif char == '\t':
-                key = 'tab'
-            elif char.lower() in self.KEY_CODES:
-                key = char.lower()
-            else:
-                logger.debug(f"无法输入字符（跳过）: {char}")
-                continue
-
-            if not self.press_key(key, delay):
-                return False
-            _precise_sleep(delay)
-
-        return True
-    
     def hotkey(self, *keys) -> bool:
         """组合键"""
         key_strokes = []
@@ -1643,18 +1371,11 @@ class InterceptionDriver:
                     logger.warning(f"未知鼠标按键: {button}")
                     return False
 
-                try:
-                    safe_clicks = max(1, int(clicks))
-                except Exception:
-                    safe_clicks = 1
-                try:
-                    safe_interval = max(0.0, float(interval))
-                except Exception:
-                    safe_interval = 0.0
-                try:
-                    safe_duration = max(0.0, float(duration))
-                except Exception:
-                    safe_duration = 0.0
+                safe_clicks = int(clicks)
+                safe_interval = float(interval)
+                safe_duration = float(duration)
+                if safe_clicks <= 0 or safe_clicks != float(clicks) or not math.isfinite(safe_interval) or not math.isfinite(safe_duration) or safe_interval < 0 or safe_duration < 0:
+                    raise ValueError("点击次数或时间参数无效")
 
                 for i in range(safe_clicks):
                     if i > 0 and safe_interval > 0:
@@ -1925,11 +1646,30 @@ class InterceptionDriver:
         """获取鼠标位置"""
         return self._get_current_mouse_pos()
     
+    def release_all_inputs(self) -> bool:
+        released = self.release_all_keys()
+        states = {
+            "left": INTERCEPTION_MOUSE_LEFT_BUTTON_UP,
+            "right": INTERCEPTION_MOUSE_RIGHT_BUTTON_UP,
+            "middle": INTERCEPTION_MOUSE_MIDDLE_BUTTON_UP,
+        }
+        with self._mouse_lock:
+            for button in list(self._pressed_mouse_buttons):
+                try:
+                    if self._send_mouse_event(0, 0, 0, states[button], 0):
+                        self._pressed_mouse_buttons.discard(button)
+                    else:
+                        released = False
+                except Exception:
+                    released = False
+        return released
+
     def close(self) -> None:
         """清理资源"""
         if self.context and self.dll:
             try:
-                self.release_all_keys()
+                if not self.release_all_inputs():
+                    logger.error("关闭驱动时输入释放失败")
             except Exception:
                 pass
             try:
@@ -1981,7 +1721,6 @@ def _close_global_driver_on_exit() -> None:
 
 
 atexit.register(_close_global_driver_on_exit)
-
 
 
 

@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 class GlobalSettingsDialogSaveMixin:
     _REQUIRED_SETTINGS_CONTROLS = (
         "mode_combo",
+        "confirm_partial_window_failure_checkbox",
+        "background_hierarchy_broadcast_check",
+        "background_fake_active_check",
+        "background_block_physical_mouse_check",
         "screenshot_engine_combo",
         "width_spinbox",
         "height_spinbox",
@@ -38,8 +42,15 @@ class GlobalSettingsDialogSaveMixin:
         "plugin_public_dropdown",
         "plugin_text_ime_check",
         "plugin_fake_active_check",
+        "plugin_bind_auto_detect_check",
         "plugin_reg_code_edit",
         "plugin_extra_code_edit",
+        "runtime_backend_combo",
+        "foreground_driver_combo",
+        "foreground_keyboard_driver_combo",
+        "foreground_py_backend_combo",
+        "ib_driver_combo",
+        "plugin_input_display_follow_check",
     )
 
     def _validate_required_controls(self) -> None:
@@ -112,10 +123,9 @@ class GlobalSettingsDialogSaveMixin:
     def get_execution_mode(self):
         """获取执行模式"""
         internal_mode = self.mode_combo.currentData()
-        if internal_mode:
-            return internal_mode
-        selected_display_mode = self.mode_combo.currentText()
-        return self.MODE_INTERNAL_MAP.get(selected_display_mode, 'background_sendmessage')
+        if internal_mode not in self.MODE_DISPLAY_MAP:
+            raise ValueError(f"未知的运行方式: {internal_mode!r}")
+        return internal_mode
     def get_custom_width(self):
         """获取自定义宽度"""
         return self.width_spinbox.value()
@@ -154,27 +164,20 @@ class GlobalSettingsDialogSaveMixin:
     def get_settings(self) -> dict:
         """Returns the edited settings as a dictionary."""
         self._validate_required_controls()
-        internal_mode = self.mode_combo.currentData()
-        if not internal_mode:
-            selected_display_mode = self.mode_combo.currentText()
-            internal_mode = self.MODE_INTERNAL_MAP.get(selected_display_mode, 'background_sendmessage')
+        internal_mode = self.get_execution_mode()
         # 根据绑定窗口数量决定窗口绑定模式
         bound_windows = self.get_bound_windows()
         window_count = len(bound_windows)
         window_binding_mode = 'multiple' if window_count > 1 else 'single'
         active_bound_windows = bound_windows
         active_window_binding_mode = window_binding_mode
-        input_backend = (
-            self._selected_input_backend()
-            if hasattr(self, "_selected_input_backend")
-            else "native"
-        )
+        input_backend = self._selected_input_backend()
         # 插件后端只能按后台消息执行，但不要覆盖原生模式的持久化值。
         # 这样在“原生 -> 插件 -> 原生”之间切换时，原生面板仍恢复用户上次选择。
         effective_execution_mode = (
             PLUGIN_EXECUTION_MODE if input_backend == "plugin" else internal_mode
         )
-        if input_backend == "plugin" and hasattr(self, "plugin_screenshot_engine_combo"):
+        if input_backend == "plugin":
             screenshot_engine = self.plugin_screenshot_engine_combo.currentData()
             if not screenshot_engine:
                 raise ValueError(
@@ -183,46 +186,27 @@ class GlobalSettingsDialogSaveMixin:
         else:
             screenshot_engine = self.screenshot_engine_combo.currentData()
             if not screenshot_engine:
-                screenshot_engine_display = self.screenshot_engine_combo.currentText()
-                screenshot_engine = self.screenshot_engine_map.get(screenshot_engine_display)
-            if not screenshot_engine:
                 raise ValueError(
                     f"未知的截图引擎选项: {self.screenshot_engine_combo.currentText()!r}"
                 )
-        plugin_mouse = normalize_plugin_mouse(
-            self.plugin_mouse_combo.currentData()
-            if hasattr(self, "plugin_mouse_combo")
-            else self.current_config.get("plugin_mouse")
-        )
-        plugin_keypad = normalize_plugin_keypad(
-            self.plugin_keypad_combo.currentData()
-            if hasattr(self, "plugin_keypad_combo")
-            else self.current_config.get("plugin_keypad")
-        )
-        follow_display = True
-        if hasattr(self, "plugin_input_display_follow_check"):
-            follow_display = bool(self.plugin_input_display_follow_check.isChecked())
-        if follow_display and hasattr(self, "_followed_plugin_input_display"):
+        plugin_mouse = normalize_plugin_mouse(self.plugin_mouse_combo.currentData())
+        plugin_keypad = normalize_plugin_keypad(self.plugin_keypad_combo.currentData())
+        follow_display = self.plugin_input_display_follow_check.isChecked()
+        if follow_display:
             plugin_input_display = str(self._followed_plugin_input_display()).strip().lower()
-        elif hasattr(self, "plugin_input_display_combo"):
+        else:
             plugin_input_display = str(self.plugin_input_display_combo.currentData() or "").strip().lower()
-        else:
-            plugin_input_display = str(self.current_config.get("plugin_input_display") or "").strip().lower()
-        if hasattr(self, "plugin_bind_mode_combo"):
-            bind_raw = self.plugin_bind_mode_combo.currentData()
-            if bind_raw is None:
-                bind_raw = self.plugin_bind_mode_combo.currentText()
-        else:
-            bind_raw = self.current_config.get("plugin_bind_mode", 0)
+        bind_raw = self.plugin_bind_mode_combo.currentData()
         plugin_bind_mode = normalize_plugin_bind_mode(bind_raw)
-        if hasattr(self, "plugin_bind_kind_combo"):
-            kind_raw = self.plugin_bind_kind_combo.currentData()
-        else:
-            kind_raw = self.current_config.get("plugin_bind_kind", "basic")
+        kind_raw = self.plugin_bind_kind_combo.currentData()
         plugin_bind_kind = normalize_plugin_bind_kind(kind_raw)
         settings = {
             'execution_mode': effective_execution_mode,
+            'confirm_partial_window_failure': self.confirm_partial_window_failure_checkbox.isChecked(),
             'native_execution_mode': internal_mode,
+            'background_hierarchy_broadcast': self.background_hierarchy_broadcast_check.isChecked(),
+            'background_fake_active': self.background_fake_active_check.isChecked(),
+            'background_block_physical_mouse': self.background_block_physical_mouse_check.isChecked(),
             # operation_mode 属于输入模拟器的独立默认值；设置页没有该控件时
             # 必须保留已有配置，不能因保存任意其它参数而重置。
             'operation_mode': self.current_config.get('operation_mode', 'auto'),
@@ -238,36 +222,22 @@ class GlobalSettingsDialogSaveMixin:
             "plugin_bind_kind": plugin_bind_kind,
             "plugin_bind_mode": plugin_bind_mode,
             "plugin_public": self._selected_plugin_public(),
-            "plugin_text_ime": (
-                bool(self.plugin_text_ime_check.isChecked())
-                if hasattr(self, "plugin_text_ime_check")
-                else bool(self.current_config.get("plugin_text_ime", False))
-            ),
-            "plugin_fake_active": (
-                bool(self.plugin_fake_active_check.isChecked())
-                if hasattr(self, "plugin_fake_active_check")
-                else bool(self.current_config.get("plugin_fake_active", False))
-            ),
-            "plugin_reg_code": self.plugin_reg_code_edit.text() if hasattr(self, "plugin_reg_code_edit") else self.current_config.get("plugin_reg_code", ""),
-            "plugin_extra_code": (
-                self.plugin_extra_code_edit.text().strip()
-                if hasattr(self, "plugin_extra_code_edit")
-                else self.current_config.get("plugin_extra_code", "")
-            ),
+            "plugin_text_ime": self.plugin_text_ime_check.isChecked(),
+            "plugin_fake_active": self.plugin_fake_active_check.isChecked(),
+            "plugin_bind_auto_detect": self.plugin_bind_auto_detect_check.isChecked(),
+            "plugin_reg_code": self.plugin_reg_code_edit.text(),
+            "plugin_extra_code": self.plugin_extra_code_edit.text().strip(),
             'foreground_mouse_driver_backend': require_foreground_backend(
-                (self.foreground_driver_combo.currentData() if hasattr(self, 'foreground_driver_combo') else None)
-                or self.current_config.get('foreground_mouse_driver_backend', 'interception')
+                self.foreground_driver_combo.currentData()
             ),
             'foreground_keyboard_driver_backend': require_foreground_backend(
-                (self.foreground_keyboard_driver_combo.currentData() if hasattr(self, 'foreground_keyboard_driver_combo') else None)
-                or self.current_config.get('foreground_keyboard_driver_backend', 'interception')
+                self.foreground_keyboard_driver_combo.currentData()
             ),
             'foreground_py_backend': require_foreground_py_backend(
-                (self.foreground_py_backend_combo.currentData() if hasattr(self, 'foreground_py_backend_combo') else None)
-                or self.current_config.get('foreground_py_backend', 'pyautogui')
+                self.foreground_py_backend_combo.currentData()
             ),
             'ibinputsimulator_driver': (
-                self.ib_driver_combo.currentData() if hasattr(self, 'ib_driver_combo') else self.current_config.get('ibinputsimulator_driver', 'Logitech')
+                self.ib_driver_combo.currentData()
             ),
             'ibinputsimulator_driver_arg': self.current_config.get('ibinputsimulator_driver_arg', ''),
             'ibinputsimulator_ahk_path': self.current_config.get('ibinputsimulator_ahk_path', ''),
@@ -275,8 +245,8 @@ class GlobalSettingsDialogSaveMixin:
             'enable_canvas_grid': self.canvas_grid_checkbox.isChecked() if hasattr(self, 'canvas_grid_checkbox') else self.current_config.get('enable_canvas_grid', True),
             'enable_card_snap': self.card_snap_checkbox.isChecked() if hasattr(self, 'card_snap_checkbox') else self.current_config.get('enable_card_snap', True),
             'enable_parameter_panel_snap': self.parameter_panel_snap_checkbox.isChecked() if hasattr(self, 'parameter_panel_snap_checkbox') else self.current_config.get('enable_parameter_panel_snap', True),
-            'enable_floating_status_window': self.floating_status_window_checkbox.isChecked() if hasattr(self, 'floating_status_window_checkbox') else self.current_config.get('enable_floating_status_window', True),
             'enable_connection_line_animation': self.connection_line_animation_checkbox.isChecked() if hasattr(self, 'connection_line_animation_checkbox') else self.current_config.get('enable_connection_line_animation', True),
+            'enable_execution_log_on_run': self.execution_log_on_run_checkbox.isChecked() if hasattr(self, 'execution_log_on_run_checkbox') else self.current_config.get('enable_execution_log_on_run', True),
             'window_binding_mode': window_binding_mode,
             'bound_windows': bound_windows,
             'active_bound_windows': active_bound_windows,

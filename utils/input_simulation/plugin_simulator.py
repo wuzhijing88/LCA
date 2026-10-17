@@ -12,6 +12,7 @@ from utils.precise_sleep import precise_sleep
 from utils.window.hwnd_utils import as_hwnd
 
 from .base import BaseInputSimulator
+from .drag_path import prepare_drag_path, iter_drag_samples
 
 
 class PluginInputSimulator(BaseInputSimulator):
@@ -22,13 +23,19 @@ class PluginInputSimulator(BaseInputSimulator):
     def __init__(self, hwnd: int):
         super().__init__(hwnd)
         self._dx = PluginDxInput(int(self.hwnd))
+        self._owned_dx = self._dx
 
     def close(self) -> None:
+        owned_dx = self.__dict__.get("_owned_dx")
+        if owned_dx is not None:
+            if not owned_dx.close():
+                raise RuntimeError("插件鼠标输入释放失败")
+            self._owned_dx = None
         self._dx = None
 
     def _input(self) -> PluginDxInput:
         if self._dx is None:
-            self._dx = PluginDxInput(int(self.hwnd))
+            raise RuntimeError("插件输入模拟器已关闭")
         return self._dx
 
     def click(
@@ -47,8 +54,7 @@ class PluginInputSimulator(BaseInputSimulator):
         return bool(self._input().move_to(client_x, client_y) and self._input().mouse_down(button))
 
     def mouse_up(self, x: int, y: int, button: str = "left", is_screen_coord: bool = False) -> bool:
-        client_x, client_y = self._to_client(x, y, is_screen_coord)
-        return bool(self._input().move_to(client_x, client_y) and self._input().mouse_up(button))
+        return bool(self._input().mouse_up(button))
 
     def double_click(
         self,
@@ -82,27 +88,23 @@ class PluginInputSimulator(BaseInputSimulator):
         return self.drag_path([(int(start_x), int(start_y)), (int(end_x), int(end_y))], duration, button)
 
     def drag_path(self, path_points: list, duration: float = 1.0, button: str = "left", timestamps: list = None) -> bool:
-        _ = timestamps
-        points = []
-        for point in path_points or ():
-            if not point or len(point) < 2:
-                continue
-            points.append((int(point[0]), int(point[1])))
-        if len(points) < 2:
-            return False
+        """以共用路径采样调用大漠按下、移动、弹起，坐标均为客户区。"""
+        points, segment_durations = prepare_drag_path(path_points, duration, timestamps)
+        if button not in {"left", "right", "middle"}:
+            raise ValueError(f"插件拖拽按钮无效：{button!r}")
         start_x, start_y = points[0]
-        if not self.mouse_down(start_x, start_y, button=button):
-            return False
-        step_sleep = max(0.01, float(duration or 0.2) / max(1, len(points) - 1))
         try:
-            for point_x, point_y in points[1:]:
+            if not self.mouse_down(start_x, start_y, button=button):
+                return False
+            for wait, point_x, point_y in iter_drag_samples(points, segment_durations):
+                if wait > 0:
+                    precise_sleep(wait)
                 if not self.move_mouse(point_x, point_y):
                     return False
-                precise_sleep(step_sleep)
         finally:
             end_x, end_y = points[-1]
-            self.mouse_up(end_x, end_y, button=button)
-        return True
+            released = bool(self.mouse_up(end_x, end_y, button=button))
+        return released
 
     def scroll(self, x: int, y: int, delta: int) -> bool:
         return bool(self._input().wheel(int(x), int(y), int(delta)))
@@ -130,21 +132,23 @@ class PluginInputSimulator(BaseInputSimulator):
         extended: bool = False,
         enable_repeat: bool = True,
         repeat_interval: Optional[float] = None,
+        stop_checker=None,
     ) -> bool:
         return hold_with_system_repeat(
             down=lambda: self.send_key_down(vk_code, scan_code, extended),
             up=lambda: self.send_key_up(vk_code, scan_code, extended),
             repeat=lambda: self.send_key_repeat(vk_code, scan_code, extended),
-            duration=max(0.0, float(duration)),
+            duration=duration,
             sleep=lambda seconds: precise_sleep(seconds),
             enable_repeat=bool(enable_repeat),
             repeat_interval=repeat_interval,
+            stop_checker=stop_checker,
         )
 
-    def send_text(self, text: str, stop_checker=None) -> bool:
-        if stop_checker and stop_checker():
-            raise InterruptedError("stop requested")
-        return bool(self._input().send_text(str(text or "")))
+    def send_text(self, text: str, stop_checker=None, delay: Optional[float] = None) -> bool:
+        return bool(self._input().send_text(
+            str(text or ""), stop_checker=stop_checker, delay=0.0 if delay is None else delay,
+        ))
 
     def send_key_combination(self, keys: list, hold_duration: float = DEFAULT_KEY_HOLD_SECONDS) -> bool:
         for key in keys:
@@ -175,5 +179,5 @@ class PluginInputSimulator(BaseInputSimulator):
             import win32gui
 
             return win32gui.ScreenToClient(as_hwnd(self.hwnd), (int(x), int(y)))
-        except Exception:
-            return int(x), int(y)
+        except Exception as exc:
+            raise RuntimeError("插件输入客户区坐标转换失败") from exc

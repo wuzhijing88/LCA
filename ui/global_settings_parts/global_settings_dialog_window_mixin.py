@@ -284,28 +284,83 @@ class GlobalSettingsDialogWindowMixin:
                 # 已绑定的窗口也检查分辨率
                 self._check_and_adjust_window_resolution(hwnd, title)
                 return
-            # 添加窗口到绑定列表
-            self._add_window_silently(title, hwnd)
-            self._save_bound_windows_config()
-            if hasattr(self, '_refresh_bound_window_ui'):
-                self._refresh_bound_window_ui(refresh_window_select=True)
-            else:
-                self._refresh_window_select_combo()
-                self._refresh_bound_windows_combo()
-            logger.info(f"自动更新窗口绑定模式: {self.window_binding_mode} (窗口数量: {len(self.bound_windows)})")
-            # 通知主窗口更新标题（显示绑定窗口数量）
-            if hasattr(self, '_sync_parent_window_binding_preview'):
-                self._sync_parent_window_binding_preview()
-            logger.info(f"窗口绑定成功：{title}")
-            if hasattr(self, "_schedule_wgc_desktop_engine_warning"):
-                self._schedule_wgc_desktop_engine_warning()
-            # 【新增】绑定成功后检查并调整分辨率
-            self._check_and_adjust_window_resolution(hwnd, title)
+            if self._should_plugin_bind_on_pick():
+                self._start_plugin_bind_tool_sweep(title, hwnd)
+                return
+            self._complete_picker_window_bind(title, hwnd)
             # 注意：窗口恢复显示由 WindowPickerOverlay.closeEvent 自动处理
         except Exception as e:
             logger.error(f"处理窗口选择失败: {e}")
             import traceback
             logger.error(f"错误详情: {traceback.format_exc()}")
+
+    def _should_plugin_bind_on_pick(self) -> bool:
+        return (
+            hasattr(self, "_selected_input_backend")
+            and self._selected_input_backend() == "plugin"
+        )
+
+    def _should_sweep_plugin_bind_on_pick(self) -> bool:
+        enabled = True
+        if hasattr(self, "_plugin_bind_auto_detect_enabled"):
+            enabled = bool(self._plugin_bind_auto_detect_enabled())
+        return self._should_plugin_bind_on_pick() and enabled
+
+    def _start_plugin_bind_tool_sweep(self, title: str, hwnd: int) -> None:
+        from ui.plugin_bind_sweep import start_picker_plugin_bind_sweep
+
+        user_params_only = not bool(
+            hasattr(self, "_plugin_bind_auto_detect_enabled")
+            and self._plugin_bind_auto_detect_enabled()
+        )
+        start_picker_plugin_bind_sweep(
+            self,
+            hwnd,
+            title,
+            user_params_only=user_params_only,
+            on_finished=lambda result: self._finish_plugin_bind_tool_sweep(
+                title, hwnd, result, apply_winner=not user_params_only
+            ),
+        )
+
+    def _finish_plugin_bind_tool_sweep(self, title: str, hwnd: int, result, *, apply_winner: bool = True) -> None:
+        from ui.plugin_bind_sweep import apply_plugin_bind_sweep_winner
+        from utils.plugin.bind_probe import PluginBindProbeResult, stamp_plugin_bind_probe
+        from utils.plugin.bind_sweep import PluginBindSweepResult, plugin_bind_sweep_failure_text
+
+        if not isinstance(result, PluginBindSweepResult) or result.cancelled:
+            return
+        if not result.ok or result.winner is None:
+            QMessageBox.warning(self, "绑定失败", plugin_bind_sweep_failure_text(result, title))
+            return
+        if apply_winner:
+            try:
+                apply_plugin_bind_sweep_winner(self, result.winner)
+            except Exception as exc:
+                logger.warning("填入绑定参数失败: %s", exc)
+                QMessageBox.warning(self, "绑定失败", f"窗口「{title}」绑定失败。\n{exc}")
+                return
+        self._complete_picker_window_bind(title, hwnd, probe_plugin=False)
+        if self.bound_windows:
+            stamp_plugin_bind_probe(self.bound_windows[-1], PluginBindProbeResult(True, True, True, ""))
+            if hasattr(self, "_refresh_plugin_probe_feedback"):
+                self._refresh_plugin_probe_feedback()
+
+    def _complete_picker_window_bind(self, title: str, hwnd: int, probe_plugin: bool | None = None) -> None:
+        self._add_window_silently(title, hwnd, probe_plugin=probe_plugin)
+        self._save_bound_windows_config()
+        if hasattr(self, '_refresh_bound_window_ui'):
+            self._refresh_bound_window_ui(refresh_window_select=True)
+        else:
+            self._refresh_window_select_combo()
+            self._refresh_bound_windows_combo()
+        logger.info(f"自动更新窗口绑定模式: {self.window_binding_mode} (窗口数量: {len(self.bound_windows)})")
+        if hasattr(self, '_sync_parent_window_binding_preview'):
+            self._sync_parent_window_binding_preview()
+        logger.info(f"窗口绑定成功：{title}")
+        if hasattr(self, "_schedule_wgc_desktop_engine_warning"):
+            self._schedule_wgc_desktop_engine_warning()
+        self._check_and_adjust_window_resolution(hwnd, title)
     def _batch_add_same_type_windows(self):
         """一键绑定所有同类型窗口"""
         if not WIN32_AVAILABLE_FOR_LIST:

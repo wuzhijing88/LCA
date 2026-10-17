@@ -11,15 +11,18 @@ logger = logging.getLogger(__name__)
 
 class ControlCenterMultiInstanceMixin:
     def open_multi_instance_dialog(self):
-        from ui.dialogs.multi_instance_dialog import MultiInstanceDialog
+        from ui.dialogs.multi_instance_dialog import MultiInstanceDialog, watch_mutex_occupancy
 
         holder = getattr(self, "_multi_instance_mutex_holder", None)
         if holder is None:
             holder = MutexOccupancy()
             self._multi_instance_mutex_holder = holder
+            watch_mutex_occupancy(self, holder)
         dialog = MultiInstanceDialog(parent=self, occupancy=holder)
         dialog.instances_ready.connect(self._add_multi_instance_windows)
-        dialog.exec()
+        from ui.dialogs.dialog_manager import exec_dialog
+
+        exec_dialog(dialog)
 
     def _add_multi_instance_windows(self, windows: List[Dict[str, Any]]) -> None:
         if not isinstance(windows, list) or not windows:

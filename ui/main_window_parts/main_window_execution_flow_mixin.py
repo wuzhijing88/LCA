@@ -557,7 +557,7 @@ class MainWindowExecutionFlowMixin:
 
         step_log_connected = False
 
-        if hasattr(task, "step_log") and hasattr(self, "_floating_window") and self._floating_window:
+        if hasattr(task, "step_log") and hasattr(self, "_execution_log_panel") and self._execution_log_panel:
 
             task.step_log.connect(self._forward_step_log)
 
@@ -1037,3 +1037,4 @@ class MainWindowExecutionFlowMixin:
         """传统停止方法，现在调用安全停止"""
 
         return main_window_stop_tasks(self)
+

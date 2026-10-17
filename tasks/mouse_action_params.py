@@ -276,12 +276,12 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "tooltip": "图片匹配的相似度阈值 (0.1 到 1.0)",
             "condition": {"param": "operation_mode", "value": "找图功能"}
         },
-        "test_image_recognition": {
+        "preview_image_recognition": {
             "label": "找图测试",
             "type": "button",
             "button_text": "测试找图并绘制结果",
             "tooltip": "测试图片识别，在绑定窗口上绘制出找到的图片区域",
-            "action": "test_image_recognition",
+            "action": "preview_image_recognition",
             "condition": {"param": "operation_mode", "value": "找图功能"}
         },
         "use_recognition_region": {
@@ -694,12 +694,12 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "default": 0,
             "condition": {"param": "operation_mode", "value": "找色功能"}
         },
-        "test_color_recognition": {
+        "preview_color_recognition": {
             "label": "找色测试",
             "type": "button",
             "button_text": "测试找色并绘制结果",
             "tooltip": "测试颜色识别，在绑定窗口上绘制出找到的颜色位置",
-            "action": "test_color_recognition",
+            "action": "preview_color_recognition",
             "condition": {"param": "operation_mode", "value": "找色功能"}
         },
         "color_enable_click": {
@@ -890,15 +890,6 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             ],
             "widget_hint": "coordinate_selector_with_display",
             "related_params": ["coordinate_x", "coordinate_y"]
-        },
-        "coordinate_value": {
-            "label": "自定义坐标（兼容）",
-            "type": "text",
-            "default": "",
-            "hidden": True,
-            "placeholder": "示例: 100,200 或 {\"x\":100,\"y\":200}",
-            "tooltip": "兼容旧工作流使用，新工作流请使用坐标工具或手动输入",
-            "condition": {"param": "operation_mode", "value": "坐标点击"}
         },
         "coordinate_x": {
             "label": "X坐标",

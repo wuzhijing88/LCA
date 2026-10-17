@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional, Tuple
 
 
@@ -35,21 +36,13 @@ def publish_card_payload(context: Any, card_id: Any, **fields: Any) -> None:
 
 
 def bounds_from_bbox(bbox: Any) -> Optional[Tuple[Any, Any, Any, Any]]:
-    if not bbox:
+    if not isinstance(bbox, list) or len(bbox) != 8 or any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+        for value in bbox
+    ):
         return None
-    try:
-        first = bbox[0]
-        if isinstance(first, (list, tuple)):
-            xs = [point[0] for point in bbox]
-            ys = [point[1] for point in bbox]
-        else:
-            xs = list(bbox[0::2])
-            ys = list(bbox[1::2])
-        if not xs or not ys:
-            return None
-        return min(xs), min(ys), max(xs), max(ys)
-    except (TypeError, IndexError, ValueError):
-        return None
+    xs, ys = bbox[::2], bbox[1::2]
+    return min(xs), min(ys), max(xs), max(ys)
 
 
 def publish_perception(card_id: Any, **fields: Any) -> None:

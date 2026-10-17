@@ -14,6 +14,12 @@ class MainWindowStatusMixin:
             base_title += get_instance_title_suffix()
         except Exception:
             pass
+        try:
+            from utils.child_session.runtime import child_session_window_suffix
+
+            base_title += child_session_window_suffix()
+        except Exception:
+            pass
 
         # 根据实际窗口数量显示不同的目标信息
 

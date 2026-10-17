@@ -11,6 +11,8 @@
 """
 
 import time
+import math
+from task_workflow.script_parameters import integer_parameter
 import threading
 import concurrent.futures
 from typing import Dict, Any, Optional, Tuple, List
@@ -31,17 +33,12 @@ def detect_optimal_thread_count() -> int:
     Returns:
         int: 推荐的线程数
     """
-    try:
-        # 使用专门的CPU检测工具
-        from utils.cpu_info_detector import detect_optimal_thread_count as cpu_detect  # type: ignore
-        return cpu_detect()
-    except ImportError:
-        # 回退到简单检测
-        import os
-        cpu_count = os.cpu_count() or 4
-        optimal_threads = max(2, min(cpu_count, 32))
-        logger.debug(f"使用简单CPU检测: 核心数={cpu_count}, 推荐线程数={optimal_threads}")
-        return optimal_threads
+    import os
+
+    cpu_count = os.cpu_count()
+    if cpu_count is None:
+        raise RuntimeError("无法确定可用CPU数量，不能自动创建识别线程池")
+    return max(2, min(cpu_count, 32))
 
 class RecognitionMode(Enum):
     """识别模式"""
@@ -108,11 +105,8 @@ class ParallelImageRecognizer:
         if not image_paths:
             return []
         if callable(stop_checker):
-            try:
-                if stop_checker():
-                    return []
-            except Exception:
-                pass
+            if stop_checker():
+                raise ValueError("多图识别已停止")
 
         start_time = time.time()
         try:
@@ -125,8 +119,7 @@ class ParallelImageRecognizer:
                 logger.debug(f"[并行识别] 清除截图缓存失败: {e}")
 
             if not target_hwnd:
-                logger.error("[并行识别] 缺少有效窗口句柄，无法使用子进程截图匹配")
-                return []
+                raise ValueError("多图识别需要有效的窗口句柄")
 
             recognition_region = None
             region_offset = (0, 0)
@@ -171,137 +164,6 @@ class ParallelImageRecognizer:
             return results
         finally:
             self.cleanup()
-    def _get_screenshot_cached(self, execution_mode: str, target_hwnd: Optional[int], params: Dict[str, Any]) -> Optional[np.ndarray]:
-        """获取缓存的截图"""
-        # 【闪退修复】使用固定key而非时间戳，避免每秒产生新key导致内存泄漏
-        cache_key = f"{execution_mode}_{target_hwnd}"
-
-        with self._cache_lock:
-            # 检查缓存是否存在且未过期（30ms TTL - 长期运行优化）
-            if cache_key in self._screenshot_cache:
-                cached_data = self._screenshot_cache[cache_key]
-                # 兼容旧格式(直接是screenshot)和新格式(tuple)
-                if isinstance(cached_data, tuple):
-                    cached_screenshot, cached_time = cached_data
-                    # 检查是否过期(30ms内复用 - 更激进释放内存)
-                    if (time.time() - cached_time) < 0.03:
-                        logger.debug("使用缓存截图")
-                        return cached_screenshot
-                    else:
-                        # 过期，显式删除numpy数组
-                        logger.debug(f"缓存截图已过期({(time.time() - cached_time)*1000:.1f}ms)，重新截图")
-                        try:
-                            del cached_screenshot
-                        except Exception:
-                            pass
-                        del self._screenshot_cache[cache_key]
-                else:
-                    # 旧格式缓存，清理掉
-                    try:
-                        del cached_data
-                    except Exception:
-                        pass
-                    del self._screenshot_cache[cache_key]
-
-        # 获取新截图
-        screenshot = self._capture_screenshot(execution_mode, target_hwnd, params)
-
-        if screenshot is not None:
-            with self._cache_lock:
-                # 【闪退修复】清理所有旧缓存，避免内存累积
-                for key in list(self._screenshot_cache.keys()):
-                    try:
-                        old_data = self._screenshot_cache[key]
-                        if isinstance(old_data, tuple):
-                            old_ss, _ = old_data
-                            del old_ss
-                        else:
-                            del old_data
-                    except Exception:
-                        pass
-                self._screenshot_cache.clear()
-                # 保存新截图和时间戳
-                self._screenshot_cache[cache_key] = (screenshot, time.time())
-
-        return screenshot
-    
-    def _capture_screenshot(self, execution_mode: str, target_hwnd: Optional[int], params: Dict[str, Any]) -> Optional[np.ndarray]:
-        """Capture a screenshot using local engines only."""
-        try:
-            # 原有模式：优先使用异步截图
-            screenshot = None
-            # 后台模式
-            is_background_mode = execution_mode and execution_mode.startswith('background')
-            if is_background_mode and target_hwnd:
-                # 【稳定性修复】禁用线程池异步截图，避免 WinRT/WGC 跨线程并发导致崩溃
-                screenshot = None
-
-            # 降级方案：使用传统WGC/OpenCV截图
-            if screenshot is None:
-                    # 验证窗口句柄是否有效
-                    if is_background_mode and target_hwnd:
-                        import win32gui
-                        try:
-                            if not win32gui.IsWindow(target_hwnd):
-                                logger.error(f"[并行识别-后台] 窗口句柄{target_hwnd}无效或窗口已关闭")
-                                return None
-                        except Exception as e:
-                            logger.error(f"[并行识别-后台] 验证窗口句柄时出错: {e}")
-                            return None
-
-                        # 后台/模拟器模式：使用统一截图接口
-                        from utils.capture.screenshot_helper import take_window_screenshot
-                        pil_img = take_window_screenshot(target_hwnd, client_area_only=True)
-                        if pil_img is not None:
-                            screenshot = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-                        else:
-                            screenshot = None
-                    elif execution_mode and execution_mode.startswith('foreground'):
-                        # 前台模式：也使用统一截图接口（与后台模式保持一致）
-                        # 这样识别出的坐标是客户区坐标，与click_coordinate的处理方式一致
-                        if target_hwnd:
-                            import win32gui
-                            try:
-                                if not win32gui.IsWindow(target_hwnd):
-                                    logger.error(f"[并行识别-前台] 窗口句柄{target_hwnd}无效或窗口已关闭")
-                                    return None
-                            except Exception as e:
-                                logger.error(f"[并行识别-前台] 验证窗口句柄时出错: {e}")
-                                return None
-
-                            from utils.capture.screenshot_helper import take_window_screenshot
-                            pil_img = take_window_screenshot(target_hwnd, client_area_only=True)
-                            if pil_img is not None:
-                                screenshot = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-                            else:
-                                screenshot = None
-                            logger.debug("[并行识别-前台] 使用统一截图接口，确保坐标为客户区坐标")
-                        else:
-                            # 没有窗口句柄时才使用全屏截图
-                            import mss
-                            import mss.tools
-                            with mss.mss() as sct:
-                                monitor = sct.monitors[1]  # 主显示器
-                                sct_img = sct.grab(monitor)
-                                screenshot = np.array(sct_img)
-                                screenshot = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
-                            logger.warning("[并行识别-前台] 无窗口句柄，使用全屏截图（坐标为屏幕坐标）")
-                    else:
-                        logger.error(f"不支持的执行模式: {execution_mode}")
-                        return None
-
-            if screenshot is None:
-                return None
-
-            # 格式统一：BGRA转BGR（不做其他预处理，与找图点击保持一致）
-            if len(screenshot.shape) == 3 and screenshot.shape[2] == 4:
-                return cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
-            return screenshot
-
-        except Exception as e:
-            logger.error(f"截图失败: {e}")
-            return None
-
     def _execute_parallel_recognition(self, tasks: List[ImageTask], screenshot: Optional[np.ndarray], mode: RecognitionMode, stop_checker=None) -> List[RecognitionResult]:
         """执行并行识别。"""
         results = []
@@ -311,23 +173,17 @@ class ParallelImageRecognizer:
             future_to_task = {}
             for task in tasks:
                 if callable(stop_checker):
-                    try:
-                        if stop_checker():
-                            stop_event.set()
-                            break
-                    except Exception:
-                        pass
+                    if stop_checker():
+                        stop_event.set()
+                        break
                 future = executor.submit(self._recognize_single_image, task, screenshot, stop_event)
                 future_to_task[future] = task
 
             found_first_match = False
             for future in concurrent.futures.as_completed(future_to_task):
                 if callable(stop_checker):
-                    try:
-                        if stop_checker():
-                            stop_event.set()
-                    except Exception:
-                        pass
+                    if stop_checker():
+                        stop_event.set()
                 task = future_to_task[future]
                 try:
                     result = future.result()
@@ -460,48 +316,30 @@ class ParallelImageRecognizer:
     ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
         """通过本地截图引擎执行截图+模板匹配。"""
         if not target_hwnd:
-            return False, 0.0, None
-
-        try:
-            match_response = capture_and_match_template_smart(
-                target_hwnd=target_hwnd,
-                template=template,
-                confidence_threshold=float(confidence_threshold),
-                template_key=(str(template_key) if template_key else None),
-                capture_timeout=0.8,
-                roi=roi,
-                client_area_only=True,
-                use_cache=False,
-            )
-
-            if not match_response or not bool(match_response.get("success")):
-                return False, 0.0, None
-
-            try:
-                score = float(match_response.get("confidence", 0.0) or 0.0)
-            except Exception:
-                score = 0.0
-
-            raw_location = match_response.get("location")
-            parsed_location = None
-            if isinstance(raw_location, (list, tuple)) and len(raw_location) == 4:
-                try:
-                    parsed_location = (
-                        int(raw_location[0]),
-                        int(raw_location[1]),
-                        int(raw_location[2]),
-                        int(raw_location[3]),
-                    )
-                except Exception:
-                    parsed_location = None
-
-            if bool(match_response.get("matched", False)) and parsed_location is not None and score >= confidence_threshold:
-                return True, score, parsed_location
+            raise ValueError("多图识别需要有效的目标窗口")
+        response = capture_and_match_template_smart(
+            target_hwnd=target_hwnd, template=template,
+            confidence_threshold=float(confidence_threshold),
+            template_key=template_key, capture_timeout=0.8, roi=roi,
+            client_area_only=True, use_cache=False,
+        )
+        if not response or not response.get("success"):
+            raise ValueError("多图截图匹配失败: " + str((response or {}).get("error") or "未返回有效结果"))
+        score = float(response["confidence"])
+        if not math.isfinite(score) or not 0 <= score <= 1:
+            raise ValueError("多图匹配置信度无效")
+        if not isinstance(response.get("matched"), bool):
+            raise ValueError("多图匹配状态未知")
+        if not response["matched"]:
             return False, score, None
+        location = response.get("location")
+        if not isinstance(location, (list, tuple)) or len(location) != 4:
+            raise ValueError("多图匹配位置无效")
+        location = tuple(integer_parameter(item, "多图匹配坐标") for item in location)
+        if location[2] <= 0 or location[3] <= 0 or score < confidence_threshold:
+            raise ValueError("多图匹配结果与命中状态不一致")
+        return True, score, location
 
-        except Exception as e:
-            logger.error(f"本地截图引擎匹配失败: {e}")
-            return False, 0.0, None
     def _load_template_image(self, image_path: str, task: ImageTask) -> Optional[np.ndarray]:
         """加载模板图片"""
         try:
@@ -557,12 +395,6 @@ class ParallelImageRecognizer:
             logger.error(f"加载模板图片失败: {image_path}, 错误: {e}")
             return None
 
-    def _match_template(self, screenshot: np.ndarray, template: np.ndarray, confidence_threshold: float,
-                       image_path: str = None, target_hwnd: Optional[int] = None) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
-        """兼容保留接口：主进程模板匹配已禁用。"""
-        logger.error("主进程模板匹配路径已禁用，请使用统一截图匹配")
-        return False, 0.0, None
-    
     def _get_image_name(self, image_path: str) -> str:
         """获取图片名称"""
         if image_path.startswith('memory://'):
@@ -585,10 +417,6 @@ class ParallelImageRecognizer:
                 except Exception:
                     pass
             self._screenshot_cache.clear()
-
-    def clear_cache(self):
-        """兼容接口：清理缓存。"""
-        self.cleanup()
 
 # 全局实例
 _parallel_recognizer = None

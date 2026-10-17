@@ -298,6 +298,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int],
         logger.error(f"[子工作流] 工作流必须是 .lca 工程: {workflow_file}")
         return _handle_failure(params, card_id, "工作流必须是 .lca 工程")
 
+    nested_session = None
     try:
         logger.info(f"[子工作流] 加载工作流文件: {workflow_file}")
         workflow_data, nested_session = load_workflow_package(
@@ -380,13 +381,15 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int],
     except Exception as e:
         logger.error(f"[子工作流] 执行异常: {e}", exc_info=True)
         return _handle_failure(params, card_id, f"执行异常: {e}")
+    finally:
+        if nested_session is not None:
+            nested_session.close()
 
 
 def _child_resource_dirs(workflow_data: Optional[Dict[str, Any]], workflow_filepath: Optional[str], nested_session: Any) -> Dict[str, str]:
     from task_workflow.resource_context import current_resource_dirs
     from task_workflow.workspace import resolve_runtime_resource_dirs, resource_runtime_kwargs
 
-    _ = nested_session
     filepath = str(workflow_filepath or "").strip()
     if filepath and not filepath.startswith("memory://") and os.path.isfile(filepath):
         disk_dirs = resolve_runtime_resource_dirs(
@@ -459,6 +462,9 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
     context_switched = False
     parent_executor = kwargs.get('executor')
     stop_checker = kwargs.get('stop_checker')
+    session_path = ""
+    sub_executor = None
+    connected_signals = []
     if parent_executor is None:
         raise RuntimeError("父工作流执行器不可用")
 
@@ -540,15 +546,6 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
             start_card_id,
         )
         child_dirs = _child_resource_dirs(workflow_data, workflow_filepath, nested_session)
-        if nested_session is not None:
-            from app_core.lca_format.session import materialize_package_assets
-
-            images_dir = str(child_dirs.get("images_dir") or "").strip()
-            if images_dir:
-                materialize_package_assets(
-                    nested_session,
-                    os.path.dirname(os.path.abspath(images_dir)),
-                )
         bound_windows = kwargs.get("bound_windows")
         if bound_windows is None:
             bound_windows = getattr(parent_executor, "bound_windows", None)
@@ -560,20 +557,13 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
 
         from app_core.lca_format.session import (
             active_session_scope,
-            register,
             register_temporary,
         )
         from task_workflow.resource_context import workflow_resource_scope
         from task_workflow.runtime_factory import create_inprocess_runtime
 
-        session_path = ""
         if nested_session is not None:
-            filepath_text = str(workflow_filepath or "").strip()
-            if filepath_text and not filepath_text.startswith("memory://") and os.path.isfile(filepath_text):
-                session_path = filepath_text
-                register(session_path, nested_session)
-            else:
-                session_path = register_temporary(nested_session)
+            session_path = register_temporary(nested_session)
 
         payload = {
             "session_mode": "single",
@@ -614,6 +604,7 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
                     yolo_dir=str(child_dirs.get("yolo_dir") or ""),
                     replays_dir=str(child_dirs.get("replays_dir") or ""),
                     plugins_dir=str(child_dirs.get("plugins_dir") or ""),
+                    package_session=nested_session,
                 )
             )
             sub_executor = create_inprocess_runtime(payload, task_modules=get_task_modules())
@@ -626,7 +617,9 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
 
             if parent_executor is not None and hasattr(parent_executor, 'step_log'):
                 try:
-                    sub_executor.step_log.connect(parent_executor.step_log.emit)
+                    slot = parent_executor.step_log.emit
+                    sub_executor.step_log.connect(slot)
+                    connected_signals.append((sub_executor.step_log, slot))
                 except Exception as exc:
                     logger.debug(f"[子工作流] 绑定步骤日志透传失败: {exc}")
             if (
@@ -635,9 +628,26 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
                 and hasattr(sub_executor, 'show_warning')
             ):
                 try:
-                    sub_executor.show_warning.connect(parent_executor.show_warning.emit)
+                    slot = parent_executor.show_warning.emit
+                    sub_executor.show_warning.connect(slot)
+                    connected_signals.append((sub_executor.show_warning, slot))
                 except Exception as exc:
                     logger.debug(f"[子工作流] 绑定警告弹窗透传失败: {exc}")
+
+            # 子工作流使用独立执行器。YOLO 任务会把画框请求发到当前执行器，
+            # 因此必须把子执行器的请求继续透传给父执行器，才能沿主工作流的
+            # 绘制链路到达主进程；否则信号没有消费者，画框会静默丢失。
+            if (
+                parent_executor is not None
+                and hasattr(parent_executor, 'overlay_update_requested')
+                and hasattr(sub_executor, 'overlay_update_requested')
+            ):
+                try:
+                    slot = parent_executor.overlay_update_requested.emit
+                    sub_executor.overlay_update_requested.connect(slot)
+                    connected_signals.append((sub_executor.overlay_update_requested, slot))
+                except Exception as exc:
+                    logger.debug(f"[子工作流] 绑定YOLO画框透传失败: {exc}")
 
             if callable(stop_checker) and stop_checker():
                 logger.info("[子工作流] 执行前检测到停止请求")
@@ -657,6 +667,20 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
         logger.error(f"[子工作流] 内部执行异常: {e}", exc_info=True)
         return False
     finally:
+        for signal, slot in connected_signals:
+            try:
+                signal.disconnect(slot)
+            except Exception as exc:
+                logger.warning(f"[子工作流] 解除信号连接失败: {exc}")
+        if sub_executor is not None:
+            try:
+                sub_executor.deleteLater()
+            except Exception as exc:
+                logger.warning(f"[子工作流] 销毁执行器失败: {exc}")
+        if session_path:
+            from app_core.lca_format.session import clear_path
+
+            clear_path(session_path)
         if context_switched:
             try:
                 from task_workflow.workflow_context import set_current_workflow_context

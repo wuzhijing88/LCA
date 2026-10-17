@@ -17,7 +17,7 @@ class GlobalSettingsDialogVisibilityMixin:
             min(max(self._DIALOG_HEIGHT_FLOOR, self.minimumHeight()), self.maximumHeight()),
         )
         # 下一拍若仍有纵向溢出，再按溢出量补高
-        QTimer.singleShot(0, self._grow_dialog_to_clear_exec_scrollbar)
+        QTimer.singleShot(0, self, self._grow_dialog_to_clear_exec_scrollbar)
 
     def _grow_dialog_to_clear_exec_scrollbar(self) -> None:
         """若执行模式页仍有纵向滚动溢出，按溢出量再拉高（受 maxHeight 限制）。"""
@@ -48,10 +48,10 @@ class GlobalSettingsDialogVisibilityMixin:
         self._update_input_backend_visibility(resize_dialog=True)
 
     def _selected_input_backend(self) -> str:
-        if hasattr(self, "runtime_backend_combo"):
-            selected = str(self.runtime_backend_combo.currentData() or "").strip().lower()
-            return "plugin" if selected == "plugin" else "native"
-        return "native"
+        selected = self.runtime_backend_combo.currentData()
+        if selected not in {"native", "plugin"}:
+            raise ValueError(f"未知的执行模式: {selected!r}")
+        return selected
 
     def _update_foreground_driver_visibility(self, *args, resize_dialog: bool = False):
         self._update_input_backend_visibility(resize_dialog=resize_dialog)
@@ -62,9 +62,10 @@ class GlobalSettingsDialogVisibilityMixin:
             self._update_runtime_backend_panels(resize_dialog=False)
 
         use_native = self._selected_input_backend() == "native"
-        internal_mode = self.mode_combo.currentData() if hasattr(self, "mode_combo") else ""
-        if not internal_mode and hasattr(self, "mode_combo"):
-            internal_mode = self.MODE_INTERNAL_MAP.get(self.mode_combo.currentText(), "")
+        internal_mode = self.get_execution_mode()
+        self.background_options_widget.setVisible(
+            use_native and internal_mode in {"background_sendmessage", "background_postmessage"}
+        )
 
         use_foreground_driver = use_native and internal_mode == "foreground_driver"
         use_foreground_py = use_native and internal_mode == "foreground_py"
@@ -98,7 +99,7 @@ class GlobalSettingsDialogVisibilityMixin:
             self.native_input_panel.setVisible(use_foreground_driver or use_foreground_py)
 
         if resize_dialog and self.isVisible():
-            QTimer.singleShot(0, self._adjust_dialog_height_only)
+            QTimer.singleShot(0, self, self._adjust_dialog_height_only)
 
     def _update_execution_mode_visibility(self):
         if hasattr(self, "exec_mode_group"):

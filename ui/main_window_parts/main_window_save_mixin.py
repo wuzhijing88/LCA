@@ -13,15 +13,10 @@ class MainWindowSaveMixin:
     def _handle_save_action(self):
         """保存并备份所有标签页的工作流，处理同名冲突"""
         if not hasattr(self, 'workflow_tab_widget') or not self.workflow_tab_widget:
-            # 回退到旧系统
-            logger.warning("WorkflowTabWidget not available, falling back to legacy save system")
-            if self.current_save_path:
-                self.perform_save(self.current_save_path)
-            else:
-                self.save_workflow_as()
+            QMessageBox.warning(self, "保存失败", "工作流标签页未初始化，无法保存")
             return
         if not hasattr(self, 'task_manager') or not self.task_manager:
-            logger.warning("TaskManager not available")
+            QMessageBox.warning(self, "保存失败", "任务管理器未初始化，无法保存")
             return
         all_tasks = self.task_manager.get_all_tasks()
         if not all_tasks:
@@ -39,6 +34,14 @@ class MainWindowSaveMixin:
                 workflow_data = workflow_view.serialize_workflow()
                 task.update_workflow_data(workflow_data)
             tasks_to_save.append((task, workflow_data))
+
+        # 子工作流先写回父工程，父工程随后从最新会话封装子包。
+        # 否则父工程会先封装旧的子包，子工作流新增资源会在随后写回时丢失。
+        tasks_to_save.sort(
+            key=lambda item: 0
+            if str(getattr(item[0], "filepath", "") or "").startswith("memory://")
+            else 1
+        )
         # 处理没有保存路径的任务
         tasks_without_path = [(t, d) for t, d in tasks_to_save if not t.filepath]
         if tasks_without_path:
@@ -72,13 +75,23 @@ class MainWindowSaveMixin:
         filepath_count = {}
         for task, workflow_data in tasks_to_save:
             filepath = task.filepath
-            if filepath in filepath_count:
-                filepath_count[filepath].append((task, workflow_data))
+            if str(filepath).startswith("memory://"):
+                identity = (
+                    os.path.normcase(os.path.abspath(task.host_workflow_filepath)),
+                    task.host_logical_path,
+                )
             else:
-                filepath_count[filepath] = [(task, workflow_data)]
+                identity = filepath
+            if identity in filepath_count:
+                filepath_count[identity].append((task, workflow_data))
+            else:
+                filepath_count[identity] = [(task, workflow_data)]
         # 处理冲突
-        for filepath, task_list in filepath_count.items():
+        for task_list in filepath_count.values():
             if len(task_list) > 1:
+                filepath = task_list[0][0].filepath
+                if str(filepath).startswith("memory://"):
+                    raise ValueError("同一父工程中的子工作流被重复打开，无法保存")
                 # 有冲突，重命名
                 base_path = os.path.splitext(filepath)[0]
                 for i, (task, _) in enumerate(task_list):

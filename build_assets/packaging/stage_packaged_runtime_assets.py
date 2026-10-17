@@ -15,8 +15,8 @@ if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
 
 from services.ocr_runtime_contract import OCR_REQUIRED_RUNTIME_DLLS
 
-# 三个核心运行文件缺一不可；xx.dat 是可选附属文件。其它文件一律不进包。
-PLUGIN_REQUIRED_FILES = ("PluginHost.exe", "dm.dll", "RegDll.dll")
+# 两个核心运行文件缺一不可；xx.dat 是可选附属文件。其它文件一律不进包。
+PLUGIN_REQUIRED_FILES = ("PluginHost.exe", "dm.dll")
 PLUGIN_OPTIONAL_FILES = ("xx.dat",)
 PLUGIN_PACK_FILES = PLUGIN_REQUIRED_FILES + PLUGIN_OPTIONAL_FILES
 
@@ -31,17 +31,6 @@ def iter_plugin_pack_files(plugin_dir: Path):
         item = plugin_dir / name
         if item.is_file():
             yield name, item
-
-
-def _resolve_existing_path(project_root: Path, candidates: list[str], *, label: str, expect_dir: bool = False) -> Path:
-    for relative_path in candidates:
-        candidate = (project_root / relative_path).resolve(strict=False)
-        if expect_dir and candidate.is_dir():
-            return candidate
-        if not expect_dir and candidate.is_file():
-            return candidate
-    expected = " / ".join(candidates)
-    raise FileNotFoundError(f"缺少源{'目录' if expect_dir else '文件'}: {label} ({expected})")
 
 
 def _copy_required_file(source_path: Path, target_path: Path, *, label: str) -> None:
@@ -102,28 +91,13 @@ def _stage_qt_platform_plugin(project_root: Path, dist_root: Path) -> None:
         _unlink_empty_parents(extra, dist_root)
     if canonical.is_file():
         return
-    source = _resolve_existing_path(
-        project_root,
-        [
-            "venv/Lib/site-packages/PySide6/plugins/platforms/qwindows.dll",
-            "venv/lib/site-packages/PySide6/plugins/platforms/qwindows.dll",
-        ],
-        label="qwindows.dll",
-    )
+    source = project_root / "venv/Lib/site-packages/PySide6/plugins/platforms/qwindows.dll"
     _copy_required_file(source, canonical, label="qwindows.dll")
 
 
 def _stage_ocr_runtime(project_root: Path, dist_root: Path) -> None:
     print("[5/6] Restore required ONNX Runtime DLLs...")
-    onnxruntime_capi = _resolve_existing_path(
-        project_root,
-        [
-            "venv/Lib/site-packages/onnxruntime/capi",
-            "venv/lib/site-packages/onnxruntime/capi",
-        ],
-        label="onnxruntime capi",
-        expect_dir=True,
-    )
+    onnxruntime_capi = project_root / "venv/Lib/site-packages/onnxruntime/capi"
 
     for relative in OCR_REQUIRED_RUNTIME_DLLS:
         filename = Path(relative).name

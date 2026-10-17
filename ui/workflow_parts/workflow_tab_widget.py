@@ -26,7 +26,7 @@ from ..system_parts.menu_style import apply_unified_menu_style
 logger = logging.getLogger(__name__)
 
 _VIEW_STATE_SETTINGS_KEY = "workflow_view_states_v1"
-_WORKFLOW_FILE_SUFFIXES = {".json", ".lca"}
+_WORKFLOW_FILE_SUFFIXES = {".lca"}
 
 
 def _strip_workflow_suffix(name: object) -> str:
@@ -105,7 +105,7 @@ class WorkflowTabWidget(QTabWidget):
 
         # 强制去掉标签栏基线与pane边框，避免顶部/右侧细线残留
         self.tabBar().setDrawBase(False)
-        self.setStyleSheet("QTabWidget::pane { border: none; top: 0px; }")
+        self.setObjectName("workflowTabWidget")
 
         # 启用滚动按钮（左右切换箭头），避免标签页过多时窗口变宽
         self.setUsesScrollButtons(True)
@@ -278,7 +278,7 @@ class WorkflowTabWidget(QTabWidget):
             restored_index = self.indexOf(previous_widget)
             if restored_index >= 0:
                 self.setCurrentIndex(restored_index)
-                self._activate_current_task_session()
+                self._safe_activate_current_task_session()
                 return
 
         previous_index = restore_state.get("index", -1)
@@ -287,7 +287,7 @@ class WorkflowTabWidget(QTabWidget):
 
         if 0 <= previous_index < self.count():
             self.setCurrentIndex(previous_index)
-            self._activate_current_task_session()
+            self._safe_activate_current_task_session()
 
     def persist_open_view_states(self) -> None:
         """将当前所有打开工作流的画布视图状态持久化到 QSettings。"""
@@ -437,13 +437,14 @@ class WorkflowTabWidget(QTabWidget):
             return None
 
         try:
-            original_filepath = filepath
             workflow_data = load_workflow_file(filepath)
-            if (
-                not str(original_filepath).startswith("memory://")
-                and Path(original_filepath).suffix.lower() == ".json"
-            ):
-                filepath = str(Path(original_filepath).with_suffix(".lca"))
+            if not str(filepath).startswith("memory://"):
+                from app_core.lca_format.session import get_active
+
+                session = get_active()
+                if session is None or session.source_path is None:
+                    raise ValueError("磁盘工程未提供现行文件路径")
+                filepath = session.source_path
             jump_config, window_binding = self._validate_workflow_import_data(workflow_data, filepath)
 
             # 生成任务名称
@@ -491,7 +492,13 @@ class WorkflowTabWidget(QTabWidget):
             QMessageBox.critical(self, "导入失败", f"导入失败:\n{e}")
             return None
 
-    def _validate_workflow_import_data(self, workflow_data: Any, filepath: str):
+    def _validate_workflow_import_data(
+        self,
+        workflow_data: Any,
+        filepath: str,
+        *,
+        forbid_sub_workflow: bool = False,
+    ):
         """校验当前版本工作流格式，并把失效 HWND 迁移到当前全局绑定。
 
         无法可信匹配时保留原绑定并继续导入，避免每次弹窗打断。
@@ -506,6 +513,11 @@ class WorkflowTabWidget(QTabWidget):
         from task_workflow.workflow_sanitize import sanitize_workflow_data
 
         sanitize_workflow_data(workflow_data)
+        if forbid_sub_workflow:
+            from app_core.lca_format.project_io import _workflow_contains_sub_workflow
+
+            if _workflow_contains_sub_workflow(workflow_data):
+                raise ValueError("子工作流不允许嵌套")
         jump_config = workflow_data.get('jump_config')
         if jump_config is not None:
             if not isinstance(jump_config, dict):
@@ -584,6 +596,16 @@ class WorkflowTabWidget(QTabWidget):
         task = self.task_manager.get_task(task_id)
         return getattr(task, "filepath", None) if task else None
 
+    @Slot(str)
+    def _open_sub_workflow_from_view(self, filepath: str) -> None:
+        view = self.sender()
+        task_id = getattr(view, "task_id", None)
+        task = self.task_manager.get_task(task_id) if task_id is not None else None
+        if task is None:
+            QMessageBox.warning(self, "打开失败", "来源工作流已关闭，无法打开子工作流")
+            return
+        self.open_sub_workflow(filepath, parent_workflow_file=task.filepath)
+
     @staticmethod
     def _resolve_explicit_sub_workflow_path(filepath: str, parent_workflow_file: Optional[str]) -> str:
         """只按调用方给出的明确路径解析，不搜索或猜测同名文件。"""
@@ -619,7 +641,7 @@ class WorkflowTabWidget(QTabWidget):
             QMessageBox.warning(self, "打开失败", "未指定子工作流文件")
             return None
 
-        parent_file = parent_workflow_file or self._get_current_workflow_filepath()
+        parent_file = self._get_current_workflow_filepath() if parent_workflow_file is None else parent_workflow_file
         try:
             resolved_filepath = self._resolve_explicit_sub_workflow_path(filepath, parent_file)
         except (TypeError, ValueError, FileNotFoundError) as exc:
@@ -632,6 +654,11 @@ class WorkflowTabWidget(QTabWidget):
         for task_id, view in self.task_views.items():
             task = self.task_manager.get_task(task_id)
             if task and task.filepath == filepath:
+                if filepath.startswith("memory://"):
+                    opened_host = os.path.normcase(os.path.abspath(task.host_workflow_filepath))
+                    requested_host = os.path.normcase(os.path.abspath(str(parent_file or "")))
+                    if opened_host != requested_host:
+                        continue
                 # 已打开，切换到该标签页
                 tab_index = self.task_to_tab.get(task_id)
                 if tab_index is not None:
@@ -640,6 +667,10 @@ class WorkflowTabWidget(QTabWidget):
                     return task_id
 
         # 文件未打开，导入它
+        task_id = None
+        nested_session = None
+        registered_path = ""
+        opened = False
         try:
             from task_workflow.workflow_payload import load_workflow_package
 
@@ -651,8 +682,13 @@ class WorkflowTabWidget(QTabWidget):
                 from app_core.lca_format.session import activate, register
 
                 register(filepath, nested_session)
+                registered_path = filepath
                 activate(filepath)
-            jump_config, window_binding = self._validate_workflow_import_data(workflow_data, filepath)
+            jump_config, window_binding = self._validate_workflow_import_data(
+                workflow_data,
+                filepath,
+                forbid_sub_workflow=True,
+            )
 
             # 生成标签页名称（带子流程前缀）
             base_name = os.path.basename(filepath)
@@ -669,26 +705,25 @@ class WorkflowTabWidget(QTabWidget):
                     from task_workflow.workspace import apply_resource_dirs_to_task
 
                     nested_path = register_temporary(nested_session)
+                    registered_path = nested_path
                     task.lca_session = nested_session
                     task.lca_session_path = nested_path
                     task.host_workflow_filepath = str(parent_file or "").strip()
                     logical = str(filepath)[len("memory://"):]
                     task.host_logical_path = logical
-                    current_id = self.get_current_task_id()
-                    parent_task = self.task_manager.get_task(current_id) if current_id is not None else None
-                    nested_dirs = {}
-                    if parent_task is not None:
-                        from task_workflow.resource_context import resource_dirs_from_mapping
+                    from task_workflow.resource_context import resource_dirs_from_mapping
 
-                        nested_dirs = resource_dirs_from_mapping(parent_task)
+                    nested_dirs = resource_dirs_from_mapping(task)
                     apply_resource_dirs_to_task(task, nested_dirs)
                     images_dir = str(nested_dirs.get("images_dir") or "").strip()
                     if images_dir:
+                        from app_core.lca_format.project_io import _iter_resource_literals
                         from app_core.lca_format.session import materialize_package_assets
 
                         materialize_package_assets(
                             nested_session,
                             os.path.dirname(os.path.abspath(images_dir)),
+                            logical_paths=_iter_resource_literals(workflow_data),
                         )
                 if jump_config is not None:
                     task.jump_enabled = jump_config['enabled']
@@ -701,8 +736,10 @@ class WorkflowTabWidget(QTabWidget):
                     task.target_hwnd = window_binding['target_hwnd']
 
             logger.info(f"[子工作流] 打开成功: {filepath}, task_id={task_id}")
+            if self.get_current_task_id() == task_id:
+                self._safe_activate_current_task_session()
             self.workflow_imported.emit(task_id)
-
+            opened = True
             return task_id
 
         except json.JSONDecodeError as e:
@@ -712,6 +749,22 @@ class WorkflowTabWidget(QTabWidget):
             logger.error(f"[子工作流] 打开失败: {e}", exc_info=True)
             QMessageBox.critical(self, "打开失败", f"打开子工作流失败:\n{e}")
             return None
+        finally:
+            if not opened and nested_session is not None:
+                if task_id is not None and self.task_manager.get_task(task_id) is not None:
+                    self.task_manager.remove_task(task_id)
+                if registered_path:
+                    from app_core.lca_format.session import clear_path
+
+                    try:
+                        clear_path(registered_path)
+                    except Exception as exc:
+                        logger.warning("清理子工作流工程会话失败: %s", exc, exc_info=True)
+                try:
+                    nested_session.close()
+                except Exception as exc:
+                    logger.warning("释放子工作流工程会话失败: %s", exc, exc_info=True)
+                self._safe_activate_current_task_session()
 
     def create_blank_workflow(self, name: str = None, workspace_dir: str = "") -> Optional[int]:
         """
@@ -825,7 +878,7 @@ class WorkflowTabWidget(QTabWidget):
             set_line_animation_paused("workflow_tab_insert", False)
             return
         workflow_view.setUpdatesEnabled(True)
-        QTimer.singleShot(0, lambda view=workflow_view: self._resume_task_view_insert(view))
+        QTimer.singleShot(0, workflow_view, lambda view=workflow_view: self._resume_task_view_insert(view))
 
     def _resume_task_view_insert(self, workflow_view) -> None:
         from shiboken6 import isValid
@@ -878,8 +931,12 @@ class WorkflowTabWidget(QTabWidget):
         workflow_view.connection_added.connect(lambda start_card, end_card, conn_type: self._mark_task_modified(task_id))
         workflow_view.connection_deleted.connect(lambda conn: self._mark_task_modified(task_id))
         workflow_view.card_moved.connect(lambda: self._mark_task_modified(task_id))
-        workflow_view.connection_added.connect(lambda start_card, end_card, conn_type: self._on_connection_changed(start_card))
-        workflow_view.connection_deleted.connect(lambda conn: self._on_connection_deleted_for_random_jump(conn, task_id))
+        workflow_view.connection_added.connect(
+            lambda start_card, end_card, conn_type: self._safe_on_connection_changed(start_card)
+        )
+        workflow_view.connection_deleted.connect(
+            lambda conn: self._safe_on_connection_deleted_for_random_jump(conn, task_id)
+        )
 
         main_window = self.window()
         if main_window is None:
@@ -892,7 +949,7 @@ class WorkflowTabWidget(QTabWidget):
             main_window._handle_test_flow_execution,
             Qt.ConnectionType.QueuedConnection,
         )
-        workflow_view.open_sub_workflow_requested.connect(self.open_sub_workflow)
+        workflow_view.open_sub_workflow_requested.connect(self._open_sub_workflow_from_view)
 
         task.card_executing.connect(
             self._on_task_card_executing,
@@ -979,7 +1036,10 @@ class WorkflowTabWidget(QTabWidget):
             ):
                 from app_core.lca_format.session import clear_path
 
-                clear_path(session_path)
+                try:
+                    clear_path(session_path)
+                except Exception as exc:
+                    logger.warning("清理工作流工程会话失败: %s", exc)
 
         if task_id not in self.task_to_tab:
             logger.warning(f"尝试删除不存在的任务: task_id={task_id}")
@@ -1078,65 +1138,14 @@ class WorkflowTabWidget(QTabWidget):
         logger.debug(f"标签页已删除: task_id={task_id}")
 
     def _dispose_workflow_widget(self, workflow_widget: Optional[QWidget]) -> None:
-        """显式销毁已关闭标签页的页面对象，避免内存残留。"""
+        """标签关闭和加载失败共用视图自身的销毁入口。"""
         if workflow_widget is None:
             return
-
-        try:
-            if isinstance(workflow_widget, WorkflowView):
-                try:
-                    workflow_widget.main_window = None
-                except Exception:
-                    pass
-
-                # WorkflowView 覆盖了 scene 为属性，不是 QGraphicsView.scene() 方法。
-                # 这里统一兼容属性/方法两种形态，避免拿不到场景导致信号无法解绑。
-                scene = getattr(workflow_widget, "scene", None)
-                if callable(scene):
-                    try:
-                        scene = scene()
-                    except Exception:
-                        scene = None
-
-                try:
-                    workflow_widget.undo_stack.clear()
-                except Exception:
-                    pass
-                try:
-                    workflow_widget.flashing_card_ids.clear()
-                except Exception:
-                    pass
-                try:
-                    workflow_widget._deleting_cards.clear()
-                except Exception:
-                    pass
-
-                if scene is not None:
-                    try:
-                        scene.clear()
-                    except Exception:
-                        pass
-
-                try:
-                    workflow_widget.cards.clear()
-                except Exception:
-                    pass
-                try:
-                    workflow_widget.connections.clear()
-                except Exception:
-                    pass
-        except Exception as exc:
-            logger.warning(f"清理已关闭工作流页面失败: {exc}")
-
-        try:
-            workflow_widget.setParent(None)
-        except Exception:
-            pass
-
-        try:
-            workflow_widget.deleteLater()
-        except RuntimeError:
-            pass
+        if isinstance(workflow_widget, WorkflowView):
+            workflow_widget.dispose_resources()
+            workflow_widget.main_window = None
+        workflow_widget.setParent(None)
+        workflow_widget.deleteLater()
 
     @Slot(int)
     def _on_task_card_executing(self, card_id: int):
@@ -1343,17 +1352,35 @@ class WorkflowTabWidget(QTabWidget):
             # else: 导入成功，_on_task_added 会自动切换到新标签页
 
     def _activate_current_task_session(self) -> None:
-        from app_core.lca_format.session import activate, deactivate, register
+        from app_core.lca_format.session import activate, deactivate, get_for_path
 
         task_id = self.get_current_task_id()
         task = self.task_manager.get_task(task_id) if task_id is not None else None
         session = getattr(task, "lca_session", None) if task is not None else None
         session_path = str(getattr(task, "lca_session_path", "") or "").strip()
         if session is not None and session_path:
-            register(session_path, session)
+            current_session = get_for_path(session_path)
+            if current_session is None:
+                raise RuntimeError(f"工作流工程会话未注册: {session_path}")
+            task.lca_session = current_session
             activate(session_path)
             return
         deactivate()
+
+    def _safe_activate_current_task_session(self) -> bool:
+        """在 Qt 标签切换回调边界收口工程会话异常。"""
+        try:
+            self._activate_current_task_session()
+            return True
+        except Exception as exc:
+            logger.error("切换工作流工程会话失败: %s", exc, exc_info=True)
+            try:
+                from app_core.lca_format.session import deactivate
+
+                deactivate()
+            except Exception:
+                pass
+            return False
 
     def _on_current_changed(self, index: int):
         """当前标签页变化"""
@@ -1376,9 +1403,12 @@ class WorkflowTabWidget(QTabWidget):
         # 发送当前工作流变化信号
         if index in self.tab_to_task:
             task_id = self.tab_to_task[index]
-            self._activate_current_task_session()
+            self._safe_activate_current_task_session()
             logger.debug(f"切换到任务: task_id={task_id}")
-            self.current_workflow_changed.emit(task_id)
+            try:
+                self.current_workflow_changed.emit(task_id)
+            except Exception as exc:
+                logger.error("切换工作流界面失败: %s", exc, exc_info=True)
         else:
             logger.debug(f"索引 {index} 不在 tab_to_task 映射中")
 
@@ -1451,6 +1481,20 @@ class WorkflowTabWidget(QTabWidget):
         # 序列化将在用户主动保存时进行
         task.modified = True
         self._update_tab_status(task_id)
+
+    def _safe_on_connection_changed(self, start_card) -> None:
+        """隔离参数面板刷新异常，避免编辑信号把异常抛回 Qt 事件循环。"""
+        try:
+            self._on_connection_changed(start_card)
+        except Exception as exc:
+            logger.warning("连接变化后刷新参数面板失败: %s", exc, exc_info=True)
+
+    def _safe_on_connection_deleted_for_random_jump(self, conn, task_id: int) -> None:
+        """隔离参数面板刷新异常，避免删除连线时触发未处理异常。"""
+        try:
+            self._on_connection_deleted_for_random_jump(conn, task_id)
+        except Exception as exc:
+            logger.warning("删除随机跳转连线后刷新参数面板失败: %s", exc, exc_info=True)
 
     def _on_connection_changed(self, start_card):
         """连接变化时刷新参数面板（用于随机跳转等动态参数）
@@ -1748,14 +1792,23 @@ class WorkflowTabWidget(QTabWidget):
             if task_session is not None and old_filepath.lower().endswith(".lca"):
                 from app_core.lca_format.session import (
                     activate,
-                    clear_path,
                     get_active,
+                    get_for_path,
+                    move_path,
                     register,
                 )
 
                 was_active = get_active() is task_session
-                clear_path(old_filepath)
-                register(task.filepath, task_session)
+                registered_session = get_for_path(old_filepath)
+                if registered_session is task_session:
+                    move_path(old_filepath, task.filepath)
+                else:
+                    if registered_session is not None:
+                        from app_core.lca_format.session import clear_path
+
+                        clear_path(old_filepath)
+                    task_session.bind_source(task.filepath)
+                    register(task.filepath, task_session)
                 task.lca_session_path = os.path.abspath(task.filepath)
                 if was_active:
                     activate(task.filepath)

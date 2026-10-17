@@ -8,6 +8,8 @@ logger = logging.getLogger(__name__)
 class MainWindowExecutionStateMixin:
 
     def _handle_execution_started(self):
+        if self._is_stale_executor_signal():
+            return
 
         from .main_window_support import create_media_control_icon, get_info_color
         # print("UI: 收到 execution_started 信号")  # 性能优化：移除print避免主线程阻塞
@@ -20,11 +22,11 @@ class MainWindowExecutionStateMixin:
 
         # ----------------------------
 
-        # 通知浮动窗口控制器
+        # 通知执行日志面板控制器
 
-        if hasattr(self, '_floating_controller') and self._floating_controller:
+        if hasattr(self, '_execution_log_panel') and self._execution_log_panel:
 
-            self._floating_controller.on_workflow_started()
+            self._execution_log_panel.on_workflow_started()
 
         # 【参考中控】更新底部状态栏显示执行开始
 
@@ -100,9 +102,9 @@ class MainWindowExecutionStateMixin:
 
         self._update_step_detail_for_card(card_id, is_executing=True)
 
-        # 通知浮动窗口当前执行的步骤
+        # 通知执行日志面板当前执行的步骤
 
-        if hasattr(self, '_floating_window') and self._floating_window:
+        if hasattr(self, '_execution_log_panel') and self._execution_log_panel:
 
             try:
 
@@ -118,51 +120,15 @@ class MainWindowExecutionStateMixin:
 
                         card_name = card.parameters.get('name', '') or card.parameters.get('description', '')
 
-                    self._floating_window.on_step_started(card_type, card_name)
+                    self._execution_log_panel.on_step_started(card_type, card_name)
 
             except Exception as e:
 
-                logger.debug(f"更新浮动窗口步骤信息失败: {e}")
+                logger.debug(f"更新执行日志面板步骤信息失败: {e}")
 
-        # 获取当前标签页ID
-
-        current_task_id = self.workflow_tab_widget.get_current_task_id()
-
-        # 优先使用当前活动的workflow_view（适用于测试模式和正常执行）
-
-        target_workflow_view = self.workflow_view
-
-        # 验证卡片是否在当前视图中
-
-        if target_workflow_view and card_id in target_workflow_view.cards:
-
-            logger.debug(f"[卡片状态] 卡片 {card_id} 在当前标签页 (task_id={current_task_id}) 中")
-
-        else:
-
-            # 卡片不在当前视图，遍历查找（适用于后台执行的情况）
-
-            logger.debug(f"[卡片状态] 卡片 {card_id} 不在当前标签页，搜索其他标签页")
-
-            target_workflow_view = None
-
-            for task_id, workflow_view in self.workflow_tab_widget.task_views.items():
-
-                if workflow_view and card_id in workflow_view.cards:
-
-                    target_workflow_view = workflow_view
-
-                    logger.debug(f"[卡片状态] 找到卡片 {card_id} 所在的工作流视图: task_id={task_id}")
-
-                    break
-
-            if not target_workflow_view:
-
-                logger.debug(f"[卡片状态] 未找到包含卡片 {card_id} 的工作流视图")
-
-                return
-
-            # 不再跳过非当前标签页：执行态必须实时可见，避免“运行中不变色，停止后才更新”。
+        target_workflow_view = self._execution_workflow_view()
+        if target_workflow_view is None:
+            return
 
         # 正常模式与测试模式统一更新卡片状态：
 
@@ -184,37 +150,10 @@ class MainWindowExecutionStateMixin:
 
         # print(f"UI: 收到 error_occurred 信号 for ID {card_id}: {error_message}")  # 性能优化：移除print
 
-        # 工具 修复：找到包含此卡片的正确工作流视图
-
-        target_workflow_view = None
-
-        target_task_id = None
-
-        for task_id, workflow_view in self.workflow_tab_widget.task_views.items():
-
-            if workflow_view and card_id in workflow_view.cards:
-
-                target_workflow_view = workflow_view
-
-                target_task_id = task_id
-
-                logger.debug(f"找到卡片 {card_id} 所在的工作流视图: task_id={task_id}")
-
-                break
-
-        if not target_workflow_view:
-
-            logger.debug(f"未找到包含卡片 {card_id} 的工作流视图，使用当前活动视图")
-
-            target_workflow_view = self.workflow_view
-
-            # 【修复闪退】检查fallback的workflow_view是否也为None
-
-            if not target_workflow_view:
-
-                logger.warning(f"当前活动视图也为None，无法设置卡片 {card_id} 的状态")
-
-                return
+        target_workflow_view = self._execution_workflow_view()
+        if target_workflow_view is None:
+            return
+        target_task_id = target_workflow_view.task_id
 
         # 性能优化：只有当标签页可见时才更新UI
 
@@ -314,11 +253,11 @@ class MainWindowExecutionStateMixin:
 
             )
 
-        # 通知浮动窗口控制器
+        # 通知执行日志面板控制器
 
-        if hasattr(self, '_floating_controller') and self._floating_controller:
+        if hasattr(self, '_execution_log_panel') and self._execution_log_panel:
 
-            self._floating_controller.on_workflow_finished(success, status_message)
+            self._execution_log_panel.on_workflow_finished(success, status_message)
 
         # 【关键修复】恢复连线动画
 
@@ -751,21 +690,36 @@ class MainWindowExecutionStateMixin:
             return f"工作流执行出现问题：{text}"
         return text
 
+    def _execution_workflow_view(self):
+        """按执行来源定位所属画布，卡片 ID 不能用于跨工作流猜测归属。"""
+        from shiboken6 import isValid
+
+        source = self.sender()
+        if source is None or source is self.executor:
+            task_id = self._active_execution_task_id
+        else:
+            task_ids = [task_id for task_id, binding in self._task_signal_bindings.items()
+                        if binding["task"] is source]
+            if len(task_ids) != 1:
+                logger.error("执行信号的工作流归属未知，无法更新卡片状态")
+                return None
+            task_id = task_ids[0]
+        view = self.workflow_tab_widget.task_views.get(task_id)
+        if view is None or not isValid(view):
+            logger.warning("执行信号所属画布已关闭或不存在：%s", task_id)
+            return None
+        return view
+
     def _is_stale_executor_signal(self) -> bool:
         """过滤历史执行器残留信号，防止执行结束后继续触发UI更新。"""
-        try:
-            signal_sender = self.sender()
-        except Exception:
-            return False
+        from task_workflow.process_proxy import ProcessWorkflowExecutorProxy
+
+        signal_sender = self.sender()
         if signal_sender is None:
             return False
-        # 仅拦截来自 WorkflowExecutor 的残留信号，任务级信号不受影响
-        if not hasattr(signal_sender, "test_mode"):
+        if not isinstance(signal_sender, ProcessWorkflowExecutorProxy):
             return False
-        current_executor = getattr(self, "executor", None)
-        if current_executor is None:
-            return True
-        return signal_sender is not current_executor
+        return signal_sender is not self.executor
 
     def _auto_reset_after_completion(self, success: bool, message: str):
         """任务完成后自动重置状态"""
@@ -833,12 +787,12 @@ class MainWindowExecutionStateMixin:
     def _on_task_status_changed(self, task_id: int, status: str):
         """任务状态变化处理（用于更新工具栏按钮）"""
         logging.debug(f"_on_task_status_changed: 任务 {task_id} 状态变为 {status}")
-        # 通知浮动窗口任务状态变化
-        if hasattr(self, '_floating_controller') and self._floating_controller:
+        # 通知执行日志面板任务状态变化
+        if hasattr(self, '_execution_log_panel') and self._execution_log_panel:
             if status == 'running':
-                self._floating_controller.on_workflow_started()
+                self._execution_log_panel.on_workflow_started()
             elif status in ['completed', 'failed', 'stopped']:
-                self._floating_controller.on_workflow_finished(status == 'completed', status)
+                self._execution_log_panel.on_workflow_finished(status == 'completed', status)
         # 【修复】执行中时不更新状态栏，让详细步骤信息显示
         # 只在非执行状态时更新状态栏
         if status not in ['running', 'paused']:

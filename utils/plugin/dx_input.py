@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional
 
-from utils.input.input_timing import DEFAULT_CLICK_HOLD_SECONDS, DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
+from utils.input.input_timing import DEFAULT_CLICK_HOLD_SECONDS
 from utils.plugin.runtime import is_plugin_runtime_available
 from utils.plugin.session import PluginSession, get_shared_plugin_client, resolve_plugin_display_mode
 from utils.precise_sleep import precise_sleep
@@ -29,10 +30,10 @@ class PluginDxInput:
         self.display = display
         self._injected_client = client
         self._client = client
-        try:
-            explicit_input = int(input_hwnd or 0)
-        except (TypeError, ValueError):
-            explicit_input = 0
+        self._pressed_mouse_buttons = set()
+        explicit_input = 0 if input_hwnd is None else int(input_hwnd)
+        if explicit_input < 0:
+            raise ValueError("插件输入窗口句柄无效")
         self._explicit_input_hwnd = explicit_input if explicit_input > 0 else 0
 
     def _resolved_input_hwnd(self) -> int:
@@ -40,7 +41,10 @@ class PluginDxInput:
             return self._explicit_input_hwnd
         from utils.window.window_binding_utils import resolve_plugin_input_hwnd_for_display
 
-        return int(resolve_plugin_input_hwnd_for_display(self.hwnd) or self.hwnd)
+        input_hwnd = int(resolve_plugin_input_hwnd_for_display(self.hwnd))
+        if input_hwnd <= 0:
+            raise RuntimeError("无法确定插件输入窗口")
+        return input_hwnd
 
     def _session(self) -> PluginSession:
         if self._injected_client is None:
@@ -69,11 +73,11 @@ class PluginDxInput:
         if self.hwnd <= 0:
             return False
         if self._injected_client is None and not is_plugin_runtime_available():
-            logger.error("插件键鼠需要安装目录内的 tools/plugin 运行库（PluginHost.exe / dm.dll / RegDll.dll）")
+            logger.error("插件键鼠需要安装目录内的 tools/plugin 运行库（PluginHost.exe / dm.dll）")
             return False
         session = self._session()
         display, mouse, keypad, mode = self._load_bind_params()
-        input_hwnd = as_hwnd(self._resolved_input_hwnd()) or self.hwnd
+        input_hwnd = as_hwnd(self._resolved_input_hwnd())
         if not session.ensure_input_bind(
             self.hwnd,
             display,
@@ -98,23 +102,34 @@ class PluginDxInput:
     def _text_ime_enabled(self) -> bool:
         from utils.runtime_config import get_runtime_config
 
-        try:
-            return bool(get_runtime_config().get("plugin_text_ime", False))
-        except Exception:
-            return False
+        enabled = get_runtime_config().get("plugin_text_ime", False)
+        if not isinstance(enabled, bool):
+            raise ValueError("插件文本输入法选项必须是布尔值")
+        return enabled
 
-    def send_text(self, text: str) -> bool:
-        """ASCII 走 KeyPressStr（按键序列）；含中文等非 ASCII 字符时走 SendString（消息注入），
-        开启「插件文本走输入法」时优先 SendStringIme（游戏类窗口通常只认这条路）。"""
+    def send_text(self, text: str, stop_checker=None, delay: float = 0.0) -> bool:
+        """文字按选项调用 SendString 或 SendStringIme；正间隔逐字发送。"""
+        pause = float(delay)
+        if not math.isfinite(pause) or pause < 0:
+            raise ValueError("文字输入间隔必须是大于等于零的有限数字")
+        if stop_checker and stop_checker():
+            raise InterruptedError("插件文字输入已停止")
         value = str(text or "")
         if not value:
             return True
+        use_ime = self._text_ime_enabled()
         if not self._ready():
             return False
-        if value.isascii():
-            return bool(self._client.key_press_str(value, hwnd=self.hwnd))
-        target = as_hwnd(self._resolved_input_hwnd()) or self.hwnd
-        return bool(self._client.send_string(self.hwnd, value, ime=self._text_ime_enabled(), target=target))
+        target = as_hwnd(self._resolved_input_hwnd())
+        chunks = (value,) if pause == 0 else value
+        for index, chunk in enumerate(chunks):
+            if stop_checker and stop_checker():
+                raise InterruptedError("插件文字输入已停止")
+            if not self._client.send_string(self.hwnd, chunk, ime=use_ime, target=target):
+                return False
+            if pause > 0 and index + 1 < len(chunks):
+                precise_sleep(pause)
+        return True
 
     def move_to(self, x: int, y: int) -> bool:
         if not self._ready():
@@ -124,22 +139,57 @@ class PluginDxInput:
     def mouse_down(self, button: str = "left") -> bool:
         if not self._ready():
             return False
+        self._pressed_mouse_buttons.add(button)
         return bool(self._client.mouse_down(button, hwnd=self.hwnd))
 
     def mouse_up(self, button: str = "left") -> bool:
         if not self._ready():
             return False
-        return bool(self._client.mouse_up(button, hwnd=self.hwnd))
+        released = bool(self._client.mouse_up(button, hwnd=self.hwnd))
+        if released:
+            self._pressed_mouse_buttons.discard(button)
+        return released
+
+    def close(self) -> bool:
+        released = True
+        for button in list(self._pressed_mouse_buttons):
+            try:
+                if not self.mouse_up(button):
+                    released = False
+            except Exception:
+                released = False
+        if released:
+            self._client = None
+            self._injected_client = None
+        return released
 
     def mouse_click(self, button: str = "left") -> bool:
         if not self._ready():
             return False
-        return bool(self._client.mouse_click(button, hwnd=self.hwnd))
+        self._pressed_mouse_buttons.add(button)
+        completed = False
+        try:
+            completed = bool(self._client.mouse_click(button, hwnd=self.hwnd))
+            return completed
+        finally:
+            if completed:
+                self._pressed_mouse_buttons.discard(button)
+            else:
+                self.mouse_up(button)
 
     def mouse_double_click(self, button: str = "left") -> bool:
         if not self._ready():
             return False
-        return bool(self._client.mouse_double_click(button, hwnd=self.hwnd))
+        self._pressed_mouse_buttons.add(button)
+        completed = False
+        try:
+            completed = bool(self._client.mouse_double_click(button, hwnd=self.hwnd))
+            return completed
+        finally:
+            if completed:
+                self._pressed_mouse_buttons.discard(button)
+            else:
+                self.mouse_up(button)
 
     def click(
         self,
@@ -150,28 +200,24 @@ class PluginDxInput:
         interval: float = 0.1,
         duration: Optional[float] = None,
     ) -> bool:
-        if not self.move_to(x, y):
+        safe_clicks = int(clicks)
+        safe_interval = float(interval)
+        hold = DEFAULT_CLICK_HOLD_SECONDS if duration is None else float(duration)
+        if safe_clicks <= 0 or safe_clicks != float(clicks) or not math.isfinite(safe_interval) or not math.isfinite(hold) or safe_interval < 0 or hold < 0:
+            raise ValueError("点击次数或时间参数无效")
+        if self._pressed_mouse_buttons or not self.move_to(x, y):
             return False
-        try:
-            safe_clicks = max(1, int(clicks))
-        except Exception:
-            safe_clicks = 1
-        try:
-            safe_interval = max(0.0, float(interval))
-        except Exception:
-            safe_interval = 0.0
-        try:
-            hold = DEFAULT_CLICK_HOLD_SECONDS if duration is None else max(0.0, float(duration))
-        except Exception:
-            hold = DEFAULT_CLICK_HOLD_SECONDS
         for index in range(safe_clicks):
             if index > 0 and safe_interval > 0:
                 precise_sleep(safe_interval)
             if hold > 0:
-                if not self.mouse_down(button):
-                    return False
-                precise_sleep(hold)
-                if not self.mouse_up(button):
+                try:
+                    if not self.mouse_down(button):
+                        return False
+                    precise_sleep(hold)
+                finally:
+                    released = self.mouse_up(button)
+                if not released:
                     return False
             elif not self.mouse_click(button):
                 return False
@@ -185,31 +231,13 @@ class PluginDxInput:
         interval: Optional[float] = None,
         hold_duration: Optional[float] = None,
     ) -> bool:
-        """左键走大漠 LeftDoubleClick（消息注入模式下两次单击不会被识别为双击）；
-        大漠没有 Right/MiddleDoubleClick，非左键用两次按下/松开凑出双击时序。"""
-        if not self.move_to(x, y):
+        """插件原生双击仅支持左键，其他按钮直接失败。"""
+        if button != "left":
+            logger.error("插件不支持该鼠标按钮的原生双击：%s", button)
             return False
-        normalized = str(button or "left").strip().lower()
-        if normalized == "left":
-            return self.mouse_double_click("left")
-        try:
-            gap = DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS if interval is None else max(0.0, float(interval))
-        except Exception:
-            gap = DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
-        try:
-            hold = DEFAULT_CLICK_HOLD_SECONDS if hold_duration is None else max(0.0, float(hold_duration))
-        except Exception:
-            hold = DEFAULT_CLICK_HOLD_SECONDS
-        for index in range(2):
-            if index > 0 and gap > 0:
-                precise_sleep(gap)
-            if not self.mouse_down(normalized):
-                return False
-            if hold > 0:
-                precise_sleep(hold)
-            if not self.mouse_up(normalized):
-                return False
-        return True
+        if self._pressed_mouse_buttons or not self.move_to(x, y):
+            return False
+        return self.mouse_double_click("left")
 
     def wheel(self, x: int, y: int, delta: int) -> bool:
         """delta 既可能是格数（±3）也可能是 WHEEL_DELTA 单位（±120 的倍数），统一换算成格数交给宿主。"""

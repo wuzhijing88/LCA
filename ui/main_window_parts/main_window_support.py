@@ -392,6 +392,29 @@ def create_hourglass_icon(size: int = 22) -> QIcon:
     return _build_modern_line_icon(size, draw)
 
 
+def create_child_session_toolbar_icon(size: int = 22) -> QIcon:
+    """桌面分身：重叠的两个桌面窗口。"""
+
+    def draw(painter: QPainter, px: int, color: QColor):
+        a = _line_content_rect(px)
+        back = QRectF(
+            a.left() + a.width() * 0.18,
+            a.top(),
+            a.width() * 0.82,
+            a.height() * 0.72,
+        )
+        front = QRectF(
+            a.left(),
+            a.top() + a.height() * 0.28,
+            a.width() * 0.82,
+            a.height() * 0.72,
+        )
+        painter.drawRoundedRect(back, _line_radius(back, 0.16), _line_radius(back, 0.16))
+        painter.drawRoundedRect(front, _line_radius(front, 0.16), _line_radius(front, 0.16))
+
+    return _build_modern_line_icon(size, draw)
+
+
 def create_monitor_toolbar_icon(size: int = 22) -> QIcon:
     """中控/调试：显示器。"""
 

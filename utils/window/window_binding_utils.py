@@ -127,10 +127,7 @@ def _host_enabled_bound_hwnds(host: Any) -> Optional[set]:
         return _enabled_bound_hwnds(runtime)
     config = getattr(host, "config", None)
     if isinstance(config, dict):
-        native = get_native_bound_windows(config)
-        if native:
-            return _enabled_bound_hwnds(native)
-        return _enabled_bound_hwnds(get_active_bound_windows(config))
+        return _enabled_bound_hwnds(get_native_bound_windows(config))
     return None
 
 
@@ -149,34 +146,28 @@ def resolve_live_target_hwnd(
     if host is None:
         return _alive_hwnd(cached_hwnd, alive)
 
-    bound_hwnds = _host_enabled_bound_hwnds(host)
     candidates: List[Any] = []
     resolve_preferred = getattr(host, "_resolve_panel_target_hwnd", None)
     if callable(resolve_preferred):
-        try:
-            preferred = resolve_preferred()
-        except Exception:
-            preferred = None
+        preferred = resolve_preferred()
         if preferred:
             candidates.append(preferred)
 
     bound_windows = getattr(host, "bound_windows", None)
-    from_bound = _hwnd_from_window_info(
-        get_first_enabled_bound_window(bound_windows if isinstance(bound_windows, list) else None),
-        alive,
-    )
-    if from_bound:
-        candidates.append(from_bound)
-
-    config = getattr(host, "config", None)
-    if isinstance(config, dict) and not isinstance(bound_windows, list):
-        from_config = _hwnd_from_window_info(get_active_bound_window(config), alive)
-        if from_config:
-            candidates.append(from_config)
+    if not isinstance(bound_windows, list):
+        bound_windows = get_native_bound_windows(getattr(host, "config", None))
+    for window_info in bound_windows:
+        if not isinstance(window_info, dict) or not window_info.get("enabled", True):
+            continue
+        from_bound = _hwnd_from_window_info(window_info, alive)
+        if from_bound:
+            candidates.append(from_bound)
+            break
 
     if cached_hwnd:
         candidates.append(cached_hwnd)
 
+    bound_hwnds = _host_enabled_bound_hwnds(host)
     seen = set()
     for candidate in candidates:
         handle = _alive_hwnd(candidate, alive)

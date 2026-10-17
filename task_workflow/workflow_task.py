@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_process_workflow_runtime(**kwargs):
-    """Compatibility seam retained for existing UI/runtime tests."""
+    """创建主窗口工作流的统一执行运行时。"""
     return create_coordinated_workflow_runtime(
         source=ExecutionSource.MAIN_WINDOW,
         **kwargs,
@@ -936,23 +936,39 @@ class WorkflowTask(QObject):
                 "target_hwnd": self.target_hwnd,
             }
             from app_core.lca_format.project_io import load_lca_from_bytes, write_nested_workflow
-            from app_core.lca_format.session import get_for_path, register_temporary
+            from app_core.lca_format.session import activate, get_active_path, get_for_path, register
+            from task_workflow.workspace import extract_workflow_resource_path
+
+            nested_path = str(self.lca_session_path or "").strip()
+            source_session = get_for_path(nested_path) if nested_path else None
+            if source_session is None:
+                raise RuntimeError("子工作流工程会话未注册，无法保存")
+            self.lca_session = source_session
+
+            source_dir = extract_workflow_resource_path(save_data)
+            if not source_dir:
+                images_dir = str(getattr(self, "images_dir", "") or "").strip()
+                if images_dir:
+                    source_dir = os.path.dirname(os.path.abspath(images_dir))
 
             write_nested_workflow(
                 host,
                 logical,
                 save_data,
-                source_session=self.lca_session,
+                source_session=source_session,
                 display_name=os.path.splitext(os.path.basename(logical))[0],
+                source_dir=source_dir,
             )
             host_session = get_for_path(host)
             nested_bytes = host_session.get_bytes(logical) if host_session is not None else None
             if nested_bytes is None:
                 raise FileNotFoundError(f"写回后未找到子工作流: {logical}")
             _nested_data, nested_session = load_lca_from_bytes(nested_bytes)
-            nested_path = register_temporary(nested_session)
+            was_active = get_active_path() == nested_path
+            register(nested_path, nested_session)
             self.lca_session = nested_session
-            self.lca_session_path = nested_path
+            if was_active:
+                activate(nested_path)
             self.modified = False
             logger.info("子工作流已写回父工程: %s -> %s", logical, host)
             return True
@@ -1029,21 +1045,25 @@ class WorkflowTask(QObject):
                 'target_hwnd': self.target_hwnd
             }
 
-            # 保存文件（旧 JSON 路径会自动转换为同名 .lca）
+            # 保存现行 LCA 工程。
             from task_workflow.workflow_payload import save_workflow_file
             from app_core.lca_format.session import (
                 activate,
                 get_active_path,
+                get_for_path,
                 register,
             )
 
             if self.lca_session is not None and self.lca_session_path:
+                current_session = get_for_path(self.lca_session_path)
+                if current_session is None:
+                    raise RuntimeError("工作流工程会话未注册，无法保存")
+                self.lca_session = current_session
                 restore_active_path = get_active_path()
                 own_session_path = os.path.normcase(
                     os.path.abspath(self.lca_session_path)
                 )
                 if restore_active_path != own_session_path:
-                    register(self.lca_session_path, self.lca_session)
                     activate(self.lca_session_path)
                     temporarily_activated = True
 
@@ -1137,6 +1157,19 @@ class WorkflowTask(QObject):
         Returns:
             是否全部成功
         """
+        if str(self.filepath).startswith("memory://"):
+            host = str(self.host_workflow_filepath or "").strip()
+            if not host:
+                logger.error("子工作流未绑定父工程，无法保存和备份")
+                return False
+            try:
+                from task_workflow.workspace import backup_workflow_file
+
+                backup_workflow_file(host)
+            except Exception as exc:
+                logger.error("父工程备份失败，已取消子工作流保存: %s", exc, exc_info=True)
+                return False
+            return self.save(workflow_data=workflow_data)
         # 如果没有文件路径（新建的空白工作流），创建临时备份
         if not self.filepath:
             logger.info(f"任务 '{self.name}' 未保存，创建临时备份")

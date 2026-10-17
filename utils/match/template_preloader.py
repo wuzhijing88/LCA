@@ -123,6 +123,14 @@ class TemplatePreloader:
         if not raw:
             return ""
         if raw.startswith("memory://"):
+            try:
+                from task_workflow.resource_context import current_package_session
+
+                session = current_package_session()
+            except Exception:
+                session = None
+            if session is not None:
+                return f"memory://package/{id(session)}/{raw[len('memory://'):]}"
             return raw
         try:
             return os.path.normcase(os.path.normpath(os.path.abspath(raw)))
@@ -434,12 +442,24 @@ class TemplatePreloader:
 
             image_bytes: Optional[bytes] = None
             if resolved_path.startswith("memory://"):
-                provider = get_memory_image_provider()
-                if callable(provider):
+                try:
+                    from task_workflow.resource_context import current_package_session
+
+                    package_session = current_package_session()
+                except Exception:
+                    package_session = None
+                if package_session is not None:
                     try:
-                        image_bytes = provider(resolved_path)
+                        image_bytes = package_session.get_bytes(resolved_path)
                     except Exception:
                         image_bytes = None
+                else:
+                    provider = get_memory_image_provider()
+                    if callable(provider):
+                        try:
+                            image_bytes = provider(resolved_path)
+                        except Exception:
+                            image_bytes = None
 
                 if not image_bytes:
                     logger.warning(f"无法从内存提供器读取模板图片: {resolved_path}")

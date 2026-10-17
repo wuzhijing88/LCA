@@ -30,7 +30,7 @@ from .main_window_screenshot_engine_mixin import MainWindowScreenshotEngineMixin
 from .main_window_favorites_batch_mixin import MainWindowFavoritesBatchMixin
 from .main_window_dpi_mixin import MainWindowDpiMixin
 from .main_window_status_mixin import MainWindowStatusMixin
-from .main_window_floating_status_mixin import MainWindowFloatingStatusMixin
+from .main_window_execution_log_mixin import MainWindowExecutionLogMixin
 
 
 class MainWindow(
@@ -61,7 +61,7 @@ class MainWindow(
     MainWindowFavoritesBatchMixin,
     MainWindowDpiMixin,
     MainWindowStatusMixin,
-    MainWindowFloatingStatusMixin,
+    MainWindowExecutionLogMixin,
     QMainWindow,
 ):
     """Main application window."""
@@ -90,3 +90,4 @@ class MainWindow(
         )
         self._setup_main_window_ui()
         self._finalize_main_window_startup()
+

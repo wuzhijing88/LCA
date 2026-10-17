@@ -1,16 +1,30 @@
 # -*- coding: utf-8 -*-
-"""Play audio and open media files without extra dependencies."""
+"""音频播放与所属脚本的关闭管理。"""
 
 from __future__ import annotations
 
-import logging
+import itertools
 import os
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Callable, Optional
 
-logger = logging.getLogger(__name__)
+_OWNER = ContextVar("lca_audio_owner", default=None)
+_LOCK = threading.RLock()
+_ALIASES = itertools.count(1)
+_active = None
 
-_MCI_ALIAS = "lca_media"
+
+@contextmanager
+def audio_owner(owner):
+    token = _OWNER.set(owner)
+    try:
+        yield
+    finally:
+        _OWNER.reset(token)
 
 
 def resolve_media_path(raw_path: str) -> Optional[str]:
@@ -36,56 +50,70 @@ def play_audio(
 ) -> str:
     from task_workflow.script_resources import read_resource_bytes
 
-    resolved = resolve_media_path(path) or str(path or "").strip()
-    if resolved and os.path.isfile(resolved):
-        stop_audio()
-        ext = os.path.splitext(resolved)[1].lower()
-        if ext == ".wav" and not (wait and stop_checker):
-            _play_wav(resolved, wait=wait)
-            return resolved
-        _play_mci(resolved, wait=wait, stop_checker=stop_checker)
-        return resolved
-    data = read_resource_bytes(path)
-    if not data:
+    resolved = resolve_media_path(path)
+    if not resolved:
         raise FileNotFoundError(f"音频文件不存在: {path}")
-    stop_audio()
-    _play_wav_bytes(data, wait=wait)
-    return resolved or str(path or "")
+    temporary = ""
+    actual = resolved
+    if resolved.startswith("memory://"):
+        data = read_resource_bytes(resolved)
+        if not data:
+            raise FileNotFoundError(f"音频文件不存在: {path}")
+        suffix = os.path.splitext(resolved)[1]
+        with tempfile.NamedTemporaryFile(prefix="lca_audio_", suffix=suffix, delete=False) as stream:
+            temporary = stream.name
+            try:
+                stream.write(data)
+            except Exception:
+                stream.close()
+                os.unlink(temporary)
+                raise
+        actual = temporary
+    try:
+        _play_mci(actual, wait=wait, stop_checker=stop_checker, temporary=temporary)
+    except Exception:
+        with _LOCK:
+            owned = _active is not None and _active["temporary"] == temporary and bool(temporary)
+        if temporary and not owned and os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+    return resolved
 
 
 def stop_audio() -> None:
-    try:
-        _mci_send(f"stop {_MCI_ALIAS}")
-    except Exception:
-        pass
-    try:
-        _mci_send(f"close {_MCI_ALIAS}")
-    except Exception:
-        pass
-    try:
-        import winsound
+    global _active
+    with _LOCK:
+        playback = _active
+        if playback is None:
+            return
+        errors = []
+        if not playback["closed"]:
+            try:
+                _mci_send(f"stop {playback['alias']}")
+            except Exception as exc:
+                errors.append(str(exc))
+            try:
+                _mci_send(f"close {playback['alias']}")
+                playback["closed"] = True
+            except Exception as exc:
+                errors.append(str(exc))
+        if playback["closed"]:
+            try:
+                if playback["temporary"]:
+                    os.unlink(playback["temporary"])
+                    playback["temporary"] = ""
+            except Exception as exc:
+                errors.append(str(exc))
+            if not playback["temporary"]:
+                _active = None
+        if errors:
+            raise ValueError("停止音频失败：" + "；".join(errors))
 
-        winsound.PlaySound(None, winsound.SND_PURGE)
-    except Exception:
-        pass
 
-
-def _play_wav(path: str, *, wait: bool) -> None:
-    import winsound
-
-    flags = winsound.SND_FILENAME | winsound.SND_NODEFAULT
-    if not wait:
-        flags |= winsound.SND_ASYNC
-    winsound.PlaySound(path, flags)
-
-
-def _play_wav_bytes(data: bytes, *, wait: bool) -> None:
-    import winsound
-
-    flags = winsound.SND_MEMORY | winsound.SND_NODEFAULT
-    if not wait:
-        flags |= winsound.SND_ASYNC
-    winsound.PlaySound(data, flags)
+def stop_owned_audio(owner) -> None:
+    with _LOCK:
+        if _active is not None and _active["owner"] is owner:
+            stop_audio()
 
 
 def _mci_send(command: str) -> str:
@@ -96,45 +124,39 @@ def _mci_send(command: str) -> str:
     if err:
         err_buf = ctypes.create_unicode_buffer(512)
         ctypes.windll.winmm.mciGetErrorStringW(err, err_buf, 511)
-        raise RuntimeError(err_buf.value or f"MCI error {err}")
+        raise RuntimeError(err_buf.value or f"音频接口错误 {err}")
     return buffer.value
 
 
-def _play_mci(
-    path: str,
-    *,
-    wait: bool,
-    stop_checker: Optional[Callable[[], bool]],
-) -> None:
-    safe = path.replace('"', "")
+def _play_mci(path: str, *, wait: bool, stop_checker, temporary: str = "") -> None:
+    global _active
+    if '"' in path:
+        raise ValueError("音频路径不能含双引号")
+    playback = {"alias": f"lca_media_{next(_ALIASES)}", "owner": _OWNER.get(),
+                "temporary": temporary, "closed": False}
+    with _LOCK:
+        stop_audio()
+        _mci_send(f'open "{path}" alias {playback["alias"]}')
+        _active = playback
+        try:
+            _mci_send(f"play {playback['alias']}")
+        except Exception:
+            stop_audio()
+            raise
+    if not wait:
+        return
     try:
-        _mci_send(f"close {_MCI_ALIAS}")
-    except Exception:
-        pass
-    _mci_send(f'open "{safe}" alias {_MCI_ALIAS}')
-    try:
-        if wait:
-            if stop_checker:
-                _mci_send(f"play {_MCI_ALIAS}")
-                while True:
-                    if stop_checker():
-                        try:
-                            _mci_send(f"stop {_MCI_ALIAS}")
-                        except Exception:
-                            pass
-                        break
-                    mode = (_mci_send(f"status {_MCI_ALIAS} mode") or "").strip().lower()
-                    if mode != "playing":
-                        break
-                    time.sleep(0.1)
-            else:
-                _mci_send(f"play {_MCI_ALIAS} wait")
-        else:
-            _mci_send(f"play {_MCI_ALIAS}")
-            return
+        while True:
+            if stop_checker and stop_checker():
+                break
+            with _LOCK:
+                if _active is not playback:
+                    break
+                mode = _mci_send(f"status {playback['alias']} mode").strip().lower()
+            if mode != "playing":
+                break
+            time.sleep(0.05)
     finally:
-        if wait:
-            try:
-                _mci_send(f"close {_MCI_ALIAS}")
-            except Exception:
-                pass
+        with _LOCK:
+            if _active is playback:
+                stop_audio()

@@ -10,10 +10,11 @@ from typing import Any, Dict, List, Mapping, Optional, Set
 from task_workflow.sub_workflow_path import resolve_sub_workflow_path
 from task_workflow.workflow_payload import workflow_body
 from task_workflow.workflow_sanitize import sanitize_workflow_data
-from task_workflow.workspace import resolve_runtime_resource_dirs
+from task_workflow.workspace import _resource_param_kind, resolve_runtime_resource_dirs
 from task_workflow.script_resources import (
     DICT_TEXT_EXTS,
     IMAGE_EXTS,
+    is_direct_component_path,
     list_script_resources,
     resource_kind,
     rewrite_resource_literal,
@@ -517,6 +518,8 @@ def _collect_script_resources(
         kind = str(item.get("kind") or "")
         raw_path = str(item.get("path") or "")
         abs_path = str(item.get("abs_path") or "")
+        if is_direct_component_path(raw_path, kind):
+            continue
         if kind == "model":
             result.has_yolo = True
         logical_path, package_data = _package_file(package_files, raw_path, kind=kind)
@@ -693,17 +696,17 @@ def _collect_parameter_files(
     for key, value in list(parameters.items()):
         if key in ignored:
             continue
-        if key not in PATH_PARAM_KEYS and not (
-            isinstance(value, str) and resource_kind(value)
-        ):
-            if key not in PATH_PARAM_KEYS:
-                continue
+        if key not in PATH_PARAM_KEYS and not _resource_param_kind(key):
+            continue
         paths = _as_path_list(value)
         if not paths:
             continue
         rewritten: List[str] = []
         for raw_path in paths:
             kind = resource_kind(raw_path) or ("audio" if "sound" in key or "audio" in key else "image")
+            if is_direct_component_path(raw_path, kind):
+                rewritten.append(raw_path)
+                continue
             if key in {"dict_file", "dict_path"} or kind == "dict":
                 kind = "dict"
             elif key == "model_path" or kind == "model":

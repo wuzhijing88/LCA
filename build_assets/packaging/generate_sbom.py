@@ -7,14 +7,13 @@ import argparse
 import json
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = PROJECT_ROOT / "build_assets" / "third_party" / "manifest.json"
 
 
 def build_sbom(manifest: dict) -> dict:
     components = []
-    for item in manifest.get("components", []):
+    for item in manifest["components"]:
         hashes = []
         if item.get("sha256"):
             hashes.append({"alg": "SHA-256", "content": item["sha256"]})
@@ -30,10 +29,10 @@ def build_sbom(manifest: dict) -> dict:
                 "hashes": hashes,
             }
         )
-    for dependency in manifest.get("python_dependencies", []):
+    for dependency in manifest["python_dependencies"]:
         properties = [
-            {"name": "lca:direct", "value": "true" if dependency.get("direct", True) else "false"},
-            {"name": "lca:bundled", "value": "true" if dependency.get("bundled", True) else "false"},
+            {"name": "lca:direct", "value": "true" if dependency["direct"] else "false"},
+            {"name": "lca:bundled", "value": "true" if dependency["bundled"] else "false"},
         ]
         required_by = dependency.get("required_by") or []
         if required_by:
@@ -44,7 +43,7 @@ def build_sbom(manifest: dict) -> dict:
                 "name": dependency.get("name"),
                 "version": dependency.get("version"),
                 "purl": f"pkg:pypi/{dependency.get('name')}@{dependency.get('version')}",
-                "scope": "required" if dependency.get("bundled", True) else "excluded",
+                "scope": "required" if dependency["bundled"] else "excluded",
                 "properties": properties,
             }
         )
@@ -69,7 +68,7 @@ def main() -> int:
         json.dumps(build_sbom(manifest), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"sbom={output}")
+    print(f"软件物料清单已生成: {output}")
     return 0
 
 

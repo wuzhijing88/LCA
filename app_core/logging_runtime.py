@@ -1,20 +1,20 @@
 import datetime
-import glob
 import logging
 import os
+import re
 import sys
 import threading
 import time
 from typing import Callable, Optional
 
-from utils.app_paths import get_logs_dir
+from utils.app_paths import get_logs_dir, get_system_log_path
 from utils.log_runtime_control import configure_noisy_logger_levels, install_runtime_log_filters
 
 def _log_dir() -> str:
     return get_logs_dir("LCA")
 
 
-LOG_FILENAME_FORMAT = "app_%Y-%m-%d.log"
+LOG_FILENAME_FORMAT = "system_%Y%m%d.log"
 MAX_LOG_FILE_SIZE_MB = 15
 MAX_LOG_BACKUP_COUNT = 0
 LOG_RETENTION_DAYS = 7
@@ -22,6 +22,7 @@ MAX_LOG_MESSAGE_CHARS = 512
 MAX_LOG_DIR_SIZE_MB = 50
 LOG_MAINTENANCE_INTERVAL_SEC = 300
 MAX_LOG_FILE_SIZE_BYTES = MAX_LOG_FILE_SIZE_MB * 1024 * 1024
+_MANAGED_LOG_FILENAME_RE = re.compile(r"^(?:system|execution)_\d{8}\.log$")
 
 logger = logging.getLogger(__name__)
 logging.getLogger("workflow.operations").setLevel(logging.INFO)
@@ -58,7 +59,7 @@ def cleanup_log_files_and_temp(
     cleanup_temp_files_cb: Optional[Callable[[], None]] = None,
     verbose: bool = False,
 ):
-    log_pattern = os.path.join(_log_dir(), "app_*")
+    log_dir = _log_dir()
     current_time = time.time()
     deleted_count = 0
     deleted_size = 0
@@ -66,7 +67,31 @@ def cleanup_log_files_and_temp(
     truncated_size_total = 0
     max_log_dir_size = MAX_LOG_DIR_SIZE_MB * 1024 * 1024
 
-    for filepath in glob.glob(log_pattern):
+    current_filenames = {
+        os.path.basename(get_system_log_path("LCA")),
+        f"execution_{datetime.date.today():%Y%m%d}.log",
+    }
+    log_files = []
+    try:
+        entries = list(os.scandir(log_dir))
+    except OSError:
+        entries = []
+
+    for entry in entries:
+        if not entry.is_file():
+            continue
+        filepath = entry.path
+        filename = entry.name
+        if not _MANAGED_LOG_FILENAME_RE.fullmatch(filename):
+            try:
+                os.remove(filepath)
+                deleted_count += 1
+                if verbose:
+                    logger.info("已清理非系统/执行日志文件 %s", filename)
+            except OSError as e:
+                if verbose:
+                    logger.warning("清理非系统/执行日志文件 %s 失败: %s", filename, e)
+            continue
         try:
             file_stat = os.stat(filepath)
             file_mtime = file_stat.st_mtime
@@ -80,25 +105,18 @@ def cleanup_log_files_and_temp(
                     logger.info(
                         f"日志文件 {os.path.basename(filepath)} 已保留{file_age_days:.1f}天，超过保留期限 {LOG_RETENTION_DAYS} 天，已删除"
                     )
+                continue
+            log_files.append((filepath, file_stat.st_mtime, file_stat.st_size, filename))
         except OSError as e:
             if verbose:
                 logger.warning(f"检查或删除日志文件 {filepath} 时出错: {e}")
 
     log_files_with_time = []
-    current_filenames = {
-        datetime.date.today().strftime(LOG_FILENAME_FORMAT),
-        f"app_{datetime.date.today():%Y-%m-%d}.jsonl",
-    }
-    for filepath in glob.glob(log_pattern):
+    for filepath, modified_time, initial_size, filename in log_files:
         try:
             file_stat = os.stat(filepath)
-            # The active file is managed by RotatingFileHandler. Older files
-            # can be truncated here without racing the open handler stream.
             effective_size = file_stat.st_size
-            if (
-                os.path.basename(filepath) not in current_filenames
-                and effective_size > MAX_LOG_FILE_SIZE_BYTES
-            ):
+            if filename.startswith("system_") and filename not in current_filenames and effective_size > MAX_LOG_FILE_SIZE_BYTES:
                 truncated_size = _truncate_log_file_if_oversized(
                     filepath,
                     MAX_LOG_FILE_SIZE_BYTES,
@@ -108,7 +126,9 @@ def cleanup_log_files_and_temp(
                     truncated_count += 1
                     truncated_size_total += truncated_size
                     effective_size = max(0, effective_size - truncated_size)
-            log_files_with_time.append((filepath, file_stat.st_mtime, effective_size))
+            log_files_with_time.append(
+                (filepath, file_stat.st_mtime or modified_time, effective_size, filename)
+            )
         except OSError:
             pass
 
@@ -118,10 +138,12 @@ def cleanup_log_files_and_temp(
             logger.info(
                 f"日志目录总大小({current_total // 1024 // 1024}MB)超过限制({MAX_LOG_DIR_SIZE_MB}MB)，清理最旧文件"
             )
-        log_files_with_time.sort(key=lambda x: x[1])
-        for filepath, _, file_size in log_files_with_time:
+        log_files_with_time.sort(key=lambda x: (x[3] in current_filenames, x[1]))
+        for filepath, _, file_size, filename in log_files_with_time:
             if current_total <= max_log_dir_size:
                 break
+            if filename in current_filenames:
+                continue
             try:
                 os.remove(filepath)
                 current_total -= file_size
@@ -192,8 +214,7 @@ def setup_logging_and_cleanup(cleanup_temp_files_cb: Optional[Callable[[], None]
         verbose=True,
     )
 
-    current_log_filename = datetime.date.today().strftime(LOG_FILENAME_FORMAT)
-    current_log_filepath = os.path.join(_log_dir(), current_log_filename)
+    current_log_filepath = get_system_log_path("LCA")
 
     logger_instance = logging.getLogger()
     if logger_instance.hasHandlers():
@@ -242,28 +263,6 @@ def setup_logging_and_cleanup(cleanup_temp_files_cb: Optional[Callable[[], None]
     file_handler.setFormatter(formatter)
     logger_instance.addHandler(file_handler)
     handlers_to_filter.append(file_handler)
-
-    structured_enabled = str(os.getenv("LCA_STRUCTURED_LOG", "") or "").strip().lower()
-    if structured_enabled in {"1", "true", "yes", "on"}:
-        from app_core.diagnostics.structured_logging import (
-            DiagnosticContextFilter,
-            JsonLineFormatter,
-        )
-
-        jsonl_path = os.path.join(_log_dir(), f"app_{datetime.date.today():%Y-%m-%d}.jsonl")
-        jsonl_handler = SafeRotatingFileHandler(
-            jsonl_path,
-            mode="a",
-            maxBytes=MAX_LOG_FILE_SIZE_BYTES,
-            backupCount=MAX_LOG_BACKUP_COUNT,
-            encoding="utf-8",
-            delay=False,
-        )
-        jsonl_handler.setLevel(logging.INFO)
-        jsonl_handler.addFilter(DiagnosticContextFilter())
-        jsonl_handler.setFormatter(JsonLineFormatter())
-        logger_instance.addHandler(jsonl_handler)
-        handlers_to_filter.append(jsonl_handler)
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO)

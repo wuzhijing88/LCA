@@ -27,7 +27,6 @@ SECTION_FIELDS = {
         "enable_canvas_grid",
         "enable_card_snap",
         "enable_parameter_panel_snap",
-        "enable_floating_status_window",
         "enable_connection_line_animation",
         "close_behavior",
         "close_behavior_remember",
@@ -36,6 +35,9 @@ SECTION_FIELDS = {
         "execution_mode",
         # 插件后端只能按后台执行，但保留用户最后选择的原生模式。
         "native_execution_mode",
+        "background_hierarchy_broadcast",
+        "background_fake_active",
+        "background_block_physical_mouse",
         "foreground_mouse_driver_backend",
         "foreground_keyboard_driver_backend",
         "foreground_py_backend",
@@ -55,12 +57,14 @@ SECTION_FIELDS = {
         "plugin_bind_mode",
         "plugin_text_ime",
         "plugin_fake_active",
+        "plugin_bind_auto_detect",
         "plugin_public",
         "plugin_reg_code",
         "plugin_extra_code",
         "binding_method",
         "window_binding_mode",
         "multi_window_delay",
+        "confirm_partial_window_failure",
     ),
     "scheduling": ("main_schedule", "control_schedule"),
     "windows": (
@@ -76,20 +80,14 @@ SECTION_FIELDS = {
 def apply_sections(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return a copy with every section mirror rebuilt from the flat keys.
 
-    Flat keys always win. A section value whose flat key is absent is lifted
-    to the flat level once so callers only ever need to read flat keys.
+    Flat keys are the only source of truth; section mirrors never supply values.
     """
     result = dict(config)
     for section_name, field_names in SECTION_FIELDS.items():
-        existing = result.get(section_name)
-        old_section = dict(existing) if isinstance(existing, Mapping) else {}
         section: dict[str, Any] = {}
         for field_name in field_names:
             if field_name in result:
                 section[field_name] = result[field_name]
-            elif field_name in old_section:
-                result[field_name] = old_section[field_name]
-                section[field_name] = old_section[field_name]
         result[section_name] = section
     result["schema_version"] = CONFIG_SCHEMA_VERSION
     # Session-only snapshots are never persisted as a second source of truth.

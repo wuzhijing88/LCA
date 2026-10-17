@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
+import logging
 from typing import List
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QPushButton, QStyle, QApplication, QSizePolicy, QToolButton,
+    QWidget, QHBoxLayout, QLabel, QMessageBox, QPushButton, QStyle, QApplication, QSizePolicy, QToolButton,
     QSpacerItem # Import QSpacerItem
 )
 # Import QIcon explicitly if needed for size setting
-from PySide6.QtCore import Qt, QPoint, QSize, QRect
-from PySide6.QtGui import QMouseEvent, QAction, QFontMetrics, QColor, QIcon, QPainter, QPaintEvent
+from PySide6.QtCore import QObject, Qt, QSize, QRect, QUrl, Slot
+from PySide6.QtGui import QDesktopServices, QMouseEvent, QAction, QFontMetrics, QColor, QIcon, QPainter, QPaintEvent
+from themes import apply_rounded_popup
 from utils.window.window_activation_utils import show_and_raise_widget
+
+logger = logging.getLogger(__name__)
 
 class MainWindow: pass
 
@@ -75,9 +79,6 @@ class CustomTitleBar(QWidget):
         self.setAutoFillBackground(False) 
 
         self.parent_window = parent 
-        self._mouse_pressed = False
-        self._mouse_press_pos = QPoint()
-        self._window_pos_before_move = QPoint()
         
         # 初始化action_widgets字典和toolbar
         self.action_widgets = {}
@@ -142,6 +143,18 @@ class CustomTitleBar(QWidget):
         window_button_layout.setContentsMargins(0, 0, 4, 0)
         window_button_layout.setSpacing(2)
 
+        self.sponsor_button = QToolButton(self.window_button_container)
+        self.sponsor_button.setObjectName("titleSponsorButton")
+        self.sponsor_button.setText("赞助")
+        self.sponsor_button.setToolTip("打开赞助页面")
+        self.sponsor_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.sponsor_button.setAutoRaise(True)
+        self.sponsor_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sponsor_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sponsor_button.setFixedHeight(30)
+        self.sponsor_button.clicked.connect(self._open_sponsor_page)
+        window_button_layout.addWidget(self.sponsor_button)
+
         from ui.main_window_parts.main_window_support import (
             create_window_close_icon,
             create_window_maximize_icon,
@@ -196,9 +209,25 @@ class CustomTitleBar(QWidget):
 
         self.setLayout(main_layout)
         # Restore connection for title update
-        self.parent_window.windowTitleChanged.connect(self.setWindowTitle)
+        title_connection = self.parent_window.windowTitleChanged.connect(self.setWindowTitle)
+        self.destroyed.connect(lambda _object=None: QObject.disconnect(title_connection))
         # Initial positioning of title
         self.title_label.adjustSize() # Get initial size hint
+
+    def _open_sponsor_page(self):
+        if QDesktopServices.openUrl(QUrl("https://www.lcaa.top/")):
+            return
+        popup = QMessageBox(
+            QMessageBox.Icon.Warning,
+            "无法打开赞助页面",
+            "无法打开赞助页面，请检查系统默认浏览器。",
+            parent=self,
+        )
+        apply_rounded_popup(popup, frameless=False)
+        try:
+            popup.exec()
+        finally:
+            popup.deleteLater()
 
     # Visibility method (no change needed)
     def set_file_actions_visible(self, visible: bool):
@@ -219,7 +248,7 @@ class CustomTitleBar(QWidget):
         super().showEvent(event)
         # 使用QTimer延迟调用，确保布局已完成
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self._update_elided_title)
+        QTimer.singleShot(0, self, self._update_elided_title)
         # if hasattr(self, 'title_label'):
         #     title_width = self.title_label.sizeHint().width()
         #     title_height = self.title_label.sizeHint().height()
@@ -233,6 +262,7 @@ class CustomTitleBar(QWidget):
         #     self.title_label.setGeometry(int(x), int(y), title_width, title_height)
 
     # --- Restore setWindowTitle --- 
+    @Slot(str)
     def setWindowTitle(self, title):
          if hasattr(self, 'title_label'):
              # --- UPDATED: Store full title and call update helper --- 
@@ -320,6 +350,7 @@ class CustomTitleBar(QWidget):
 
             return bool(window_handle.startSystemMove())
         except Exception:
+            logger.exception("启动系统窗口拖动失败")
             return False
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -331,36 +362,12 @@ class CustomTitleBar(QWidget):
             event.ignore()  # Delegate to child widget.
             return
 
-        # Start system move first; fall back to manual drag logic.
         if event.button() == Qt.MouseButton.LeftButton:
             if self._start_system_move():
-                self._mouse_pressed = False
                 event.accept()
-                return
-
-            self._mouse_pressed = True
-            self._mouse_press_pos = event.globalPosition().toPoint()
-            self._window_pos_before_move = self.parent_window.pos()
-            event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if self._mouse_pressed and event.buttons() == Qt.MouseButton.LeftButton:
-            try:
-                global_pos = event.globalPosition().toPoint()
-                delta = global_pos - self._mouse_press_pos
-                self.parent_window.move(self._window_pos_before_move + delta)
-                event.accept()
-            except Exception:
-                # 防止拖动时发生异常导致卡死
-                self._mouse_pressed = False
+            else:
+                logger.warning("系统窗口拖动不可用")
                 event.ignore()
-        else:
-            event.ignore()
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._mouse_pressed = False
-            event.accept()
         else:
             event.ignore()
             
@@ -370,7 +377,6 @@ class CustomTitleBar(QWidget):
         if hasattr(self.parent_window, 'parameter_panel'):
             from PySide6.QtCore import Qt
             self.parent_window.parameter_panel.sync_window_state(Qt.WindowState.WindowMinimized)
-        # 再最小化窗口
         self.parent_window.showMinimized()
 
     def _toggle_maximize(self):
@@ -385,7 +391,7 @@ class CustomTitleBar(QWidget):
 
         # 使用定时器再次确保状态同步
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(100, lambda: self._update_maximize_icon(self.parent_window.windowState()))
+        QTimer.singleShot(100, self, lambda: self._update_maximize_icon(self.parent_window.windowState()))
 
     def _update_maximize_icon(self, state):
         # 直接检查窗口是否最大化
@@ -403,14 +409,17 @@ class CustomTitleBar(QWidget):
 
     def _toggle_topmost(self):
         """切换窗口置顶状态"""
-        self._window_topmost = not self._window_topmost
+        self.set_topmost_state(not self._window_topmost)
         if self._window_topmost:
             self.parent_window.setWindowFlags(self.parent_window.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
-            self.topmost_button.setToolTip("取消置顶")
         else:
             self.parent_window.setWindowFlags(self.parent_window.windowFlags() & ~Qt.WindowType.WindowStaysOnTopHint)
-            self.topmost_button.setToolTip("窗口置顶")
         show_and_raise_widget(self.parent_window, log_prefix='标题栏置顶切换')
+
+    def set_topmost_state(self, enabled: bool):
+        self._window_topmost = bool(enabled)
+        self.topmost_button.setChecked(self._window_topmost)
+        self.topmost_button.setToolTip("取消置顶" if self._window_topmost else "窗口置顶")
 
     def create_toolbar_button(self, action):
         """创建工具栏按钮"""

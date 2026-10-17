@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import logging
 import threading
 import time
@@ -19,7 +20,6 @@ INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_SCANCODE = 0x0008
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -164,13 +164,6 @@ _BUTTON_FLAGS = {
 }
 
 
-def normalize_normal_hd_backend(value: object) -> str:
-    raw = str(value or "").strip().lower().replace("_", ".")
-    if raw in {"normal.hd", "normalhd", "normal.hd."}:
-        return "normal.hd"
-    return str(value or "").strip().lower()
-
-
 def resolve_virtual_key(key: str) -> Optional[int]:
     normalized = str(key or "").strip().lower()
     if not normalized:
@@ -234,27 +227,13 @@ class NormalHdDriver:
         event.union.ki = _KEYBDINPUT(0, scan, flags, 0, None)
         return event
 
-    def _unicode_events(self, char: str) -> list[_INPUT]:
-        code = ord(char)
-        events = []
-        for key_up in (False, True):
-            event = _INPUT()
-            event.type = INPUT_KEYBOARD
-            flags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if key_up else 0)
-            event.union.ki = _KEYBDINPUT(0, code, flags, 0, None)
-            events.append(event)
-        return events
-
     def _virtual_screen_bounds(self) -> Tuple[int, int, int, int]:
         left = int(self._user32.GetSystemMetrics(76))
         top = int(self._user32.GetSystemMetrics(77))
         width = int(self._user32.GetSystemMetrics(78))
         height = int(self._user32.GetSystemMetrics(79))
         if width <= 0 or height <= 0:
-            width = int(self._user32.GetSystemMetrics(0))
-            height = int(self._user32.GetSystemMetrics(1))
-            left = 0
-            top = 0
+            raise RuntimeError("无法读取虚拟屏幕范围")
         return left, top, width, height
 
     def _absolute_mouse_point(self, x: int, y: int) -> Tuple[int, int]:
@@ -286,43 +265,66 @@ class NormalHdDriver:
             return self._send([event])
 
     def _normalize_button(self, button: str) -> str:
-        name = str(button or "left").strip().lower()
-        return name if name in _BUTTON_FLAGS else "left"
+        name = str(button).strip().lower()
+        if name not in _BUTTON_FLAGS:
+            raise ValueError(f"不支持的鼠标按钮：{button}")
+        return name
 
     def click_mouse(self, x=None, y=None, button="left", clicks=1, interval=0.0, duration=0.0, **_kwargs) -> bool:
         if x is None or y is None:
             return False
-        down_flag, up_flag = _BUTTON_FLAGS[self._normalize_button(button)]
-        hold = max(0.0, float(duration or 0.0) or _DEFAULT_CLICK_HOLD_SECONDS)
-        safe_clicks = max(1, int(clicks or 1))
-        gap = max(0.0, float(interval or 0.0))
+        name = self._normalize_button(button)
+        down_flag, up_flag = _BUTTON_FLAGS[name]
+        hold = float(duration)
+        safe_clicks = int(clicks)
+        gap = float(interval)
+        if safe_clicks <= 0 or safe_clicks != float(clicks) or not math.isfinite(hold) or not math.isfinite(gap) or hold < 0 or gap < 0:
+            raise ValueError("点击次数或时间参数无效")
+        if hold == 0:
+            hold = _DEFAULT_CLICK_HOLD_SECONDS
         with self._lock:
+            if self._pressed_buttons:
+                return False
             for index in range(safe_clicks):
                 if index and gap:
                     _shared_precise_sleep(gap)
-                if not self._send([self._mouse_event(int(x), int(y), down_flag)]):
+                previous_clip = wintypes.RECT()
+                if not self._user32.GetClipCursor(ctypes.byref(previous_clip)):
                     return False
-                if hold:
-                    _shared_precise_sleep(hold)
-                if not self._send([self._mouse_event(int(x), int(y), up_flag)]):
+                click_clip = wintypes.RECT(int(x), int(y), int(x) + 1, int(y) + 1)
+                if not self._user32.ClipCursor(ctypes.byref(click_clip)):
                     return False
+                try:
+                    try:
+                        if not self.mouse_down(int(x), int(y), name):
+                            return False
+                        if hold:
+                            _shared_precise_sleep(hold)
+                    finally:
+                        released = self.mouse_up(int(x), int(y), name)
+                    if not released:
+                        return False
+                finally:
+                    if not self._user32.ClipCursor(ctypes.byref(previous_clip)):
+                        raise RuntimeError("无法恢复鼠标活动范围")
         return True
 
     def mouse_down(self, x, y, button="left") -> bool:
         name = self._normalize_button(button)
         down_flag, _ = _BUTTON_FLAGS[name]
         with self._lock:
+            self._pressed_buttons.add(name)
             ok = self._send([self._mouse_event(int(x), int(y), down_flag)])
-            if ok:
-                self._pressed_buttons.add(name)
             return ok
 
     def mouse_up(self, x, y, button="left") -> bool:
         name = self._normalize_button(button)
         _, up_flag = _BUTTON_FLAGS[name]
         with self._lock:
-            ok = self._send([self._mouse_event(int(x), int(y), up_flag)])
-            self._pressed_buttons.discard(name)
+            # 弹起只发按钮事件，不能在仍按住时把指针拉回点击点。
+            ok = self._send([self._mouse_event(None, None, up_flag)])
+            if ok:
+                self._pressed_buttons.discard(name)
             return ok
 
     def drag_mouse(self, start_x, start_y, end_x, end_y, button="left", duration=1.0) -> bool:
@@ -332,12 +334,13 @@ class NormalHdDriver:
         if not points or len(points) < 2:
             return False
         name = self._normalize_button(button)
-        down_flag, up_flag = _BUTTON_FLAGS[name]
         start_x, start_y = int(points[0][0]), int(points[0][1])
         with self._lock:
-            if not self._send([self._mouse_event(start_x, start_y, down_flag)]):
+            if self._pressed_buttons:
                 return False
             try:
+                if not self.mouse_down(start_x, start_y, name):
+                    return False
                 if timestamps and len(timestamps) == len(points):
                     prev = float(timestamps[0])
                     for (x, y), stamp in zip(points[1:], timestamps[1:]):
@@ -353,8 +356,8 @@ class NormalHdDriver:
                         if not self._send([self._mouse_event(int(x), int(y), 0)]):
                             return False
             finally:
-                self._send([self._mouse_event(int(points[-1][0]), int(points[-1][1]), up_flag)])
-        return True
+                released = self.mouse_up(0, 0, name)
+        return released
 
     def scroll_mouse(self, direction, clicks=1, x=None, y=None) -> bool:
         amount = int(clicks or 1) * WHEEL_DELTA
@@ -380,7 +383,8 @@ class NormalHdDriver:
             return False
         with self._lock:
             ok = self._send([event])
-            self._pressed_keys.discard(str(key).strip().lower())
+            if ok:
+                self._pressed_keys.discard(str(key).strip().lower())
             return ok
 
     def press_key(self, key: str, duration: float = _DEFAULT_KEY_HOLD_SECONDS) -> bool:
@@ -406,26 +410,9 @@ class NormalHdDriver:
                 self.key_up(name)
         return True
 
-    def type_text(self, text, **_kwargs) -> bool:
-        payload = str(text or "")
-        if not payload:
-            return True
-        events: list[_INPUT] = []
-        for char in payload:
-            if char == "\n":
-                down = self._keyboard_event("enter", False)
-                up = self._keyboard_event("enter", True)
-                if down and up:
-                    events.extend((down, up))
-                continue
-            events.extend(self._unicode_events(char))
-        with self._lock:
-            return self._send(events)
-
     def release_all_keys(self) -> bool:
         with self._lock:
             pending = list(self._pressed_keys)
-            self._pressed_keys.clear()
         ok = True
         for key in reversed(pending):
             if not self.key_up(key):
@@ -436,12 +423,10 @@ class NormalHdDriver:
         ok = self.release_all_keys()
         with self._lock:
             pending = list(self._pressed_buttons)
-            self._pressed_buttons.clear()
-        for button in pending:
-            try:
-                _, up_flag = _BUTTON_FLAGS[button]
-                if not self._send([self._mouse_event(None, None, up_flag)]):
+            for button in pending:
+                try:
+                    if not self.mouse_up(0, 0, button):
+                        ok = False
+                except Exception:
                     ok = False
-            except Exception:
-                ok = False
         return ok

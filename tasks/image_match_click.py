@@ -1,14 +1,13 @@
 # 图片点击任务模块
 import logging  # 导入logging模块
 import random  # 导入random模块
-import re
 # Import Optional and Tuple for older Python versions
 from typing import Dict, Any, Optional, Tuple
 import os # Import os for path check
 import traceback # Import traceback for printing exception details
-from tasks.task_utils import coerce_bool, coerce_float, coerce_int, capture_and_match_template_smart
+from tasks.task_utils import coerce_bool, capture_and_match_template_smart
 from tasks.click_action_executor import execute_simulator_click_action
-from tasks.click_param_resolver import resolve_click_params
+from tasks.click_param_resolver import resolve_click_params, safe_integer, safe_non_negative_float
 from utils.window.hwnd_utils import as_hwnd
 from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
@@ -41,6 +40,8 @@ def _publish_image_perception(
     card_id: Any,
     *,
     ok: bool,
+    query_ok: bool = True,
+    error: Any = None,
     score: Any = None,
     threshold: Any = None,
     x: Any = None,
@@ -60,6 +61,8 @@ def _publish_image_perception(
             card_id,
             kind="image",
             ok=ok,
+            query_ok=query_ok,
+            error=error,
             score=score,
             threshold=threshold,
             x=x,
@@ -75,14 +78,9 @@ def _publish_image_perception(
 
 
 def _normalize_image_position_mode(value: Any) -> str:
-    mode = str(value or "").strip()
-    if mode in ("精准坐标", "精准点击", "精确坐标", "精确点击", "无偏移", "原始坐标"):
-        return "精准坐标"
-    if mode in ("固定偏移", "固定"):
-        return "固定偏移"
-    if mode in ("随机偏移", "随机"):
-        return "随机偏移"
-    return "精准坐标"
+    if value not in {"精准坐标", "固定偏移", "随机偏移"}:
+        raise ValueError(f"不支持的找图点击位置模式：{value!r}")
+    return value
 
 
 def locate_image_in_window(
@@ -99,22 +97,9 @@ def locate_image_in_window(
     if hwnd == 0:
         return False, None, None
 
-    from task_workflow.resource_path import format_resource_text, unwrap_resource_path
+    from task_workflow.resource_path import unwrap_resource_path
 
     raw_image_path = unwrap_resource_path((params or {}).get('image_path')) or ""
-    if not raw_image_path:
-        raw_image_paths = format_resource_text((params or {}).get('image_paths'))
-        if raw_image_paths:
-            for raw_line in re.split(r'[\r\n;]+', raw_image_paths):
-                line = raw_line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if '  # ' in line:
-                    line = line.split('  # ', 1)[0].strip()
-                if line:
-                    raw_image_path = line
-                    break
-
     if not raw_image_path:
         return False, None, None
 
@@ -147,21 +132,23 @@ def locate_image_in_window(
     if template_w <= 0 or template_h <= 0:
         return False, None, absolute_image_path
 
-    confidence = coerce_float((params or {}).get('confidence', 0.8), 0.8)
+    confidence = safe_non_negative_float((params or {}).get('confidence', 0.8))
     use_recognition_region = coerce_bool((params or {}).get('use_recognition_region', False))
     recognition_region = None
     if use_recognition_region:
-        region_x = coerce_int((params or {}).get('recognition_region_x', 0), 0)
-        region_y = coerce_int((params or {}).get('recognition_region_y', 0), 0)
-        region_w = coerce_int((params or {}).get('recognition_region_width', 0), 0)
-        region_h = coerce_int((params or {}).get('recognition_region_height', 0), 0)
+        region_x = safe_integer((params or {}).get('recognition_region_x', 0))
+        region_y = safe_integer((params or {}).get('recognition_region_y', 0))
+        region_w = safe_integer((params or {}).get('recognition_region_width', 0))
+        region_h = safe_integer((params or {}).get('recognition_region_height', 0))
         if region_w > 0 and region_h > 0:
             recognition_region = (region_x, region_y, region_w, region_h)
+        else:
+            raise ValueError("找图识别区域宽高必须为正整数")
 
     if capture_timeout is None:
-        timeout_value = coerce_float((params or {}).get('capture_timeout', 1.2), 1.2)
+        timeout_value = safe_non_negative_float((params or {}).get('capture_timeout', 1.2))
     else:
-        timeout_value = coerce_float(capture_timeout, 1.2)
+        timeout_value = safe_non_negative_float(capture_timeout)
 
     match_response = capture_and_match_template_smart(
         target_hwnd=hwnd,
@@ -172,8 +159,8 @@ def locate_image_in_window(
         roi=recognition_region,
         client_area_only=True,
         use_cache=False,
-        template_scale=coerce_float((params or {}).get('template_scale', 1.0), 1.0),
-        mode=str((params or {}).get('image_mode', '彩色') or '彩色'),
+        template_scale=safe_non_negative_float((params or {}).get('template_scale', 1.0)),
+        mode=(params or {}).get('image_mode', '彩色'),
         rotation=(params or {}).get('image_rotation', 0),
     )
 
@@ -184,38 +171,25 @@ def locate_image_in_window(
     if not (isinstance(raw_location, (list, tuple)) and len(raw_location) == 4):
         return False, None, absolute_image_path
 
-    try:
-        match_score = float(match_response.get("confidence", 0.0) or 0.0)
-    except Exception:
-        match_score = 0.0
+    match_score = safe_non_negative_float(match_response['confidence'])
 
     try:
-        match_x = int(raw_location[0])
-        match_y = int(raw_location[1])
-        match_w = int(raw_location[2])
-        match_h = int(raw_location[3])
+        match_x = safe_integer(raw_location[0])
+        match_y = safe_integer(raw_location[1])
+        match_w = safe_integer(raw_location[2])
+        match_h = safe_integer(raw_location[3])
     except Exception:
         return False, None, absolute_image_path
 
     if not bool(match_response.get("matched", False)) or match_score < confidence:
         return False, None, absolute_image_path
+    if match_w <= 0 or match_h <= 0:
+        raise ValueError("找图匹配尺寸无效")
 
-    screenshot_w = match_response.get("screenshot_width")
-    screenshot_h = match_response.get("screenshot_height")
-    if screenshot_w is None or screenshot_h is None:
-        screenshot_shape = match_response.get("screenshot_shape")
-        if isinstance(screenshot_shape, (list, tuple)) and len(screenshot_shape) >= 2:
-            try:
-                screenshot_h = int(screenshot_shape[0])
-                screenshot_w = int(screenshot_shape[1])
-            except Exception:
-                screenshot_w = 0
-                screenshot_h = 0
-
-    if screenshot_w is None:
-        screenshot_w = 0
-    if screenshot_h is None:
-        screenshot_h = 0
+    screenshot_w = safe_integer(match_response['screenshot_width'])
+    screenshot_h = safe_integer(match_response['screenshot_height'])
+    if screenshot_w <= 0 or screenshot_h <= 0:
+        raise ValueError("找图截图尺寸未知或无效")
 
     return True, (
         int(match_x),
@@ -304,7 +278,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
             "label": "测试图片识别",
             "type": "button",
             "button_text": "测试识别",
-            "action": "test_image_recognition",
+            "action": "preview_image_recognition",
             "tooltip": "点击进行图片识别测试，查看当前参数的识别效果"
         },
         "enable_click": {
@@ -490,13 +464,22 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     get_image_data = kwargs.get('get_image_data', None)
     if get_image_data is None:
         try:
-            from utils.match.template_preloader import get_memory_image_provider
+            from task_workflow.resource_context import current_package_session
 
-            provider = get_memory_image_provider()
-            if callable(provider):
-                get_image_data = provider
+            package_session = current_package_session()
         except Exception:
-            pass
+            package_session = None
+        if package_session is not None:
+            get_image_data = package_session.get_bytes
+        else:
+            try:
+                from utils.match.template_preloader import get_memory_image_provider
+
+                provider = get_memory_image_provider()
+                if callable(provider):
+                    get_image_data = provider
+            except Exception:
+                pass
 
 
     # 1. 参数获取与检查
@@ -509,7 +492,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     from tasks.task_utils import correct_single_image_path
     absolute_image_path = correct_single_image_path(raw_image_path, card_id) if raw_image_path else None
 
-    confidence = coerce_float(params.get('confidence', 0.8), 0.8)
+    confidence = safe_non_negative_float(params.get('confidence', 0.8))
     enable_click = coerce_bool(params.get('enable_click', True))
     button_param = params.get('button', '左键')
     click_button, clicks, interval, click_action, enable_auto_release, hold_duration = resolve_click_params(
@@ -526,23 +509,17 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     )
     # --- 新增：获取重试参数 ---
     enable_retry = coerce_bool(params.get('enable_retry', False))
-    max_attempts = coerce_int(params.get('retry_attempts', 3), 3) if enable_retry else 1 # 如果不启用，只尝试1次
-    retry_interval = coerce_float(params.get('retry_interval', 0.5), 0.5)
+    max_attempts = safe_integer(params.get('retry_attempts', 3)) if enable_retry else 1 # 如果不启用，只尝试1次
+    retry_interval = safe_non_negative_float(params.get('retry_interval', 0.5))
     stop_checker = kwargs.get('stop_checker', None)
-    capture_timeout = coerce_float(params.get('capture_timeout', 1.2), 1.2)
+    capture_timeout = safe_non_negative_float(params.get('capture_timeout', 1.2))
     capture_timeout = max(0.3, float(capture_timeout))
 
     def _is_stop_requested() -> bool:
-        try:
-            return bool(stop_checker and stop_checker())
-        except Exception:
-            return False
+        return bool(stop_checker and stop_checker())
 
     def _wait_with_stop(total_wait: float) -> bool:
-        try:
-            wait_seconds = max(0.0, float(total_wait))
-        except (TypeError, ValueError):
-            wait_seconds = 0.0
+        wait_seconds = safe_non_negative_float(total_wait)
         if wait_seconds <= 0:
             return True
         elapsed = 0.0
@@ -557,16 +534,16 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     # -------------------------
     # --- 新增：获取识别区域参数 ---
     use_recognition_region = coerce_bool(params.get('use_recognition_region', False))
-    recognition_region_x = coerce_int(params.get('recognition_region_x', 0), 0)
-    recognition_region_y = coerce_int(params.get('recognition_region_y', 0), 0)
-    recognition_region_width = coerce_int(params.get('recognition_region_width', 0), 0)
-    recognition_region_height = coerce_int(params.get('recognition_region_height', 0), 0)
+    recognition_region_x = safe_integer(params.get('recognition_region_x', 0))
+    recognition_region_y = safe_integer(params.get('recognition_region_y', 0))
+    recognition_region_width = safe_integer(params.get('recognition_region_width', 0))
+    recognition_region_height = safe_integer(params.get('recognition_region_height', 0))
     # --- 获取点击偏移参数 ---
     image_position_mode = _normalize_image_position_mode(params.get('image_position_mode', '精准坐标'))
-    fixed_offset_x = coerce_int(params.get('fixed_offset_x', 0), 0)
-    fixed_offset_y = coerce_int(params.get('fixed_offset_y', 0), 0)
-    random_offset_x = coerce_int(params.get('random_offset_x', 5), 5)
-    random_offset_y = coerce_int(params.get('random_offset_y', 5), 5)
+    fixed_offset_x = safe_integer(params.get('fixed_offset_x', 0))
+    fixed_offset_y = safe_integer(params.get('fixed_offset_y', 0))
+    random_offset_x = safe_integer(params.get('random_offset_x', 5))
+    random_offset_y = safe_integer(params.get('random_offset_y', 5))
 
     # 验证识别区域参数
     recognition_region = None
@@ -579,6 +556,12 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         )
         logger.info(f"使用识别区域: X={recognition_region_x}, Y={recognition_region_y}, "
                    f"宽度={recognition_region_width}, 高度={recognition_region_height}")
+    elif use_recognition_region:
+        raise ValueError("找图识别区域宽高必须为正整数")
+    if random_offset_x < 0 or random_offset_y < 0:
+        raise ValueError("找图随机偏移范围不能为负数")
+    if max_attempts <= 0:
+        raise ValueError("找图重试次数必须为正整数")
     # -------------------------
 
     # --- ADDED: Construct absolute path and validate ---
@@ -646,7 +629,11 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         logger.debug(f"[找图] 清除帧缓存失败: {e}")
 
     # 绑定窗口搜索阶段
+    query_ok = False
+    query_error = None
     for attempt in range(1, max_attempts + 1):
+        query_ok = False
+        query_error = None
         if _is_stop_requested():
             logger.warning("[停止请求] 找图尝试前检测到停止请求，立即终止")
             return False, '停止工作流', None
@@ -691,7 +678,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                         image_name = absolute_image_path.replace('memory://', '') if absolute_image_path.startswith('memory://') else os.path.basename(absolute_image_path)
                         logger.debug(f"[性能优化] 使用缓存的模板: '{image_name}'")
                 except Exception as e:
-                    logger.debug(f"[性能优化] 模板缓存读取失败: {e}")
+                    raise RuntimeError("模板缓存读取失败") from e
 
                 # 如果缓存未命中，正常加载
                 if needle_image_raw is None:
@@ -827,8 +814,8 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 roi=roi_param,
                 client_area_only=True,
                 use_cache=False,
-                template_scale=coerce_float(params.get('template_scale', 1.0), 1.0),
-                mode=str(params.get('image_mode', '彩色') or '彩色'),
+                template_scale=safe_non_negative_float(params.get('template_scale', 1.0)),
+                mode=params.get('image_mode', '彩色'),
                 rotation=params.get('image_rotation', 0),
             )
 
@@ -838,15 +825,19 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
 
             if not match_response or not bool(match_response.get("success")):
                 if isinstance(match_response, dict):
-                    err_msg = str(match_response.get("error") or "unknown_error")
+                    err_msg = str(match_response.get("error") or "截图引擎未返回错误详情")
                 else:
-                    err_msg = "unknown_error"
+                    err_msg = "截图引擎未返回有效结果"
                 logger.error(f"[统一后台识别] 本地引擎截图匹配失败: {err_msg}")
+                query_error = err_msg
             else:
-                try:
-                    match_score = float(match_response.get("confidence", 0.0) or 0.0)
-                except Exception:
-                    match_score = 0.0
+                import math
+
+                if not isinstance(match_response.get("matched"), bool):
+                    raise ValueError("找图匹配状态未知")
+                match_score = safe_non_negative_float(match_response['confidence'])
+                if not math.isfinite(match_score) or not 0 <= match_score <= 1:
+                    raise ValueError("找图匹配分数无效")
                 logger.info(f"[模板匹配] 分数: {match_score:.4f}, 阈值: {confidence:.4f}, 方法: local_engine")
 
                 parsed_location = None
@@ -854,37 +845,31 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 if isinstance(raw_location, (list, tuple)) and len(raw_location) == 4:
                     try:
                         parsed_location = (
-                            int(raw_location[0]),
-                            int(raw_location[1]),
-                            int(raw_location[2]),
-                            int(raw_location[3]),
+                            safe_integer(raw_location[0]),
+                            safe_integer(raw_location[1]),
+                            safe_integer(raw_location[2]),
+                            safe_integer(raw_location[3]),
                         )
                     except Exception:
                         parsed_location = None
 
-                screenshot_w = match_response.get("screenshot_width")
-                screenshot_h = match_response.get("screenshot_height")
-                if screenshot_w is None or screenshot_h is None:
-                    screenshot_shape = match_response.get("screenshot_shape")
-                    if isinstance(screenshot_shape, (list, tuple)) and len(screenshot_shape) >= 2:
-                        try:
-                            screenshot_h = int(screenshot_shape[0])
-                            screenshot_w = int(screenshot_shape[1])
-                        except Exception:
-                            screenshot_h = None
-                            screenshot_w = None
+                screenshot_w = safe_integer(match_response['screenshot_width'])
+                screenshot_h = safe_integer(match_response['screenshot_height'])
+                if screenshot_w <= 0 or screenshot_h <= 0:
+                    raise ValueError("找图截图尺寸未知或无效")
+                if match_response.get("matched") is True and parsed_location is None:
+                    raise ValueError("找图命中但匹配位置无效")
+                if match_response.get("matched") is True and match_score < confidence:
+                    raise ValueError("找图匹配分数与命中状态不一致")
+                query_ok = True
 
                 if bool(match_response.get("matched", False)) and parsed_location is not None and match_score >= confidence:
-                    found = True
                     match_x, match_y, match_w, match_h = parsed_location
-                    if match_w > 0 and match_h > 0:
-                        template_w = int(match_w)
-                        template_h = int(match_h)
-                    if screenshot_w is None:
-                        screenshot_w = 0
-                    if screenshot_h is None:
-                        screenshot_h = 0
-
+                    if match_w <= 0 or match_h <= 0:
+                        raise ValueError("找图匹配尺寸无效")
+                    template_w = match_w
+                    template_h = match_h
+                    found = True
                     location = (
                         int(match_x),
                         int(match_y),
@@ -913,6 +898,8 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                         )
 
         except Exception as find_err:
+            query_ok = False
+            query_error = str(find_err)
             # 显示错误详细信息
             # 只显示图片名称，不显示路径前缀
             if absolute_image_path.startswith('memory://'):
@@ -971,15 +958,10 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     if found and location:
         click_success = not enable_click
 
-        # 解析location元组
-        if len(location) >= 6:
-            # 新格式: (x, y, width, height, screenshot_w, screenshot_h)
-            left_x, top_y, template_w, template_h, screenshot_width, screenshot_height = location[:6]
-        else:
-            # 旧格式兼容: (x, y, width, height)
-            left_x, top_y, template_w, template_h = location[:4]
-            screenshot_width = None
-            screenshot_height = None
+        if len(location) != 6:
+            logger.error("图像匹配结果格式无效")
+            return False, on_failure_action, failure_jump_id
+        left_x, top_y, template_w, template_h, screenshot_width, screenshot_height = location
 
         # 【关键修复】简化坐标计算，与文字点击保持一致
         # WGC截图返回的坐标直接作为客户区坐标使用
@@ -1156,7 +1138,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                             auto_release=enable_auto_release,
                             mode_label="前台模式",
                             logger_obj=logger,
-                            single_click_retry=True,
                             require_atomic_hold=True,
                             move_before_click=False,
                             stop_checker=stop_checker,
@@ -1211,7 +1192,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                             auto_release=enable_auto_release,
                             mode_label="后台点击",
                             logger_obj=logger,
-                            single_click_retry=False,
                             require_atomic_hold=True,
                             move_before_click=False,
                             stop_checker=stop_checker,
@@ -1266,6 +1246,8 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 _publish_image_perception(
                     card_id,
                     ok=False,
+                    query_ok=query_ok,
+                    error=query_error,
                     score=locals().get("match_score"),
                     threshold=locals().get("confidence"),
                     path=absolute_image_path,
@@ -1285,7 +1267,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         match_result = None
 
 
-def test_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
+def preview_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
     """
     测试图片识别功能，在绑定窗口上绘制找到的图片区域（使用统一测试模块）
 
@@ -1296,8 +1278,7 @@ def test_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = 
         parameter_panel: 参数面板对象（用于隐藏）
     """
     try:
-        from tasks.image_match_probe import test_image_recognition as unified_test
+        from tasks.image_match_probe import preview_image_recognition as unified_test
         unified_test(params, target_hwnd, main_window, parameter_panel)
     except Exception as e:
         logger.error(f"调用统一测试函数失败: {e}", exc_info=True)
-

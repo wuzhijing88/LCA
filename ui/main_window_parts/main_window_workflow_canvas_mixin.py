@@ -14,26 +14,9 @@ class MainWindowWorkflowCanvasMixin:
             self.parameter_panel.refresh_runtime_parameters(card_id)
         # 【参考中控】更新底部状态栏显示执行结果
         self._update_step_detail_for_card(card_id, is_executing=False, success=success)
-        # 获取当前标签页ID
-        current_task_id = self.workflow_tab_widget.get_current_task_id()
-        # 优先使用当前活动的workflow_view（适用于测试模式和正常执行）
-        target_workflow_view = self.workflow_view
-        # 验证卡片是否在当前视图中
-        if target_workflow_view and card_id in target_workflow_view.cards:
-            logger.debug(f"[卡片状态] 卡片 {card_id} 在当前标签页 (task_id={current_task_id}) 中")
-        else:
-            # 卡片不在当前视图，遍历查找（适用于后台执行的情况）
-            logger.debug(f"[卡片状态] 卡片 {card_id} 不在当前标签页，搜索其他标签页")
-            target_workflow_view = None
-            for task_id, workflow_view in self.workflow_tab_widget.task_views.items():
-                if workflow_view and card_id in workflow_view.cards:
-                    target_workflow_view = workflow_view
-                    logger.debug(f"[卡片状态] 找到卡片 {card_id} 所在的工作流视图: task_id={task_id}")
-                    break
-            if not target_workflow_view:
-                logger.debug(f"[卡片状态] 未找到包含卡片 {card_id} 的工作流视图")
-                return
-            # 不再跳过非当前标签页：执行结果需要立即写回视图状态。
+        target_workflow_view = self._execution_workflow_view()
+        if target_workflow_view is None:
+            return
         state = 'success' if success else 'failure'
         try:
             target_workflow_view.set_card_state(card_id, state)
@@ -89,42 +72,6 @@ class MainWindowWorkflowCanvasMixin:
             self._update_main_window_title()
         else:
             logger.info("用户取消了清空工作流操作。") 
-    def _on_card_deleted(self, card_id: int):
-        """处理卡片删除事件 - 清理相关资源防止崩溃"""
-        logger.info(f"处理卡片删除: {card_id}")
-        try:
-            # 1. 清理工作流上下文中的卡片数据
-            from task_workflow.workflow_context import clear_card_ocr_data
-            # 清理默认工作流上下文
-            clear_card_ocr_data(card_id)
-            # 也清理可能存在的其他工作流上下文
-            try:
-                from task_workflow.workflow_context import _context_manager
-                for workflow_id in list(_context_manager.contexts.keys()):
-                    clear_card_ocr_data(card_id, workflow_id)
-            except Exception as multi_e:
-                logger.debug(f"清理多工作流上下文时出错: {multi_e}")
-            logger.debug(f"已清理卡片 {card_id} 的工作流上下文数据")
-            # 2. 清理执行器中的持久化计数器
-            if hasattr(self, 'executor') and self.executor:
-                try:
-                    if hasattr(self.executor, '_persistent_counters'):
-                        # 清理与该卡片相关的计数器
-                        keys_to_remove = []
-                        for key in self.executor._persistent_counters.keys():
-                            if str(card_id) in str(key):
-                                keys_to_remove.append(key)
-                        for key in keys_to_remove:
-                            del self.executor._persistent_counters[key]
-                            logger.debug(f"已清理执行器计数器: {key}")
-                except Exception as exec_e:
-                    logger.debug(f"清理执行器数据时出错: {exec_e}")
-            # 4. 强制垃圾回收，清理可能的循环引用
-            import gc
-            gc.collect()
-            logger.info(f"卡片 {card_id} 删除后清理完成")
-        except Exception as e:
-            logger.error(f"处理卡片 {card_id} 删除时发生错误: {e}", exc_info=True)
     def add_new_task_card(self):
         """Prompts the user to select a task type and adds a new card for it."""
         # 检查是否有当前工作流

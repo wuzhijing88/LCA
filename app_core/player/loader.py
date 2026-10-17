@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import copy
 import json
-import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -23,12 +21,10 @@ from app_core.player.secure_package import (
     find_sealed_package,
     load_sealed_package_memory,
 )
-from app_core.player.memory_store import get_player_memory_json, list_player_memory_files
-from task_workflow.workflow_payload import load_workflow_json
+from app_core.player.memory_store import get_player_memory_json
+from app_core.lca_format.project_io import load_lca_project
 from app_core.player.script_metadata import validate_release_metadata, verify_release_workflow
 from utils.app_paths import get_app_root, get_plugin_dir, is_packaged_runtime, resolve_running_executable
-
-logger = logging.getLogger(__name__)
 
 PLAYER_FLAG = "--player"
 PACKAGE_FLAG = "--package"
@@ -66,7 +62,7 @@ def resolve_product_role(argv: Optional[Sequence[str]] = None) -> str:
     解析当前进程产品角色（离线主流：显式双身份）。
 
     - worker 子进程：ROLE_WORKER
-    - 打包后：只认 exe PE 印记（player / editor）；无印记时兼容旧包 → editor
+    - 打包后：只认 exe PE 印记（player / editor）；无有效印记时失败
     - 源码：默认 editor；``--player`` / ``--package`` 便于本地调试播放器
     """
     args = [str(item) for item in (argv if argv is not None else ())]
@@ -78,8 +74,7 @@ def resolve_product_role(argv: Optional[Sequence[str]] = None) -> str:
             return ROLE_PLAYER
         if stamp == ENTRY_EDITOR:
             return ROLE_EDITOR
-        # 未盖印的旧安装包：按编辑器运行，避免误伤已发布 LCA
-        return ROLE_EDITOR
+        raise ValueError("程序身份印记缺失或无效，请重新安装 LCA")
     if _argv_has_flag(args, PLAYER_FLAG) or _argv_has_flag(args, PACKAGE_FLAG):
         return ROLE_PLAYER
     return ROLE_EDITOR
@@ -261,23 +256,29 @@ def apply_player_isolation(argv: Optional[Sequence[str]] = None) -> Optional[Pat
     return open_package_dir(export_root)
 
 
+def _read_disk_workflow(path: Path) -> Dict[str, Any]:
+    """通过工程入口读取磁盘工作流，并释放本次读取创建的会话。"""
+    payload, session = load_lca_project(path)
+    try:
+        return payload
+    finally:
+        session.close()
+
+
 def _try_load_script_payload(relpath: str, package_dir: str = "") -> Optional[Dict[str, Any]]:
     rel = str(relpath or "").replace("\\", "/").lstrip("/")
     if not rel:
         return None
-    data = get_player_memory_json(rel)
-    if isinstance(data, dict):
-        return data
     if package_dir:
         path = Path(package_dir) / rel
         if path.is_file():
-            try:
-                payload = load_workflow_json(str(path))
-            except Exception:
-                logger.debug("读取脚本失败: %s", path, exc_info=True)
-                return None
-            return payload if isinstance(payload, dict) else None
-    return None
+            return _read_disk_workflow(path)
+        return None
+    from app_core.lca_format.project_io import is_lca_path
+    from app_core.player.workflow_io import read_player_memory_lca
+
+    data = read_player_memory_lca(rel) if is_lca_path(rel) else get_player_memory_json(rel)
+    return data if isinstance(data, dict) else None
 
 
 def load_package_scripts(
@@ -294,10 +295,14 @@ def load_package_scripts(
 
     def _add_meta(item: Mapping[str, Any]) -> None:
         sid = str(item.get("id") or "").strip()
-        if not sid or sid in seen:
+        if not sid:
+            raise ValueError("发布脚本缺少标识")
+        if sid in seen:
             return
         seen.add(sid)
-        path = str(item.get("path") or item.get("source") or f"workflows/scripts/{sid}.json")
+        path = str(item.get("path") or "").strip()
+        if not path:
+            raise ValueError(f"发布脚本缺少工作流路径: {sid}")
         meta = {
             "id": sid,
             "title": str(item.get("title") or sid).strip() or sid,
@@ -320,46 +325,10 @@ def load_package_scripts(
     for meta in metas:
         sid = meta["id"]
         data = _try_load_script_payload(meta["path"], package_dir)
-        if "workflow_sha256" in meta:
-            if data is None:
-                raise ValueError(f"发布脚本工作流缺失或无效: {sid}")
-            verify_release_workflow(meta, data)
         if data is None:
-            data = _try_load_script_payload(f"workflows/scripts/{sid}.json", package_dir)
-        if isinstance(data, dict):
-            scripts[sid] = data
-
-    if not scripts:
-        for key in list_player_memory_files():
-            text = str(key or "").replace("\\", "/")
-            if not (text.startswith("workflows/scripts/") and text.endswith(".json")):
-                continue
-            sid = Path(text).stem
-            data = get_player_memory_json(text)
-            if isinstance(data, dict):
-                scripts[sid] = data
-        folder = Path(package_dir) / "workflows" / "scripts" if package_dir else None
-        if folder is not None and folder.is_dir():
-            for path in folder.glob("*.json"):
-                sid = path.stem
-                if sid in scripts:
-                    continue
-                try:
-                    payload = load_workflow_json(str(path))
-                except Exception:
-                    continue
-                if isinstance(payload, dict):
-                    scripts[sid] = payload
-
-    entry_id = str(manifest.get("entry_script_id") or "").strip()
-    if not entry_id:
-        entry_rel = str(manifest.get("entry_workflow") or "workflows/main.json").replace("\\", "/")
-        for meta in metas:
-            if str(meta.get("path") or "").replace("\\", "/") == entry_rel:
-                entry_id = meta["id"]
-                break
-    if entry_id and entry_id not in scripts and isinstance(workflow_data, Mapping) and workflow_data:
-        scripts[entry_id] = copy.deepcopy(dict(workflow_data))
+            raise ValueError(f"发布脚本工作流缺失或无效: {sid}")
+        verify_release_workflow(meta, data)
+        scripts[sid] = data
     return scripts
 
 
@@ -372,8 +341,7 @@ def load_player_package(package_dir: Path | str) -> PlayerPackage:
         try:
             from app_core.player.package_integrity import verify_player_memory_package
 
-            # 有摘要则强制校验；旧包无摘要则跳过以保持兼容
-            verify_player_memory_package(require=False)
+            verify_player_memory_package(require=True)
         except ValueError as exc:
             from app_core.player.secure_package import SecurePackageError
 
@@ -429,7 +397,7 @@ def load_player_package(package_dir: Path | str) -> PlayerPackage:
         entry_path.relative_to(root.resolve())
     except ValueError as exc:
         raise ValueError("入口工作流必须位于 package 目录内") from exc
-    workflow_data = load_workflow_json(str(entry_path))
+    workflow_data = _read_disk_workflow(entry_path)
 
     assets_root = root / "assets"
     images_dir = assets_root / "images"
@@ -441,8 +409,6 @@ def load_player_package(package_dir: Path | str) -> PlayerPackage:
     dicts_dir = assets_root / "dicts"
     dicts_dir.mkdir(parents=True, exist_ok=True)
     yolo_dir = assets_root / "yolo"
-    if not yolo_dir.is_dir() and (assets_root / "models").is_dir():
-        yolo_dir = assets_root / "models"
     yolo_dir.mkdir(parents=True, exist_ok=True)
     plugin_dir = Path(get_plugin_dir())
 

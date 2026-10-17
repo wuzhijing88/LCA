@@ -6,8 +6,12 @@ from __future__ import annotations
 import threading
 from typing import Any, Dict, Iterable, Optional
 
+from task_workflow.script_parameters import add_numeric_values
+
 PERCEPTION_FIELDS = (
     "ok",
+    "query_ok",
+    "error",
     "kind",
     "text",
     "x",
@@ -35,6 +39,52 @@ KIND_ALIASES = {
 MAX_VAR_NAME_LEN = 64
 MAX_VAR_TEXT_LEN = 4096
 MAX_ITEMS = 50
+
+
+def normalize_var_value(value: Any) -> Any:
+    """复制并校验用户变量；容量错误不能改写或截短原数据。"""
+    active = set()
+    nodes = 0
+
+    def visit(item, depth):
+        nonlocal nodes
+        nodes += 1
+        if depth > 32 or nodes > 10000:
+            raise ValueError("变量嵌套不能超过32层，总元素不能超过10000项")
+        if item is None or isinstance(item, (bool, int)):
+            return item
+        if isinstance(item, float):
+            import math
+
+            if not math.isfinite(item):
+                raise ValueError("变量数值必须是有限数字")
+            return item
+        if isinstance(item, str):
+            if len(item) > MAX_VAR_TEXT_LEN:
+                raise ValueError(f"变量文本不能超过{MAX_VAR_TEXT_LEN}个字符")
+            return item
+        if not isinstance(item, (list, tuple, dict)):
+            raise TypeError("变量值只支持无、真假、数字、文本、列表和字典")
+        if len(item) > MAX_ITEMS:
+            raise ValueError(f"变量列表或字典不能超过{MAX_ITEMS}项")
+        identity = id(item)
+        if identity in active:
+            raise ValueError("变量不能包含循环引用")
+        active.add(identity)
+        try:
+            if isinstance(item, dict):
+                result = {}
+                for key, child in item.items():
+                    if not isinstance(key, str):
+                        raise TypeError("变量字典的键必须是文本")
+                    visit(key, depth + 1)
+                    result[key] = visit(child, depth + 1)
+                return result
+            return [visit(child, depth + 1) for child in item]
+        finally:
+            active.remove(identity)
+
+    return visit(value, 0)
 
 
 def empty_perception(kind: Optional[str] = None) -> Dict[str, Any]:
@@ -177,7 +227,7 @@ class RuntimeStore:
 
     def set_var(self, name: Any, value: Any) -> Any:
         key = normalize_var_name(name)
-        stored = _json_safe(value)
+        stored = normalize_var_value(value)
         with self._lock:
             self._vars[key] = stored
         return stored
@@ -198,18 +248,9 @@ class RuntimeStore:
 
     def inc_var(self, name: Any, step: Any = 1) -> Any:
         key = normalize_var_name(name)
-        try:
-            delta = float(step)
-        except (TypeError, ValueError):
-            raise ValueError("步长必须是数字") from None
         with self._lock:
             current = self._vars.get(key, 0)
-            try:
-                next_value = float(current) + delta
-            except (TypeError, ValueError):
-                next_value = delta
-            if float(next_value).is_integer():
-                next_value = int(next_value)
+            next_value = add_numeric_values(current, step)
             self._vars[key] = next_value
             return next_value
 
@@ -372,32 +413,22 @@ def get_store_from_context(context: Any) -> Optional[RuntimeStore]:
 
 
 def perception_from_ocr_results(results: Any, *, ok: Optional[bool] = None) -> Dict[str, Any]:
+    from task_workflow.card_payload import bounds_from_bbox
+
     items = []
     if isinstance(results, list):
         for item in results:
             if not isinstance(item, dict):
                 continue
             text = item.get("text")
-            if text is None:
-                text = item.get("文字")
             score = item.get("confidence")
-            if score is None:
-                score = item.get("score")
-            box = item.get("bbox") or item.get("box")
+            box = item.get("bbox")
             x = item.get("x")
             y = item.get("y")
             x1 = y1 = x2 = y2 = None
-            if isinstance(box, (list, tuple)) and box:
-                try:
-                    first = box[0]
-                    if isinstance(first, (list, tuple)):
-                        xs = [float(point[0]) for point in box]
-                        ys = [float(point[1]) for point in box]
-                        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-                    elif len(box) >= 4:
-                        x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
-                except (TypeError, ValueError, IndexError):
-                    x1 = y1 = x2 = y2 = None
+            bounds = bounds_from_bbox(box)
+            if bounds is not None:
+                x1, y1, x2, y2 = bounds
             if x is None and x1 is not None and x2 is not None:
                 x = (float(x1) + float(x2)) / 2
             if y is None and y1 is not None and y2 is not None:
@@ -418,6 +449,7 @@ def perception_from_ocr_results(results: Any, *, ok: Optional[bool] = None) -> D
     matched = bool(items) if ok is None else bool(ok)
     return normalize_perception(
         ok=matched,
+        query_ok=True,
         kind="ocr",
         text=first.get("text"),
         x=first.get("x"),
@@ -436,6 +468,7 @@ def perception_from_yolo_result(result: Any, *, ok: Optional[bool] = None) -> Di
     matched = bool(payload) if ok is None else bool(ok)
     return normalize_perception(
         ok=matched,
+        query_ok=True,
         kind="yolo",
         text=payload.get("class_name"),
         class_name=payload.get("class_name"),

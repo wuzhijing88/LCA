@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime
 import hashlib
 import logging
 import os
@@ -18,7 +17,7 @@ from PySide6.QtCore import Qt
 
 from app_core.diagnostics.context import bind_diagnostic_context
 from services.ocr_socket_message_utils import recv_message, send_message
-from utils.app_paths import get_app_root, get_logs_dir
+from utils.app_paths import get_app_root, get_system_log_path
 from utils.log_runtime_control import configure_noisy_logger_levels, install_runtime_log_filters
 from app_core.runtime.worker_entry import bootstrap_current_process_virtual_environment
 
@@ -60,9 +59,7 @@ def _configure_logging() -> None:
 
     root_logger = logging.getLogger()
 
-    log_dir = get_logs_dir("LCA")
-    log_filename = f"app_{datetime.date.today().strftime('%Y-%m-%d')}.log"
-    log_path = os.path.join(log_dir, log_filename)
+    log_path = get_system_log_path("LCA")
 
     formatter = logging.Formatter(
         "%(asctime)s - %(levelname)s - [pid=%(process)d] - [%(module)s:%(lineno)d] - %(message)s"
@@ -78,47 +75,46 @@ def _configure_logging() -> None:
             break
 
     if managed_file_handler is None:
-        try:
-            managed_file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-            managed_file_handler.setLevel(logging.INFO)
-            managed_file_handler.setFormatter(formatter)
-            root_logger.addHandler(managed_file_handler)
-            handlers_to_filter.append(managed_file_handler)
-        except Exception:
-            managed_file_handler = None
-
-    if not root_logger.handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - [pid=%(process)d] - [%(module)s:%(lineno)d] - %(message)s",
-        )
-        handlers_to_filter = list(root_logger.handlers)
-    elif not handlers_to_filter:
-        handlers_to_filter = list(root_logger.handlers)
+        managed_file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        managed_file_handler.setLevel(logging.INFO)
+        managed_file_handler.setFormatter(formatter)
+        root_logger.addHandler(managed_file_handler)
+        handlers_to_filter.append(managed_file_handler)
 
     install_runtime_log_filters(handlers_to_filter or root_logger.handlers, MAX_WORKER_LOG_MESSAGE_CHARS)
     configure_noisy_logger_levels()
 
-    try:
-        from utils.log_message_translator import install_log_message_translator
-        install_log_message_translator(root_logger)
-    except Exception:
-        pass
+    from utils.log_message_translator import install_log_message_translator
+    install_log_message_translator(root_logger)
     _WORKFLOW_LOGGING_CONFIGURED = True
 
 
 def _configure_faulthandler() -> None:
     global _FAULT_HANDLER_STREAM
-    try:
-        import faulthandler
+    import faulthandler
 
-        log_dir = get_logs_dir("LCA")
-        fault_log_path = os.path.join(log_dir, f"workflow_worker_fault_{os.getpid()}.log")
-        _FAULT_HANDLER_STREAM = open(fault_log_path, "a", encoding="utf-8")
-        faulthandler.enable(file=_FAULT_HANDLER_STREAM, all_threads=True)
-        logger.info(f"工作流子进程已启用崩溃诊断: {fault_log_path}")
+    _shutdown_faulthandler()
+    fault_log_path = get_system_log_path("LCA")
+    stream = open(fault_log_path, "a", encoding="utf-8")
+    try:
+        faulthandler.enable(file=stream, all_threads=True)
     except Exception as exc:
-        logger.warning(f"启用工作流子进程崩溃诊断失败: {exc}")
+        stream.close()
+        raise RuntimeError(f"启用工作流子进程崩溃诊断失败：{exc}") from exc
+    _FAULT_HANDLER_STREAM = stream
+    logger.info("工作流子进程已启用崩溃诊断: %s", fault_log_path)
+
+
+def _shutdown_faulthandler() -> None:
+    global _FAULT_HANDLER_STREAM
+    if _FAULT_HANDLER_STREAM is None:
+        return
+    import faulthandler
+
+    # 必须先卸载原生处理器，再关闭它仍持有的文件描述符。
+    faulthandler.disable()
+    stream, _FAULT_HANDLER_STREAM = _FAULT_HANDLER_STREAM, None
+    stream.close()
 
 
 class _SocketSignalBridge:
@@ -273,11 +269,17 @@ def _attach_workflow_graph(payload: Dict[str, Any], workflow_data: Dict[str, Any
 
 
 def _load_memory_workflow(memory_uri: str) -> Dict[str, Any]:
+    from app_core.lca_format.project_io import is_lca_path
     from app_core.player.memory_store import get_player_memory_json
     from app_core.player.runtime_images import ensure_player_image_memory
+    from app_core.player.workflow_io import read_player_memory_lca
 
     ensure_player_image_memory()
-    workflow_data = get_player_memory_json(memory_uri)
+    workflow_data = (
+        read_player_memory_lca(memory_uri)
+        if is_lca_path(memory_uri)
+        else get_player_memory_json(memory_uri)
+    )
     if not isinstance(workflow_data, dict):
         raise FileNotFoundError("工作流引用不存在")
     return workflow_data
@@ -307,7 +309,7 @@ def _materialize_workflow_reference(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _attach_payload_lca_session(payload: Dict[str, Any]) -> None:
     filepath = str(payload.get("workflow_filepath") or "").strip()
-    if not filepath:
+    if not filepath or filepath.startswith("memory://"):
         return
     from app_core.lca_format.project_io import ensure_registered_lca_session, is_lca_path
     from app_core.lca_format.session import activate
@@ -355,6 +357,24 @@ def _is_socket_peer_closed(sock: socket.socket) -> bool:
         return False
     except OSError:
         return True
+
+
+def _cleanup_worker_input_state() -> None:
+    """清理本轮输入模拟器，避免预热子进程把旧窗口状态带到下一轮。"""
+    try:
+        from utils.input_simulation.factory import global_input_simulator_manager
+
+        global_input_simulator_manager.clear_cache()
+    except Exception as exc:
+        logger.warning("工作流子进程清理输入模拟器缓存失败: %s", exc)
+
+    try:
+        from utils.input.foreground_input_manager import get_foreground_input_manager
+
+        manager = get_foreground_input_manager()
+        manager.release_all_inputs()
+    except Exception as exc:
+        logger.warning("工作流子进程释放前台输入状态失败: %s", exc)
 
 
 def _wait_for_init_message(sock: socket.socket, *, poll_timeout: float = 1.0):
@@ -432,11 +452,6 @@ def run_workflow_worker_standalone(port: int) -> int:
         runtime_label="工作流子进程",
         logger=logger,
     )
-    _configure_faulthandler()
-    # 注册规范化配置提供者。utils 层读配置只走 utils.runtime_config，
-    # 子进程不导入本模块就拿不到经过校验的配置。
-    import app_core.config_store  # noqa: F401
-
     if not port:
         logger.error("工作流子进程缺少端口参数")
         return 2
@@ -446,6 +461,10 @@ def run_workflow_worker_standalone(port: int) -> int:
     stop_event = threading.Event()
 
     try:
+        _configure_faulthandler()
+        # 注册规范化配置提供者，子进程配置只走规范化入口。
+        import app_core.config_store  # noqa: F401
+
         sock = socket.create_connection(("127.0.0.1", int(port)), timeout=8.0)
         auth_token = str(os.getenv("LCA_WORKFLOW_AUTH_TOKEN", "") or "")
         if not auth_token:
@@ -532,6 +551,7 @@ def run_workflow_worker_standalone(port: int) -> int:
                         control_thread.join(timeout=1.0)
                     except Exception:
                         pass
+                _cleanup_worker_input_state()
 
             if bridge.send_failed:
                 logger.error("工作流子进程通信发送失败")
@@ -544,7 +564,6 @@ def run_workflow_worker_standalone(port: int) -> int:
                 logger.error("工作流子进程发送 idle 失败")
                 return 9
     finally:
-        global _FAULT_HANDLER_STREAM
         stop_event.set()
         if control_thread is not None and control_thread.is_alive():
             try:
@@ -556,16 +575,7 @@ def run_workflow_worker_standalone(port: int) -> int:
                 sock.close()
             except Exception:
                 pass
-        if _FAULT_HANDLER_STREAM is not None:
-            try:
-                _FAULT_HANDLER_STREAM.flush()
-            except Exception:
-                pass
-            try:
-                _FAULT_HANDLER_STREAM.close()
-            except Exception:
-                pass
-            _FAULT_HANDLER_STREAM = None
+        _shutdown_faulthandler()
 
 
 def main(argv: Optional[list[str]] = None) -> int:

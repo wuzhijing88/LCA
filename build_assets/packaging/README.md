@@ -10,7 +10,8 @@
 build_assets\packaging\build_release.bat
 ```
 
-插件运行库放在 `tools/plugin/`。`PluginHost.exe`、`dm.dll`、`RegDll.dll` 是必需文件，缺少任一项立即终止打包；`xx.dat` 是可选附属文件。打包时只按文件白名单纳入：Nuitka 用 `--include-data-files`，`stage_packaged_runtime_assets.py` 再拷到发行目录并清掉其它残留。
+插件运行库放在 `tools/plugin/`。`PluginHost.exe`、`dm.dll` 是必需文件，缺少任一项立即终止打包；`xx.dat` 是可选附属文件。打包时只按文件白名单纳入：Nuitka 用 `--include-data-files`，`stage_packaged_runtime_assets.py` 再拷到发行目录并清掉其它残留。`RegDll.dll` 已移除，宿主不依赖 COM 注册表。
+
 
 离线双身份（行业常见、无授权）：
 

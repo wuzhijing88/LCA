@@ -18,26 +18,11 @@ MAX_INSTANCE_SLOTS = 32
 
 _SLOT: Optional[int] = None
 _OWNS_LOCK = False
-_INSTANCES_DIR_OVERRIDE: Optional[str] = None
 
 PidAliveFn = Callable[[int], bool]
 HwndAncestryFn = Callable[[int], Sequence[int]]
 WindowPidFn = Callable[[int], int]
 ForegroundFn = Callable[[], int]
-
-
-def reset_instance_runtime_for_tests() -> None:
-    """测试用：清掉进程内槽位状态。"""
-    global _SLOT, _OWNS_LOCK, _INSTANCES_DIR_OVERRIDE
-    _SLOT = None
-    _OWNS_LOCK = False
-    _INSTANCES_DIR_OVERRIDE = None
-    os.environ.pop(INSTANCE_SLOT_ENV, None)
-
-
-def set_instances_dir_for_tests(path: Optional[str]) -> None:
-    global _INSTANCES_DIR_OVERRIDE
-    _INSTANCES_DIR_OVERRIDE = path
 
 
 def get_instance_slot() -> int:
@@ -411,8 +396,6 @@ def _parse_slot(value: Any) -> int:
 def _resolve_instances_dir(instances_dir: Optional[str] = None) -> str:
     if instances_dir:
         return instances_dir
-    if _INSTANCES_DIR_OVERRIDE:
-        return _INSTANCES_DIR_OVERRIDE
     from utils.app_paths import get_user_data_dir
 
     return os.path.join(get_user_data_dir("LCA"), "runtime", "instances")

@@ -2,11 +2,14 @@
 
 dm.dll 只有 32 位 COM 实现，所以由这个独立的 x86 进程加载它，主程序通过命名管道 RPC 调用；
 帧数据走 64MiB 共享内存。运行时文件固定放在安装目录 `tools/plugin/`：
-`PluginHost.exe`、`dm.dll`、`RegDll.dll`（免注册加载）以及厂商附带的 `xx.dat`。
+`PluginHost.exe`、`dm.dll`（免注册加载）以及厂商附带的 `xx.dat`。
 
 宿主通过 `dm.dll` 导出的 `DllGetClassObject` 直接创建 `dmsoft`，不写 COM 注册表；
-`RegDll.dll` 仅随包提供给插件运行环境，不调用 `DllRegisterServer` 或其它注册入口；
-创建对象后仍按官方流程调用 `dm.Ver` 和 `dm.Reg(注册码, 附加码)` 验证授权。
+宿主不调用 `DllRegisterServer` 或其它注册入口；创建对象后仍按官方流程调用
+`dm.Ver` 和 `dm.Reg(注册码, 附加码)` 验证授权。
+方法信息通过 `LoadTypeLibEx(REGKIND_NONE)` 从当前 `dm.dll` 的内置类型库读取，
+普通参数和输出参数统一用 `DispInvoke` 调用双接口，不依赖系统类型库注册或 .NET 反射晚绑定。
+初始化失败和宿主退出会释放插件对象、类型信息、类工厂和 DLL。
 
 ## 构建
 
@@ -54,15 +57,15 @@ keypad / mode，可选 `public`（BindWindowEx 的 public 串，如 `dx.public.i
 否则每次截图↔键鼠交替都会解绑重绑。
 
 每个 dm 对象只 `Reg` 一次：窗口解绑/关闭后对象回到空闲池，下一个窗口直接复用，不重新注册；对象总数上限 16，
-满了淘汰最久未用的窗口（解绑后回池）。所以宿主生命周期内的注册次数 <= 同时绑定过的最大窗口数。`bind` 结果里的
+满了直接失败，不淘汰已绑定窗口。所以宿主生命周期内的注册次数 <= 同时绑定过的最大窗口数。`bind` 结果里的
 `registered` 表示本次为该窗口新建了对象并注册，`registrations` 是累计次数，Python 侧会记一条 INFO 日志；
 `stats` 随时可查。
 
 ## 真机自检
 
 ```
-python build_assets/plugin_host/plugin_selfcheck.py --no-auth              # 文件/架构/宿主协议，不联网不注册
-python build_assets/plugin_host/plugin_selfcheck.py --title "窗口标题" --title "第二个窗口"
+venv\Scripts\python.exe tests/plugin_selfcheck.py --no-auth              # 文件/架构/宿主协议，不联网不注册
+venv\Scripts\python.exe tests/plugin_selfcheck.py --title "窗口标题" --title "第二个窗口"
 ```
 
 完整模式用配置里的注册码起共享宿主（1 次 Reg），对每个窗口做试绑 → IsBind → 客户区尺寸 → MoveTo(0,0)（不点击）→ 解绑，

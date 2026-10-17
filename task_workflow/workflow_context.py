@@ -273,8 +273,6 @@ class WorkflowContext:
         """获取最近写入的OCR结果卡片ID。"""
         if self.latest_ocr_card_id is not None and self.latest_ocr_card_id in self.ocr_results:
             return self.latest_ocr_card_id
-        if self.ocr_results:
-            return max(self.ocr_results.keys())
         return None
 
     def _forget_ocr_card(self, card_id: int) -> None:

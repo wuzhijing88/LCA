@@ -19,6 +19,28 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindowRunWorkflowMixin:
+    def _connect_workflow_runtime(self):
+        """绑定本轮执行器与进程句柄，迟到信号不会作用于下一轮对象。"""
+        executor, handle = self.executor, self.executor_thread
+        executor.moveToThread(handle)
+        executor.execution_started.connect(self._handle_execution_started)
+        executor.card_executing.connect(self._handle_card_executing)
+        executor.card_finished.connect(self._handle_card_finished)
+        executor.error_occurred.connect(self._handle_error_occurred)
+        executor.execution_finished.connect(self._handle_execution_finished)
+        executor.path_updated.connect(self._handle_path_updated)
+        executor.param_updated.connect(self._handle_param_updated)
+        executor.path_resolution_failed.connect(self._handle_path_resolution_failed)
+        executor.step_details.connect(self._update_step_details)
+        executor.show_warning.connect(self._show_warning_dialog)
+        if self._execution_log_panel is not None:
+            executor.step_log.connect(self._forward_step_log, Qt.ConnectionType.QueuedConnection)
+        handle.started.connect(executor.run)
+        # Qt 接收对象销毁时会自动断开；不能在闭包中重新读取 self.executor_thread。
+        executor.execution_finished.connect(handle.quit)
+        handle.finished.connect(handle.deleteLater)
+        handle.finished.connect(self._cleanup_references)
+
     def run_workflow(self, *args, **kwargs):
 
         """Initiates the workflow execution in a separate thread.
@@ -1048,135 +1070,7 @@ class MainWindowRunWorkflowMixin:
 
             
 
-            # 检查WorkflowExecutor是否为真正的QObject（支持线程）
-
-            is_qobject_executor = hasattr(self.executor, 'moveToThread') and hasattr(self.executor, 'execution_started')
-
-            if is_qobject_executor:
-
-                logging.debug("run_workflow: Moving executor to thread...")
-
-                self.executor.moveToThread(self.executor_thread)
-
-                # 3. Connect signals/slots
-
-                logging.debug("run_workflow: Connecting signals and slots...")
-
-                self.executor.execution_started.connect(self._handle_execution_started)
-
-                self.executor.card_executing.connect(self._handle_card_executing)
-
-                self.executor.card_finished.connect(self._handle_card_finished)
-
-                # self.executor.card_state_reset.connect(self._handle_card_state_reset)  # 注释：executor中未定义此信号，会导致卡死
-
-                self.executor.error_occurred.connect(self._handle_error_occurred)
-
-                self.executor.execution_finished.connect(self._handle_execution_finished)
-
-                # --- ADDED: Connect new signals ---
-
-                self.executor.path_updated.connect(self._handle_path_updated)
-
-                self.executor.param_updated.connect(self._handle_param_updated)
-
-                self.executor.path_resolution_failed.connect(self._handle_path_resolution_failed)
-
-                # --- ADDED: Connect step_details signal ---
-
-                self.executor.step_details.connect(self._update_step_details)
-
-                # --- ADDED: Connect show_warning signal ---
-
-                if hasattr(self.executor, 'show_warning'):
-
-                    self.executor.show_warning.connect(self._show_warning_dialog)
-
-                # --- 浮动窗口信号连接 ---
-
-                if hasattr(self, '_floating_window') and self._floating_window:
-
-                    if hasattr(self.executor, 'step_log'):
-
-                        self.executor.step_log.connect(
-
-                            self._forward_step_log,
-
-                            Qt.ConnectionType.QueuedConnection
-
-                        )
-
-                        logging.info("[浮动窗口] step_log信号已连接到_forward_step_log")
-
-                    else:
-
-                        logging.warning("[浮动窗口] executor没有step_log信号")
-
-                else:
-
-                    logging.warning(f"[浮动窗口] 未连接信号: _floating_window={getattr(self, '_floating_window', None)}")
-
-                # ------------------------------------------
-
-                self.executor_thread.started.connect(self.executor.run)
-
-                # 【修复闪退】创建一个安全的quit方法避免访问已删除的thread
-
-                def safe_quit_thread():
-
-                    try:
-
-                        if hasattr(self, 'executor_thread') and self.executor_thread:
-
-                            self.executor_thread.quit()
-
-                    except (RuntimeError, AttributeError) as e:
-
-                        logging.debug(f"safe_quit_thread: 线程已被删除或无效: {e}")
-
-                self.executor.execution_finished.connect(lambda success, msg: safe_quit_thread())
-
-                # 不使用lambda直接调用executor.deleteLater，改为在_cleanup_references中处理
-
-                # self.executor.execution_finished.connect(lambda success, msg: self.executor.deleteLater())
-
-                self.executor_thread.finished.connect(self.executor_thread.deleteLater)
-
-                # --- ADDED connection for explicit reference cleanup ---
-
-                self.executor_thread.finished.connect(self._cleanup_references)
-
-                # -------------------------------------------------------
-
-                logging.debug("run_workflow: Signals connected.")
-
-            else:
-
-                # 处理stub版本的WorkflowExecutor（打包版本）
-
-                logging.warning("run_workflow: 检测到stub版本的WorkflowExecutor，工作流功能在打包版本中被禁用")
-
-                QMessageBox.information(self, "功能限制",
-
-                                      "工作流执行功能在当前版本中不可用。\n"
-
-                                      "这是为了防止源代码泄露而设计的限制。")
-
-                self._reset_run_button()
-
-                # 清理资源
-
-                self.executor = None
-
-                if self.executor_thread:
-
-                    self.executor_thread.deleteLater()
-
-                    self.executor_thread = None
-
-                self._active_execution_task_id = None
-
-                return
+            self._connect_workflow_runtime()
 
             # 4. Start Thread
 
@@ -1206,11 +1100,7 @@ class MainWindowRunWorkflowMixin:
 
                      if self.executor:
 
-                         # 只有QObject才能调用deleteLater
-
-                         if hasattr(self.executor, 'deleteLater'):
-
-                             self.executor.deleteLater()
+                         self.executor.deleteLater()
 
                  finally:
 
@@ -1258,11 +1148,7 @@ class MainWindowRunWorkflowMixin:
 
             if self.executor:
 
-                # 只有QObject才能调用deleteLater
-
-                if hasattr(self.executor, 'deleteLater'):
-
-                    self.executor.deleteLater()
+                self.executor.deleteLater()
 
                 self.executor = None
 

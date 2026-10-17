@@ -1,6 +1,8 @@
+import copy
 import json
 import os
 import shutil
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from task_workflow.thread_start import THREAD_START_TASK_TYPE
@@ -20,6 +22,33 @@ WORKFLOW_RESOURCE_SUBDIRS = ("images", "sounds", "dicts", "yolo", "replays")
 _WORKFLOW_FILE_EXTENSIONS = {".json", ".lca"}
 
 WORKSPACE_FAVORITES_SCHEMA_VERSION = 3
+_WORKSPACE_PROJECT_CACHE_MAX = 256
+_WORKSPACE_PROJECT_CACHE: "OrderedDict[str, Tuple[Tuple[int, int], Dict[str, Any], str]]" = OrderedDict()
+
+
+def _workspace_project_stat(filepath: str) -> Optional[Tuple[int, int]]:
+    try:
+        stat = os.stat(filepath)
+    except OSError:
+        return None
+    return int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def _cache_workspace_project(
+    filepath: str,
+    file_stat: Tuple[int, int],
+    workflow_data: Dict[str, Any],
+    source_path: str,
+) -> None:
+    key = os.path.normcase(os.path.abspath(filepath))
+    _WORKSPACE_PROJECT_CACHE[key] = (
+        file_stat,
+        copy.deepcopy(workflow_data),
+        str(source_path or ""),
+    )
+    _WORKSPACE_PROJECT_CACHE.move_to_end(key)
+    while len(_WORKSPACE_PROJECT_CACHE) > _WORKSPACE_PROJECT_CACHE_MAX:
+        _WORKSPACE_PROJECT_CACHE.popitem(last=False)
 
 
 def favorite_path_key(filepath: str) -> str:
@@ -41,19 +70,7 @@ def resolve_existing_workflow_path(filepath: str) -> str:
     raw_path = str(filepath or "").strip()
     if not raw_path:
         return ""
-    abs_path = os.path.abspath(raw_path)
-    if os.path.isfile(abs_path):
-        return abs_path
-    root, extension = os.path.splitext(abs_path)
-    if extension.lower() == ".json":
-        sibling = root + ".lca"
-    elif extension.lower() == ".lca":
-        sibling = root + ".json"
-    else:
-        return abs_path
-    if os.path.isfile(sibling):
-        return sibling
-    return abs_path
+    return os.path.abspath(raw_path)
 
 
 def backup_workflow_file(filepath: str) -> str:
@@ -67,7 +84,7 @@ def backup_workflow_file(filepath: str) -> str:
     backups_dir = os.path.join(os.path.dirname(abs_filepath), "backups")
     os.makedirs(backups_dir, exist_ok=True)
     name, extension = os.path.splitext(os.path.basename(abs_filepath))
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = os.path.join(backups_dir, f"{name}_backup_{timestamp}{extension or '.lca'}")
     shutil.copy2(abs_filepath, backup_path)
     return backup_path
@@ -78,22 +95,7 @@ def workflow_path_keys(filepath: str) -> List[str]:
     if not raw_path:
         return []
 
-    candidates = [raw_path]
-    root, extension = os.path.splitext(raw_path)
-    if extension.lower() == ".json":
-        candidates.append(root + ".lca")
-    elif extension.lower() == ".lca":
-        candidates.append(root + ".json")
-
-    keys: List[str] = []
-    seen = set()
-    for candidate in candidates:
-        key = favorite_path_key(candidate)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        keys.append(key)
-    return keys
+    return [favorite_path_key(raw_path)]
 
 
 def path_is_under_workspace(filepath: str, workspace_dir: str) -> bool:
@@ -146,39 +148,45 @@ def is_workflow_json_data(data: Any) -> bool:
     return isinstance(workflow_data, dict) and isinstance(workflow_data.get("cards"), list)
 
 
-def load_workflow_json(filepath: str) -> Optional[Dict[str, Any]]:
+def _load_workspace_project(filepath: str) -> Optional[Tuple[Dict[str, Any], str]]:
     workflow_path = str(filepath or "").strip()
     if not workflow_path or not os.path.exists(workflow_path):
         return None
-    try:
-        with open(workflow_path, "r", encoding="utf-8") as file_obj:
-            data = json.load(file_obj)
-    except Exception:
+    file_stat = _workspace_project_stat(workflow_path)
+    if file_stat is None:
         return None
-    if not is_workflow_json_data(data):
-        return None
-    from task_workflow.workflow_sanitize import sanitize_workflow_data
+    cache_key = os.path.normcase(os.path.abspath(workflow_path))
+    cached = _WORKSPACE_PROJECT_CACHE.get(cache_key)
+    if cached is not None:
+        cached_stat, cached_data, cached_source_path = cached
+        if cached_stat == file_stat:
+            _WORKSPACE_PROJECT_CACHE.move_to_end(cache_key)
+            return copy.deepcopy(cached_data), cached_source_path
+        _WORKSPACE_PROJECT_CACHE.pop(cache_key, None)
+    from app_core.lca_format.container import LcaFormatError
+    from app_core.lca_format.project_io import load_lca_project
 
-    return sanitize_workflow_data(data)
+    try:
+        data, session = load_lca_project(workflow_path)
+    except LcaFormatError:
+        return None
+    try:
+        if not is_workflow_json_data(data):
+            raise ValueError("工作流必须包含卡片列表")
+        from task_workflow.workflow_sanitize import sanitize_workflow_data
+
+        if session.source_path is None:
+            raise ValueError("磁盘工程未提供现行文件路径")
+        sanitized = sanitize_workflow_data(data)
+        _cache_workspace_project(workflow_path, file_stat, sanitized, session.source_path)
+        return copy.deepcopy(sanitized), session.source_path
+    finally:
+        session.close()
 
 
 def load_workspace_workflow(filepath: str) -> Optional[Dict[str, Any]]:
-    workflow_path = str(filepath or "").strip()
-    if not workflow_path or not os.path.exists(workflow_path):
-        return None
-    if workflow_path.lower().endswith(".lca"):
-        try:
-            from app_core.lca_format.project_io import load_lca_project
-
-            data, _session = load_lca_project(workflow_path)
-        except Exception:
-            return None
-        if not is_workflow_json_data(data):
-            return None
-        from task_workflow.workflow_sanitize import sanitize_workflow_data
-
-        return sanitize_workflow_data(data)
-    return load_workflow_json(workflow_path)
+    project = _load_workspace_project(filepath)
+    return project[0] if project is not None else None
 
 
 def get_workflow_body(workflow_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -473,7 +481,7 @@ def iter_workspace_workflow_files(workspace_dir: str) -> List[str]:
     if not normalized_dir or not os.path.isdir(normalized_dir):
         return []
 
-    workflow_files: List[str] = []
+    workflow_files: set[str] = set()
     for root, dirnames, filenames in os.walk(normalized_dir):
         dirnames[:] = [
             dirname
@@ -484,24 +492,11 @@ def iter_workspace_workflow_files(workspace_dir: str) -> List[str]:
             if not filename.lower().endswith((".json", ".lca")):
                 continue
             full_path = os.path.abspath(os.path.join(root, filename))
-            workflow_data = load_workspace_workflow(full_path)
-            if workflow_data is None:
+            project = _load_workspace_project(full_path)
+            if project is None:
                 continue
-            workflow_files.append(full_path)
-    workflow_files.sort(key=lambda path: path.lower())
-    lca_keys = {
-        favorite_path_key(path)
-        for path in workflow_files
-        if path.lower().endswith(".lca")
-    }
-    filtered_files: List[str] = []
-    for path in workflow_files:
-        if path.lower().endswith(".json"):
-            sibling_lca = os.path.splitext(path)[0] + ".lca"
-            if favorite_path_key(sibling_lca) in lca_keys:
-                continue
-        filtered_files.append(path)
-    return filtered_files
+            workflow_files.add(project[1])
+    return sorted(workflow_files, key=lambda path: path.lower())
 
 
 def _normalize_saved_local_favorite(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -522,6 +517,10 @@ def _normalize_saved_local_favorite(item: Dict[str, Any]) -> Optional[Dict[str, 
     workspace_dir = normalize_workspace_dir(item.get("workspace_dir"))
     if workspace_dir:
         normalized_item["workspace_dir"] = workspace_dir
+    if os.path.isfile(abs_path):
+        project = _load_workspace_project(abs_path)
+        if project is not None:
+            normalized_item["filepath"] = project[1]
     return normalized_item
 
 
@@ -583,10 +582,11 @@ def add_workspace_workflow(
     resolved = resolve_existing_workflow_path(filepath)
     if not resolved or not os.path.isfile(resolved):
         return "invalid", _normalize_path_list(excluded_paths), _normalize_path_list(extra_paths)
-    if load_workspace_workflow(resolved) is None:
+    project = _load_workspace_project(resolved)
+    if project is None:
         return "invalid", _normalize_path_list(excluded_paths), _normalize_path_list(extra_paths)
 
-    abs_path = os.path.abspath(resolved)
+    abs_path = project[1]
     excluded = _normalize_path_list(excluded_paths)
     extras = _normalize_path_list(extra_paths)
     new_excluded = [path for path in excluded if not workflow_matches_any(abs_path, [path])]
@@ -610,6 +610,10 @@ def remove_workspace_workflow(
     extra_paths: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[str]]:
     abs_path = os.path.abspath(str(filepath or "").strip())
+    if os.path.isfile(abs_path):
+        project = _load_workspace_project(abs_path)
+        if project is not None:
+            abs_path = project[1]
     excluded = _normalize_path_list(excluded_paths)
     extras = [path for path in _normalize_path_list(extra_paths) if not workflow_matches_any(abs_path, [path])]
     if any(path_is_under_workspace(abs_path, workspace) for workspace in workspaces):
@@ -639,24 +643,9 @@ def forget_deleted_workspace_workflow(
     if not abs_path:
         return excluded, extras
     if any(path_is_under_workspace(abs_path, workspace) for workspace in workspaces or []):
-        for candidate in _workflow_sibling_paths(abs_path):
-            if not workflow_matches_any(candidate, excluded):
-                excluded.append(os.path.abspath(candidate))
+        if not workflow_matches_any(abs_path, excluded):
+            excluded.append(abs_path)
     return excluded, extras
-
-
-def _workflow_sibling_paths(filepath: str) -> List[str]:
-    raw_path = str(filepath or "").strip()
-    if not raw_path:
-        return []
-    abs_path = os.path.abspath(raw_path)
-    candidates = [abs_path]
-    root, extension = os.path.splitext(abs_path)
-    if extension.lower() == ".json":
-        candidates.append(root + ".lca")
-    elif extension.lower() == ".lca":
-        candidates.append(root + ".json")
-    return candidates
 
 
 def explorer_select_args(filepath: str) -> List[str]:
@@ -718,9 +707,8 @@ def build_workspace_favorites(
                         None,
                     )
                 )
-            preferred = _prefer_lca_sibling_favorites(offline_entries)
-            favorites.extend(preferred)
-            for entry in preferred:
+            favorites.extend(offline_entries)
+            for entry in offline_entries:
                 existing_keys.update(workflow_path_keys(str(entry.get("filepath") or "")))
             continue
 
@@ -763,31 +751,6 @@ def build_workspace_favorites(
         existing_keys.update(workflow_path_keys(extra_path))
 
     return favorites
-
-
-def _prefer_lca_sibling_favorites(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_stem: Dict[str, Dict[str, Any]] = {}
-    order: List[str] = []
-    for entry in entries:
-        stem = workflow_stem_key(str(entry.get("filepath") or ""))
-        if not stem:
-            continue
-        existing = by_stem.get(stem)
-        if existing is None:
-            by_stem[stem] = entry
-            order.append(stem)
-            continue
-        incoming_is_lca = str(entry.get("filepath") or "").lower().endswith(".lca")
-        existing_is_lca = str(existing.get("filepath") or "").lower().endswith(".lca")
-        keep = entry if incoming_is_lca and not existing_is_lca else existing
-        drop = existing if keep is entry else entry
-        keep["checked"] = bool(keep.get("checked")) or bool(drop.get("checked"))
-        if not str(keep.get("name") or "").strip():
-            keep["name"] = drop.get("name") or keep.get("name")
-        if not keep.get("resource_path") and drop.get("resource_path"):
-            keep["resource_path"] = drop.get("resource_path")
-        by_stem[stem] = keep
-    return [by_stem[stem] for stem in order]
 
 
 def _lookup_saved_favorite_state(
@@ -833,33 +796,43 @@ def _make_workspace_favorite_entry(
 
 def load_workspace_favorites_snapshot(
     config_path: str,
+    *,
+    rebuild: bool = True,
 ) -> Tuple[List[str], List[Dict[str, Any]], List[str], List[str], bool]:
+    """读取工作区收藏快照。
+
+    ``rebuild`` 为真时会扫描工作区并解析其中的工作流文件，供收藏面板刷新使用。
+    启动路径只需要已保存的收藏条目，传入假值可避免在主线程递归解包整个工作区。
+    """
     if not config_path or not os.path.exists(config_path):
         return [], [], [], [], False
 
-    try:
-        with open(config_path, "r", encoding="utf-8") as file_obj:
-            data = json.load(file_obj)
-    except Exception:
-        return [], [], [], [], False
+    with open(config_path, "r", encoding="utf-8") as file_obj:
+        data = json.load(file_obj)
 
     if not isinstance(data, dict):
-        return [], [], [], [], True
+        raise ValueError("工作区配置必须是字典")
+    if {"excluded", "extras"}.intersection(data):
+        raise ValueError("工作区配置包含已停用字段，请使用 excluded_paths 和 extra_paths")
 
     raw_favorites = data.get("favorites")
     raw_workspaces = data.get("workspaces")
-    excluded_paths = _read_named_path_list(data, "excluded_paths", "excluded")
-    extra_paths = _read_named_path_list(data, "extra_paths", "extras")
+    excluded_paths = _normalize_path_list(data.get("excluded_paths"))
+    extra_paths = _normalize_path_list(data.get("extra_paths"))
 
     workspaces = _normalize_workspace_entries(raw_workspaces)
     changed = False
 
-    favorites = build_workspace_favorites(
-        workspaces,
-        raw_favorites if isinstance(raw_favorites, list) else [],
-        excluded_paths,
-        extra_paths,
-    )
+    saved_favorites = raw_favorites if isinstance(raw_favorites, list) else []
+    if rebuild:
+        favorites = build_workspace_favorites(
+            workspaces,
+            saved_favorites,
+            excluded_paths,
+            extra_paths,
+        )
+    else:
+        favorites = [dict(item) for item in saved_favorites if isinstance(item, dict)]
 
     expected_data = {
         "schema_version": WORKSPACE_FAVORITES_SCHEMA_VERSION,
@@ -873,27 +846,18 @@ def load_workspace_favorites_snapshot(
     return workspaces, favorites, excluded_paths, extra_paths, changed
 
 
-def _read_named_path_list(data: Dict[str, Any], primary: str, fallback: str) -> List[str]:
-    if primary in data:
-        return _normalize_path_list(data.get(primary))
-    if fallback in data:
-        return _normalize_path_list(data.get(fallback))
-    return []
-
-
 def _existing_snapshot_path_lists(config_path: str) -> Tuple[List[str], List[str]]:
     if not config_path or not os.path.exists(config_path):
         return [], []
-    try:
-        with open(config_path, "r", encoding="utf-8") as file_obj:
-            data = json.load(file_obj)
-    except Exception:
-        return [], []
+    with open(config_path, "r", encoding="utf-8") as file_obj:
+        data = json.load(file_obj)
     if not isinstance(data, dict):
-        return [], []
+        raise ValueError("工作区配置必须是字典")
+    if {"excluded", "extras"}.intersection(data):
+        raise ValueError("工作区配置包含已停用字段，请使用 excluded_paths 和 extra_paths")
     return (
-        _read_named_path_list(data, "excluded_paths", "excluded"),
-        _read_named_path_list(data, "extra_paths", "extras"),
+        _normalize_path_list(data.get("excluded_paths")),
+        _normalize_path_list(data.get("extra_paths")),
     )
 
 
@@ -1614,15 +1578,16 @@ def update_workflow_resource_path(filepath: str, resource_dir: str) -> Dict[str,
     workflow_path = str(filepath or "").strip()
     if not workflow_path:
         raise ValueError("工作流路径不能为空")
-    workflow_data = load_workspace_workflow(workflow_path)
-    if workflow_data is None:
-        raise ValueError("工作流文件不存在或格式无效")
-
     normalized_resource = normalize_workspace_dir(resource_dir)
     if not normalized_resource or not os.path.isdir(normalized_resource):
         raise ValueError("资源目录不存在")
     if not is_exclusive_workflow_dir(normalized_resource, workflow_path):
         raise ValueError("该文件夹已有其他工作流")
+
+    project = _load_workspace_project(workflow_path)
+    if project is None:
+        raise ValueError("工作流文件不存在或格式无效")
+    workflow_data, workflow_path = project
 
     metadata = workflow_data.setdefault("metadata", {})
     if not isinstance(metadata, dict):
@@ -1641,10 +1606,8 @@ def update_workflow_resource_path(filepath: str, resource_dir: str) -> Dict[str,
     updated_count = int(migrate_result.get("updated_count") or 0)
     metadata["custom_resource_path"] = normalized_resource
 
-    stem, extension = os.path.splitext(os.path.basename(workflow_path))
-    if not extension:
-        extension = ".lca"
-    dest_file = os.path.join(normalized_resource, f"{stem}{extension}")
+    stem = os.path.splitext(os.path.basename(workflow_path))[0]
+    dest_file = os.path.join(normalized_resource, f"{stem}.lca")
     if os.path.isfile(workflow_path):
         try:
             backup_workflow_file(workflow_path)
@@ -1703,37 +1666,28 @@ def _write_workspace_workflow(filepath: str, workflow_data: Dict[str, Any]) -> s
     abs_path = os.path.abspath(str(filepath or "").strip())
     if not abs_path:
         raise ValueError("工作流路径不能为空")
-    if abs_path.lower().endswith(".lca"):
-        from app_core.lca_format.container import seal_lca_bytes
-        from app_core.lca_format.project_io import ENTRY_WORKFLOW, load_lca_project
+    if not abs_path.lower().endswith(".lca"):
+        raise ValueError("只能保存现行 .lca 工程，旧格式须先经工程转换")
+    from app_core.lca_format.container import seal_lca_bytes
+    from app_core.lca_format.project_io import load_lca_project
 
-        _payload, session = load_lca_project(abs_path)
+    _payload, session = load_lca_project(abs_path)
+    try:
         files = session.snapshot_files()
-        entry = ENTRY_WORKFLOW
-        manifest_bytes = files.get("manifest.json")
-        if manifest_bytes:
-            manifest = json.loads(manifest_bytes.decode("utf-8"))
-            if isinstance(manifest, dict):
-                listed = str(manifest.get("entry_workflow") or "").strip()
-                if listed:
-                    entry = listed
+        manifest = json.loads(files["manifest.json"].decode("utf-8"))
+        entry = manifest["entry_workflow"]
         files[entry] = json.dumps(workflow_data, ensure_ascii=False, indent=4).encode("utf-8")
         sealed = seal_lca_bytes(files)
-        tmp_path = abs_path + ".tmp"
-        try:
-            with open(tmp_path, "wb") as handle:
-                handle.write(sealed)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp_path, abs_path)
-        except Exception:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
-        return abs_path
-    with open(abs_path, "w", encoding="utf-8") as handle:
-        json.dump(workflow_data, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    finally:
+        session.close()
+    tmp_path = abs_path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as handle:
+            handle.write(sealed)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, abs_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
     return abs_path

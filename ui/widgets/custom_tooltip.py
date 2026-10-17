@@ -2,6 +2,9 @@
 from PySide6.QtCore import QEvent, QObject, QPoint, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QCursor, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QGraphicsView, QLabel, QWidget
+from shiboken6 import isValid
+
+from themes import get_theme_manager, theme_color
 
 from utils.window.window_activation_utils import show_and_raise_widget
 
@@ -9,22 +12,11 @@ _tooltip_manager = None
 _TOOLTIP_RADIUS = 6.0
 
 
-def _theme_color(key: str, default: str) -> QColor:
-    try:
-        from themes import get_theme_manager
-
-        return get_theme_manager().get_qcolor(key)
-    except Exception:
-        return QColor(default)
-
-
 class RoundedTooltip(QLabel):
     """无边框提示：自己画圆角，避免 Windows 垫一层直角底。"""
 
     def __init__(self) -> None:
-        flags = Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint
-        if hasattr(Qt.WindowType, "NoDropShadowWindowHint"):
-            flags |= Qt.WindowType.NoDropShadowWindowHint
+        flags = Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
         super().__init__(None, flags)
         self.setObjectName("customRoundedTooltip")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -33,23 +25,11 @@ class RoundedTooltip(QLabel):
         self.setWordWrap(True)
         self.setMaximumWidth(520)
         self.setTextFormat(Qt.TextFormat.PlainText)
-        self._bg = QColor("#f5f5f5")
-        self._fg = QColor("#333333")
-        self._border = QColor("#e0e0e0")
         self.apply_theme()
 
     def apply_theme(self) -> None:
-        self._bg = _theme_color("surface", "#f5f5f5")
-        self._fg = _theme_color("text", "#333333")
-        self._border = _theme_color("border", "#e0e0e0")
-        self.setStyleSheet(
-            "QLabel#customRoundedTooltip {"
-            "background: transparent;"
-            f"color: {self._fg.name()};"
-            "border: none;"
-            "padding: 6px 8px;"
-            "}"
-        )
+        self._bg = QColor(theme_color("surface"))
+        self._border = QColor(theme_color("border"))
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -67,19 +47,62 @@ class RoundedTooltip(QLabel):
 
 class CustomTooltipManager(QObject):
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__(QApplication.instance() if parent is None else parent)
+        self._application = None
+        self._application_connections = []
+        self._disposed = False
         self._tooltip = RoundedTooltip()
+        self._tooltip_destroyed_connection = self._tooltip.destroyed.connect(self.shutdown)
+        # 自身或所属窗口被直接销毁时，仍须释放独立的顶层提示窗口。
+        # 使用普通 Python 回调，避免 QObject 销毁后跳过发给自身的槽。
+        self.destroyed.connect(lambda: self.shutdown())
 
     def install(self, app: QApplication) -> None:
+        if self._disposed:
+            raise RuntimeError("提示框管理器已关闭")
+        if self._application is app:
+            return
+        if self._application is not None:
+            raise RuntimeError("提示框管理器已经绑定应用程序")
+        self._application = app
         app.installEventFilter(self)
+        self._application_connections = [
+            app.aboutToQuit.connect(self.shutdown),
+            app.destroyed.connect(self.shutdown),
+        ]
+
+    def shutdown(self) -> None:
+        """先摘除全局过滤器，再销毁提示框，避免窗口销毁事件重入。"""
+        if self._disposed:
+            return
+        self._disposed = True
+        app, self._application = self._application, None
+        if app is not None and isValid(app) and isValid(self):
+            app.removeEventFilter(self)
+        for connection in self._application_connections:
+            QObject.disconnect(connection)
+        self._application_connections.clear()
+        get_theme_manager().unregister_theme_change_callback(self.set_theme)
+        tooltip, self._tooltip = self._tooltip, None
+        if tooltip is not None and isValid(tooltip):
+            QObject.disconnect(self._tooltip_destroyed_connection)
+            if isValid(self):
+                tooltip.hide()
+            tooltip.deleteLater()
 
     def set_theme(self, theme_name: str = "") -> None:
+        if self._disposed:
+            return
         self._tooltip.apply_theme()
         app = QApplication.instance()
         if app:
             self._tooltip.setFont(app.font())
 
     def eventFilter(self, obj, event):
+        # PySide 在 QWidget 析构期间会先使 Python 包装对象失效，再派发隐藏事件。
+        # destroyed 信号尚未到达时也不能再调用该包装对象的方法。
+        if self._disposed or not isValid(self._tooltip):
+            return False
         if obj is self._tooltip:
             return False
         if event.type() == QEvent.Type.ToolTip:
@@ -99,6 +122,8 @@ class CustomTooltipManager(QObject):
         return False
 
     def show_text(self, text: str, global_pos: QPoint = None) -> None:
+        if self._disposed:
+            raise RuntimeError("提示框管理器已关闭")
         if not text:
             self.hide()
             return
@@ -112,7 +137,8 @@ class CustomTooltipManager(QObject):
         show_and_raise_widget(self._tooltip, log_prefix="自定义提示")
 
     def hide(self) -> None:
-        self._tooltip.hide()
+        if not self._disposed and isValid(self._tooltip):
+            self._tooltip.hide()
 
     def _resolve_tooltip_text(self, obj, event) -> str:
         view = None
@@ -121,8 +147,8 @@ class CustomTooltipManager(QObject):
         elif isinstance(obj, QWidget) and isinstance(obj.parent(), QAbstractItemView):
             view = obj.parent()
         if view is not None:
-            index = view.indexAt(event.pos()) if hasattr(event, "pos") else None
-            if index is not None and index.isValid():
+            index = view.indexAt(event.pos())
+            if index.isValid():
                 data = index.data(Qt.ItemDataRole.ToolTipRole)
                 if data:
                     return str(data)
@@ -133,7 +159,7 @@ class CustomTooltipManager(QObject):
             gv = obj
         elif isinstance(obj, QWidget) and isinstance(obj.parent(), QGraphicsView):
             gv = obj.parent()
-        if gv is not None and hasattr(event, "pos"):
+        if gv is not None:
             item = gv.itemAt(event.pos())
             if item:
                 item_text = item.toolTip()
@@ -146,11 +172,7 @@ class CustomTooltipManager(QObject):
         return ""
 
     def _resolve_tooltip_pos(self, obj, event) -> QPoint:
-        if hasattr(event, "globalPos"):
-            return event.globalPos()
-        if isinstance(obj, QWidget) and hasattr(event, "pos"):
-            return obj.mapToGlobal(event.pos())
-        return QCursor.pos()
+        return event.globalPos()
 
     def _clamp_to_screen(self, pos: QPoint) -> QPoint:
         screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
@@ -164,6 +186,6 @@ class CustomTooltipManager(QObject):
 
 def get_tooltip_manager() -> CustomTooltipManager:
     global _tooltip_manager
-    if _tooltip_manager is None:
+    if _tooltip_manager is None or not isValid(_tooltip_manager):
         _tooltip_manager = CustomTooltipManager()
     return _tooltip_manager

@@ -420,6 +420,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                         card_id,
                         kind="yolo",
                         ok=False,
+                        query_ok=True,
                         threshold=params.get("confidence_threshold"),
                     )
                 except Exception:

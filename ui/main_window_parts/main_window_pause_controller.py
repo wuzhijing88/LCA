@@ -136,12 +136,12 @@ def _sync_pause_ui(ctx, paused: bool, source: str) -> None:
         if hasattr(ctx, "_set_line_animation_paused"):
             ctx._set_line_animation_paused("task_runtime", bool(paused))
 
-        floating_controller = getattr(ctx, "_floating_controller", None)
-        if floating_controller:
-            if paused and hasattr(floating_controller, "on_workflow_paused"):
-                floating_controller.on_workflow_paused()
-            elif not paused and hasattr(floating_controller, "on_workflow_resumed"):
-                floating_controller.on_workflow_resumed()
+        execution_log_panel = getattr(ctx, "_execution_log_panel", None)
+        if execution_log_panel:
+            if paused and hasattr(execution_log_panel, "on_workflow_paused"):
+                execution_log_panel.on_workflow_paused()
+            elif not paused and hasattr(execution_log_panel, "on_workflow_resumed"):
+                execution_log_panel.on_workflow_resumed()
 
         _sync_pause_flags(ctx, paused=paused, source=source)
     except Exception as exc:
@@ -229,3 +229,6 @@ def resume_main_window_workflow(ctx, source: str = "manual") -> bool:
         error_context="恢复工作流",
         source=source,
     )
+
+
+

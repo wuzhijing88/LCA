@@ -24,6 +24,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QCompleter, QFrame, QLabel, QPlainTextEdit, QTextEdit, QWidget
 
 from ui.system_parts.menu_style import create_themed_edit_menu
+from themes import get_theme_manager, theme_color
 
 from tasks.script_hints import (
     EMPTY_PARAM_LABEL,
@@ -250,23 +251,18 @@ class ScriptCodeEdit(QPlainTextEdit):
         return completer
 
     def _register_theme_callback(self) -> None:
-        try:
-            from themes import get_theme_manager
+        import weakref
 
-            manager = get_theme_manager()
-            manager.register_theme_change_callback(self._on_theme_changed)
-        except Exception:
-            return
+        manager = get_theme_manager()
+        owner = weakref.ref(self)
 
-        def _forget(_=None, callback=self._on_theme_changed) -> None:
-            try:
-                from themes import get_theme_manager
+        def changed(theme) -> None:
+            editor = owner()
+            if editor is not None:
+                editor._on_theme_changed(theme)
 
-                get_theme_manager().unregister_theme_change_callback(callback)
-            except Exception:
-                pass
-
-        self.destroyed.connect(_forget)
+        manager.register_theme_change_callback(changed)
+        self.destroyed.connect(lambda _obj=None: manager.unregister_theme_change_callback(changed))
 
     def _on_theme_changed(self, _theme=None) -> None:
         self._dark = is_dark_theme()
@@ -312,55 +308,13 @@ class ScriptCodeEdit(QPlainTextEdit):
     def _apply_completer_theme(self, popup) -> None:
         self._prepare_completer_popup(popup)
         colors = _script_popup_colors()
-        popup.setStyleSheet(
-            f"""
-            QListView#scriptCompleterPopup {{
-                background: transparent;
-                color: {colors['text']};
-                border: none;
-                outline: none;
-                padding: 4px 2px;
-                font-family: Consolas, "Microsoft YaHei UI", monospace;
-                font-size: 12px;
-            }}
-            QListView#scriptCompleterPopup::viewport {{
-                background: transparent;
-            }}
-            QListView#scriptCompleterPopup::item {{
-                padding: 6px 12px;
-                min-height: 20px;
-                border: none;
-                border-radius: 3px;
-                margin: 1px 2px;
-            }}
-            QListView#scriptCompleterPopup::item:hover {{
-                background-color: {colors['hover']};
-            }}
-            QListView#scriptCompleterPopup::item:selected {{
-                background-color: {colors['selected']};
-                color: #ffffff;
-            }}
-            QListView#scriptCompleterPopup QScrollBar:vertical {{
-                background: transparent;
-                width: 8px;
-                margin: 0px;
-                border: none;
-            }}
-            QListView#scriptCompleterPopup QScrollBar::handle:vertical {{
-                background-color: {colors['scroll']};
-                border-radius: 4px;
-                min-height: 24px;
-                margin: 2px;
-            }}
-            """
-        )
         from themes.rounded_popup import apply_transparent_popup_palette
 
         apply_transparent_popup_palette(popup)
         palette = popup.palette()
         palette.setColor(QPalette.ColorRole.Text, QColor(colors["text"]))
         palette.setColor(QPalette.ColorRole.Highlight, QColor(colors["selected"]))
-        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(theme_color("accent_text")))
         popup.setPalette(palette)
         viewport = popup.viewport()
         if viewport is not None:
@@ -502,9 +456,9 @@ class ScriptCodeEdit(QPlainTextEdit):
         from themes import theme_color
 
         painter = QPainter(self._line_area)
-        painter.fillRect(event.rect(), QColor(theme_color("surface", "#2d2d2d" if self._dark else "#f5f5f5")))
-        number_color = QColor(theme_color("text_disabled", "#666666" if self._dark else "#999999"))
-        current_color = QColor(theme_color("text", "#e0e0e0" if self._dark else "#333333"))
+        painter.fillRect(event.rect(), QColor(theme_color("surface")))
+        number_color = QColor(theme_color("text_disabled"))
+        current_color = QColor(theme_color("text"))
 
         block = self.firstVisibleBlock()
         block_number = block.blockNumber()
@@ -513,7 +467,7 @@ class ScriptCodeEdit(QPlainTextEdit):
         current = self.textCursor().blockNumber()
         width = self._line_area.width() - 8
         height = self.fontMetrics().height()
-        marker_color = QColor("#d9534f")
+        marker_color = QColor(theme_color("error"))
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
@@ -904,7 +858,7 @@ class ScriptCodeEdit(QPlainTextEdit):
 
         selections = []
         current = QTextEdit.ExtraSelection()
-        current.format.setBackground(QColor(theme_color("hover", "#3a3a3a" if self._dark else "#e8e8e8")))
+        current.format.setBackground(QColor(theme_color("hover")))
         current.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
         current.cursor = self.textCursor()
         current.cursor.clearSelection()
@@ -914,8 +868,9 @@ class ScriptCodeEdit(QPlainTextEdit):
             block = self.document().findBlockByNumber(int(exec_line) - 1)
             if block.isValid():
                 marker = QTextEdit.ExtraSelection()
-                # 半透明琥珀色，覆盖在当前行高亮之上，主题无关。
-                marker.format.setBackground(QColor(255, 200, 0, 55))
+                color = QColor(theme_color("warning"))
+                color.setAlpha(55)
+                marker.format.setBackground(color)
                 marker.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
                 marker.cursor = QTextCursor(block)
                 selections.append(marker)
@@ -1020,6 +975,9 @@ class ScriptCodeEdit(QPlainTextEdit):
         self._schedule_hide_signature_hint()
 
     def hideEvent(self, event) -> None:
+        self._hide_hint_timer.stop()
+        self._execution_repaint_timer.stop()
+        self._completer.popup().hide()
         self._signature_hint.hide()
         super().hideEvent(event)
 
@@ -1035,16 +993,13 @@ class ScriptSignatureHint(QLabel):
         )
         if hasattr(Qt.WindowType, "NoDropShadowWindowHint"):
             flags |= Qt.WindowType.NoDropShadowWindowHint
-        super().__init__(None, flags)
+        super().__init__(editor, flags)
         self.setObjectName("scriptSignatureHint")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setTextFormat(Qt.TextFormat.RichText)
         self.setWordWrap(False)
-        self._bg = QColor("#252525")
-        self._fg = QColor("#e0e0e0")
-        self._border = QColor("#3e3e3e")
         self.apply_theme(editor._dark)
         self.hide()
 
@@ -1053,13 +1008,6 @@ class ScriptSignatureHint(QLabel):
         self._bg = QColor(colors["canvas"])
         self._fg = QColor(colors["text"])
         self._border = QColor(colors["border"])
-        self.setStyleSheet(
-            f"QLabel#scriptSignatureHint {{"
-            f"background:transparent;color:{colors['text']};"
-            f"border:none;padding:6px 8px;"
-            f'font-family:Consolas,"Microsoft YaHei UI",monospace;font-size:12px;'
-            f"}}"
-        )
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -1085,39 +1033,8 @@ class ScriptSignatureHint(QLabel):
 
 
 def _script_popup_colors() -> dict:
-    fallback = {
-        "surface": "#2d2d2d",
-        "canvas": "#252525",
-        "text": "#e0e0e0",
-        "border": "#3e3e3e",
-        "combo_popup_border": "#707070",
-        "hover": "#3a3a3a",
-        "selected": "#0078d4",
-        "scroll": "rgba(255, 255, 255, 0.2)",
-    }
-    light = {
-        "surface": "#ffffff",
-        "canvas": "#ffffff",
-        "text": "#333333",
-        "border": "#e0e0e0",
-        "combo_popup_border": "#707070",
-        "hover": "#e8e8e8",
-        "selected": "#0078d4",
-        "scroll": "rgba(0, 0, 0, 0.2)",
-    }
-    try:
-        from themes import get_theme_manager
-
-        manager = get_theme_manager()
-        colors = light if not manager.is_dark_mode() else fallback
-        for key in ("surface", "canvas", "text", "border", "combo_popup_border", "hover", "selected"):
-            value = str(manager.get_color(key) or "").strip()
-            if value:
-                colors[key] = value
-        colors["scroll"] = "rgba(255, 255, 255, 0.2)" if manager.is_dark_mode() else "rgba(0, 0, 0, 0.2)"
-        return colors
-    except Exception:
-        return fallback if is_dark_theme() else light
+    return {key: theme_color(key) for key in
+            ("surface", "canvas", "text", "border", "combo_popup_border", "hover", "selected")}
 
 
 def _is_completion_char(char: str) -> bool:

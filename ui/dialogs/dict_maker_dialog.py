@@ -461,6 +461,9 @@ class DictMakerDialog(QDialog):
         self._glyphs: List[Any] = []
         self._rows: List[_GlyphRow] = []
         self._selected_indexes: List[int] = []
+        self._library_ids: set = set()
+        self._loaded_dict_path = ""
+        self._loaded_library_count = 0
         self._syncing_labels = False
         self._selector = None
         self.saved_dict_path = ""
@@ -482,6 +485,7 @@ class DictMakerDialog(QDialog):
         file_row.addWidget(QLabel("字库"))
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("images/dicts/ui.txt")
+        self.path_edit.editingFinished.connect(self._on_dict_path_committed)
         file_row.addWidget(self.path_edit, 1)
         browse = QPushButton("浏览")
         browse.clicked.connect(self._browse_file)
@@ -584,7 +588,6 @@ class DictMakerDialog(QDialog):
         self.glyph_list.setContentsMargins(0, 0, 0, 0)
         self.glyph_list.setSpacing(4)
         self.glyph_list.addStretch(1)
-        self._show_glyph_empty()
 
         scroller = QScrollArea()
         scroller.setWidgetResizable(True)
@@ -598,6 +601,7 @@ class DictMakerDialog(QDialog):
         merge.setToolTip("按住 Ctrl 点选多个点阵后合并成一个字")
         merge.clicked.connect(self._merge_selected)
         remove = QPushButton("删除")
+        remove.setToolTip("点选一行删除一个字；按住 Ctrl 点选多个再删除。字库里已有的字删除后需覆盖保存才会写入文件。")
         remove.clicked.connect(self._remove_selected)
         edit_row.addWidget(merge)
         edit_row.addWidget(remove)
@@ -616,8 +620,10 @@ class DictMakerDialog(QDialog):
         bottom = QHBoxLayout()
         bottom.addStretch(1)
         append_btn = QPushButton("追加到字库")
+        append_btn.setToolTip("把本次提取并标注的字追加到字库，不改动文件里已有的字。")
         append_btn.clicked.connect(lambda: self._save(append=True))
         overwrite = QPushButton("覆盖保存")
+        overwrite.setToolTip("把右侧列表写成字库文件。已删除的字不会再写入。")
         overwrite.clicked.connect(lambda: self._save(append=False))
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.reject)
@@ -669,9 +675,6 @@ class DictMakerDialog(QDialog):
         preview_bg = "#111111"
         self.label_box.setStyleSheet(
             f"""
-            QLabel#dictGlyphEmpty {{
-                color: {muted};
-            }}
             QFrame#dictGlyphRow {{
                 background: transparent;
                 border: 1px solid transparent;
@@ -703,6 +706,7 @@ class DictMakerDialog(QDialog):
         color = str(self._params.get("color_format") or "").strip()
         if color:
             self.color_edit.setText(color)
+        self._load_dict_glyphs()
 
     def _dicts_dir(self) -> str:
         from task_workflow.resource_context import current_dicts_dir
@@ -716,33 +720,154 @@ class DictMakerDialog(QDialog):
 
         return get_dicts_dir("LCA")
 
+    def _logical_dict_name(self, path: str = "") -> str:
+        text = str(path or self.path_edit.text() or "").replace("\\", "/").strip()
+        name = os.path.basename(text)
+        if not name or name in {".", ".."}:
+            name = "ui.txt"
+        if not os.path.splitext(name)[1]:
+            name += ".txt"
+        return name
+
+    def _logical_dict_file(self, path: str = "") -> str:
+        return f"dicts/{self._logical_dict_name(path)}"
+
+    def _dict_save_path(self) -> str:
+        dicts_dir = str(self._dicts_dir() or "").strip()
+        if not dicts_dir:
+            return ""
+        os.makedirs(dicts_dir, exist_ok=True)
+        return os.path.abspath(os.path.join(dicts_dir, self._logical_dict_name()))
+
+    def _resolved_dict_path(self) -> str:
+        from task_workflow.resource_path import unwrap_resource_path
+
+        text = unwrap_resource_path(self.path_edit.text()) or ""
+        text = str(text).strip()
+        if not text:
+            return ""
+        dicts_dir = str(self._dicts_dir() or "").strip()
+        name = self._logical_dict_name(text)
+        if dicts_dir:
+            workspace_path = os.path.join(dicts_dir, name)
+            if os.path.isfile(workspace_path):
+                return os.path.abspath(workspace_path)
+        if os.path.isfile(text):
+            return os.path.abspath(text)
+        from task_workflow.script_resources import resolve_resource_path
+
+        located = resolve_resource_path(text, dicts_dir=dicts_dir, enforce_jail=False)
+        if located and os.path.isfile(located):
+            return os.path.abspath(located)
+        from services.dict_ocr_service import resolve_dict_path
+
+        located = resolve_dict_path(text)
+        if located and os.path.isfile(located):
+            return os.path.abspath(located)
+        return ""
+
+    def _dict_path_key(self) -> str:
+        path = self._resolved_dict_path()
+        if path:
+            return os.path.normcase(os.path.abspath(path))
+        return str(self.path_edit.text() or "").strip()
+
+    def _on_dict_path_committed(self) -> None:
+        if self._dict_path_key() == self._loaded_dict_path:
+            return
+        self._load_dict_glyphs()
+
+    def _is_library_item(self, item) -> bool:
+        return id(item) in self._library_ids
+
+    def _library_items(self) -> List[Any]:
+        return [item for item in self._glyphs if self._is_library_item(item)]
+
+    def _extracted_items(self) -> List[Any]:
+        return [item for item in self._glyphs if not self._is_library_item(item)]
+
+    def _extracted_from_library(self, glyph):
+        from services.dict_ocr_service import ExtractedGlyph
+
+        return ExtractedGlyph(
+            bitmap=np.ascontiguousarray(glyph.bitmap, dtype=np.uint8).copy(),
+            x=0,
+            y=0,
+            width=int(glyph.width),
+            height=int(glyph.height),
+            bit_count=int(glyph.bit_count),
+            text=str(glyph.text or ""),
+        )
+
+    def _load_dict_glyphs(self, source_path: str = "") -> None:
+        extracted = self._extracted_items()
+        path = str(source_path or "").strip() or self._resolved_dict_path()
+        library_items: List[Any] = []
+        self._library_ids = set()
+        glyphs = []
+        if path:
+            try:
+                with open(path, "rb") as handle:
+                    raw = handle.read()
+                from services.dict_ocr_service import parse_op_binary_dict, parse_text_dict_bytes
+
+                glyphs = parse_text_dict_bytes(raw)
+                if not glyphs:
+                    glyphs = parse_op_binary_dict(raw)
+            except OSError as exc:
+                QMessageBox.warning(self, "制作字库", f"读取字库失败: {exc}")
+            else:
+                if raw.strip() and not glyphs:
+                    QMessageBox.warning(self, "制作字库", "字库格式无法识别。")
+            for glyph in glyphs:
+                item = self._extracted_from_library(glyph)
+                library_items.append(item)
+                self._library_ids.add(id(item))
+        self._glyphs = library_items + extracted
+        self._loaded_library_count = len(library_items)
+        self._loaded_dict_path = self._dict_path_key()
+        self._reload_glyphs()
+        if library_items:
+            self.status_label.setText(f"字库已有 {len(library_items)} 个字")
+        elif path:
+            self.status_label.setText("字库是空的")
+
     def _browse_file(self) -> None:
-        start = str(self.path_edit.text() or "").strip() or self._dicts_dir()
+        start = self._resolved_dict_path() or self._dicts_dir()
         path, _ = QFileDialog.getOpenFileName(
             self,
             "选择字库文件",
             start,
             "字库文件 (*.txt);;所有文件 (*.*)",
         )
-        if path:
-            self.path_edit.setText(path)
+        if not path:
+            return
+        loaded = os.path.abspath(path) if os.path.isfile(path) else ""
+        self.path_edit.setText(self._logical_dict_file(path))
+        self._load_dict_glyphs(loaded)
 
     def _new_file(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self,
             "新建字库文件",
-            os.path.join(self._dicts_dir(), "ui.txt"),
+            os.path.join(self._dicts_dir(), self._logical_dict_name() or "ui.txt"),
             "字库文件 (*.txt);;所有文件 (*.*)",
         )
         if not path:
             return
-        if not os.path.splitext(path)[1]:
+        name = self._logical_dict_name(path)
+        dest = self._dicts_dir()
+        if dest:
+            os.makedirs(dest, exist_ok=True)
+            path = os.path.join(dest, name)
+        elif not os.path.splitext(path)[1]:
             path += ".txt"
         if not os.path.exists(path):
             os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
             with open(path, "w", encoding="utf-8"):
                 pass
-        self.path_edit.setText(path)
+        self.path_edit.setText(self._logical_dict_file(path))
+        self._load_dict_glyphs()
 
     def _pick_region(self) -> None:
         if self._hwnd <= 0:
@@ -793,7 +918,7 @@ class DictMakerDialog(QDialog):
     def _set_sample_image(self, roi: np.ndarray) -> None:
         self._roi = roi
         self._excluded_pixels.clear()
-        self._glyphs = []
+        self._glyphs = self._library_items()
         self._reload_glyphs()
         self.source_view.set_image(roi)
         self._refresh_binary()
@@ -854,7 +979,15 @@ class DictMakerDialog(QDialog):
     def _update_binary_preview(self) -> None:
         if self._binary is None:
             return
-        self.binary_label.set_image(_binary_to_preview(self._binary, self._glyphs, self._selected_indexes))
+        boxes = []
+        selected = []
+        for index, item in enumerate(self._glyphs):
+            if self._is_library_item(item):
+                continue
+            if index in self._selected_indexes:
+                selected.append(len(boxes))
+            boxes.append(item)
+        self.binary_label.set_image(_binary_to_preview(self._binary, boxes, selected))
 
     def _extract_glyphs(self, mode: str = "multiple") -> None:
         if self._roi is None:
@@ -866,22 +999,30 @@ class DictMakerDialog(QDialog):
             return
         from services.dict_ocr_service import extract_glyphs_from_binary
 
-        self._glyphs = extract_glyphs_from_binary(
+        extracted = extract_glyphs_from_binary(
             self._binary,
             mode=mode,
             row_gap=int(self.row_gap_spin.value()),
             col_gap=int(self.col_gap_spin.value()),
         )
+        library = self._library_items()
+        self._glyphs = library + extracted
         self._reload_glyphs()
         self._update_binary_preview()
         kind = "单个" if mode == "single" else "多个"
-        self.status_label.setText(f"{kind}提取到 {len(self._glyphs)} 个")
-        if self._rows:
+        if library:
+            self.status_label.setText(f"字库已有 {len(library)} 个，本次提取 {len(extracted)} 个")
+        else:
+            self.status_label.setText(f"{kind}提取到 {len(extracted)} 个")
+        start = len(library)
+        if start < len(self._rows):
+            self._rows[start].focus_input()
+        elif self._rows:
             self._rows[0].focus_input()
-        if not self._glyphs:
+        if not extracted:
             QMessageBox.information(self, "制作字库", "没有提取到点阵。再点一下文字颜色，或把框选收紧到只有字。")
-        elif mode == "multiple" and len(self._glyphs) > 8:
-            self.status_label.setText(f"提取到 {len(self._glyphs)} 个，切碎了就加大列距")
+        elif mode == "multiple" and len(extracted) > 8:
+            self.status_label.setText(f"提取到 {len(extracted)} 个，切碎了就加大列距")
 
     def _on_binary_exclude(self, x: int, y: int, _pixel) -> None:
         self._toggle_excluded_pixel(x, y)
@@ -890,6 +1031,8 @@ class DictMakerDialog(QDialog):
         if not self._glyphs:
             return
         for index, item in enumerate(self._glyphs):
+            if self._is_library_item(item):
+                continue
             if item.x <= x < item.x + item.width and item.y <= y < item.y + item.height:
                 self._select_indexes([index], toggle=True)
                 if 0 <= index < len(self._rows):
@@ -903,12 +1046,6 @@ class DictMakerDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
 
-    def _show_glyph_empty(self) -> None:
-        empty = QLabel("提取后按从左到右列在这里，每行填一个字。")
-        empty.setWordWrap(True)
-        empty.setObjectName("dictGlyphEmpty")
-        self.glyph_list.insertWidget(0, empty)
-
     def _reload_glyphs(self) -> None:
         existing = [row.text() for row in self._rows]
         self._rows = []
@@ -916,7 +1053,6 @@ class DictMakerDialog(QDialog):
         self._clear_glyph_list()
         self.glyph_list.addStretch(1)
         if not self._glyphs:
-            self._show_glyph_empty()
             self.label_box.setTitle("标注")
             return
         for index, item in enumerate(self._glyphs):
@@ -1000,20 +1136,41 @@ class DictMakerDialog(QDialog):
             QMessageBox.information(self, "制作字库", "先点选一行，再删除。")
             return
         self._sync_row_texts()
-        self._glyphs = [item for index, item in enumerate(self._glyphs) if index not in set(self._selected_indexes)]
+        selected = set(self._selected_indexes)
+        remaining = []
+        library_ids = set()
+        for index, item in enumerate(self._glyphs):
+            if index in selected:
+                continue
+            remaining.append(item)
+            if self._is_library_item(item):
+                library_ids.add(id(item))
+        self._glyphs = remaining
+        self._library_ids = library_ids
         self._reload_glyphs()
         self._update_binary_preview()
+        library_n = len(self._library_items())
+        if library_n:
+            self.status_label.setText(f"字库还剩 {library_n} 个字，覆盖保存后生效")
+        elif self._loaded_library_count:
+            self.status_label.setText("字库文字已全部从列表删除，覆盖保存后生效")
 
     def _merge_selected(self) -> None:
         if len(self._selected_indexes) < 2:
             QMessageBox.information(self, "制作字库", "按住 Ctrl 点选至少两行，再合并。")
+            return
+        indexes = sorted(self._selected_indexes)
+        if any(
+            0 <= index < len(self._glyphs) and self._is_library_item(self._glyphs[index])
+            for index in indexes
+        ):
+            QMessageBox.information(self, "制作字库", "字库里已有的字不能合并，只合并本次提取的点阵。")
             return
         if self._binary is None:
             return
         from services.dict_ocr_service import ExtractedGlyph, sort_glyphs_reading_order
 
         self._sync_row_texts()
-        indexes = sorted(self._selected_indexes)
         items = [self._glyphs[index] for index in indexes]
         left = min(item.x for item in items)
         top = min(item.y for item in items)
@@ -1032,8 +1189,9 @@ class DictMakerDialog(QDialog):
             text=str(items[0].text or ""),
         )
         self._glyphs = [item for index, item in enumerate(self._glyphs) if index not in set(indexes)]
-        self._glyphs.insert(min(indexes), merged)
-        self._glyphs = sort_glyphs_reading_order(self._glyphs)
+        extracted = self._extracted_items()
+        extracted.append(merged)
+        self._glyphs = self._library_items() + sort_glyphs_reading_order(extracted)
         self._reload_glyphs()
         for index, item in enumerate(self._glyphs):
             if item is merged:
@@ -1042,16 +1200,36 @@ class DictMakerDialog(QDialog):
         self._update_binary_preview()
 
     def _save(self, append: bool) -> None:
-        path = str(self.path_edit.text() or "").strip()
-        if not path:
+        if not str(self.path_edit.text() or "").strip():
             self._new_file()
-            path = str(self.path_edit.text() or "").strip()
+        if not str(self.path_edit.text() or "").strip():
+            return
+        path = self._dict_save_path()
         if not path:
+            QMessageBox.warning(self, "制作字库", "没有脚本字库目录，无法保存。")
             return
-        labeled = self._collect_labeled_glyphs()
-        if not labeled:
-            QMessageBox.warning(self, "制作字库", "还没有标注文字。在右侧列表里填字，或在上方整句填入。")
-            return
+        self._sync_row_texts()
+        if append:
+            if len(self._library_items()) < self._loaded_library_count:
+                QMessageBox.warning(
+                    self,
+                    "制作字库",
+                    "列表里删除的字不会在追加时去掉。要从字库删字，请用覆盖保存。",
+                )
+                return
+            labeled = []
+            for item in self._extracted_items():
+                glyph = item.to_glyph()
+                if glyph is not None:
+                    labeled.append(glyph)
+            if not labeled:
+                QMessageBox.warning(self, "制作字库", "还没有标注文字。在右侧列表里填字，或在上方整句填入。")
+                return
+        else:
+            labeled = self._collect_labeled_glyphs()
+            if not labeled and self._glyphs:
+                QMessageBox.warning(self, "制作字库", "还没有标注文字。在右侧列表里填字，或在上方整句填入。")
+                return
         from services.dict_ocr_service import write_dict_text_file
 
         try:
@@ -1059,11 +1237,11 @@ class DictMakerDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "制作字库", f"保存失败: {exc}")
             return
-        self.saved_dict_path = os.path.abspath(path)
+        self.saved_dict_path = self._logical_dict_file(path)
         self.saved_color_format = str(self.color_edit.text() or "").strip()
         self.path_edit.setText(self.saved_dict_path)
         verb = "追加" if append else "覆盖保存"
-        QMessageBox.information(self, "制作字库", f"{verb}完成，写入 {added} 个新字形。\n{self.saved_dict_path}")
+        QMessageBox.information(self, "制作字库", f"{verb}完成，写入 {added} 个新字形。\n{path}")
         self.accept()
 
 

@@ -25,7 +25,7 @@ from .task_utils import (
     capture_and_match_template_smart,
 )
 from .click_action_executor import execute_simulator_click_action
-from .click_param_resolver import resolve_click_params, normalize_button
+from .click_param_resolver import resolve_click_params, normalize_button, safe_integer, safe_non_negative_float
 
 from utils.input.relative_mouse_move import perform_timed_relative_move as _shared_perform_timed_relative_move
 from utils.match.smart_image_matcher import normalize_match_image
@@ -60,8 +60,10 @@ TASK_NAME = "模拟鼠标操作"
 
 def _resolve_drag_button(button: Any) -> Optional[str]:
     """统一解析拖拽按钮，避免链路中途回落为左键。"""
-    normalized = normalize_button(button, default="")
-    return normalized or None
+    try:
+        return normalize_button(button)
+    except ValueError:
+        return None
 
 
 def requires_input_lock(params: Dict[str, Any]) -> bool:
@@ -78,40 +80,11 @@ def requires_input_lock(params: Dict[str, Any]) -> bool:
 
 
 def _normalize_operation_mode(value: Any) -> str:
-    """归一化操作模式，兼容旧模式名。"""
-    legacy_mode_by_index = [
-        "找图功能",
-        "坐标点击",
-        "文字点击",
-        "找色功能",
-        "元素点击",
-        "鼠标滚轮",
-        "鼠标拖拽",
-        "鼠标移动",
-    ]
-
-    mode = ""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        idx = int(value)
-        if 0 <= idx < len(legacy_mode_by_index):
-            mode = legacy_mode_by_index[idx]
-        else:
-            mode = str(value).strip()
-    else:
-        mode = str(value or "").strip()
-        if mode.isdigit():
-            idx = int(mode)
-            if 0 <= idx < len(legacy_mode_by_index):
-                mode = legacy_mode_by_index[idx]
-
-    alias_map = {
-        "图片点击": "找图功能",
-        "找图点击": "找图功能",
-        "找图功能": "找图功能",
-        "找色点击": "找色功能",
-        "找色功能": "找色功能",
-    }
-    return alias_map.get(mode, mode)
+    """仅接受现行鼠标操作模式。"""
+    modes = {"找图功能", "坐标点击", "文字点击", "找色功能", "元素点击", "鼠标滚轮", "鼠标拖拽", "鼠标移动"}
+    if not isinstance(value, str) or value not in modes:
+        raise ValueError(f"不支持的鼠标操作模式：{value!r}")
+    return value
 
 
 def _apply_click_offsets(
@@ -124,6 +97,10 @@ def _apply_click_offsets(
     random_offset_y: int = 0,
 ) -> Tuple[int, int, int, int]:
     """统一处理点击偏移：固定偏移模式下也允许叠加随机偏移。"""
+    if position_mode not in {'精准坐标', '固定偏移', '随机偏移'}:
+        raise ValueError(f"不支持的点击位置模式：{position_mode!r}")
+    if random_offset_x < 0 or random_offset_y < 0:
+        raise ValueError("随机偏移范围不能为负数")
     click_x = int(base_x)
     click_y = int(base_y)
     applied_offset_x = 0
@@ -222,25 +199,7 @@ def _execute_mouse_action(params: Dict[str, Any], counters: Dict[str, int], exec
     # 获取基本参数
     operation_mode = _normalize_operation_mode(params.get('operation_mode', ''))
 
-    # 刷新 向后兼容：根据旧任务类型自动推断操作模式
-    task_type = params.get('task_type', '')
-
-    # 优先根据任务类型推断操作模式
-    if task_type in ('图片点击', '找图功能', '找图点击'):
-        operation_mode = '找图功能'
-    elif task_type == '点击指定坐标':
-        operation_mode = '坐标点击'
-    elif not operation_mode:
-        # 如果没有指定操作模式，根据参数推断
-        if params.get('image_path'):
-            operation_mode = '找图功能'
-        elif 'coordinate_x' in params and 'coordinate_y' in params:
-            operation_mode = '坐标点击'
-        elif params.get('scroll_direction'):
-            operation_mode = '鼠标滚轮'
-        else:
-            # 默认为找图功能
-            operation_mode = '找图功能'
+    task_type = TASK_TYPE
 
     on_success_action = params.get('on_success', '执行下一步')
     success_jump_id = params.get('success_jump_target_id')
@@ -448,16 +407,8 @@ def _execute_coordinate_click(params: Dict[str, Any], execution_mode: str, targe
         if coordinate_source_mode not in ("坐标工具获取坐标", "手动输入", "无坐标"):
             logger.error(f"坐标点击不支持的坐标获取方式: {coordinate_source_mode}")
             return _handle_failure(on_failure_action, failure_jump_id, card_id)
-        from task_workflow.card_payload import coerce_number
-
-        resolved_coordinate_x = int(coerce_number(params.get('coordinate_x', 0), 0, as_float=False))
-        resolved_coordinate_y = int(coerce_number(params.get('coordinate_y', 0), 0, as_float=False))
-        coordinate_value_for_click = params.get('coordinate_value', '')
-
-        # 坐标来源互斥；坐标工具/手动输入模式不读取旧的 coordinate_value 字段。
-        if coordinate_source_mode in ('坐标工具获取坐标', '手动输入'):
-            coordinate_value_for_click = ''
-
+        resolved_coordinate_x = safe_integer(params.get('coordinate_x', 0))
+        resolved_coordinate_y = safe_integer(params.get('coordinate_y', 0))
         coordinate_mode_for_click = params.get('coordinate_mode', '客户区坐标')
 
         if coordinate_source_mode == '无坐标':
@@ -467,7 +418,6 @@ def _execute_coordinate_click(params: Dict[str, Any], execution_mode: str, targe
                 cursor_x, cursor_y = win32api.GetCursorPos()
                 resolved_coordinate_x = int(cursor_x)
                 resolved_coordinate_y = int(cursor_y)
-                coordinate_value_for_click = ''
                 coordinate_mode_for_click = '屏幕坐标'
                 logger.info(
                     f"坐标点击使用无坐标模式: 当前鼠标屏幕位置=({resolved_coordinate_x}, {resolved_coordinate_y})"
@@ -502,7 +452,6 @@ def _execute_coordinate_click(params: Dict[str, Any], execution_mode: str, targe
         coordinate_params = {
             'coordinate_x': resolved_coordinate_x,
             'coordinate_y': resolved_coordinate_y,
-            'coordinate_value': coordinate_value_for_click,
             'coordinate_mode': coordinate_mode_for_click,
             'position_mode': coordinate_position_mode,  # 关键：传递位置模式（click_coordinate使用position_mode）
             'enable_click': coordinate_enable_click,
@@ -520,16 +469,16 @@ def _execute_coordinate_click(params: Dict[str, Any], execution_mode: str, targe
 
         # 根据点击位置模式添加偏移参数
         if coordinate_position_mode == '固定偏移':
-            coordinate_params['fixed_offset_x'] = int(coerce_number(params.get('coordinate_fixed_offset_x', 0), 0, as_float=False))
-            coordinate_params['fixed_offset_y'] = int(coerce_number(params.get('coordinate_fixed_offset_y', 0), 0, as_float=False))
-            coordinate_params['random_offset_x'] = int(coerce_number(params.get('coordinate_random_offset_x', 5), 5, as_float=False))
-            coordinate_params['random_offset_y'] = int(coerce_number(params.get('coordinate_random_offset_y', 5), 5, as_float=False))
+            coordinate_params['fixed_offset_x'] = safe_integer(params.get('coordinate_fixed_offset_x', 0))
+            coordinate_params['fixed_offset_y'] = safe_integer(params.get('coordinate_fixed_offset_y', 0))
+            coordinate_params['random_offset_x'] = safe_integer(params.get('coordinate_random_offset_x', 5))
+            coordinate_params['random_offset_y'] = safe_integer(params.get('coordinate_random_offset_y', 5))
             logger.info(f"执行坐标点击（固定偏移模式）: ({resolved_coordinate_x}, {resolved_coordinate_y})")
         elif coordinate_position_mode == '随机偏移':
             coordinate_params['fixed_offset_x'] = 0
             coordinate_params['fixed_offset_y'] = 0
-            coordinate_params['random_offset_x'] = int(coerce_number(params.get('coordinate_random_offset_x', 5), 5, as_float=False))
-            coordinate_params['random_offset_y'] = int(coerce_number(params.get('coordinate_random_offset_y', 5), 5, as_float=False))
+            coordinate_params['random_offset_x'] = safe_integer(params.get('coordinate_random_offset_x', 5))
+            coordinate_params['random_offset_y'] = safe_integer(params.get('coordinate_random_offset_y', 5))
             logger.info(f"执行坐标点击（随机偏移模式）: ({resolved_coordinate_x}, {resolved_coordinate_y})")
         else:  # 精准坐标
             coordinate_params['fixed_offset_x'] = 0
@@ -580,68 +529,52 @@ def _execute_text_click(params: Dict[str, Any], execution_mode: str, target_hwnd
         from tasks.click_coordinate import execute_task as execute_coordinate_click
 
         # 获取文字位置参数
-        text_match_mode = params.get('text_match_mode', '包含')
         text_position_mode = params.get('text_position_mode', '精准坐标')
         text_enable_click = coerce_bool(params.get('text_enable_click', True))
 
         # 根据点击位置模式获取偏移参数
-        from task_workflow.card_payload import coerce_number
-
         if text_position_mode == '固定偏移':
-            text_fixed_offset_x = int(coerce_number(params.get('text_fixed_offset_x', 0), 0, as_float=False))
-            text_fixed_offset_y = int(coerce_number(params.get('text_fixed_offset_y', 0), 0, as_float=False))
-            text_random_offset_x = int(coerce_number(params.get('text_random_offset_x', 5), 5, as_float=False))
-            text_random_offset_y = int(coerce_number(params.get('text_random_offset_y', 5), 5, as_float=False))
+            text_fixed_offset_x = safe_integer(params.get('text_fixed_offset_x', 0))
+            text_fixed_offset_y = safe_integer(params.get('text_fixed_offset_y', 0))
+            text_random_offset_x = safe_integer(params.get('text_random_offset_x', 5))
+            text_random_offset_y = safe_integer(params.get('text_random_offset_y', 5))
         elif text_position_mode == '随机偏移':
             text_fixed_offset_x = 0
             text_fixed_offset_y = 0
-            text_random_offset_x = int(coerce_number(params.get('text_random_offset_x', 5), 5, as_float=False))
-            text_random_offset_y = int(coerce_number(params.get('text_random_offset_y', 5), 5, as_float=False))
-        else:  # 精准坐标
+            text_random_offset_x = safe_integer(params.get('text_random_offset_x', 5))
+            text_random_offset_y = safe_integer(params.get('text_random_offset_y', 5))
+        elif text_position_mode == '精准坐标':
             text_fixed_offset_x = 0
             text_fixed_offset_y = 0
             text_random_offset_x = 0
             text_random_offset_y = 0
+        else:
+            raise ValueError(f"不支持的文字点击位置模式：{text_position_mode!r}")
 
         logger.info(f"执行文字点击: 点击位置={text_position_mode}")
 
-        # 从工作流上下文中获取最新的识别结果
-        # 支持OCR识别和字库识别两种模式，获取最新的识别结果
-        ocr_results = _get_ocr_results_from_context(card_id)
+        # 文字点击明确使用最近一次识别；后续数据全部来自这个来源卡片。
+        from task_workflow.workflow_context import get_workflow_context
+        context = get_workflow_context()
+        ocr_card_id = context.get_latest_ocr_card_id()
+        if ocr_card_id is None:
+            raise RuntimeError("最近一次OCR识别来源未知")
+        ocr_results = _get_ocr_results_from_context(ocr_card_id)
 
-        # 【关键修复】验证OCR结果是否来自同一个窗口，防止跨窗口上下文污染
+        # 窗口信息缺失时不能确认坐标所属窗口。
         if ocr_results:
-            try:
-                from task_workflow.workflow_context import get_workflow_context
-                context = get_workflow_context()
-                latest_ocr_card_id = context.get_latest_ocr_card_id()
-
-                if latest_ocr_card_id is not None:
-                    ocr_window_hwnd = context.get_card_data(latest_ocr_card_id, 'ocr_window_hwnd')
-
-                    if ocr_window_hwnd is not None:
-                        if ocr_window_hwnd != target_hwnd:
-                            logger.error(f"【窗口HWND不匹配】OCR结果来自窗口HWND={ocr_window_hwnd}，但当前文字点击任务的目标窗口HWND={target_hwnd}")
-                            logger.error(f"这是跨窗口上下文污染！窗口{target_hwnd}的点击任务不应该使用窗口{ocr_window_hwnd}的OCR结果")
-                            logger.error(f"OCR来源卡片: {latest_ocr_card_id}, 当前文字点击卡片: {card_id}")
-                            logger.error("拒绝使用错误的OCR结果，判定为点击失败")
-                            return _handle_failure(on_failure_action, failure_jump_id, card_id)
-                        else:
-                            logger.info(f"【窗口HWND验证通过】OCR结果和文字点击任务都在窗口HWND={target_hwnd}")
-                    else:
-                        logger.warning(f"OCR卡片{latest_ocr_card_id}未保存窗口HWND信息，无法验证窗口一致性")
-                        logger.warning("建议更新OCR识别模块以保存窗口HWND")
-            except Exception as e:
-                logger.error(f"验证OCR窗口HWND时发生错误: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+            ocr_window_hwnd = context.get_card_data(ocr_card_id, 'ocr_window_hwnd')
+            if ocr_window_hwnd is None:
+                raise RuntimeError("OCR来源窗口未知")
+            if ocr_window_hwnd != target_hwnd:
+                raise RuntimeError(f"OCR来源窗口{ocr_window_hwnd}与点击窗口{target_hwnd}不一致")
 
         if not ocr_results:
             # 检查是否是多组文字识别模式且上下文为空
             try:
                 from task_workflow.workflow_context import get_workflow_context
                 context = get_workflow_context()
-                text_groups, current_index, clicked_texts = context.get_multi_text_recognition_state(card_id)
+                text_groups, current_index, clicked_texts = context.get_multi_text_recognition_state(ocr_card_id)
 
                 if text_groups and len(text_groups) > 1:
                     logger.warning("多组文字识别模式下上下文为空，判断为点击失败")
@@ -663,7 +596,7 @@ def _execute_text_click(params: Dict[str, Any], execution_mode: str, target_hwnd
 
         # 从工作流上下文获取最新识别卡片的目标文字（支持OCR和字库识别）
         logger.info(f" [调试] 文字点击卡片{card_id}尝试获取目标文字")
-        target_text, final_match_mode = _get_ocr_target_text_from_context(card_id)
+        target_text, final_match_mode = _get_ocr_target_text_from_context(ocr_card_id)
         logger.info(f" [调试] 获取到的目标文字: '{target_text}', 匹配模式: {final_match_mode}")
 
         if not target_text:
@@ -690,43 +623,33 @@ def _execute_text_click(params: Dict[str, Any], execution_mode: str, target_hwnd
         logger.info(f" [调试] 文字边界框: {text_bbox}")
 
         # 计算点击坐标
-        # 兼容两种bbox格式：扁平数组 [x1,y1,x2,y2,x3,y3,x4,y4] 或嵌套数组 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
         if text_bbox:
-            # 转换嵌套数组格式为扁平数组
-            if isinstance(text_bbox[0], (list, tuple)):
-                # 嵌套数组格式 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] -> [x1,y1,x2,y2,x3,y3,x4,y4]
-                text_bbox = [coord for point in text_bbox for coord in point]
-                logger.info(f" [调试] 转换嵌套bbox为扁平格式: {text_bbox}")
-
+            if not isinstance(text_bbox, list) or len(text_bbox) != 8 or any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in text_bbox):
+                raise ValueError("文字边界框必须是8个有限坐标值的列表")
             if len(text_bbox) >= 8:
-                # 统一使用文字中心（传入"精准点击"模式，让_calculate_click_position计算中心）
-                relative_click_x, relative_click_y = _calculate_click_position(text_bbox, "精准点击", 0, 0)
+                relative_click_x, relative_click_y = _calculate_click_position(text_bbox)
                 logger.info(f"[调试] 计算的相对坐标: ({relative_click_x}, {relative_click_y})")
 
                 # 本地OCR返回的是相对于识别区域的局部坐标，需要加区域偏移。
                 try:
                     from task_workflow.workflow_context import get_workflow_context
                     context = get_workflow_context()
-                    latest_ocr_card_id = context.get_latest_ocr_card_id()
-                    if latest_ocr_card_id is not None:
-                        region_offset = context.get_card_data(latest_ocr_card_id, 'ocr_region_offset')
+                    if ocr_card_id is not None:
+                        region_offset = context.get_card_data(ocr_card_id, 'ocr_region_offset')
 
                         if region_offset:
-                            offset_x, offset_y = region_offset
+                            if not isinstance(region_offset, (list, tuple)) or len(region_offset) != 2:
+                                raise ValueError("OCR识别区域偏移格式无效")
+                            offset_x, offset_y = map(safe_integer, region_offset)
                             click_x = relative_click_x + offset_x
                             click_y = relative_click_y + offset_y
                             logger.info(f" [本地OCR] 局部坐标加区域偏移: ({relative_click_x}, {relative_click_y}) + ({offset_x}, {offset_y}) = ({click_x}, {click_y})")
                         else:
-                            click_x, click_y = relative_click_x, relative_click_y
-                            logger.info(f" [本地OCR] 无区域偏移，直接使用: ({click_x}, {click_y})")
+                            raise RuntimeError("OCR识别区域偏移未知")
                     else:
-                        click_x, click_y = relative_click_x, relative_click_y
-                        logger.warning(f" [本地OCR] 未找到OCR卡片信息，直接使用坐标: ({click_x}, {click_y})")
+                        raise RuntimeError("未找到OCR卡片信息")
                 except Exception as e:
-                    logger.warning(f"获取OCR区域偏移失败: {e}，直接使用原始坐标")
-                    import traceback
-                    logger.debug(traceback.format_exc())
-                    click_x, click_y = relative_click_x, relative_click_y
+                    raise RuntimeError("获取OCR区域偏移失败，禁止继续点击") from e
 
                 # 应用偏移（根据点击位置模式）
                 click_x, click_y, applied_offset_x, applied_offset_y = _apply_click_offsets(
@@ -843,16 +766,12 @@ def _execute_text_click(params: Dict[str, Any], execution_mode: str, target_hwnd
 
                 # 检查是否是多组文字识别模式
                 # 需要使用OCR卡片的ID，而不是文字点击卡片的ID
-                ocr_card_id = _get_ocr_card_id_from_context(card_id)
-                if ocr_card_id is not None:
-                    text_groups, current_index, clicked_texts = context.get_multi_text_recognition_state(ocr_card_id)
-                else:
-                    text_groups, current_index, clicked_texts = [], 0, []
+                text_groups, current_index, clicked_texts = context.get_multi_text_recognition_state(ocr_card_id)
 
                 if text_groups and len(text_groups) > 1 and ocr_card_id is not None:
                     # 多组文字识别模式
                     # 记录已点击的文字
-                    clicked_text = _get_clicked_text_from_context(card_id)
+                    clicked_text = matched_text
                     if clicked_text:
                         context.add_clicked_text(ocr_card_id, clicked_text)
                         logger.info(f"记录已点击文字到记忆: '{clicked_text}' (OCR卡片ID: {ocr_card_id})")
@@ -872,11 +791,11 @@ def _execute_text_click(params: Dict[str, Any], execution_mode: str, target_hwnd
                         context.clear_card_ocr_data(ocr_card_id)
                 else:
                     # 单组文字识别模式，清除OCR上下文数据
-                    context.clear_card_ocr_context(card_id)
+                    context.clear_card_ocr_context(ocr_card_id)
                     logger.info("单组文字点击成功，已清除OCR上下文数据")
 
             except Exception as e:
-                logger.warning(f"处理文字点击后续逻辑时发生错误: {e}")
+                raise RuntimeError("处理文字点击后续逻辑失败") from e
 
         return success, action, next_id
 
@@ -1068,18 +987,12 @@ def _execute_color_click(params: Dict[str, Any], execution_mode: str, target_hwn
         retry_attempts_raw = params.get('retry_attempts', 3)
         retry_interval_raw = params.get('retry_interval', 0.5)
 
-        try:
-            retry_attempts = int(retry_attempts_raw)
-        except (TypeError, ValueError):
-            retry_attempts = 3
-
-        max_attempts = max(1, min(retry_attempts, 10)) if enable_retry else 1
-
-        try:
-            retry_interval = float(retry_interval_raw)
-        except (TypeError, ValueError):
-            retry_interval = 0.5
-        retry_interval = max(0.0, retry_interval)
+        retry_attempts = safe_integer(retry_attempts_raw)
+        if not 1 <= retry_attempts <= 10:
+            raise ValueError("找色重试次数必须在1到10之间")
+        # 含输入的动作结果未知时不可重放；重试仅用于纯识别。
+        max_attempts = retry_attempts if enable_retry and not coerce_bool(params.get('color_enable_click', True)) else 1
+        retry_interval = safe_non_negative_float(retry_interval_raw)
 
         logger.info("[找色功能] 使用本地截图和OpenCV")
 
@@ -1167,6 +1080,9 @@ def _execute_color_click_original(params: Dict[str, Any], execution_mode: str, t
                                   card_id: Optional[int], on_success_action: str, success_jump_id: Optional[int],
                                   on_failure_action: str, failure_jump_id: Optional[int], stop_checker=None) -> Tuple[bool, str, Optional[int]]:
     """原生模式找色：截图与匹配都在主进程执行，主进程只消费结果。"""
+    from task_workflow.runtime_store import publish_perception
+
+    publish_perception(card_id, kind="click", ok=False, query_ok=None)
     try:
         from services.screenshot_pool import (
             capture_and_find_color,
@@ -1191,20 +1107,22 @@ def _execute_color_click_original(params: Dict[str, Any], execution_mode: str, t
         click_position_mode = params.get('click_position_mode', '精准坐标')
 
         if click_position_mode == '固定偏移':
-            color_fixed_offset_x = int(params.get('color_fixed_offset_x', 0) or 0)
-            color_fixed_offset_y = int(params.get('color_fixed_offset_y', 0) or 0)
-            color_random_offset_x = int(params.get('color_random_offset_x', 5) or 0)
-            color_random_offset_y = int(params.get('color_random_offset_y', 5) or 0)
+            color_fixed_offset_x = safe_integer(params.get('color_fixed_offset_x', 0))
+            color_fixed_offset_y = safe_integer(params.get('color_fixed_offset_y', 0))
+            color_random_offset_x = safe_integer(params.get('color_random_offset_x', 5))
+            color_random_offset_y = safe_integer(params.get('color_random_offset_y', 5))
         elif click_position_mode == '随机偏移':
             color_fixed_offset_x = 0
             color_fixed_offset_y = 0
-            color_random_offset_x = int(params.get('color_random_offset_x', 5) or 0)
-            color_random_offset_y = int(params.get('color_random_offset_y', 5) or 0)
-        else:
+            color_random_offset_x = safe_integer(params.get('color_random_offset_x', 5))
+            color_random_offset_y = safe_integer(params.get('color_random_offset_y', 5))
+        elif click_position_mode == '精准坐标':
             color_fixed_offset_x = 0
             color_fixed_offset_y = 0
             color_random_offset_x = 0
             color_random_offset_y = 0
+        else:
+            raise ValueError(f"不支持的找色点击位置模式：{click_position_mode!r}")
 
         h_tolerance = 10
         s_tolerance = 40
@@ -1254,15 +1172,15 @@ def _execute_color_click_original(params: Dict[str, Any], execution_mode: str, t
 
         roi = None
         if recognition_region_enabled:
-            rx = int(params.get('search_region_x', 0) or 0)
-            ry = int(params.get('search_region_y', 0) or 0)
-            rw = int(params.get('search_region_width', 0) or 0)
-            rh = int(params.get('search_region_height', 0) or 0)
+            rx = safe_integer(params.get('search_region_x', 0))
+            ry = safe_integer(params.get('search_region_y', 0))
+            rw = safe_integer(params.get('search_region_width', 0))
+            rh = safe_integer(params.get('search_region_height', 0))
             if rw > 0 and rh > 0:
                 roi = (rx, ry, rw, rh)
                 logger.info(f"[找色功能] 启用识别区域: X={rx}, Y={ry}, W={rw}, H={rh}")
             else:
-                logger.warning(f"[找色功能] 识别区域宽高无效: W={rw}, H={rh}，将使用整窗")
+                raise ValueError("找色识别区域宽高必须为正整数")
 
         logger.info(f"[找色功能] 匹配开始，模式={color_mode}")
         find_response = capture_and_find_color(
@@ -1280,6 +1198,11 @@ def _execute_color_click_original(params: Dict[str, Any], execution_mode: str, t
         )
 
         if not find_response.get('success') or not find_response.get('found'):
+            from task_workflow.runtime_store import publish_perception
+
+            publish_perception(card_id, kind="click", ok=False,
+                               query_ok=bool(find_response.get('success')),
+                               error=None if find_response.get('success') else str(find_response.get('error') or "找色查询失败"))
             try:
                 clear_screenshot_engine_cache(hwnd=int(target_hwnd))
             except Exception as clear_exc:
@@ -1291,34 +1214,23 @@ def _execute_color_click_original(params: Dict[str, Any], execution_mode: str, t
                 logger.info('未找到匹配的目标颜色')
             return _handle_failure(on_failure_action, failure_jump_id, card_id)
 
-        payload_positions = find_response.get('positions') or []
+        payload_positions = find_response['positions']
+        if not isinstance(payload_positions, list):
+            raise ValueError("找色结果位置必须是列表")
         found_positions: List[Tuple[int, int]] = []
         for pos in payload_positions[:4096]:
-            if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                try:
-                    found_positions.append((int(pos[0]), int(pos[1])))
-                except Exception:
-                    continue
+            if not isinstance(pos, (list, tuple)) or len(pos) != 2:
+                raise ValueError("找色结果位置必须包含两个坐标")
+            found_positions.append((safe_integer(pos[0]), safe_integer(pos[1])))
 
         if not found_positions:
-            center_payload = find_response.get('center')
-            if isinstance(center_payload, (list, tuple)) and len(center_payload) >= 2:
-                try:
-                    found_positions.append((int(center_payload[0]), int(center_payload[1])))
-                except Exception:
-                    pass
-
-        if not found_positions:
-            logger.info('未找到匹配的目标颜色')
-            return _handle_failure(on_failure_action, failure_jump_id, card_id)
+            raise ValueError("找色声明命中但位置列表为空")
 
         center_payload = find_response.get('center')
-        if isinstance(center_payload, (list, tuple)) and len(center_payload) >= 2:
-            click_x = int(center_payload[0])
-            click_y = int(center_payload[1])
-        else:
-            click_x = sum(pos[0] for pos in found_positions) // len(found_positions)
-            click_y = sum(pos[1] for pos in found_positions) // len(found_positions)
+        if not isinstance(center_payload, (list, tuple)) or len(center_payload) != 2:
+            raise ValueError("找色结果中心坐标未知")
+        click_x = safe_integer(center_payload[0])
+        click_y = safe_integer(center_payload[1])
 
         logger.info(f"[找色功能] 返回匹配点数: {len(found_positions)}，中心=({click_x}, {click_y})")
         base_click_x = click_x
@@ -1406,11 +1318,8 @@ def _execute_color_click_original(params: Dict[str, Any], execution_mode: str, t
         click_button, clicks, interval, click_action, enable_auto_release, hold_duration = resolve_click_params(
             params,
             button_key="color_click_button",
-            fallback_button_key="button",
             clicks_key="color_click_clicks",
-            fallback_clicks_key="clicks",
             interval_key="color_click_interval",
-            fallback_interval_key="interval",
             action_key="color_click_action",
             auto_release_key="color_enable_auto_release",
             hold_duration_key="color_hold_duration",
@@ -1523,11 +1432,15 @@ def _find_single_color(screenshot_bgr: np.ndarray, target_color_bgr: Tuple[int, 
     logger.debug(f"匹配像素数量: {match_pixel_count} (阈值: {min_pixel_count})")
 
     if match_pixel_count < min_pixel_count:
-        # 【闪退修复】添加调试信息时验证图像格式
+        if not logger.isEnabledFor(logging.DEBUG):
+            return []
+        # 仅在开启调试日志时计算整张截图的颜色统计。
         try:
             if len(hsv_image.shape) == 3 and hsv_image.shape[2] == 3:
-                unique_colors_count = len(np.unique(hsv_image.reshape(-1, 3), axis=0))
-                logger.debug(f"图像中唯一颜色数: {unique_colors_count}, 图像HSV范围: H=[{hsv_image[:,:,0].min()},{hsv_image[:,:,0].max()}], S=[{hsv_image[:,:,1].min()},{hsv_image[:,:,1].max()}], V=[{hsv_image[:,:,2].min()},{hsv_image[:,:,2].max()}]")
+                pixels = hsv_image.reshape(-1, 3)
+                stride = max(1, (len(pixels) + 4095) // 4096)
+                unique_colors_count = len(np.unique(pixels[::stride], axis=0))
+                logger.debug(f"采样唯一颜色数: {unique_colors_count}, 图像HSV范围: H=[{hsv_image[:,:,0].min()},{hsv_image[:,:,0].max()}], S=[{hsv_image[:,:,1].min()},{hsv_image[:,:,1].max()}], V=[{hsv_image[:,:,2].min()},{hsv_image[:,:,2].max()}]")
             else:
                 logger.warning(f"HSV图像形状异常: {hsv_image.shape}，跳过调试统计")
         except Exception as e:
@@ -1650,18 +1563,10 @@ def _execute_mouse_scroll(params: Dict[str, Any], execution_mode: str, target_hw
     try:
         from tasks.mouse_scroll_runtime import execute_mouse_scroll
 
-        # 解析滚动起始位置坐标
         scroll_position = params.get('scroll_start_position', '500,300')
-        try:
-            if isinstance(scroll_position, str) and ',' in scroll_position:
-                scroll_x, scroll_y = map(int, scroll_position.split(','))
-            else:
-                # 兼容旧版本的 scroll_x 和 scroll_y 参数
-                scroll_x = int(params.get('scroll_x', 500))
-                scroll_y = int(params.get('scroll_y', 300))
-        except (ValueError, TypeError):
-            logger.warning(f"无法解析滚动坐标: {scroll_position}，使用默认值 (500, 300)")
-            scroll_x, scroll_y = 500, 300
+        if not isinstance(scroll_position, str) or scroll_position.count(',') != 1:
+            raise ValueError("滚动起点必须是横坐标,纵坐标")
+        scroll_x, scroll_y = map(int, scroll_position.split(','))
 
         # 构造鼠标滚轮的参数
         scroll_params = {
@@ -1671,8 +1576,6 @@ def _execute_mouse_scroll(params: Dict[str, Any], execution_mode: str, target_hw
             'location_mode': '指定坐标',  # 使用指定坐标模式
             'scroll_start_position': f"{scroll_x},{scroll_y}",  # 设置正确的坐标字符串
             'coordinate_mode': '客户区坐标',  # 设置坐标模式
-            'scroll_x': scroll_x,  # 传递解析后的X坐标（兼容性）
-            'scroll_y': scroll_y,  # 传递解析后的Y坐标（兼容性）
             'on_success': on_success_action,
             'success_jump_target_id': success_jump_id,
             'on_failure': on_failure_action,
@@ -1725,11 +1628,8 @@ def _perform_move_click(params: Dict[str, Any], execution_mode: str, target_hwnd
         safe_click_button, safe_clicks, safe_interval, normalized_action, enable_auto_release, safe_hold_duration = resolve_click_params(
             params,
             button_key="move_click_button",
-            fallback_button_key="button",
             clicks_key="move_click_clicks",
-            fallback_clicks_key="clicks",
             interval_key="move_click_interval",
-            fallback_interval_key="interval",
             action_key="move_click_action",
             auto_release_key="move_enable_auto_release",
             hold_duration_key="move_hold_duration",
@@ -1763,7 +1663,6 @@ def _perform_move_click(params: Dict[str, Any], execution_mode: str, target_hwnd
             auto_release=enable_auto_release,
             mode_label="鼠标移动点击",
             logger_obj=logger,
-            single_click_retry=False,
             require_atomic_hold=True,
             stop_checker=stop_checker,
             execution_mode=execution_mode,
@@ -1794,38 +1693,17 @@ def _get_task_simulator(target_hwnd: Optional[int], execution_mode: str):
 def _resolve_relative_move_start(execution_mode: str, target_hwnd: int) -> Tuple[int, int]:
     if _is_background_execution_mode(execution_mode):
         simulator = _get_task_simulator(target_hwnd, execution_mode)
-        getter = getattr(simulator, "get_virtual_cursor", None) if simulator else None
-        if callable(getter):
-            try:
-                cursor = getter()
-                if cursor and len(cursor) >= 2:
-                    return int(cursor[0]), int(cursor[1])
-            except Exception:
-                pass
-        try:
-            import win32gui
+        if simulator is None:
+            raise RuntimeError("后台输入模拟器不可用")
+        x, y = simulator.get_virtual_cursor()
+        return int(x), int(y)
 
-            rect = win32gui.GetClientRect(target_hwnd)
-            return max(0, int(rect[2]) // 2), max(0, int(rect[3]) // 2)
-        except Exception:
-            return 0, 0
+    import win32api
+    import win32gui
 
-    try:
-        import win32api
-        import win32gui
-
-        cursor_pos = win32api.GetCursorPos()
-        start_x, start_y = win32gui.ScreenToClient(target_hwnd, cursor_pos)
-        return int(start_x), int(start_y)
-    except Exception as e:
-        logger.warning(f"[鼠标移动] 获取鼠标位置失败: {e}，使用窗口中心点")
-        try:
-            import win32gui
-
-            rect = win32gui.GetClientRect(target_hwnd)
-            return int(rect[2]) // 2, int(rect[3]) // 2
-        except Exception:
-            return 500, 300
+    cursor_pos = win32api.GetCursorPos()
+    start_x, start_y = win32gui.ScreenToClient(target_hwnd, cursor_pos)
+    return int(start_x), int(start_y)
 
 
 def _perform_background_client_move(
@@ -1939,22 +1817,11 @@ def _perform_timed_relative_move(offset_x: int, offset_y: int, duration: float,
     )
 
 def _client_to_screen_point(target_hwnd: int, x: int, y: int) -> tuple:
-    """将客户区坐标转换为屏幕坐标，失败时回退原值。"""
-    try:
-        import win32gui
-        sx, sy = win32gui.ClientToScreen(target_hwnd, (int(x), int(y)))
-        return int(sx), int(sy)
-    except Exception:
-        return int(x), int(y)
+    """将客户区坐标转换为屏幕坐标；转换失败直接抛错。"""
+    import win32gui
+    sx, sy = win32gui.ClientToScreen(target_hwnd, (int(x), int(y)))
+    return int(sx), int(sy)
 
-def _screen_to_client_point(target_hwnd: int, x: int, y: int) -> tuple:
-    """将屏幕坐标转换为客户区坐标，失败时回退原值。"""
-    try:
-        import win32gui
-        cx, cy = win32gui.ScreenToClient(target_hwnd, (int(x), int(y)))
-        return int(cx), int(cy)
-    except Exception:
-        return int(x), int(y)
 
 def _resolve_move_click_screen_point(execution_mode: str, target_hwnd: Optional[int],
                                      click_x: int, click_y: int,
@@ -1991,32 +1858,31 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
 
         # 获取移动参数
         move_mode = params.get('move_mode', '绝对移动')
+        if move_mode not in {'绝对移动', '相对移动'}:
+            raise ValueError(f"不支持的鼠标移动模式：{move_mode!r}")
 
         # 根据持续时间模式获取持续时间
         duration_mode = params.get('move_duration_mode', '固定持续时间')
+        if duration_mode not in {'固定持续时间', '随机持续时间'}:
+            raise ValueError(f"不支持的鼠标移动持续时间模式：{duration_mode!r}")
         instant_move_requested = False
         if duration_mode == '随机持续时间':
             try:
                 min_duration = float(params.get('move_duration_min', 0.3))
                 max_duration = float(params.get('move_duration_max', 0.8))
             except (TypeError, ValueError):
-                logger.warning("[鼠标移动] 随机持续时间参数无效，使用默认值")
-                min_duration, max_duration = 0.3, 0.8
+                raise ValueError("鼠标移动随机持续时间参数无效")
 
-            min_duration = max(0.0, min_duration)
-            max_duration = max(0.0, max_duration)
-            if min_duration > max_duration:
-                min_duration, max_duration = max_duration, min_duration
+            if not math.isfinite(min_duration) or not math.isfinite(max_duration) or min_duration < 0 or max_duration < min_duration:
+                raise ValueError("鼠标移动随机持续时间范围无效")
             duration = random.uniform(min_duration, max_duration)
         else:
             try:
                 duration = float(params.get('move_duration', 0.5))
             except (TypeError, ValueError):
-                logger.warning("[鼠标移动] 固定持续时间参数无效，使用默认值0.5秒")
-                duration = 0.5
-            if duration < 0:
-                logger.warning("[鼠标移动] 固定持续时间小于0，已按0秒处理")
-                duration = 0.0
+                raise ValueError("鼠标移动固定持续时间参数无效")
+            if not math.isfinite(duration) or duration < 0:
+                raise ValueError("鼠标移动固定持续时间必须是非负有限数值")
             instant_move_requested = duration <= 0.0
 
         use_bezier = params.get('move_use_bezier', False)
@@ -2063,6 +1929,8 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
         else:
             # 相对移动：基于当前鼠标位置的偏移
             offset_mode = params.get('move_offset_mode', '固定偏移')
+            if offset_mode not in {'固定偏移', '随机偏移'}:
+                raise ValueError(f"不支持的鼠标移动偏移模式：{offset_mode!r}")
 
             # 根据偏移模式获取偏移量
             if offset_mode == '随机偏移':
@@ -2072,15 +1940,10 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
                     offset_y_min = int(params.get('move_offset_y_min', -50))
                     offset_y_max = int(params.get('move_offset_y_max', 50))
                 except (ValueError, TypeError):
-                    logger.warning("[鼠标移动] 随机偏移参数无效,使用默认值")
-                    offset_x_min, offset_x_max = -50, 50
-                    offset_y_min, offset_y_max = -50, 50
+                    raise ValueError("鼠标移动随机偏移参数无效")
 
-                # 防御性编程: 确保min <= max
-                if offset_x_min > offset_x_max:
-                    offset_x_min, offset_x_max = offset_x_max, offset_x_min
-                if offset_y_min > offset_y_max:
-                    offset_y_min, offset_y_max = offset_y_max, offset_y_min
+                if offset_x_min > offset_x_max or offset_y_min > offset_y_max:
+                    raise ValueError("鼠标移动随机偏移范围无效")
 
                 offset_x = random.randint(offset_x_min, offset_x_max)
                 offset_y = random.randint(offset_y_min, offset_y_max)
@@ -2089,8 +1952,7 @@ def _execute_mouse_move(params: Dict[str, Any], execution_mode: str, target_hwnd
                     offset_x = int(params.get('move_offset_x', 0))
                     offset_y = int(params.get('move_offset_y', 0))
                 except (ValueError, TypeError):
-                    logger.warning("[鼠标移动] 固定偏移参数无效,使用默认值0")
-                    offset_x, offset_y = 0, 0
+                    raise ValueError("鼠标移动固定偏移参数无效")
 
             start_x, start_y = _resolve_relative_move_start(execution_mode, target_hwnd)
 
@@ -2326,10 +2188,7 @@ def _find_image_for_drag_opencv(target_hwnd: int, image_path: str, confidence: f
             logger.error(f"[原有模式找图] 匹配失败: {err}")
             return None
 
-        try:
-            max_val = float(match_response.get("confidence", 0.0) or 0.0)
-        except Exception:
-            max_val = 0.0
+        max_val = safe_non_negative_float(match_response['confidence'])
 
         raw_location = match_response.get("location")
         parsed_location = None
@@ -2372,15 +2231,13 @@ def _correct_single_image_path(raw_path: str) -> Optional[str]:
     from tasks.task_utils import correct_single_image_path
     return correct_single_image_path(raw_path)
 
-def _find_image_for_drag(target_hwnd: int, image_path: str, confidence: float,
-                         execution_mode: str) -> Optional[Tuple[int, int]]:
+def _find_image_for_drag(target_hwnd: int, image_path: str, confidence: float) -> Optional[Tuple[int, int]]:
     """使用本地 OpenCV 查找拖拽起点或终点图片。
 
     Args:
         target_hwnd: 目标窗口句柄
         image_path: 图片路径
         confidence: 置信度阈值
-        execution_mode: 执行模式（保留此参数以兼容任务调用接口）
 
     Returns:
         (x, y) 图片中心坐标，如果未找到则返回None
@@ -2457,6 +2314,8 @@ def _execute_simple_drag(params: Dict[str, Any], execution_mode: str, target_hwn
 
         # ===== 获取起点坐标 =====
         drag_start_mode = params.get('drag_start_mode', '坐标')
+        if drag_start_mode not in {'坐标', '图片'}:
+            raise ValueError(f"不支持的拖拽起点模式：{drag_start_mode!r}")
         start_x, start_y = None, None
 
         if drag_start_mode == '图片':
@@ -2475,7 +2334,7 @@ def _execute_simple_drag(params: Dict[str, Any], execution_mode: str, target_hwn
             logger.info(f"[拖拽] 起点使用图片模式，查找: {os.path.basename(start_image_path)}")
 
             # 使用本地OpenCV找图接口。
-            start_result = _find_image_for_drag(target_hwnd, start_image_path, start_confidence, execution_mode)
+            start_result = _find_image_for_drag(target_hwnd, start_image_path, start_confidence)
 
             if start_result is None:
                 logger.error(f"[拖拽] 起点图片未找到: {os.path.basename(start_image_path)}")
@@ -2494,14 +2353,14 @@ def _execute_simple_drag(params: Dict[str, Any], execution_mode: str, target_hwn
                 if isinstance(drag_start, str) and ',' in drag_start:
                     start_x, start_y = map(int, drag_start.split(','))
                 else:
-                    start_x, start_y = 500, 300
-                    logger.warning(f"[拖拽] 起点坐标格式错误，使用默认值: ({start_x}, {start_y})")
+                    raise ValueError("拖拽起点坐标格式错误")
             except (ValueError, TypeError) as e:
-                start_x, start_y = 500, 300
-                logger.warning(f"[拖拽] 解析起点坐标失败: {e}，使用默认值: ({start_x}, {start_y})")
+                raise ValueError("拖拽起点坐标无效") from e
 
         # ===== 获取终点坐标 =====
         drag_end_mode = params.get('drag_end_mode', '坐标')
+        if drag_end_mode not in {'坐标', '图片'}:
+            raise ValueError(f"不支持的拖拽终点模式：{drag_end_mode!r}")
         end_x, end_y = None, None
 
         if drag_end_mode == '图片':
@@ -2520,7 +2379,7 @@ def _execute_simple_drag(params: Dict[str, Any], execution_mode: str, target_hwn
             logger.info(f"[拖拽] 终点使用图片模式，查找: {os.path.basename(end_image_path)}")
 
             # 使用本地OpenCV找图接口。
-            end_result = _find_image_for_drag(target_hwnd, end_image_path, end_confidence, execution_mode)
+            end_result = _find_image_for_drag(target_hwnd, end_image_path, end_confidence)
 
             if end_result is None:
                 logger.error(f"[拖拽] 终点图片未找到: {os.path.basename(end_image_path)}")
@@ -2539,11 +2398,9 @@ def _execute_simple_drag(params: Dict[str, Any], execution_mode: str, target_hwn
                 if isinstance(drag_end, str) and ',' in drag_end:
                     end_x, end_y = map(int, drag_end.split(','))
                 else:
-                    end_x, end_y = 700, 300
-                    logger.warning(f"[拖拽] 终点坐标格式错误，使用默认值: ({end_x}, {end_y})")
+                    raise ValueError("拖拽终点坐标格式错误")
             except (ValueError, TypeError) as e:
-                end_x, end_y = 700, 300
-                logger.warning(f"[拖拽] 解析终点坐标失败: {e}，使用默认值: ({end_x}, {end_y})")
+                raise ValueError("拖拽终点坐标无效") from e
 
         # ===== 坐标验证和限制 =====
         logger.info(f"[拖拽] 解析后的起点: ({start_x}, {start_y})")
@@ -2576,7 +2433,7 @@ def _execute_simple_drag(params: Dict[str, Any], execution_mode: str, target_hwn
                 logger.warning(f"[拖拽] 终点坐标超出窗口范围，已调整: ({original_end_x},{original_end_y}) -> ({end_x},{end_y})")
 
         except Exception as e:
-            logger.warning(f"[拖拽] 无法获取窗口尺寸: {e}，使用原始坐标")
+            raise RuntimeError("无法获取拖拽窗口尺寸") from e
 
         # 显示最终拖拽信息
         start_mode_desc = "图片" if drag_start_mode == "图片" else "坐标"
@@ -2698,107 +2555,25 @@ def _parse_path_points(path_points_text: str) -> tuple:
               时间戳列表: [t1, t2, ...] 或 None（如果没有时间戳）
     """
     try:
-        path_points = []
-        timestamps = []
-        has_timestamps = False
-        lines = path_points_text.strip().split('\n')
-
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if not line:
+        path_points, timestamps = [], []
+        point_width = None
+        for row, line in enumerate(path_points_text.strip().splitlines(), 1):
+            if not line.strip():
                 continue
-
-            try:
-                if ',' in line:
-                    parts = line.split(',')
-                    x = int(parts[0].strip())
-                    y = int(parts[1].strip())
-                    path_points.append((x, y))
-
-                    # 检查是否有时间戳
-                    if len(parts) >= 3:
-                        try:
-                            timestamp = float(parts[2].strip())
-                            timestamps.append(timestamp)
-                            has_timestamps = True
-                        except (ValueError, IndexError):
-                            # 如果时间戳解析失败，标记为无时间戳
-                            has_timestamps = False
-                            timestamps = []
-                            logger.debug(f"第{i+1}行时间戳解析失败，将使用默认时间分配")
-                    else:
-                        # 没有时间戳字段
-                        if has_timestamps:
-                            # 前面有时间戳但这里没有，数据不一致
-                            logger.warning(f"路径点格式不一致（第{i+1}行），将使用默认时间分配")
-                            has_timestamps = False
-                            timestamps = []
-                else:
-                    logger.warning(f"路径点格式错误（第{i+1}行）: {line}，跳过")
-            except (ValueError, TypeError) as e:
-                logger.warning(f"解析路径点失败（第{i+1}行）: {line}，错误: {e}")
-                continue
-
-        if has_timestamps and len(timestamps) == len(path_points):
-            logger.info(f"解析路径点完成: {len(path_points)}个有效点, 带时间戳, 总时长={timestamps[-1]:.3f}s")
-            return path_points, timestamps
-        else:
-            logger.debug(f"解析路径点完成: {len(path_points)}个有效点, 无时间戳")
-            return path_points, None
-
-    except Exception as e:
-        logger.error(f"解析路径点文本失败: {e}")
+            parts = line.split(',')
+            if len(parts) not in (2, 3) or (point_width is not None and len(parts) != point_width):
+                raise ValueError(f"第{row}行拖拽路径格式无效或时间戳格式不一致")
+            point_width = len(parts)
+            path_points.append((int(parts[0]), int(parts[1])))
+            if point_width == 3:
+                stamp = float(parts[2])
+                if not math.isfinite(stamp) or stamp < 0 or (timestamps and stamp < timestamps[-1]):
+                    raise ValueError(f"第{row}行拖拽时间戳无效")
+                timestamps.append(stamp)
+        return path_points, timestamps if point_width == 3 else None
+    except (ValueError, TypeError) as exc:
+        logger.error(f"解析路径点文本失败: {exc}")
         return [], None
-
-def perform_mouse_drag_path(hwnd: int, path_points: list, duration: float = 1.0,
-                           execution_mode: str = 'background', timestamps: list = None,
-                           button: str = 'left',
-                           device_id: str = None) -> bool:
-    """执行多点路径拖拽操作
-
-    Args:
-        hwnd: 目标窗口句柄
-        path_points: 路径点列表，格式: [(x1, y1), (x2, y2), (x3, y3), ...]
-        duration: 总持续时间（秒），如果提供timestamps则此参数被忽略
-        execution_mode: 执行模式 ('foreground' 或 'background')
-        timestamps: 时间戳列表（秒），如果提供则按时间戳执行精确回放
-        device_id: 目标设备ID (多设备支持)
-
-    Returns:
-        bool: 是否执行成功
-    """
-    try:
-        if not path_points or len(path_points) < 2:
-            logger.error("路径点数量不足，至少需要2个点")
-            return False
-
-        raw_button = button
-        button = _resolve_drag_button(raw_button)
-        if not button:
-            logger.error(f"拖拽按钮无效: {raw_button}")
-            return False
-
-        # 如果有时间戳，使用时间戳作为实际时长
-        if timestamps and len(timestamps) == len(path_points):
-            actual_duration = timestamps[-1]
-            logger.info(f"开始多点路径拖拽: {len(path_points)}个点, 带时间戳回放, 总时长: {actual_duration:.3f}秒, 执行模式: {execution_mode}")
-        else:
-            actual_duration = duration
-            logger.info(f"开始多点路径拖拽: {len(path_points)}个点, 均匀分配时间, 总时长: {duration}秒, 执行模式: {execution_mode}")
-
-        logger.info(f"执行本地多点拖拽，device_id={device_id}，execution_mode={execution_mode}")
-        return perform_mouse_drag_path_native(
-            hwnd,
-            path_points,
-            actual_duration,
-            execution_mode,
-            timestamps,
-            button=button,
-        )
-
-    except Exception as e:
-        logger.error(f"多点拖拽执行失败: {e}", exc_info=True)
-        return False
 
 
 def _convert_client_path_to_screen(hwnd: int, path_points: list) -> list:
@@ -2809,321 +2584,39 @@ def _convert_client_path_to_screen(hwnd: int, path_points: list) -> list:
     for point in path_points:
         x = int(point[0])
         y = int(point[1])
-        try:
-            sx, sy = win32gui.ClientToScreen(hwnd, (x, y))
-        except Exception:
-            sx, sy = x, y
+        sx, sy = win32gui.ClientToScreen(hwnd, (x, y))
         converted.append((int(sx), int(sy)))
     return converted
 
 
-def perform_mouse_drag_path_native(hwnd: int, path_points: list, duration: float = 1.0,
-                                   execution_mode: str = 'background', timestamps: list = None,
-                                   button: str = 'left') -> bool:
-    """原生模式完整路径拖拽实现
+def perform_mouse_drag_path(hwnd: int, path_points: list, duration: float = 1.0,
+                            execution_mode: str = 'background_sendmessage', timestamps: list = None,
+                            button: str = 'left', device_id: str = None) -> bool:
+    """通过统一模拟器拖拽客户区路径；前台原生转换屏幕坐标，结束后关闭实例。"""
+    from utils.input_simulation.drag_path import prepare_drag_path
+    from utils.input_simulation.factory import global_input_simulator_manager
+    from utils.input_simulation.mode_utils import is_plugin_input_backend
+    from utils.runtime_config import get_runtime_config
 
-    支持前台模式（使用驱动）和后台模式（使用 Win32 消息）
-
-    Args:
-        hwnd: 目标窗口句柄
-        path_points: 路径点列表，格式: [(x1, y1), (x2, y2), (x3, y3), ...]
-        duration: 总持续时间（秒）
-        execution_mode: 执行模式 ('foreground', 'foreground_*', 'background', 'background_*')
-        timestamps: 时间戳列表（秒），如果提供则按时间戳执行精确回放
-
-    Returns:
-        bool: 是否执行成功
-    """
     try:
-        import win32gui, win32con, win32api
-        import time
-
-        if not path_points or len(path_points) < 2:
-            logger.error("路径点数量不足，至少需要2个点")
-            return False
-
-        raw_button = button
-        button = _resolve_drag_button(raw_button)
-        if not button:
-            logger.error(f"原生路径拖拽按钮无效: {raw_button}")
-            return False
-
-        start_x, start_y = path_points[0]
-
-        # Determine if foreground mode should be used
-        use_foreground = execution_mode.startswith('foreground') if execution_mode else False
-        
-        def _format_execution_mode_name(mode: str) -> str:
-            if not mode:
-                return "未知"
-            mode = mode.strip().lower()
-            if mode == "foreground_driver":
-                return "前台一"
-            if mode == "foreground_py":
-                return "前台二"
-            if mode == "background_sendmessage":
-                return "后台一"
-            if mode == "background_postmessage":
-                return "后台二"
-            if mode.startswith("background"):
-                return "后台"
-            if mode.startswith("foreground"):
-                return "前台"
-            return mode
-        
-        mode_name = _format_execution_mode_name(execution_mode)
-        if use_foreground:
-            # 前台模式：使用驱动进行多点路径拖拽
-            logger.info(f"\u524d\u53f0\u9a71\u52a8\u6a21\u5f0f\u5b8c\u6574\u8def\u5f84\u62d6\u62fd({mode_name}): \u8d77\u70b9({start_x},{start_y}), {len(path_points)}\u4e2a\u70b9, \u603b\u65f6\u957f: {duration}\u79d2")
-            from utils.input_simulation.factory import InputSimulatorFactory
-
-            try:
-                simulator = InputSimulatorFactory.create_simulator(hwnd, execution_mode=execution_mode)
-                if not simulator:
-                    logger.error("无法创建输入模拟器")
-                    return False
-
-                # 前台驱动以屏幕坐标执行，拖拽点统一从客户区坐标转换
-                screen_path_points = _convert_client_path_to_screen(hwnd, path_points)
-
-                # 获取起点和终点
-                end_x, end_y = screen_path_points[-1]
-
-                # 使用多点路径拖拽 - 一次按下经过所有点最后松开
-                # 当有timestamps时，使用timestamps[-1]作为总时长；否则使用duration
-                actual_drag_duration = timestamps[-1] if (timestamps and len(timestamps) == len(path_points)) else duration
-                result = simulator.drag_path(
-                    screen_path_points,
-                    actual_drag_duration,
-                    button=button,
-                    timestamps=timestamps,
-                )
-                if result:
-                    logger.info(f"前台模式多点路径拖拽成功，通过 {len(path_points)} 个路径点")
-                    return True
-                else:
-                    logger.error("前台模式多点路径拖拽失败")
-                    return False
-
-            except Exception as foreground_error:
-                logger.error(f"前台驱动模式拖拽失败: {foreground_error}", exc_info=True)
-                return False
-
-        # 后台模式：使用 Win32 消息
-        logger.info(f"\u540e\u53f0\u6d88\u606f\u6a21\u5f0f\u5b8c\u6574\u8def\u5f84\u62d6\u62fd({mode_name}): \u8d77\u70b9({start_x},{start_y}), {len(path_points)}\u4e2a\u70b9, \u603b\u65f6\u957f: {duration}\u79d2")
-        use_simple_background = (execution_mode or "").strip().lower() == "background_postmessage"
-        send_fn = win32gui.PostMessage if use_simple_background else win32gui.SendMessage
-
-        button_message_map = {
-            "left": (
-                win32con.WM_LBUTTONDOWN,
-                win32con.WM_LBUTTONUP,
-                win32con.MK_LBUTTON,
-                "WM_LBUTTONDOWN",
-                "WM_LBUTTONUP",
-            ),
-            "right": (
-                win32con.WM_RBUTTONDOWN,
-                win32con.WM_RBUTTONUP,
-                win32con.MK_RBUTTON,
-                "WM_RBUTTONDOWN",
-                "WM_RBUTTONUP",
-            ),
-            "middle": (
-                win32con.WM_MBUTTONDOWN,
-                win32con.WM_MBUTTONUP,
-                win32con.MK_MBUTTON,
-                "WM_MBUTTONDOWN",
-                "WM_MBUTTONUP",
-            ),
-        }
-        down_msg, up_msg, move_wparam, down_msg_name, up_msg_name = button_message_map[button]
-
-        def _background_drag_sleep(wait_seconds: float) -> None:
-            """后台拖拽等待：优先让出CPU，避免多窗口并发时忙等抢占导致速度下降。"""
-            try:
-                wait_value = float(wait_seconds)
-            except Exception:
-                return
-            if wait_value <= 0:
-                return
-            time.sleep(wait_value)
-
-        # 多层级窗口查找：构建完整的窗口链并向所有层级发送消息
-        window_chain = [hwnd]  # 至少包含主窗口
-        window_coords = {}  # 存储每个窗口相对于自己客户区的坐标
-        window_screen_offsets = {}  # 存储窗口左上角屏幕坐标，避免每步重复GetWindowRect
+        if execution_mode not in {'foreground_driver', 'foreground_py', 'background_sendmessage', 'background_postmessage'}:
+            raise ValueError(f"不支持的拖拽执行模式：{execution_mode!r}")
+        path_points, _ = prepare_drag_path(path_points, duration, timestamps)
+        button = normalize_button(button)
+        plugin_backend = is_plugin_input_backend(get_runtime_config())
+        simulator = global_input_simulator_manager.create_temporary_simulator(
+            hwnd, execution_mode=execution_mode, device_id=device_id,
+        )
+        if simulator is None:
+            raise RuntimeError("无法创建所选输入模拟器")
         try:
-            from utils.window.enhanced_child_window_finder import EnhancedChildWindowFinder
-
-            finder = EnhancedChildWindowFinder()
-            screen_x, screen_y = win32gui.ClientToScreen(hwnd, (start_x, start_y))
-
-            # 查找完整的窗口链：find_deepest_child 返回 (deepest_hwnd, chain_list, client_coords)
-            deepest_hwnd, chain_dicts, client_coords = finder.find_deepest_child(hwnd, screen_x, screen_y)
-
-            if chain_dicts and len(chain_dicts) > 0:
-                # chain_dicts 是字典列表，每个字典包含 'hwnd' 等信息
-                window_chain = [c['hwnd'] for c in chain_dicts if 'hwnd' in c]
-                if window_chain:
-                    logger.info(f"[多层级查找] 找到 {len(window_chain)} 层窗口链，将向所有层级发送消息")
-                    # 为每个窗口计算相对于其客户区的坐标
-                    for i, w in enumerate(window_chain):
-                        logger.debug(f"  第{i+1}层: 0x{w:08X}")
-                        try:
-                            # 将屏幕坐标转换为该窗口的客户区坐标
-                            rect = win32gui.GetWindowRect(w)
-                            window_screen_offsets[w] = (int(rect[0]), int(rect[1]))
-                            client_x = screen_x - rect[0]
-                            client_y = screen_y - rect[1]
-                            window_coords[w] = (client_x, client_y)
-                            logger.debug(f"    坐标: ({client_x}, {client_y})")
-                        except Exception as e:
-                            logger.debug(f"    坐标转换失败: {e}，使用原始坐标")
-                            window_coords[w] = (start_x, start_y)
-                else:
-                    logger.info(f"[多层级查找] 链路为空，使用原始窗口: 0x{hwnd:08X}")
-                    window_coords[hwnd] = (start_x, start_y)
-            else:
-                logger.info(f"[多层级查找] 未找到多层窗口，使用原始窗口: 0x{hwnd:08X}")
-                window_coords[hwnd] = (start_x, start_y)
-                try:
-                    rect = win32gui.GetWindowRect(hwnd)
-                    window_screen_offsets[hwnd] = (int(rect[0]), int(rect[1]))
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.debug(f"[多层级查找] 失败: {e}，使用原始窗口")
-            window_chain = [hwnd]
-            window_coords[hwnd] = (start_x, start_y)
-            try:
-                rect = win32gui.GetWindowRect(hwnd)
-                window_screen_offsets[hwnd] = (int(rect[0]), int(rect[1]))
-            except Exception:
-                pass
-
-        # 按下鼠标（在起点）- 向所有层级发送（使用各自的坐标）
-        for target_hwnd in window_chain:
-            coord_x, coord_y = window_coords.get(target_hwnd, (start_x, start_y))
-            start_lparam = win32api.MAKELONG(coord_x, coord_y)
-            send_fn(target_hwnd, down_msg, move_wparam, start_lparam)
-            logger.debug(f"[{down_msg_name}] 发送到 0x{target_hwnd:08X}，坐标: ({coord_x}, {coord_y})")
-        _background_drag_sleep(0.01)
-
-        # 根据是否有时间戳，选择回放方式
-        if timestamps and len(timestamps) == len(path_points):
-            # 使用时间戳精确回放（60fps插值）
-            logger.info("使用时间戳进行精确回放")
-            total_steps = max(1, int(max(0.001, float(duration)) * 60.0))
-            last_time = 0.0
-
-            for step in range(1, total_steps + 1):
-                current_time = (step / total_steps) * duration
-
-                point_idx = 0
-                for i in range(len(timestamps) - 1):
-                    if timestamps[i] <= current_time <= timestamps[i + 1]:
-                        point_idx = i
-                        break
-                else:
-                    if current_time > timestamps[-1]:
-                        point_idx = len(timestamps) - 2
-
-                p1 = path_points[point_idx]
-                p2 = path_points[point_idx + 1]
-                t1, t2 = timestamps[point_idx], timestamps[point_idx + 1]
-
-                if t2 > t1:
-                    progress = (current_time - t1) / (t2 - t1)
-                else:
-                    progress = 0.0
-                progress = max(0.0, min(1.0, progress))
-
-                current_x = int(p1[0] + (p2[0] - p1[0]) * progress)
-                current_y = int(p1[1] + (p2[1] - p1[1]) * progress)
-
-                # 发送消息（需要包含按钮状态标志）- 向所有层级发送
-                screen_move_x, screen_move_y = win32gui.ClientToScreen(hwnd, (current_x, current_y))
-                for target_hwnd in window_chain:
-                    coord_x, coord_y = window_coords.get(target_hwnd, (current_x, current_y))
-                    # 使用缓存窗口偏移，避免每步调用GetWindowRect导致并发拖拽变慢
-                    offset = window_screen_offsets.get(target_hwnd)
-                    if offset is not None:
-                        coord_x = screen_move_x - offset[0]
-                        coord_y = screen_move_y - offset[1]
-                    move_lparam = win32api.MAKELONG(coord_x, coord_y)
-                    send_fn(target_hwnd, win32con.WM_MOUSEMOVE, move_wparam, move_lparam)
-
-                # 时间控制
-                time_delta = current_time - last_time
-                if time_delta > 0:
-                    _background_drag_sleep(time_delta)
-                    last_time = current_time
-        else:
-            # 无时间戳，均匀分配时间（60fps）
-            safe_duration = max(0.001, float(duration))
-            target_fps = 60.0
-            total_steps = max(1, int(safe_duration * target_fps))
-
-            for step in range(1, total_steps + 1):
-                progress = step / total_steps
-
-                # 找到当前进度对应的两个路径点
-                point_idx = int(progress * (len(path_points) - 1))
-                if point_idx >= len(path_points) - 1:
-                    point_idx = len(path_points) - 2
-
-                # 段内进度
-                segment_progress = (progress * (len(path_points) - 1)) - point_idx
-
-                p1 = path_points[point_idx]
-                p2 = path_points[point_idx + 1]
-
-                current_x = int(p1[0] + (p2[0] - p1[0]) * segment_progress)
-                current_y = int(p1[1] + (p2[1] - p1[1]) * segment_progress)
-
-                # 发送消息（需要包含按钮状态标志）- 向所有层级发送
-                screen_move_x, screen_move_y = win32gui.ClientToScreen(hwnd, (current_x, current_y))
-                for target_hwnd in window_chain:
-                    coord_x, coord_y = window_coords.get(target_hwnd, (current_x, current_y))
-                    # 使用缓存窗口偏移，避免每步调用GetWindowRect导致并发拖拽变慢
-                    offset = window_screen_offsets.get(target_hwnd)
-                    if offset is not None:
-                        coord_x = screen_move_x - offset[0]
-                        coord_y = screen_move_y - offset[1]
-                    move_lparam = win32api.MAKELONG(coord_x, coord_y)
-                    send_fn(target_hwnd, win32con.WM_MOUSEMOVE, move_wparam, move_lparam)
-
-                # 时间控制
-                _background_drag_sleep(safe_duration / total_steps)
-
-        # 释放鼠标（在终点）- 向所有层级发送
-        end_x, end_y = path_points[-1]
-        screen_end_x, screen_end_y = win32gui.ClientToScreen(hwnd, (end_x, end_y))
-        for target_hwnd in window_chain:
-            coord_x, coord_y = window_coords.get(target_hwnd, (end_x, end_y))
-            # 使用缓存窗口偏移，避免每步调用GetWindowRect导致并发拖拽变慢
-            offset = window_screen_offsets.get(target_hwnd)
-            if offset is not None:
-                coord_x = screen_end_x - offset[0]
-                coord_y = screen_end_y - offset[1]
-            end_lparam = win32api.MAKELONG(coord_x, coord_y)
-            send_fn(target_hwnd, up_msg, 0, end_lparam)
-            logger.debug(f"[{up_msg_name}] 发送到 0x{target_hwnd:08X}，坐标: ({coord_x}, {coord_y})")
-        _background_drag_sleep(0.01)
-
-        logger.info(f"\u540e\u53f0\u6d88\u606f\u6a21\u5f0f\u5b8c\u6574\u8def\u5f84\u62d6\u62fd\u5b8c\u6210({mode_name})\uff0c\u7ec8\u70b9: ({end_x},{end_y})")
-        return True
-
-    except Exception as e:
-        logger.error(f"\u540e\u53f0\u6d88\u606f\u6a21\u5f0f\u5b8c\u6574\u8def\u5f84\u62d6\u62fd\u6267\u884c\u5931\u8d25({mode_name}): {e}", exc_info=True)
-        # 紧急释放鼠标
-        try:
-            end_x, end_y = path_points[-1]
-            end_lparam = win32api.MAKELONG(end_x, end_y)
-            send_fn(hwnd, up_msg, 0, end_lparam)
-        except Exception:
-            pass
+            if not plugin_backend and execution_mode.startswith('foreground'):
+                path_points = _convert_client_path_to_screen(hwnd, path_points)
+            return bool(simulator.drag_path(path_points, duration, button=button, timestamps=timestamps))
+        finally:
+            global_input_simulator_manager.close_simulator(simulator)
+    except Exception as exc:
+        logger.error(f"路径拖拽执行失败：{exc}", exc_info=True)
         return False
 
 
@@ -3198,56 +2691,39 @@ def _show_no_images_found_dialog(image_paths: list) -> None:
     logger.warning(f"未找到有效的图片路径，收到的路径列表: {image_paths}")
 
 
-def _get_ocr_results_from_context(card_id: Optional[int]) -> Optional[list]:
-    """从工作流上下文获取OCR识别结果"""
-    try:
-        from task_workflow.workflow_context import get_workflow_context
-        context = get_workflow_context()
-        if card_id is not None:
-            results = context.get_ocr_results(card_id)
-            if results:
-                return results
-        return context.get_latest_ocr_results()
-    except Exception as e:
-        logger.debug(f"获取OCR结果失败: {e}")
-        return None
+def _get_ocr_results_from_context(card_id: int) -> list:
+    """读取明确选定的OCR卡片，不补读其他卡片。"""
+    from task_workflow.workflow_context import get_workflow_context
+    if card_id is None:
+        raise RuntimeError("OCR来源卡片未知")
+    return get_workflow_context().get_ocr_results(card_id)
 
 
-def _get_ocr_target_text_from_context(card_id: Optional[int]) -> Tuple[Optional[str], str]:
-    """从工作流上下文获取OCR目标文本和匹配模式"""
-    try:
-        from task_workflow.workflow_context import get_workflow_context
-        context = get_workflow_context()
-        candidates = []
-        if card_id is not None:
-            candidates.append(card_id)
-        latest_ocr_card_id = context.get_latest_ocr_card_id()
-        if latest_ocr_card_id is not None and latest_ocr_card_id not in candidates:
-            candidates.append(latest_ocr_card_id)
-
-        target_text = None
-        match_mode = None
-        for ocr_card_id in candidates:
-            target_text = context.get_card_data(ocr_card_id, 'ocr_target_text')
-            match_mode = context.get_card_data(ocr_card_id, 'ocr_match_mode')
-            if target_text:
-                break
-
-        if not match_mode:
-            match_mode = '包含'
-        return target_text, match_mode
-    except Exception as e:
-        logger.debug(f"获取OCR目标文本失败: {e}")
-        return None, '包含'
+def _get_ocr_target_text_from_context(card_id: int) -> Tuple[str, str]:
+    """读取同一来源的目标文字和匹配模式，缺失时失败。"""
+    from task_workflow.workflow_context import get_workflow_context
+    if card_id is None:
+        raise RuntimeError("OCR来源卡片未知")
+    context = get_workflow_context()
+    target_text = context.get_card_data(card_id, 'ocr_target_text')
+    match_mode = context.get_card_data(card_id, 'ocr_match_mode')
+    if not isinstance(target_text, str) or not target_text:
+        raise ValueError("OCR目标文字缺失或无效")
+    if match_mode not in {'完全匹配', '包含'}:
+        raise ValueError("OCR匹配模式缺失或无效")
+    return target_text, match_mode
 
 
 def _find_matching_text_in_ocr_results(ocr_results: list, target_text: str, match_mode: str) -> Optional[dict]:
     """在OCR结果中查找匹配的文本"""
     if not ocr_results or not target_text:
         return None
-
+    if not isinstance(ocr_results, list) or any(not isinstance(result, dict) or not isinstance(result.get('text'), str) for result in ocr_results):
+        raise ValueError("OCR结果必须是含文字字段的字典列表")
+    if match_mode not in {'完全匹配', '包含'}:
+        raise ValueError(f"不支持的OCR匹配模式：{match_mode!r}")
     for result in ocr_results:
-        result_text = result.get('text', '') if isinstance(result, dict) else str(result)
+        result_text = result['text']
 
         if match_mode == '完全匹配':
             if result_text == target_text:
@@ -3257,85 +2733,26 @@ def _find_matching_text_in_ocr_results(ocr_results: list, target_text: str, matc
                 return result
 
     return None
-def _calculate_click_position(bbox: tuple, position_mode: str, offset_x: int = 0, offset_y: int = 0) -> Tuple[int, int]:
-    """根据边界框和位置模式计算点击位置"""
-    if not bbox or len(bbox) < 4:
-        return 0, 0
-
-    points = []
-    try:
-        if isinstance(bbox[0], (list, tuple)):
-            for point in bbox:
-                if not isinstance(point, (list, tuple)) or len(point) < 2:
-                    continue
-                points.append((float(point[0]), float(point[1])))
-        else:
-            flat_values = [float(value) for value in bbox]
-            pair_count = len(flat_values) // 2
-            for index in range(pair_count):
-                points.append((flat_values[index * 2], flat_values[index * 2 + 1]))
-    except Exception:
-        return 0, 0
-
-    if not points:
-        return 0, 0
-
-    xs = [point[0] for point in points]
-    ys = [point[1] for point in points]
-    x1 = min(xs)
-    y1 = min(ys)
-    x2 = max(xs)
-    y2 = max(ys)
-
-    if position_mode == '中心':
-        click_x = int((x1 + x2) / 2) + offset_x
-        click_y = int((y1 + y2) / 2) + offset_y
-    elif position_mode == '左上角':
-        click_x = x1 + offset_x
-        click_y = y1 + offset_y
-    elif position_mode == '右下角':
-        click_x = x2 + offset_x
-        click_y = y2 + offset_y
-    else:  # 默认精准点击为中心
-        click_x = int((x1 + x2) / 2) + offset_x
-        click_y = int((y1 + y2) / 2) + offset_y
-
-    return click_x, click_y
+def _calculate_click_position(bbox: list) -> Tuple[int, int]:
+    """从现行的扁平八坐标边界框计算文字中心。"""
+    if not isinstance(bbox, list) or len(bbox) != 8 or any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+        for value in bbox
+    ):
+        raise ValueError("文字边界框必须是8个有限坐标值的列表")
+    xs, ys = bbox[::2], bbox[1::2]
+    return int((min(xs) + max(xs)) / 2), int((min(ys) + max(ys)) / 2)
 
 
-def _get_ocr_card_id_from_context(card_id: Optional[int]) -> Optional[int]:
-    """从工作流上下文获取OCR卡片ID"""
-    try:
-        from task_workflow.workflow_context import get_workflow_context
-        context = get_workflow_context()
-        ocr_card_id = context.get_card_data(card_id, 'ocr_card_id')
-        return ocr_card_id
-    except Exception as e:
-        logger.debug(f"获取OCR卡片ID失败: {e}")
-        return card_id
-
-
-def _get_clicked_text_from_context(card_id: Optional[int]) -> Optional[str]:
-    """从工作流上下文获取已点击的文本"""
-    try:
-        from task_workflow.workflow_context import get_workflow_context
-        context = get_workflow_context()
-        clicked_text = context.get_card_data(card_id, 'clicked_text')
-        return clicked_text
-    except Exception as e:
-        logger.debug(f"获取已点击文本失败: {e}")
-        return None
-
-
-def test_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
+def preview_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
     """测试图像识别功能（调用统一测试模块）"""
     try:
-        from tasks.image_match_probe import test_image_recognition as unified_test
+        from tasks.image_match_probe import preview_image_recognition as unified_test
         unified_test(params, target_hwnd, main_window, parameter_panel)
     except Exception as e:
         logger.error(f"测试图像识别失败: {e}", exc_info=True)
 
-def test_color_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
+def preview_color_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
     """测试找色识别功能（复用找色执行链路，仅识别不点击）。"""
     def restore_windows():
         try:

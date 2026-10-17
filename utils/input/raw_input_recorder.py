@@ -101,6 +101,9 @@ def _init_winapi_prototypes():
     kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
+    user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+    user32.UnregisterClassW.restype = wintypes.BOOL
+
     user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
     user32.RegisterClassExW.restype = wintypes.ATOM
 
@@ -158,6 +161,7 @@ class RawInputRecorder:
         self.hwnd = None
         self._thread = None
         self._message_window_class = None
+        self._message_window_class_name = None
         self._init_success = False  # 初始化成功标志
         self._init_event = threading.Event()  # 初始化完成事件
 
@@ -302,12 +306,24 @@ class RawInputRecorder:
                 except Exception:
                     pass
                 self.hwnd = None
+            class_name = self._message_window_class_name
+            if class_name:
+                try:
+                    user32.UnregisterClassW(
+                        class_name,
+                        kernel32.GetModuleHandleW(None),
+                    )
+                except Exception:
+                    pass
+            self._message_window_class = None
+            self._message_window_class_name = None
 
     def _create_message_window(self):
         """创建隐藏的消息窗口"""
         try:
             # 窗口类名
             class_name = f"RawInputRecorder_{id(self)}"
+            self._message_window_class_name = class_name
             logger.debug(f"[Raw Input] 准备创建消息窗口，类名: {class_name}")
 
             # 定义窗口过程

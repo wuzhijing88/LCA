@@ -2,6 +2,8 @@ import logging
 
 from PySide6.QtWidgets import QDialog
 
+from ui.dialogs.dialog_manager import get_dialog_manager
+
 from app_core.config_sections import DEFAULT_HOTKEYS
 from utils.plugin.settings_sync import (
     diff_plugin_settings,
@@ -44,11 +46,7 @@ def _sync_foreground_input_runtime(config: dict) -> None:
     global_input_simulator_manager.set_default_execution_mode(execution_mode)
 
     if not is_foreground_mode(execution_mode) or is_plugin_input_backend(config):
-        reset_runtime = getattr(foreground_input, "reset_runtime", None)
-        if callable(reset_runtime):
-            reset_runtime()
-        else:  # 兼容旧版管理器/测试替身
-            foreground_input.close()
+        foreground_input.reset_runtime()
         global_input_simulator_manager.clear_cache()
         return
 
@@ -75,6 +73,9 @@ def _sync_foreground_input_runtime(config: dict) -> None:
 _RUNTIME_RECYCLE_KEYS = (
     "execution_mode",
     "native_execution_mode",
+    "background_hierarchy_broadcast",
+    "background_fake_active",
+    "background_block_physical_mouse",
     "operation_mode",
     "input_backend",
     "foreground_mouse_driver_backend",
@@ -99,17 +100,9 @@ class MainWindowGlobalSettingsMixin:
         show_and_activate_overlay(dialog, log_prefix='全局设置对话框', focus=True)
     def _on_global_settings_finished(self, dialog, result):
         """全局设置对话框结束后的处理"""
-        try:
-            if result == QDialog.DialogCode.Accepted:
-                settings = dialog.get_settings()
-                self._apply_global_settings(settings)
-        finally:
-            if self._global_settings_dialog is dialog:
-                self._global_settings_dialog = None
-            if hasattr(dialog, "request_delete"):
-                dialog.request_delete()
-            else:
-                dialog.deleteLater()
+        if result == QDialog.DialogCode.Accepted:
+            settings = dialog.get_settings()
+            self._apply_global_settings(settings)
     def _apply_global_settings(self, settings: dict):
         """应用全局设置对话框返回的配置"""
         logger.info(f"GlobalSettingsDialog 返回的 bound_windows: {len(settings.get('bound_windows', []))} 个")
@@ -243,12 +236,9 @@ class MainWindowGlobalSettingsMixin:
         parameter_panel_snap_enabled = settings.get('enable_parameter_panel_snap', True)
         self.enable_card_snap = settings.get('enable_card_snap', True)
         self.enable_parameter_panel_snap = parameter_panel_snap_enabled
-        self.enable_floating_status_window = settings.get('enable_floating_status_window', True)
         self.enable_connection_line_animation = settings.get('enable_connection_line_animation', True)
         if hasattr(self, 'parameter_panel') and self.parameter_panel:
             self.parameter_panel.set_snap_to_parent_enabled(parameter_panel_snap_enabled)
-        if hasattr(self, '_floating_controller') and self._floating_controller:
-            self._floating_controller.set_enabled(self.enable_floating_status_window)
         if hasattr(self, '_set_line_animation_paused'):
             self._set_line_animation_paused("user_setting", not self.enable_connection_line_animation)
         # 用户在前台模式中选择 Interception 后，必须再次明确同意才能安装。
@@ -329,21 +319,14 @@ class MainWindowGlobalSettingsMixin:
                     "任务运行期间不能修改全局设置，请先停止任务。",
                 )
                 return
-            if self._global_settings_dialog is not None:
-                dialog = self._global_settings_dialog
-                if dialog.isVisible():
-                    self._present_global_settings_dialog(dialog)
-                    return
-                self._present_global_settings_dialog(dialog)
-                return
             logger.info(f"打开全局设置前，MainWindow.config 中的 bound_windows: {len(self.config.get('bound_windows', []))} 个")
-            dialog = GlobalSettingsDialog(
-                self.config,
-                self
+            get_dialog_manager(self).show(
+                "global_settings",
+                lambda: GlobalSettingsDialog(self.config, self),
+                present=self._present_global_settings_dialog,
+                on_finished=self._on_global_settings_finished,
+                dispose=lambda dialog: dialog.request_delete(),
             )
-            self._global_settings_dialog = dialog
-            dialog.finished.connect(lambda result, dlg=dialog: self._on_global_settings_finished(dlg, result))
-            self._present_global_settings_dialog(dialog)
         except Exception as e:
             logging.error(f"打开全局设置对话框时出错: {e}")
             try:
@@ -355,10 +338,4 @@ class MainWindowGlobalSettingsMixin:
                     context="打开全局设置"
                 )
             except Exception as dialog_error:
-                logging.error(f"显示错误对话框失败: {dialog_error}")
-                # 回退到标准消息框
-                try:
-                    from PySide6.QtWidgets import QMessageBox
-                    QMessageBox.critical(self, "错误", f"打开全局设置失败: {e}\n\n{dialog_error}")
-                except Exception:
-                    pass
+                raise RuntimeError(f"显示设置错误对话框失败: {dialog_error}") from dialog_error

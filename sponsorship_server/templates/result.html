@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card result"><span class="result-symbol" aria-hidden="true">{{ '♡' if confirmed else '…' }}</span><p class="eyebrow">{{ '每一份支持，都有回响' if confirmed else '赞助状态' }}</p><h1>{{ '谢谢你的支持！' if confirmed else '赞助提示' }}</h1><p class="result-description" role="status">{{ message }}</p>
+{% if retry %}<p class="hint">请稍后刷新本页重新核实，无需重复付款。</p>{% endif %}
+<a class="button primary" href="/#thanks">{{ '查看赞助感谢墙' if confirmed else '返回赞助首页' }} <span aria-hidden="true">↗</span></a></section>
+{% endblock %}

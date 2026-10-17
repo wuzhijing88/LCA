@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+from .click_param_resolver import safe_non_negative_float, safe_positive_int
 
 from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
@@ -42,17 +43,14 @@ class ForegroundDriverSimulatorAdapter:
     ) -> bool:
         if not hasattr(self._driver, "click_mouse"):
             raise AttributeError("驱动不支持click_mouse方法")
-        try:
-            safe_duration = max(0.0, float(duration))
-        except Exception:
-            safe_duration = 0.0
+        safe_duration = safe_non_negative_float(duration)
         return bool(
             self._driver.click_mouse(
                 x=int(x),
                 y=int(y),
                 button=button,
-                clicks=int(clicks),
-                interval=float(interval),
+                clicks=safe_positive_int(clicks),
+                interval=safe_non_negative_float(interval),
                 duration=safe_duration,
             )
         )
@@ -65,38 +63,10 @@ class ForegroundDriverSimulatorAdapter:
         interval: Optional[float] = None,
         hold_duration: Optional[float] = None,
     ) -> bool:
-        native = getattr(self._driver, "double_click", None)
-        if callable(native):
-            try:
-                return bool(
-                    native(
-                        int(x),
-                        int(y),
-                        button=button,
-                        interval=interval,
-                        hold_duration=hold_duration,
-                    )
-                )
-            except TypeError:
-                return bool(native(int(x), int(y), button))
         if not hasattr(self._driver, "click_mouse"):
             raise AttributeError("驱动不支持click_mouse方法")
-        try:
-            safe_interval = (
-                DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
-                if interval is None
-                else max(0.0, float(interval))
-            )
-        except Exception:
-            safe_interval = DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
-        try:
-            safe_hold = (
-                DEFAULT_CLICK_HOLD_SECONDS
-                if hold_duration is None
-                else max(0.0, float(hold_duration))
-            )
-        except Exception:
-            safe_hold = DEFAULT_CLICK_HOLD_SECONDS
+        safe_interval = DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS if interval is None else safe_non_negative_float(interval)
+        safe_hold = DEFAULT_CLICK_HOLD_SECONDS if hold_duration is None else safe_non_negative_float(hold_duration)
         return bool(
             self._driver.click_mouse(
                 x=int(x),

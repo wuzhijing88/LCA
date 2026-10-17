@@ -131,7 +131,9 @@ def _read_plugin_config() -> dict:
     }
 
 
-_PLUGIN_RUNTIME_FILES = ("PluginHost.exe", "dm.dll", "RegDll.dll")
+# 免注册 COM 激活只需要宿主和 dm.dll。RegDll.dll 是厂商提供的旧注册工具，
+# 宿主通过 dm.dll 的 DllGetClassObject 创建对象，从不加载或调用该工具。
+_PLUGIN_RUNTIME_FILES = ("PluginHost.exe", "dm.dll")
 _PE_MACHINE_I386 = 0x014C
 _PE_MACHINE_AMD64 = 0x8664
 _PE_MACHINE_ARM64 = 0xAA64
@@ -367,12 +369,10 @@ class PluginClient:
 
     def is_bind(self, hwnd: int) -> bool:
         """问大漠该窗口当前是否仍处于绑定状态（宿主缓存与实际不一致时以此为准）。"""
-        try:
-            result = self._rpc.call("is_bind", hwnd=int(hwnd))
-        except Exception:
-            logger.debug("plugin is_bind failed", exc_info=True)
-            return False
-        return bool(isinstance(result, dict) and result.get("bound"))
+        result = self._rpc.call("is_bind", hwnd=int(hwnd))
+        if not isinstance(result, dict) or not isinstance(result.get("bound"), bool):
+            raise ValueError("插件绑定状态返回值无效")
+        return result["bound"]
 
     def fake_active(self, hwnd: int, enable: bool) -> bool:
         return bool(self._rpc.call("fake_active", hwnd=int(hwnd), enable=bool(enable)))
@@ -380,7 +380,9 @@ class PluginClient:
     def stats(self) -> dict:
         """宿主对象池统计：slots（绑定中的窗口数）、free（空闲对象）、registrations（累计 Reg 次数）。"""
         result = self._rpc.call("stats")
-        return dict(result) if isinstance(result, dict) else {}
+        if not isinstance(result, dict):
+            raise ValueError("插件对象池统计返回值无效")
+        return dict(result)
 
     def send_string(self, hwnd: int, text: str, ime: bool = False, target: int = 0) -> bool:
         """hwnd 选择绑定该窗口的 dm 对象；target 为实际收字的（子）窗口，缺省即 hwnd。"""
@@ -447,10 +449,10 @@ class PluginClient:
         return self._rpc.call("memory_call", operation=name, hwnd=int(hwnd), **arguments)
 
     def last_error(self, hwnd: int = 0) -> int:
-        try:
-            return int(self._rpc.call("last_error", hwnd=int(hwnd or 0)) or 0)
-        except Exception:
-            return 0
+        result = self._rpc.call("last_error", hwnd=int(hwnd or 0))
+        if isinstance(result, bool) or not isinstance(result, int):
+            raise ValueError("插件错误码返回值无效")
+        return result
 
     def close(self) -> None:
         """共享宿主由主进程预热并复用，关闭客户端不断开、也不 shutdown。"""
@@ -761,10 +763,9 @@ def _call_rpc_with_timeout(
         except Exception as exc:  # noqa: BLE001
             box["err"] = exc
 
-    try:
-        wait_seconds = max(0.05, float(timeout))
-    except (TypeError, ValueError):
-        wait_seconds = PLUGIN_INIT_TIMEOUT
+    wait_seconds = float(timeout)
+    if not 0 < wait_seconds < float("inf"):
+        raise ValueError("插件调用超时必须是有限正数")
     worker = threading.Thread(target=_worker, name=f"plugin-{method}", daemon=True)
     worker.start()
     worker.join(wait_seconds)
@@ -958,7 +959,7 @@ def probe_plugin_authorization(
         return AuthProbeResult(False, "未填写插件注册码")
     directory = find_plugin_dir()
     if directory is None:
-        return AuthProbeResult(False, "插件运行库不可用：安装目录 tools/plugin 缺少 PluginHost.exe / dm.dll / RegDll.dll")
+        return AuthProbeResult(False, "插件运行库不可用：安装目录 tools/plugin 缺少 PluginHost.exe / dm.dll")
     arch_problem = check_plugin_runtime_arch(directory)
     if arch_problem:
         return AuthProbeResult(False, arch_problem)
@@ -992,30 +993,21 @@ def probe_plugin_authorization(
                 "插件宿主未使用免注册加载（activation_mode=%s）；请更新 tools/plugin/PluginHost.exe"
                 % (activation_mode or "unknown")
             )
-        version = ""
-        try:
-            version = str(_call_rpc_with_timeout(rpc, 3.0, "version") or "")
-        except Exception as exc:
-            logger.debug("读取插件版本失败: %s", exc)
-        try:
-            _call_rpc_with_timeout(rpc, 2.0, "shutdown")
-        except Exception:
-            pass
-        suffix = f"，dm 版本 {version}" if version else ""
-        return AuthProbeResult(True, f"授权通过（免注册加载，Ver + Reg{suffix}）", version)
+        version = str(_call_rpc_with_timeout(rpc, 3.0, "version") or "").strip()
+        if not version:
+            raise RuntimeError("插件版本读取结果为空")
+        _call_rpc_with_timeout(rpc, 2.0, "shutdown")
+        return AuthProbeResult(True, f"授权通过（免注册加载，Ver + Reg，dm 版本 {version}）", version)
     except Exception as exc:
         return AuthProbeResult(False, str(exc) or exc.__class__.__name__)
     finally:
-        if pipe_file is not None:
-            try:
+        try:
+            if pipe_file is not None:
                 pipe_file.close()
-            except Exception:
-                pass
-        if proc is not None:
-            try:
-                proc.wait(timeout=1.5)
-            except Exception:
+        finally:
+            if proc is not None:
                 try:
+                    proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
                     proc.kill()
-                except Exception:
-                    pass
+                    proc.wait(timeout=2.0)

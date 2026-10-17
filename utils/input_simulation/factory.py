@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 import os
+import math
 from typing import Optional, Dict, Tuple, List
 from utils.runtime_config import get_runtime_config
 from .base import BaseInputSimulator, InputSimulatorType
@@ -15,9 +16,12 @@ from .mode_utils import (
     get_foreground_driver,
     is_foreground_mode,
     is_plugin_input_backend,
+    parse_background_options,
+    physical_mouse_block_targets,
 )
 
 logger = logging.getLogger(__name__)
+SimulatorCacheKey = Tuple[int, int, str, str, Optional[str], str, Tuple[bool, bool], tuple]
 
 
 class SimulatorBackend:
@@ -37,7 +41,7 @@ class InputSimulatorFactory:
     def create_simulator(
         hwnd: int,
         operation_mode: str = "auto",
-        execution_mode: str = "background",
+        execution_mode: str = "background_sendmessage",
         backend: str = SimulatorBackend.AUTO,
         device_id: Optional[str] = None
     ) -> Optional[BaseInputSimulator]:
@@ -46,8 +50,8 @@ class InputSimulatorFactory:
 
         Args:
             hwnd: 窗口句柄
-            operation_mode: 操作模式 ("standard_window", "emulator_window", "auto")
-            execution_mode: 执行模式 (支持: "foreground", "foreground_*", "background", "background_*", "emulator_*")
+            operation_mode: 操作模式 ("standard_window", "auto")
+            execution_mode: 原生前台或后台运行方式
             backend: 后端类型
                 - "auto": 使用原生输入实现
                 - "native": 强制使用原生输入实现
@@ -61,6 +65,8 @@ class InputSimulatorFactory:
         """
         # 延迟导入避免循环依赖
 
+        if operation_mode not in {"auto", "standard_window"}:
+            raise ValueError(f"不支持的输入操作模式：{operation_mode!r}")
         if not hwnd:
             logger.error("窗口句柄无效（为空）")
             return None
@@ -76,29 +82,26 @@ class InputSimulatorFactory:
         if backend not in (SimulatorBackend.AUTO, SimulatorBackend.NATIVE):
             raise BackendNotAvailableError(f"不支持的输入后端: {backend!r}")
 
-        if is_plugin_input_backend(get_runtime_config()):
+        config = get_runtime_config()
+        if is_plugin_input_backend(config):
             from .plugin_simulator import PluginInputSimulator
 
             return PluginInputSimulator(hwnd)
-        return InputSimulatorFactory._create_native_simulator(
-            hwnd, operation_mode, execution_mode, device_id=device_id
-        )
+        return InputSimulatorFactory._create_native_simulator(hwnd, execution_mode, config)
 
     @staticmethod
     def _create_native_simulator(
         hwnd: int,
-        operation_mode: str,
         execution_mode: str,
-        device_id: Optional[str] = None
+        config: dict,
     ) -> Optional[BaseInputSimulator]:
         """
         创建原生模式模拟器
 
         Args:
             hwnd: 窗口句柄
-            operation_mode: 操作模式
             execution_mode: 执行模式
-            device_id: 目标设备ID (多设备支持)
+            config: 本次创建使用的输入配置
 
         Returns:
             原生模式模拟器实例
@@ -106,13 +109,15 @@ class InputSimulatorFactory:
         from .standard_window import StandardWindowInputSimulator
 
         use_foreground = is_foreground_mode(execution_mode)
-        foreground_driver = get_foreground_driver(execution_mode)
+        foreground_driver = get_foreground_driver(execution_mode) if use_foreground else "interception"
+        hierarchy_broadcast, fake_active = parse_background_options(config)
         return StandardWindowInputSimulator(
             hwnd,
             use_foreground=use_foreground,
             foreground_driver=foreground_driver,
-            enable_deep_child_search=True,
-            enable_activation_sequence=True,
+            enable_activation_sequence=fake_active,
+            background_hierarchy_broadcast=hierarchy_broadcast,
+            physical_mouse_block_targets=physical_mouse_block_targets(config, hwnd, execution_mode),
             enable_message_guard=True,
             execution_mode=execution_mode
         )
@@ -128,10 +133,12 @@ class GlobalInputSimulatorManager:
 
     def __init__(self):
         self._default_operation_mode = "auto"
-        self._default_execution_mode = "background"  # 恢复默认值
-        self._simulators: Dict[Tuple[int, int, str, str, Optional[str], str], BaseInputSimulator] = {}
-        self._simulator_access_ts: Dict[Tuple[int, int, str, str, Optional[str], str], float] = {}
+        self._default_execution_mode = "background_sendmessage"
+        self._simulators: Dict[SimulatorCacheKey, BaseInputSimulator] = {}
+        self._simulator_access_ts: Dict[SimulatorCacheKey, float] = {}
         self._lock = threading.Lock()  # 线程锁，保护缓存字典
+        self._close_lock = threading.Lock()
+        self._failed_closes: List[BaseInputSimulator] = []
         self._enable_cache = True  # 是否启用缓存（可在并发场景禁用）
         self._max_cache_size = self._read_int_env(
             "LCA_INPUT_SIM_CACHE_MAX_SIZE",
@@ -160,12 +167,10 @@ class GlobalInputSimulatorManager:
             return default
         try:
             parsed_value = int(raw_value)
-        except (TypeError, ValueError):
-            return default
-        if parsed_value < min_value:
-            return min_value
-        if parsed_value > max_value:
-            return max_value
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"环境变量 {name} 必须是整数") from exc
+        if not min_value <= parsed_value <= max_value:
+            raise ValueError(f"环境变量 {name} 必须在 {min_value} 到 {max_value} 之间")
         return parsed_value
 
     @staticmethod
@@ -175,26 +180,37 @@ class GlobalInputSimulatorManager:
             return default
         try:
             parsed_value = float(raw_value)
-        except (TypeError, ValueError):
-            return default
-        if parsed_value < min_value:
-            return min_value
-        if parsed_value > max_value:
-            return max_value
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"环境变量 {name} 必须是数字") from exc
+        if not math.isfinite(parsed_value) or not min_value <= parsed_value <= max_value:
+            raise ValueError(f"环境变量 {name} 必须在 {min_value} 到 {max_value} 之间")
         return parsed_value
 
-    @staticmethod
-    def _safe_close_simulator(simulator: BaseInputSimulator) -> None:
-        close_fn = getattr(simulator, "close", None)
-        if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:
-                pass
+    def create_temporary_simulator(self, hwnd: int, execution_mode: str, device_id=None):
+        """创建动作结束即关闭的实例，旧输入状态未释放时禁止开始新动作。"""
+        self._close_simulators([])
+        return InputSimulatorFactory.create_simulator(
+            hwnd, execution_mode=execution_mode, device_id=device_id,
+        )
+
+    def close_simulator(self, simulator: BaseInputSimulator) -> None:
+        """关闭临时实例；释放失败也交由同一管理器保留并重试。"""
+        self._close_simulators([simulator])
 
     def _close_simulators(self, simulators: List[BaseInputSimulator]) -> None:
-        for simulator in simulators:
-            self._safe_close_simulator(simulator)
+        with self._close_lock:
+            pending = {id(simulator): simulator for simulator in [*self._failed_closes, *simulators]}
+            self._failed_closes.clear()
+            errors = []
+            for simulator in pending.values():
+                try:
+                    simulator.close()
+                except Exception as exc:
+                    logger.error("关闭输入实例失败", exc_info=True)
+                    self._failed_closes.append(simulator)
+                    errors.append(str(exc))
+            if errors:
+                raise RuntimeError("输入实例释放失败：" + "；".join(errors))
 
     @staticmethod
     def _is_window_valid(hwnd: int) -> bool:
@@ -210,7 +226,7 @@ class GlobalInputSimulatorManager:
         self._last_cache_cleanup_ts = time.monotonic()
         return simulators
 
-    def _evict_cache_keys_unlocked(self, keys: List[Tuple[int, int, str, str, Optional[str], str]]) -> List[BaseInputSimulator]:
+    def _evict_cache_keys_unlocked(self, keys: List[SimulatorCacheKey]) -> List[BaseInputSimulator]:
         removed: List[BaseInputSimulator] = []
         for key in keys:
             simulator = self._simulators.pop(key, None)
@@ -271,7 +287,7 @@ class GlobalInputSimulatorManager:
 
     def set_default_operation_mode(self, mode: str):
         """设置默认操作模式"""
-        if mode in [InputSimulatorType.STANDARD_WINDOW, InputSimulatorType.EMULATOR_WINDOW, "auto"]:
+        if mode in [InputSimulatorType.STANDARD_WINDOW, "auto"]:
             simulators_to_close: List[BaseInputSimulator] = []
             with self._lock:
                 self._default_operation_mode = mode
@@ -281,12 +297,11 @@ class GlobalInputSimulatorManager:
                 self._close_simulators(simulators_to_close)
             logger.info(f"默认操作模式已设置为: {mode}")
         else:
-            logger.warning(f"无效的操作模式: {mode}")
+            raise ValueError(f"无效的操作模式：{mode!r}")
 
     def set_default_execution_mode(self, mode: str):
         """设置默认执行模式"""
-        valid_modes = ["foreground", "background"]
-        if mode in valid_modes or mode.startswith('foreground') or mode.startswith('background'):
+        if mode in {"foreground_driver", "foreground_py", "background_sendmessage", "background_postmessage"}:
             simulators_to_close: List[BaseInputSimulator] = []
             with self._lock:
                 self._default_execution_mode = mode
@@ -296,7 +311,7 @@ class GlobalInputSimulatorManager:
                 self._close_simulators(simulators_to_close)
             logger.info(f"默认执行模式已设置为: {mode}")
         else:
-            logger.warning(f"无效的执行模式: {mode}")
+            raise ValueError(f"无效的执行模式：{mode!r}")
 
     def get_simulator(self, hwnd: int, operation_mode: Optional[str] = None,
                      execution_mode: Optional[str] = None, device_id: Optional[str] = None) -> Optional[BaseInputSimulator]:
@@ -309,21 +324,17 @@ class GlobalInputSimulatorManager:
             hwnd: 窗口句柄
             operation_mode: 操作模式，None使用默认值
             execution_mode: 执行模式，None使用默认值
-                          支持模式: 'foreground', 'background'
+                          支持前台一、前台二、后台一和后台二的现行模式名
             device_id: 目标设备ID (多设备支持)
 
         Returns:
             BaseInputSimulator: 输入模拟器实例
         """
         # 使用默认值
+        self._close_simulators([])
         if operation_mode is None:
             operation_mode = self._default_operation_mode
         if execution_mode is None:
-            # 如果没有指定执行模式，使用默认值
-            # 如果默认值也是None，说明需要调用方明确指定，抛出警告
-            if self._default_execution_mode is None:
-                logger.error("execution_mode为None且没有设置默认值，调用方必须明确指定执行模式！")
-                return None
             execution_mode = self._default_execution_mode
             logger.debug(f"execution_mode为None，使用默认值: {execution_mode}")
 
@@ -336,13 +347,16 @@ class GlobalInputSimulatorManager:
         thread_id = threading.get_ident()
 
         # 生成缓存键（包含线程ID和device_id）
+        runtime_config = get_runtime_config()
         cache_key = (
             thread_id,
             hwnd,
             operation_mode,
             execution_mode,
             device_id,
-            "plugin" if is_plugin_input_backend(get_runtime_config()) else "native",
+            "plugin" if is_plugin_input_backend(runtime_config) else "native",
+            parse_background_options(runtime_config),
+            physical_mouse_block_targets(runtime_config, hwnd, execution_mode),
         )
 
         simulators_to_close: List[BaseInputSimulator] = []
@@ -388,8 +402,7 @@ class GlobalInputSimulatorManager:
         simulators: List[BaseInputSimulator] = []
         with self._lock:
             simulators = self._drain_cache_unlocked()
-        if simulators:
-            self._close_simulators(simulators)
+        self._close_simulators(simulators)
         logger.info("输入模拟器缓存已清除")
 
     def get_default_operation_mode(self) -> str:

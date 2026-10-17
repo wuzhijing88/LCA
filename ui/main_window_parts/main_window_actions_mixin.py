@@ -12,6 +12,7 @@ class MainWindowActionsMixin:
         """Creates all QAction instances."""
         from .main_window_support import (
             create_ai_toolbar_icon,
+            create_child_session_toolbar_icon,
             create_copy_toolbar_icon,
             create_export_standalone_icon,
             create_hourglass_icon,
@@ -68,6 +69,17 @@ class MainWindowActionsMixin:
         self.debug_run_action.triggered.connect(self.open_control_center)
         self.debug_run_action.setVisible(True)
 
+        from utils.child_session.runtime import is_child_session_instance
+
+        self.child_session_action = QAction(
+            create_child_session_toolbar_icon(icon_size),
+            "桌面分身",
+            self,
+        )
+        self.child_session_action.setToolTip("打开独立桌面，在其中运行 LCA 与游戏，不占用本机键鼠")
+        self.child_session_action.triggered.connect(self.open_child_session)
+        self.child_session_action.setVisible(not is_child_session_instance())
+
         self.global_settings_action = QAction(
             create_settings_toolbar_icon(icon_size),
             "全局设置",
@@ -100,6 +112,7 @@ class MainWindowActionsMixin:
         """刷新标题栏中依赖主题色的动作图标。"""
         from .main_window_support import (
             create_ai_toolbar_icon,
+            create_child_session_toolbar_icon,
             create_export_standalone_icon,
             create_hourglass_icon,
             create_media_control_icon,
@@ -119,6 +132,7 @@ class MainWindowActionsMixin:
             ("new_workflow_action", lambda: create_new_toolbar_icon(icon_size)),
             ("export_standalone_action", lambda: create_export_standalone_icon(icon_size)),
             ("debug_run_action", lambda: create_monitor_toolbar_icon(icon_size)),
+            ("child_session_action", lambda: create_child_session_toolbar_icon(icon_size)),
             ("global_settings_action", lambda: create_settings_toolbar_icon(icon_size)),
             ("ai_workflow_action", lambda: create_ai_toolbar_icon(icon_size)),
             ("timer_action", lambda: create_hourglass_icon(icon_size)),

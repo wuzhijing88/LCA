@@ -7,6 +7,8 @@ import logging
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QMessageBox
 
+from ui.dialogs.dialog_manager import exec_dialog
+
 _LOGITECH_INSTALL_HINT = (
     "请安装指定版本后重启电脑和 LCA。\n"
     "指定版本：Logitech G HUB 2026.4，"
@@ -22,7 +24,7 @@ def _show_logitech_version_dialog(main_window, version_result) -> None:
         msg_box.setText(version_result.user_message())
         msg_box.setInformativeText(_LOGITECH_INSTALL_HINT)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg_box.exec()
+        exec_dialog(msg_box)
     except Exception as dialog_error:
         logging.error(f"显示罗技驱动版本提示失败: {dialog_error}")
 
@@ -36,7 +38,7 @@ def _show_driver_restart_dialog(main_window, prompt_config) -> None:
         msg_box.setText(message)
         msg_box.setInformativeText(informative_text)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg_box.exec()
+        exec_dialog(msg_box)
         logging.info("用户已确认重启提示")
     except Exception as e:
         logging.error(f"显示重启提示时出错: {e}")

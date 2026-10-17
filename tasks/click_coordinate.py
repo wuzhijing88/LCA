@@ -8,67 +8,37 @@
 import logging
 import random
 import ctypes
-import json
-import re
 from typing import Dict, Any, Optional, Tuple
 from utils.input.input_timing import (
     DEFAULT_CLICK_HOLD_SECONDS,
     DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
 )
 
-# 安全导入 wintypes
-try:
-    from ctypes import wintypes
-    WINTYPES_AVAILABLE = True
-except ImportError:
-    WINTYPES_AVAILABLE = False
-    # 创建一个简单的 POINT 类作为备用
-    class POINT(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-    class RECT(ctypes.Structure):
-        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                   ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-
-    # 创建一个模拟的 wintypes 模块
-    class MockWinTypes:
-        POINT = POINT
-        RECT = RECT
-
-    wintypes = MockWinTypes()
+from ctypes import wintypes
 
 # 初始化logger（必须在使用前定义）
 logger = logging.getLogger(__name__)
 
 # WinAPI 原型（避免 64 位下句柄/返回值截断导致闪退）
-_CLICK_USER32 = None
-try:
-    if hasattr(wintypes, "HWND") and hasattr(wintypes, "BOOL") and hasattr(wintypes, "POINT"):
-        _CLICK_USER32 = ctypes.WinDLL("user32", use_last_error=True)
-        _CLICK_USER32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
-        _CLICK_USER32.ScreenToClient.restype = wintypes.BOOL
-        _CLICK_USER32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
-        _CLICK_USER32.ClientToScreen.restype = wintypes.BOOL
-        _CLICK_USER32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-        _CLICK_USER32.GetWindowRect.restype = wintypes.BOOL
-except Exception:
-    _CLICK_USER32 = None
+_CLICK_USER32 = ctypes.WinDLL("user32", use_last_error=True)
+_CLICK_USER32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+_CLICK_USER32.ScreenToClient.restype = wintypes.BOOL
+_CLICK_USER32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+_CLICK_USER32.ClientToScreen.restype = wintypes.BOOL
+_CLICK_USER32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_CLICK_USER32.GetWindowRect.restype = wintypes.BOOL
 
 
 def _safe_screen_to_client(hwnd: int, point) -> bool:
     try:
-        if _CLICK_USER32 and hasattr(wintypes, "HWND"):
-            return bool(_CLICK_USER32.ScreenToClient(wintypes.HWND(hwnd), ctypes.byref(point)))
-        return bool(ctypes.windll.user32.ScreenToClient(hwnd, ctypes.byref(point)))
+        return bool(_CLICK_USER32.ScreenToClient(wintypes.HWND(hwnd), ctypes.byref(point)))
     except Exception:
         return False
 
 
 def _safe_client_to_screen(hwnd: int, point) -> bool:
     try:
-        if _CLICK_USER32 and hasattr(wintypes, "HWND"):
-            return bool(_CLICK_USER32.ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(point)))
-        return bool(ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(point)))
+        return bool(_CLICK_USER32.ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(point)))
     except Exception:
         return False
 
@@ -96,7 +66,7 @@ def _client_to_screen_compensated(hwnd: int, client_x: int, client_y: int, max_i
     for _ in range(rounds):
         back_point = wintypes.POINT(int(screen_x), int(screen_y))
         if not _safe_screen_to_client(base_hwnd, back_point):
-            break
+            return None
 
         err_x = int(back_point.x) - target_x
         err_y = int(back_point.y) - target_y
@@ -112,10 +82,7 @@ def _client_to_screen_compensated(hwnd: int, client_x: int, client_y: int, max_i
 def _safe_get_window_rect(hwnd: int) -> Optional[Any]:
     try:
         rect = wintypes.RECT()
-        if _CLICK_USER32 and hasattr(wintypes, "HWND"):
-            ok = bool(_CLICK_USER32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)))
-        else:
-            ok = bool(ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)))
+        ok = bool(_CLICK_USER32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)))
         return rect if ok else None
     except Exception:
         return None
@@ -176,25 +143,15 @@ def _window_to_client_coords(hwnd: int, window_x: int, window_y: int) -> Optiona
 
 
 def _normalize_coordinate_mode(value: Any) -> str:
-    mode = str(value or '').strip()
-    if mode in ('窗口坐标', '窗口'):
-        return '窗口坐标'
-    if mode in ('屏幕坐标', '屏幕'):
-        return '屏幕坐标'
-    if mode in ('客户区坐标', '客户区'):
-        return '客户区坐标'
-    return '客户区坐标'
+    if value not in ('窗口坐标', '屏幕坐标', '客户区坐标'):
+        raise ValueError(f"不支持的坐标模式：{value!r}")
+    return value
 
 
 def _normalize_position_mode(value: Any) -> str:
-    mode = str(value or '').strip()
-    if mode in ('精准坐标', '精准点击', '精确坐标', '精确点击', '无偏移', '原始坐标'):
-        return '精准坐标'
-    if mode in ('固定偏移', '固定'):
-        return '固定偏移'
-    if mode in ('随机偏移', '随机'):
-        return '随机偏移'
-    return '精准坐标'
+    if value not in ('精准坐标', '固定偏移', '随机偏移'):
+        raise ValueError(f"不支持的点击位置模式：{value!r}")
+    return value
 
 
 def _apply_random_offset_with_bounds(
@@ -205,8 +162,12 @@ def _apply_random_offset_with_bounds(
     coordinate_hwnd: Optional[int],
 ) -> tuple[int, int, int, int, int, int]:
     """在给定基准坐标上追加随机偏移，并尽量限制在窗口客户区内。"""
-    actual_range_x = max(0, int(random_offset_x or 0))
-    actual_range_y = max(0, int(random_offset_y or 0))
+    actual_range_x = safe_integer(random_offset_x)
+    actual_range_y = safe_integer(random_offset_y)
+    if actual_range_x < 0 or actual_range_y < 0:
+        raise ValueError("随机偏移范围不能为负数")
+    if coordinate_hwnd and not PYWIN32_AVAILABLE:
+        raise RuntimeError("读取窗口边界所需的Windows接口不可用")
     if coordinate_hwnd and PYWIN32_AVAILABLE:
         try:
             client_rect = win32gui.GetClientRect(coordinate_hwnd)
@@ -216,79 +177,13 @@ def _apply_random_offset_with_bounds(
             actual_range_y = min(actual_range_y, int(base_y), max(0, client_height - 1 - int(base_y)))
             actual_range_x = max(0, actual_range_x)
             actual_range_y = max(0, actual_range_y)
-        except Exception:
-            actual_range_x = max(0, int(random_offset_x or 0))
-            actual_range_y = max(0, int(random_offset_y or 0))
+        except Exception as exc:
+            raise RuntimeError("无法读取随机偏移的窗口边界") from exc
 
     offset_x = random.randint(-actual_range_x, actual_range_x) if actual_range_x > 0 else 0
     offset_y = random.randint(-actual_range_y, actual_range_y) if actual_range_y > 0 else 0
     return int(base_x) + offset_x, int(base_y) + offset_y, offset_x, offset_y, actual_range_x, actual_range_y
 
-
-_COORD_NUM_PATTERN = re.compile(r"[-+]?\d*\.?\d+")
-
-
-def _coerce_int_value(value: Any) -> Optional[int]:
-    """将不同类型输入安全转换为整数，失败返回 None。"""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            return int(float(text))
-        except ValueError:
-            return None
-    return None
-
-
-def _extract_coordinate_pair(value: Any) -> Optional[Tuple[int, int]]:
-    """从列表/字典/字符串中提取 (x, y) 坐标。"""
-    if value is None:
-        return None
-
-    if isinstance(value, (list, tuple)) and len(value) >= 2:
-        x_val = _coerce_int_value(value[0])
-        y_val = _coerce_int_value(value[1])
-        if x_val is not None and y_val is not None:
-            return x_val, y_val
-
-    if isinstance(value, dict):
-        for x_key, y_key in (("x", "y"), ("X", "Y"), ("坐标X", "坐标Y")):
-            if x_key in value and y_key in value:
-                x_val = _coerce_int_value(value.get(x_key))
-                y_val = _coerce_int_value(value.get(y_key))
-                if x_val is not None and y_val is not None:
-                    return x_val, y_val
-
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-
-        # 允许 JSON 结构字符串："[100,200]" / "{\"x\":100,\"y\":200}"
-        if (text.startswith('{') and text.endswith('}')) or (text.startswith('[') and text.endswith(']')):
-            try:
-                parsed = json.loads(text)
-                pair = _extract_coordinate_pair(parsed)
-                if pair is not None:
-                    return pair
-            except Exception:
-                pass
-
-        nums = _COORD_NUM_PATTERN.findall(text.replace('，', ','))
-        if len(nums) >= 2:
-            try:
-                return int(float(nums[0])), int(float(nums[1]))
-            except ValueError:
-                return None
-
-    return None
 
 # 导入通用坐标系统
 from utils.universal_coordinate_system import (
@@ -299,7 +194,7 @@ from utils.input_simulation.mode_utils import (
     normalize_execution_mode,
 )
 from .click_action_executor import execute_simulator_click_action
-from .click_param_resolver import resolve_click_params
+from .click_param_resolver import resolve_click_params, safe_integer
 from .task_utils import coerce_bool, precise_sleep
 # Windows API 相关导入
 try:
@@ -309,7 +204,7 @@ try:
 except ImportError:
     PYWIN32_AVAILABLE = False
 
-# 前台输入驱动管理器导入（自动处理 Interception/Win32 回退）
+# 前台输入驱动管理器导入
 try:
     from utils.input.foreground_input_manager import get_foreground_input_manager
     foreground_input = get_foreground_input_manager()
@@ -344,8 +239,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
     # 获取参数
     coordinate_x = params.get('coordinate_x', 0)
     coordinate_y = params.get('coordinate_y', 0)
-    coordinate_value = params.get('coordinate_value')
-    coordinate_text = params.get('coordinate_text')
     coordinate_mode = _normalize_coordinate_mode(params.get('coordinate_mode', '客户区坐标'))
     enable_click = coerce_bool(params.get('enable_click', True))
     button, clicks, interval, click_action, auto_release, hold_duration = resolve_click_params(
@@ -354,7 +247,6 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         clicks_key="clicks",
         interval_key="interval",
         action_key="click_action",
-        fallback_action_key="coordinate_click_action",
         auto_release_key="enable_auto_release",
         hold_duration_key="hold_duration",
         mode_label="点击坐标",
@@ -364,12 +256,12 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
 
     # 获取固定偏移和随机偏移范围参数
     position_mode = _normalize_position_mode(
-        params.get('position_mode', params.get('coordinate_position_mode', '精准坐标'))
+        params.get('position_mode', '精准坐标')
     )  # 精准坐标、固定偏移、随机偏移
-    fixed_offset_x = params.get('fixed_offset_x', params.get('coordinate_fixed_offset_x', 0))
-    fixed_offset_y = params.get('fixed_offset_y', params.get('coordinate_fixed_offset_y', 0))
-    random_offset_x = params.get('random_offset_x', params.get('coordinate_random_offset_x', 5))
-    random_offset_y = params.get('random_offset_y', params.get('coordinate_random_offset_y', 5))
+    fixed_offset_x = params.get('fixed_offset_x', 0)
+    fixed_offset_y = params.get('fixed_offset_y', 0)
+    random_offset_x = params.get('random_offset_x', 5)
+    random_offset_y = params.get('random_offset_y', 5)
 
     # 获取执行后操作参数
     on_success_action = params.get('on_success', '执行下一步')
@@ -383,27 +275,17 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
         return handle_success_action(params, card_id, kwargs.get('stop_checker'))
 
     # 参数验证
-    parsed_pair = None
-    if coordinate_value not in (None, ""):
-        parsed_pair = _extract_coordinate_pair(coordinate_value)
-    if parsed_pair is None and coordinate_text not in (None, ""):
-        parsed_pair = _extract_coordinate_pair(coordinate_text)
-    if parsed_pair is None:
-        parsed_pair = _extract_coordinate_pair([coordinate_x, coordinate_y])
-
-    if parsed_pair is None:
-        logger.error(f"坐标参数解析失败: coordinate_value={coordinate_value}, coordinate_text={coordinate_text}, coordinate_x={coordinate_x}, coordinate_y={coordinate_y}")
-        return _handle_failure(on_failure_action, failure_jump_id, card_id)
-
-    coordinate_x, coordinate_y = parsed_pair
-
     try:
+        coordinate_x = safe_integer(coordinate_x)
+        coordinate_y = safe_integer(coordinate_y)
         clicks = int(clicks)
         interval = float(interval)
-        fixed_offset_x = int(fixed_offset_x)
-        fixed_offset_y = int(fixed_offset_y)
-        random_offset_x = int(random_offset_x)
-        random_offset_y = int(random_offset_y)
+        fixed_offset_x = safe_integer(fixed_offset_x)
+        fixed_offset_y = safe_integer(fixed_offset_y)
+        random_offset_x = safe_integer(random_offset_x)
+        random_offset_y = safe_integer(random_offset_y)
+        if random_offset_x < 0 or random_offset_y < 0:
+            raise ValueError("随机偏移范围不能为负数")
     except (ValueError, TypeError) as e:
         logger.error(f"参数类型错误: {e}")
         return _handle_failure(on_failure_action, failure_jump_id, card_id)
@@ -501,12 +383,8 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                     logger.error(f"坐标转换失败: {e}")
                     return _handle_failure(on_failure_action, failure_jump_id, card_id)
             else:
-                # 如果没有窗口句柄，直接使用屏幕坐标
-                coord_info = CoordinateInfo(
-                    x=coordinate_x, y=coordinate_y,
-                    coord_type=CoordinateType.PHYSICAL
-                )
-                logger.warning("没有窗口句柄，直接使用屏幕坐标")
+                logger.error("屏幕坐标转换需要有效窗口句柄和pywin32")
+                return _handle_failure(on_failure_action, failure_jump_id, card_id)
 
         # 根据点击位置模式决定是否应用偏移
         if position_mode == '精准坐标':
@@ -561,6 +439,7 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int], execution_mod
                 logger.info(f"[随机偏移模式] 原始({original_x}, {original_y}) -> 偏移后({coord_info.x}, {coord_info.y}), 偏移量=({offset_x}, {offset_y}) [范围: ±{actual_range_x}, ±{actual_range_y}]")
             except Exception as offset_error:
                 logger.error(f"应用随机偏移失败: {offset_error}", exc_info=True)
+                return _handle_failure(on_failure_action, failure_jump_id, card_id)
 
         logger.debug(f"[DEBUG] 准备确定点击模式: execution_mode={execution_mode}")
 
@@ -797,7 +676,7 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
         get_standard_click_offset_params(),
         get_standard_next_step_delay_params()
     )
-    # 坐标点击默认优先精准，避免旧数据缺参时误走随机偏移
+    # 坐标点击的默认位置模式是精准坐标。
     if "position_mode" in merged and isinstance(merged["position_mode"], dict):
         merged["position_mode"]["default"] = "精准坐标"
 
@@ -851,41 +730,24 @@ def _perform_simulator_click(simulator, x: int, y: int, button: str, click_actio
         f"[{mode_label}模式] 执行点击: 坐标({x}, {y}), 按钮={button}, 动作={click_action}, "
         f"次数={clicks}, 自动释放={auto_release}"
     )
-    is_foreground_single_click = (
-        is_foreground_mode(execution_mode)
-        and str(click_action or "").strip() == "完整点击"
-        and int(clicks or 1) == 1
+    success = execute_simulator_click_action(
+        simulator=simulator,
+        x=x,
+        y=y,
+        button=button,
+        click_action=click_action,
+        clicks=clicks,
+        interval=interval,
+        hold_duration=hold_duration,
+        auto_release=auto_release,
+        mode_label=f"{mode_label}模式",
+        logger_obj=logger,
+        require_atomic_hold=require_atomic_hold,
+        move_before_click=move_before_click,
+        execution_mode=execution_mode,
+        target_hwnd=target_hwnd,
+        task_type=TASK_TYPE,
     )
-    max_attempts = 3 if is_foreground_single_click else 1
-    success = False
-
-    for attempt_index in range(max_attempts):
-        success = execute_simulator_click_action(
-            simulator=simulator,
-            x=x,
-            y=y,
-            button=button,
-            click_action=click_action,
-            clicks=clicks,
-            interval=interval,
-            hold_duration=hold_duration,
-            auto_release=auto_release,
-            mode_label=f"{mode_label}模式",
-            logger_obj=logger,
-            single_click_retry=is_foreground_mode(execution_mode),
-            require_atomic_hold=require_atomic_hold,
-            move_before_click=move_before_click,
-            execution_mode=execution_mode,
-            target_hwnd=target_hwnd,
-            task_type=TASK_TYPE,
-        )
-        if success:
-            break
-        if attempt_index < (max_attempts - 1):
-            logger.warning(
-                f"[{mode_label}模式] 这次没点上，再试一次（{attempt_index + 2}/{max_attempts}）"
-            )
-            precise_sleep(0.12)
 
     if success:
         logger.info(f"[{mode_label}模式] 点击成功")

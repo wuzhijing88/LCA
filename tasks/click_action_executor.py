@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import threading
 import time
 import ctypes
@@ -62,23 +63,19 @@ def _normalize_button(button: Any) -> Optional[str]:
     return _BUTTON_MAP.get(text)
 
 
-def _safe_int(value: Any, default: int = 0, minimum: Optional[int] = None) -> int:
-    try:
-        result = int(value)
-    except Exception:
-        result = int(default)
+def _safe_int(value: Any, minimum: Optional[int] = None) -> int:
+    result = int(value)
     if minimum is not None and result < minimum:
-        result = minimum
+        raise ValueError(f"整数参数不能小于 {minimum}")
     return result
 
 
-def _safe_float(value: Any, default: float = 0.0, minimum: Optional[float] = None) -> float:
-    try:
-        result = float(value)
-    except Exception:
-        result = float(default)
+def _safe_float(value: Any, minimum: Optional[float] = None) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("时间参数必须是有限数值")
     if minimum is not None and result < minimum:
-        result = minimum
+        raise ValueError(f"时间参数不能小于 {minimum}")
     return result
 
 
@@ -96,7 +93,7 @@ def _is_stop_requested(stop_checker: Optional[Callable[[], bool]]) -> bool:
     try:
         return bool(stop_checker())
     except Exception:
-        return False
+        return True
 
 
 def _sleep_with_stop(duration: float, stop_checker: Optional[Callable[[], bool]]) -> bool:
@@ -111,36 +108,15 @@ def _sleep_with_stop(duration: float, stop_checker: Optional[Callable[[], bool]]
             return not _is_stop_requested(stop_checker)
         except InterruptedError:
             return False
-        except Exception:
-            # 防御性回退
-            precise_sleep(safe_duration)
-            return not _is_stop_requested(stop_checker)
     precise_sleep(safe_duration)
     return True
 
 
 def _is_foreground_click_context(simulator: Any, execution_mode: Any) -> bool:
     """判断当前点击是否处于前台上下文。"""
-    try:
-        if normalize_execution_mode(str(execution_mode or "")) == "foreground":
-            return True
-    except Exception:
-        pass
-
-    try:
-        if bool(getattr(simulator, "use_foreground", False)):
-            return True
-    except Exception:
-        pass
-
-    try:
-        is_fg = getattr(simulator, "_is_foreground_mode", None)
-        if callable(is_fg):
-            return bool(is_fg())
-    except Exception:
-        pass
-
-    return False
+    if execution_mode is not None:
+        return normalize_execution_mode(execution_mode) == "foreground"
+    return bool(getattr(simulator, "use_foreground", False))
 
 
 def _wait_foreground_click_gap(
@@ -180,6 +156,9 @@ def _wait_foreground_click_gap(
 def _mark_foreground_click_completion(lock_resource: Optional[str]) -> None:
     key = str(lock_resource or "").strip() or "__default_foreground_resource__"
     with _FOREGROUND_CLICK_CADENCE_LOCK:
+        _FOREGROUND_CLICK_LAST_TS.pop(key, None)
+        if len(_FOREGROUND_CLICK_LAST_TS) >= 256:
+            del _FOREGROUND_CLICK_LAST_TS[next(iter(_FOREGROUND_CLICK_LAST_TS))]
         _FOREGROUND_CLICK_LAST_TS[key] = time.monotonic()
 
 
@@ -191,14 +170,6 @@ def _get_cursor_position() -> Optional[tuple[int, int]]:
     except Exception:
         return None
     return None
-
-
-def _set_cursor_position(x: int, y: int) -> bool:
-    try:
-        return bool(ctypes.windll.user32.SetCursorPos(int(x), int(y)))
-    except Exception:
-        return False
-
 
 
 def _is_mouse_button_pressed(button_type: str) -> Optional[bool]:
@@ -230,8 +201,7 @@ def _wait_mouse_button_release(
 
         pressed = _is_mouse_button_pressed(button_type)
         if pressed is None:
-            # 系统无法读取按键状态时不做硬失败，保持兼容性。
-            return True
+            return False
         if not pressed:
             return True
 
@@ -244,51 +214,6 @@ def _wait_mouse_button_release(
     # 能读取状态但超时仍为按下，视为点击未完整结束。
     return False
 
-
-def _force_release_mouse_button(
-    simulator: Any,
-    x: int,
-    y: int,
-    button_type: str,
-    mode_label: str,
-    log_obj: Any,
-    stop_checker: Optional[Callable[[], bool]] = None,
-) -> bool:
-    """
-    前台点击恢复：当检测到按键未弹起时，主动补发 mouse_up 进行修复。
-    """
-    mouse_up_fn = getattr(simulator, "mouse_up", None)
-    if not callable(mouse_up_fn):
-        return False
-
-    points = []
-    try:
-        points.append((int(x), int(y)))
-    except Exception:
-        pass
-
-    current_pos = _get_cursor_position()
-    if current_pos is not None:
-        points.append((int(current_pos[0]), int(current_pos[1])))
-
-    if not points:
-        return False
-
-    for release_x, release_y in points:
-        for _ in range(2):
-            if _is_stop_requested(stop_checker):
-                return False
-            try:
-                mouse_up_fn(int(release_x), int(release_y), button_type)
-            except Exception:
-                pass
-            if _sleep_with_stop(0.01, stop_checker):
-                pressed = _is_mouse_button_pressed(button_type)
-                if pressed is False:
-                    _log(log_obj, "warning", f"[{mode_label}] 已自动补发mouse_up并恢复弹起")
-                    return True
-
-    return _is_mouse_button_pressed(button_type) is False
 
 def _wait_cursor_reach_target(
     x: int,
@@ -304,7 +229,6 @@ def _wait_cursor_reach_target(
     except Exception:
         return False
 
-    sampled = False
     deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
     wait_slice = max(0.001, float(poll_interval or 0.0))
     safe_tolerance = max(0, int(tolerance))
@@ -315,7 +239,6 @@ def _wait_cursor_reach_target(
 
         pos = _get_cursor_position()
         if pos is not None:
-            sampled = True
             if (
                 abs(int(pos[0]) - target_x) <= safe_tolerance
                 and abs(int(pos[1]) - target_y) <= safe_tolerance
@@ -328,8 +251,7 @@ def _wait_cursor_reach_target(
         if not _sleep_with_stop(wait_slice, stop_checker):
             return False
 
-    # 无法读取系统光标时不做硬失败，避免兼容性问题导致全量点击失败。
-    return not sampled
+    return False
 
 
 def _is_target_window_foreground(target_hwnd: Any) -> bool:
@@ -375,7 +297,7 @@ def _ensure_target_window_foreground_for_click(
     log_obj: Any,
 ) -> bool:
     """完整点击前确保目标在前台；丢焦时尝试恢复一次（罗技连线场景常见）。"""
-    safe_hwnd = _safe_int(target_hwnd, default=0, minimum=0)
+    safe_hwnd = _safe_int(target_hwnd, minimum=0)
     if safe_hwnd <= 0:
         return True
     if _is_target_window_foreground(safe_hwnd):
@@ -439,41 +361,19 @@ def _ensure_foreground_cursor_ready(
 ) -> bool:
     move_fn = getattr(simulator, "move_mouse", None)
     if not callable(move_fn):
-        _log(log_obj, "error", f"[{mode_label}] 没法移动鼠标，点不了")
+        _log(log_obj, "error", f"[{mode_label}] 模拟器不支持移动鼠标")
         return False
-
-    max_attempts = 3
-    target_x = int(x)
-    target_y = int(y)
-    for attempt in range(max_attempts):
-        if _is_stop_requested(stop_checker):
-            return False
-
-        try:
-            moved = bool(move_fn(target_x, target_y))
-        except Exception as err:
-            _log(log_obj, "warning", f"[{mode_label}] 鼠标移到点击位置时出错: {err}")
-            moved = False
-
-        if moved and _wait_cursor_reach_target(
-            target_x,
-            target_y,
-            stop_checker=stop_checker,
-        ):
-            return True
-
-        if _set_cursor_position(target_x, target_y) and _wait_cursor_reach_target(
-            target_x,
-            target_y,
-            stop_checker=stop_checker,
-        ):
-            return True
-
-        if attempt < (max_attempts - 1):
-            _sleep_with_stop(0.01, stop_checker)
-
-    _log(log_obj, "error", f"[{mode_label}] 鼠标没移到要点的位置 ({target_x}, {target_y})")
-    return False
+    if _is_stop_requested(stop_checker):
+        return False
+    try:
+        moved = bool(move_fn(int(x), int(y)))
+    except Exception as err:
+        _log(log_obj, "error", f"[{mode_label}] 移动鼠标失败：{err}")
+        return False
+    if not moved or not _wait_cursor_reach_target(int(x), int(y), stop_checker=stop_checker):
+        _log(log_obj, "error", f"[{mode_label}] 鼠标未到达点击位置 ({x}, {y})")
+        return False
+    return True
 
 
 def _supports_atomic_click_hold(simulator: Any) -> bool:
@@ -499,38 +399,6 @@ def _supports_atomic_click_hold(simulator: Any) -> bool:
     return False
 
 
-def _prefer_atomic_foreground_click(simulator: Any) -> bool:
-    """
-    在特定前台驱动下优先走原子click链路，避免down/up分离引入时序偏差。
-    """
-    try:
-        backend_getter = getattr(simulator, "_get_foreground_mouse_backend", None)
-        if callable(backend_getter):
-            backend_name = str(backend_getter() or "").strip().lower()
-            if backend_name in {"ibinputsimulator", "pyautogui"}:
-                return True
-    except Exception:
-        pass
-
-    try:
-        driver_obj = getattr(simulator, "driver", None)
-        if driver_obj is not None:
-            driver_name = type(driver_obj).__name__.lower()
-            if "ibinput" in driver_name:
-                return True
-            if "pyautogui" in driver_name:
-                return True
-            mouse_driver = getattr(driver_obj, "_mouse_driver", None)
-            if mouse_driver is not None:
-                mouse_driver_name = type(mouse_driver).__name__.lower()
-                if "ibinput" in mouse_driver_name or "pyautogui" in mouse_driver_name:
-                    return True
-    except Exception:
-        pass
-
-    return False
-
-
 def _invoke_native_double_click(
     simulator: Any,
     x: int,
@@ -540,35 +408,16 @@ def _invoke_native_double_click(
     hold_duration: float,
     mode_label: str,
     log_obj: Any,
-) -> Optional[bool]:
-    """优先用模拟器自己的 double_click。
-
-    后台消息 / 插件消息注入下，两次单击不会被目标识别为双击（系统只为真实输入合成 WM_xBUTTONDBLCLK），
-    只有模拟器知道该发 DBLCLK 消息还是调大漠 LeftDoubleClick。模拟器没有该接口时返回 None，由调用方退回两次单击。
-    """
+) -> bool:
     double_fn = getattr(simulator, "double_click", None)
     if not callable(double_fn):
-        return None
-    kwargs: dict = {}
+        _log(log_obj, "error", f"[{mode_label}] 模拟器不支持双击接口")
+        return False
     try:
-        params = inspect.signature(double_fn).parameters
-        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        if "interval" in params or accepts_var_kw:
-            kwargs["interval"] = float(interval)
-        if "hold_duration" in params or accepts_var_kw:
-            kwargs["hold_duration"] = float(hold_duration)
-    except (TypeError, ValueError):
-        kwargs = {}
-    try:
-        return bool(double_fn(int(x), int(y), button_type, **kwargs))
-    except TypeError:
-        try:
-            return bool(double_fn(int(x), int(y), button_type))
-        except Exception as err:
-            _log(log_obj, "error", f"[{mode_label}] 双击执行失败: {err}")
-            return False
+        return bool(double_fn(int(x), int(y), button_type,
+                              interval=float(interval), hold_duration=float(hold_duration)))
     except Exception as err:
-        _log(log_obj, "error", f"[{mode_label}] 双击执行失败: {err}")
+        _log(log_obj, "error", f"[{mode_label}] 双击执行失败：{err}")
         return False
 
 
@@ -596,188 +445,9 @@ def _invoke_atomic_click_hold(
                 duration=float(hold_duration),
             )
         )
-    except TypeError:
-        return None
     except Exception as err:
         _log(log_obj, "error", f"[{mode_label}] 原子按住执行失败: {err}")
         return False
-
-
-def _single_click_with_retry(
-    simulator: Any,
-    x: int,
-    y: int,
-    button_type: str,
-    interval: float,
-    mode_label: str,
-    log_obj: Any,
-    hold_duration: Optional[float] = None,
-    stop_checker: Optional[Callable[[], bool]] = None,
-) -> bool:
-    try:
-        if hold_duration is not None:
-            first_ok = bool(
-                simulator.click(
-                    x,
-                    y,
-                    button=button_type,
-                    clicks=1,
-                    interval=interval,
-                    duration=float(hold_duration),
-                )
-            )
-        else:
-            first_ok = bool(
-                simulator.click(
-                    x,
-                    y,
-                    button=button_type,
-                    clicks=1,
-                    interval=interval,
-                )
-            )
-    except Exception as err:
-        _log(log_obj, "warning", f"[{mode_label}] 单击执行异常: {err}")
-        first_ok = False
-
-    if first_ok:
-        return True
-
-    retry_wait = min(0.1, interval) if interval > 0 else 0.03
-    if retry_wait > 0:
-        if not _sleep_with_stop(retry_wait, stop_checker):
-            _log(log_obj, "warning", f"[{mode_label}] 单击补发前收到停止请求")
-            return False
-
-    _log(log_obj, "warning", f"[{mode_label}] 单击未成功，执行补发")
-    try:
-        if hold_duration is not None:
-            second_ok = bool(
-                simulator.click(
-                    x,
-                    y,
-                    button=button_type,
-                    clicks=1,
-                    interval=interval,
-                    duration=float(hold_duration),
-                )
-            )
-        else:
-            second_ok = bool(
-                simulator.click(
-                    x,
-                    y,
-                    button=button_type,
-                    clicks=1,
-                    interval=interval,
-                )
-            )
-    except Exception as err:
-        _log(log_obj, "warning", f"[{mode_label}] 补发执行异常: {err}")
-        second_ok = False
-
-    return second_ok
-
-
-def _foreground_single_click_via_down_up(
-    simulator: Any,
-    x: int,
-    y: int,
-    button_type: str,
-    hold_duration: float,
-    mode_label: str,
-    log_obj: Any,
-    stop_checker: Optional[Callable[[], bool]] = None,
-) -> bool:
-    mouse_down_fn = getattr(simulator, "mouse_down", None)
-    mouse_up_fn = getattr(simulator, "mouse_up", None)
-    if not callable(mouse_down_fn) or not callable(mouse_up_fn):
-        return False
-
-    safe_hold = max(0.0, float(hold_duration or 0.0))
-    down_sent = False
-    hold_completed = True
-    try:
-        if not bool(mouse_down_fn(int(x), int(y), button_type)):
-            return False
-        down_sent = True
-        if safe_hold > 0:
-            hold_completed = _sleep_with_stop(safe_hold, stop_checker)
-        if not bool(mouse_up_fn(int(x), int(y), button_type)):
-            return False
-        down_sent = False
-        return bool(hold_completed)
-    except Exception as err:
-        _log(log_obj, "warning", f"[{mode_label}] 前台down/up点击异常: {err}")
-        return False
-    finally:
-        if down_sent:
-            try:
-                mouse_up_fn(int(x), int(y), button_type)
-            except Exception:
-                pass
-
-
-def _foreground_single_click_with_retry(
-    simulator: Any,
-    x: int,
-    y: int,
-    button_type: str,
-    hold_duration: float,
-    interval: float,
-    mode_label: str,
-    log_obj: Any,
-    stop_checker: Optional[Callable[[], bool]] = None,
-    align_before_click: Optional[Callable[[], bool]] = None,
-) -> bool:
-    if callable(align_before_click):
-        try:
-            if not bool(align_before_click()):
-                _log(log_obj, "warning", f"[{mode_label}] 鼠标没移到要点的位置，已取消点击")
-                return False
-        except Exception as err:
-            _log(log_obj, "warning", f"[{mode_label}] 鼠标移到点击位置时出错: {err}")
-            return False
-
-    first_ok = _foreground_single_click_via_down_up(
-        simulator=simulator,
-        x=int(x),
-        y=int(y),
-        button_type=button_type,
-        hold_duration=float(hold_duration),
-        mode_label=mode_label,
-        log_obj=log_obj,
-        stop_checker=stop_checker,
-    )
-    if first_ok:
-        return True
-
-    retry_wait = min(0.1, float(interval or 0.0)) if interval > 0 else 0.03
-    if retry_wait > 0:
-        if not _sleep_with_stop(retry_wait, stop_checker):
-            _log(log_obj, "warning", f"[{mode_label}] 再点一次前收到停止")
-            return False
-
-    if callable(align_before_click):
-        try:
-            if not bool(align_before_click()):
-                _log(log_obj, "warning", f"[{mode_label}] 再点一次前鼠标没移到位，已取消点击")
-                return False
-        except Exception as err:
-            _log(log_obj, "warning", f"[{mode_label}] 再点一次前移动鼠标出错: {err}")
-            return False
-
-    _log(log_obj, "warning", f"[{mode_label}] 这次没点上，再点一次")
-    return _foreground_single_click_via_down_up(
-        simulator=simulator,
-        x=int(x),
-        y=int(y),
-        button_type=button_type,
-        hold_duration=float(hold_duration),
-        mode_label=mode_label,
-        log_obj=log_obj,
-        stop_checker=stop_checker,
-    )
 
 
 def execute_simulator_click_action(
@@ -793,7 +463,6 @@ def execute_simulator_click_action(
     mode_label: str = "点击",
     logger_obj: Any = None,
     call_lock: Any = None,
-    single_click_retry: bool = False,
     require_atomic_hold: bool = False,
     move_before_click: bool = False,
     stop_checker: Optional[Callable[[], bool]] = None,
@@ -814,9 +483,13 @@ def execute_simulator_click_action(
         _log(logger_obj, "error", f"[{mode_label}] 不支持的按钮类型: {button}")
         return False
 
-    safe_clicks = _safe_int(clicks, default=1, minimum=1)
-    safe_interval = _safe_float(interval, default=0.0, minimum=0.0)
-    safe_hold_duration = _safe_float(hold_duration, default=0.0, minimum=0.0)
+    try:
+        safe_clicks = _safe_int(clicks, minimum=1)
+        safe_interval = _safe_float(interval, minimum=0.0)
+        safe_hold_duration = _safe_float(hold_duration, minimum=0.0)
+    except (TypeError, ValueError, OverflowError) as err:
+        _log(logger_obj, "error", f"[{mode_label}] 点击参数无效：{err}")
+        return False
     complete_click_hold_duration = (
         safe_hold_duration if safe_hold_duration > 0 else DEFAULT_CLICK_HOLD_SECONDS
     )
@@ -825,300 +498,98 @@ def execute_simulator_click_action(
         if _is_stop_requested(stop_checker):
             _log(logger_obj, "warning", f"[{mode_label}] 收到停止请求，取消点击")
             return False
-        foreground_context = _is_foreground_click_context(
-            simulator,
-            execution_mode,
-        )
-        requires_foreground_click_precheck = click_action in {"完整点击", "双击"}
-        # 根因修复：前台驱动在高负载下可能消费到旧坐标，执行层需在每次点击前做强制落位校验。
-        def _align_foreground_cursor() -> bool:
-            return _ensure_foreground_cursor_ready(
-                simulator=simulator,
-                x=int(x),
-                y=int(y),
-                mode_label=mode_label,
-                log_obj=logger_obj,
-                stop_checker=stop_checker,
-            )
+        foreground_context = _is_foreground_click_context(simulator, execution_mode)
+        complete_action = click_action in {"完整点击", "双击"} or (click_action == "仅按下" and auto_release)
 
-        # 前台先把系统光标落到点击点；后台先把虚拟光标/消息坐标落到点击点。
-        effective_move_before_click = bool(move_before_click)
-        if effective_move_before_click:
-            move_fn = getattr(simulator, "move_mouse", None)
-            if callable(move_fn):
-                try:
-                    moved = bool(move_fn(int(x), int(y)))
-                except Exception as err:
-                    _log(logger_obj, "error", f"[{mode_label}] 点击前移动失败: {err}")
+        # 先检查按钮，再进行任何移动。按住或状态未知时禁止开始完整点击。
+        if foreground_context and complete_action:
+            for checked_button in _MOUSE_BUTTON_VK_MAP:
+                if _is_mouse_button_pressed(checked_button) is not False:
+                    button_label = {"left": "左键", "right": "右键", "middle": "中键"}[checked_button]
+                    _log(logger_obj, "error", f"[{mode_label}] 鼠标{button_label}未确认松开，取消点击")
                     return False
-                if not moved:
-                    _log(logger_obj, "error", f"[{mode_label}] 点击前移动失败")
-                    return False
-            else:
-                _log(logger_obj, "warning", f"[{mode_label}] 模拟器不支持move_mouse，跳过点击前移动")
-        if foreground_context:
-            cadence_ok, waited_gap = _wait_foreground_click_gap(
-                active_lock_resource,
-                stop_checker,
-            )
-            if not cadence_ok:
-                _log(logger_obj, "warning", f"[{mode_label}] 前台点击步间隔等待被中断")
+            try:
+                safe_target_hwnd = _safe_int(0 if target_hwnd is None else target_hwnd, minimum=0)
+            except (TypeError, ValueError, OverflowError) as err:
+                _log(logger_obj, "error", f"[{mode_label}] 目标窗口无效：{err}")
                 return False
-            if waited_gap > 0.001:
-                _log(logger_obj, "debug", f"[{mode_label}] 前台点击步间隔等待 {waited_gap * 1000.0:.1f}ms")
-            if not _sleep_with_stop(_FOREGROUND_PRE_CLICK_SETTLE_SECONDS, stop_checker):
-                _log(logger_obj, "warning", f"[{mode_label}] 点击前稳定等待被中断")
-                return False
-
-        # 完整点击和双击都是真实前台按下/松开序列；验证失败前禁止发送任何点击。
-        if foreground_context and requires_foreground_click_precheck:
-            pressed_before_click = _is_mouse_button_pressed(button_type)
-            if pressed_before_click is True:
-                _log(logger_obj, "warning", f"[{mode_label}] 点击前检测到鼠标按键残留按下，尝试自动释放")
-                if not _force_release_mouse_button(
-                    simulator=simulator,
-                    x=int(x),
-                    y=int(y),
-                    button_type=button_type,
-                    mode_label=mode_label,
-                    log_obj=logger_obj,
-                    stop_checker=stop_checker,
-                ):
-                    _log(logger_obj, "warning", f"[{mode_label}] 鼠标还按着没松开，没法点，已取消点击")
-                    return False
-            safe_target_hwnd = _safe_int(target_hwnd, default=0, minimum=0)
             if safe_target_hwnd > 0 and not _ensure_target_window_foreground_for_click(
-                safe_target_hwnd,
-                mode_label=mode_label,
-                log_obj=logger_obj,
+                safe_target_hwnd, mode_label=mode_label, log_obj=logger_obj,
             ):
                 return False
-            if not _align_foreground_cursor():
-                _log(logger_obj, "warning", f"[{mode_label}] 鼠标没移到要点的位置，已取消点击")
+
+        if complete_action and click_action != "双击" and not _supports_atomic_click_hold(simulator):
+            _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持完整的点击按住接口")
+            return False
+        if foreground_context:
+            cadence_ok, _ = _wait_foreground_click_gap(active_lock_resource, stop_checker)
+            if not cadence_ok or not _sleep_with_stop(_FOREGROUND_PRE_CLICK_SETTLE_SECONDS, stop_checker):
                 return False
-        click_attempted = False
+            if complete_action and not _ensure_foreground_cursor_ready(
+                simulator, int(x), int(y), mode_label, logger_obj, stop_checker,
+            ):
+                return False
+        elif move_before_click and click_action != "仅松开":
+            move_fn = getattr(simulator, "move_mouse", None)
+            if not callable(move_fn):
+                _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持移动鼠标")
+                return False
+            try:
+                if not bool(move_fn(int(x), int(y))):
+                    return False
+            except Exception as err:
+                _log(logger_obj, "error", f"[{mode_label}] 点击前移动失败：{err}")
+                return False
+
         success = False
         try:
-            click_attempted = True
             if click_action == "完整点击":
-                use_foreground_down_up = (
-                    foreground_context
-                    and hasattr(simulator, "mouse_down")
-                    and hasattr(simulator, "mouse_up")
-                    and (not _prefer_atomic_foreground_click(simulator))
-                )
-                if use_foreground_down_up:
-                    if safe_clicks == 1 and single_click_retry:
-                        success = _foreground_single_click_with_retry(
-                            simulator=simulator,
-                            x=int(x),
-                            y=int(y),
-                            button_type=button_type,
-                            hold_duration=complete_click_hold_duration,
-                            interval=safe_interval,
-                            mode_label=mode_label,
-                            log_obj=logger_obj,
-                            stop_checker=stop_checker,
-                            align_before_click=None,
-                        )
-                    else:
-                        success = True
-                        for click_index in range(safe_clicks):
-                            if _is_stop_requested(stop_checker):
-                                _log(logger_obj, "warning", f"[{mode_label}] 连续点击过程中收到停止请求")
-                                return False
-                            if click_index > 0 and safe_interval > 0:
-                                if not _sleep_with_stop(safe_interval, stop_checker):
-                                    _log(logger_obj, "warning", f"[{mode_label}] 连续点击间隔被中断")
-                                    return False
-                            click_ok = _foreground_single_click_via_down_up(
-                                simulator=simulator,
-                                x=int(x),
-                                y=int(y),
-                                button_type=button_type,
-                                hold_duration=complete_click_hold_duration,
-                                mode_label=mode_label,
-                                log_obj=logger_obj,
-                                stop_checker=stop_checker,
-                            )
-                            if not click_ok:
-                                success = False
-                                break
-                else:
-                    if not hasattr(simulator, "click"):
-                        _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持click接口")
+                for click_index in range(safe_clicks):
+                    if _is_stop_requested(stop_checker):
                         return False
-                    atomic_click_hold_supported = _supports_atomic_click_hold(simulator)
-                    if safe_clicks == 1 and single_click_retry:
-                        retry_hold_duration = (
-                            complete_click_hold_duration if atomic_click_hold_supported else None
-                        )
-                        success = _single_click_with_retry(
-                            simulator,
-                            int(x),
-                            int(y),
-                            button_type,
-                            safe_interval,
-                            mode_label,
-                            logger_obj,
-                            hold_duration=retry_hold_duration,
-                            stop_checker=stop_checker,
-                        )
-                    else:
-                        success = True
-                        for click_index in range(safe_clicks):
-                            if _is_stop_requested(stop_checker):
-                                _log(logger_obj, "warning", f"[{mode_label}] 连续点击过程中收到停止请求")
-                                return False
-                            if click_index > 0 and safe_interval > 0:
-                                if not _sleep_with_stop(safe_interval, stop_checker):
-                                    _log(logger_obj, "warning", f"[{mode_label}] 连续点击间隔被中断")
-                                    return False
-                            if atomic_click_hold_supported:
-                                click_ok = bool(
-                                    simulator.click(
-                                        int(x),
-                                        int(y),
-                                        button=button_type,
-                                        clicks=1,
-                                        interval=0.0,
-                                        duration=complete_click_hold_duration,
-                                    )
-                                )
-                            else:
-                                click_ok = bool(
-                                    simulator.click(
-                                        int(x),
-                                        int(y),
-                                        button=button_type,
-                                        clicks=1,
-                                        interval=0.0,
-                                    )
-                                )
-                            if not click_ok:
-                                success = False
-                                break
+                    if click_index and not _sleep_with_stop(safe_interval, stop_checker):
+                        return False
+                    if not bool(simulator.click(int(x), int(y), button=button_type, clicks=1,
+                                                interval=0.0, duration=complete_click_hold_duration)):
+                        return False
+                success = True
             elif click_action == "双击":
-                dbl_interval = safe_interval if safe_interval > 0 else DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS
-                native_double = _invoke_native_double_click(
-                    simulator,
-                    int(x),
-                    int(y),
-                    button_type,
-                    dbl_interval,
-                    complete_click_hold_duration,
-                    mode_label,
-                    logger_obj,
+                success = _invoke_native_double_click(
+                    simulator, int(x), int(y), button_type,
+                    safe_interval if safe_interval > 0 else DEFAULT_DOUBLE_CLICK_INTERVAL_SECONDS,
+                    complete_click_hold_duration, mode_label, logger_obj,
                 )
-                if native_double is not None:
-                    success = bool(native_double)
-                else:
-                    # 模拟器没有 double_click 时退回两次单击（只对前台真实输入有效，系统会自行合成双击）
-                    if not hasattr(simulator, "click"):
-                        _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持click接口")
-                        return False
-                    atomic_click_hold_supported = _supports_atomic_click_hold(simulator)
-
-                    def _single_click() -> bool:
-                        if atomic_click_hold_supported:
-                            return bool(
-                                simulator.click(
-                                    int(x),
-                                    int(y),
-                                    button=button_type,
-                                    clicks=1,
-                                    interval=0.0,
-                                    duration=complete_click_hold_duration,
-                                )
-                            )
-                        return bool(simulator.click(int(x), int(y), button=button_type, clicks=1, interval=0.0))
-
-                    success = _single_click()
-                    if success:
-                        if dbl_interval > 0 and not _sleep_with_stop(dbl_interval, stop_checker):
-                            _log(logger_obj, "warning", f"[{mode_label}] 双击间隔被中断")
-                            return False
-                        success = _single_click()
             elif click_action == "仅按下":
-                effective_hold_duration = (
-                    safe_hold_duration if safe_hold_duration > 0 else DEFAULT_CLICK_HOLD_SECONDS
-                )
                 if auto_release:
-                    atomic_supported = _supports_atomic_click_hold(simulator)
-                    if atomic_supported:
-                        atomic_success = _invoke_atomic_click_hold(
-                            simulator,
-                            int(x),
-                            int(y),
-                            button_type,
-                            effective_hold_duration,
-                            mode_label,
-                            logger_obj,
-                        )
-                        if atomic_success is None:
-                            _log(logger_obj, "error", f"[{mode_label}] 原子按住调用签名不支持duration参数")
-                            return False
-                        return bool(atomic_success)
-                    if require_atomic_hold:
-                        _log(logger_obj, "error", f"[{mode_label}] 当前模拟器不支持原子按住")
-                        return False
-
-                if not hasattr(simulator, "mouse_down"):
-                    _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持mouse_down接口")
-                    return False
-                success = bool(simulator.mouse_down(int(x), int(y), button_type))
-                if success and auto_release:
-                    if not hasattr(simulator, "mouse_up"):
-                        _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持mouse_up接口")
-                        return False
-                    hold_completed = _sleep_with_stop(effective_hold_duration, stop_checker)
-                    if not hold_completed:
-                        _log(logger_obj, "warning", f"[{mode_label}] 按住期间收到停止请求，提前释放")
-                    released = bool(simulator.mouse_up(int(x), int(y), button_type))
-                    if not released:
-                        return False
-                    if not hold_completed:
-                        return False
-                    success = released
+                    success = bool(_invoke_atomic_click_hold(
+                        simulator, int(x), int(y), button_type, complete_click_hold_duration,
+                        mode_label, logger_obj,
+                    ))
+                else:
+                    success = bool(simulator.mouse_down(int(x), int(y), button_type))
             elif click_action == "仅松开":
-                if not hasattr(simulator, "mouse_up"):
-                    _log(logger_obj, "error", f"[{mode_label}] 模拟器不支持mouse_up接口")
-                    return False
+                # 松开必须直接发送；禁止先移动、校准或等待停止状态。
                 success = bool(simulator.mouse_up(int(x), int(y), button_type))
             else:
-                _log(logger_obj, "error", f"[{mode_label}] 不支持的点击动作: {click_action}")
+                _log(logger_obj, "error", f"[{mode_label}] 不支持的点击动作：{click_action}")
                 return False
         except Exception as err:
-            _log(logger_obj, "error", f"[{mode_label}] 点击动作执行失败: {err}")
+            _log(logger_obj, "error", f"[{mode_label}] 点击动作执行失败：{err}")
             return False
         finally:
-            if foreground_context and click_attempted:
+            if foreground_context:
                 _mark_foreground_click_completion(active_lock_resource)
 
         if foreground_context and success:
-            if click_action in {"完整点击", "双击", "仅松开"}:
-                if not _wait_mouse_button_release(button_type, stop_checker=stop_checker):
-                    _log(logger_obj, "warning", f"[{mode_label}] 点完后鼠标还按着，正在松开")
-                    recovered = _force_release_mouse_button(
-                        simulator=simulator,
-                        x=int(x),
-                        y=int(y),
-                        button_type=button_type,
-                        mode_label=mode_label,
-                        log_obj=logger_obj,
-                        stop_checker=stop_checker,
-                    )
-                    if not recovered:
-                        _log(logger_obj, "warning", f"[{mode_label}] 点完后鼠标松不开")
-                        return False
-                    if not _wait_mouse_button_release(button_type, stop_checker=stop_checker, timeout=0.12):
-                        _log(logger_obj, "warning", f"[{mode_label}] 点完后鼠标还是按着")
-                        return False
-            if not _sleep_with_stop(_FOREGROUND_POST_CLICK_SETTLE_SECONDS, stop_checker):
-                _log(logger_obj, "warning", f"[{mode_label}] 点击后稳定等待被中断")
+            if (complete_action or click_action == "仅松开") and not _wait_mouse_button_release(
+                button_type, stop_checker=stop_checker,
+            ):
+                _log(logger_obj, "error", f"[{mode_label}] 鼠标弹起未确认，点击失败")
                 return False
-
+            if not _sleep_with_stop(_FOREGROUND_POST_CLICK_SETTLE_SECONDS, stop_checker):
+                return False
         return bool(success)
+
     if call_lock is not None:
         call_lock_resource = str(lock_resource or "").strip()
         if not call_lock_resource:
@@ -1177,6 +648,3 @@ def execute_simulator_click_action(
             elif total_wait_ms > 20.0:
                 _log(logger_obj, "debug", f"[{mode_label}] 等待输入锁 {total_wait_ms:.1f}ms")
             return _run_click_action_locked(resolved_lock_resource)
-
-
-

@@ -17,6 +17,16 @@ QPushButton:focus, QToolButton:focus, QCommandLinkButton:focus {
 }
 
 /* 涓荤獥鍙ｅ拰瀵硅瘽妗?*/
+QLabel#errorMessageHeading {
+    font-size: 16px;
+    font-weight: bold;
+}
+
+QLabel[windowBehaviorHint="true"] {
+    color: #666666;
+    font-size: 9pt;
+}
+
 QMainWindow, QDialog, QWidget {
     background-color: #ffffff;
     color: #333333;
@@ -35,6 +45,11 @@ QPushButton {
     border-radius: 4px;
     padding: 6px 16px;
     min-height: 22px;
+}
+
+QPushButton#aboutJoinCommunityButton {
+    padding-left: 8px;
+    padding-right: 8px;
 }
 
 QPushButton:hover {
@@ -1481,26 +1496,6 @@ QListWidget#customDropdownList::item:selected:hover {
     border-bottom: none;
 }
 
-/* 璧炲姪鎸夐挳鐗规畩鏍峰紡 - 蹇呴』鍦ㄩ€氱敤鏍峰紡涔嬪墠瀹氫箟浠ョ‘淇濅紭鍏堢骇 */
-#CustomTitleBar QToolButton#sponsorButton {
-    color: #ff4757 !important;
-    font-size: 18px;
-    background-color: transparent;
-    border: none;
-    padding: 4px;
-    border-radius: 4px;
-}
-
-#CustomTitleBar QToolButton#sponsorButton:hover {
-    background-color: rgba(255, 71, 87, 0.2);
-    color: #ff1744 !important;
-}
-
-#CustomTitleBar QToolButton#sponsorButton:pressed {
-    background-color: rgba(255, 71, 87, 0.3);
-    color: #d50000 !important;
-}
-
 #CustomTitleBar QToolButton {
     background-color: transparent;
     border: none;
@@ -1528,6 +1523,25 @@ QListWidget#customDropdownList::item:selected:hover {
 
 #CustomTitleBar QToolButton:disabled {
     opacity: 0.5;
+}
+
+#CustomTitleBar QToolButton#titleSponsorButton {
+    color: #0078d4;
+    font-size: 12px;
+    background-color: transparent;
+    border: none;
+    padding: 0px 8px;
+    margin: 0px 2px;
+}
+
+#CustomTitleBar QToolButton#titleSponsorButton:hover {
+    color: #1084d8;
+    background-color: transparent;
+}
+
+#CustomTitleBar QToolButton#titleSponsorButton:pressed {
+    color: #006cbe;
+    background-color: transparent;
 }
 
 /* 鏍囬鏍忕獥鍙ｆ寜閽?*/
@@ -1913,14 +1927,21 @@ QFrame#randomTargetCard:hover {
 /* ========== 娴姩鐘舵€佺獥鍙?========== */
 
 /* 娴姩绐楀彛瀹瑰櫒 */
-#floatingContainer {
-    background-color: #ffffff;
-    border: 1px solid #d0d0d0;
-    border-radius: 6px;
+QLabel#customRoundedTooltip {
+    background: transparent;
+    color: #333333;
+    border: none;
+    padding: 6px 8px;
+}
+
+#executionLogContainer {
+    background-color: transparent;
+    border: none;
+    border-radius: 0;
 }
 
 /* 鐘舵€佹枃瀛?*/
-#floatingStatusLabel {
+#executionLogStatusLabel {
     color: #333333;
     font-size: 12px;
     font-weight: normal;
@@ -1930,7 +1951,7 @@ QFrame#randomTargetCard:hover {
 }
 
 /* 蹇嵎閿彁绀?*/
-#floatingHotkeyLabel {
+#executionLogHotkeyLabel {
     color: #888888;
     font-size: 10px;
     background: transparent;
@@ -1939,7 +1960,7 @@ QFrame#randomTargetCard:hover {
 }
 
 /* 鎺у埗鎸夐挳 */
-#floatingCtrlBtn {
+#executionLogCtrlBtn {
     background-color: #f0f0f0;
     border: 1px solid #d0d0d0;
     border-radius: 4px;
@@ -1948,45 +1969,69 @@ QFrame#randomTargetCard:hover {
     padding: 0px;
 }
 
-#floatingCtrlBtn:hover {
+#executionLogCtrlBtn:hover {
     background-color: #e0e0e0;
     border-color: #c0c0c0;
 }
 
-#floatingCtrlBtn:pressed {
+#executionLogCtrlBtn:pressed {
     background-color: #d0d0d0;
 }
 
-#floatingCtrlBtn:disabled {
+#executionLogCtrlBtn:disabled {
     color: #aaaaaa;
     background-color: #f5f5f5;
     border-color: #e0e0e0;
 }
 
-/* 灞曞紑鎸夐挳 */
-#floatingExpandBtn {
-    background-color: transparent;
-    border: none;
-    color: #888888;
-    font-size: 8px;
-    padding: 0px;
+#executionLogOpacitySlider {
+    min-height: 22px;
 }
 
-#floatingExpandBtn:hover {
-    color: #333333;
+#executionLogOpacitySlider::groove:horizontal {
+    height: 6px;
+    background-color: #d0d0d0;
+    border-radius: 3px;
+}
+
+#executionLogOpacitySlider::sub-page:horizontal {
+    background-color: #0078d4;
+    border-radius: 3px;
+}
+
+#executionLogOpacitySlider::add-page:horizontal {
+    background-color: #d0d0d0;
+    border-radius: 3px;
+}
+
+#executionLogOpacitySlider::handle:horizontal {
+    width: 14px;
+    height: 14px;
+    margin: -5px 0;
+    background-color: #0078d4;
+    border: 2px solid #ffffff;
+    border-radius: 7px;
+}
+
+#executionLogOpacitySlider::handle:horizontal:hover {
+    background-color: #1084d8;
+}
+
+#executionLogOpacitySlider::handle:horizontal:disabled {
+    background-color: #aaaaaa;
 }
 
 /* 鏃ュ織闈㈡澘 */
-#floatingLogPanel {
+#executionLogPanel {
     background: transparent;
     border: none;
 }
 
 /* 鏃ュ織瑙嗗浘 */
-#floatingLogView {
-    background-color: #fafafa;
-    border: 1px solid #e0e0e0;
-    border-radius: 4px;
+#executionLogView {
+    background-color: transparent;
+    border: none;
+    border-radius: 0;
     color: #333333;
     font-family: "Consolas", "Microsoft YaHei UI", monospace;
     font-size: 11px;
@@ -2362,9 +2407,9 @@ QTabWidget#workflowTabs::pane {
 }
 
 QLabel#scriptSignatureHint {
-    background-color: #ffffff;
+    background-color: transparent;
     color: #333333;
-    border: 1px solid #e0e0e0;
+    border: none;
     border-radius: 4px;
     padding: 6px 8px;
     font-family: Consolas, "Microsoft YaHei UI", monospace;
@@ -2396,6 +2441,24 @@ QListView#scriptCompleterPopup::item:hover {
 QListView#scriptCompleterPopup::item:selected {
     background-color: #0078d4;
     color: #ffffff;
+}
+
+QListView#scriptCompleterPopup::viewport {
+    background: transparent;
+}
+
+QListView#scriptCompleterPopup QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 0px;
+    border: none;
+}
+
+QListView#scriptCompleterPopup QScrollBar::handle:vertical {
+    background-color: rgba(0, 0, 0, 0.2);
+    border-radius: 4px;
+    min-height: 24px;
+    margin: 2px;
 }
 
 #aiImagePreviewDialog {
@@ -2434,4 +2497,9 @@ QListView#scriptCompleterPopup::item:selected {
     background-color: #fafafa;
     border: 1px solid #e0e0e0;
     border-radius: 4px;
+}
+
+QTabWidget#workflowTabWidget::pane {
+    border: none;
+    top: 0px;
 }

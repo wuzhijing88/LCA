@@ -28,7 +28,6 @@ class GlobalSettingsDialogWindowCrudMixin:
         # OCR服务会在首次使用时自动创建
         # for window_info in self.bound_windows:
         #     if window_info.get('hwnd'):
-        #         self._preregister_window_ocr_service(window_info)
         # 注册窗口到句柄管理器
         self._register_windows_to_handle_manager()
 
@@ -181,30 +180,46 @@ class GlobalSettingsDialogWindowCrudMixin:
 
         from utils.plugin.session import unbind_shared_plugin_windows
 
-        threading.Thread(target=unbind_shared_plugin_windows, name="plugin-probe-discard", daemon=True).start()
+        worker = threading.Thread(target=unbind_shared_plugin_windows, name="plugin-probe-discard", daemon=True)
+        self._plugin_probe_discard_thread = worker
+        worker.start()
 
     def _finish_live_plugin_probe_for_accept(self) -> None:
         """确认保存后不再需要还原打开对话框前的旧戳记。"""
         self._plugin_probe_stamps_backup = None
 
+    def _stop_plugin_bind_sweep(self) -> None:
+        from ui.plugin_bind_sweep import stop_settings_plugin_bind_sweep
+
+        stop_settings_plugin_bind_sweep(self)
+
+    def done(self, result):
+        self._release_window_handle_callbacks()
+        super().done(result)
+
     def reject(self):
         try:
+            self._stop_plugin_bind_sweep()
             self._discard_live_plugin_probe()
         except Exception:
             logger.debug("取消设置时清理插件试绑状态失败", exc_info=True)
         super().reject()
 
     def closeEvent(self, event):
+        self._release_window_handle_callbacks()
         # 标题栏关闭和代码调用 close() 不一定经过 reject()，也必须停掉延迟/后台试绑。
         try:
+            self._stop_plugin_bind_sweep()
             self._discard_live_plugin_probe()
         except Exception:
             logger.debug("关闭设置时清理插件试绑状态失败", exc_info=True)
         super().closeEvent(event)
 
     def close(self):
+        self._release_window_handle_callbacks()
         # 对话框尚未 show 时 Qt 不一定派发 closeEvent；测试和程序化关闭也要立即取消试绑。
         try:
+            self._stop_plugin_bind_sweep()
             self._discard_live_plugin_probe()
         except Exception:
             logger.debug("程序化关闭设置时清理插件试绑状态失败", exc_info=True)
@@ -314,7 +329,6 @@ class GlobalSettingsDialogWindowCrudMixin:
         if hasattr(self, "_schedule_wgc_desktop_engine_warning"):
             self._schedule_wgc_desktop_engine_warning()
         # 【性能优化】不预创建OCR服务，改为按需创建（避免绑定窗口时卡顿）
-        # self._preregister_window_ocr_service(new_window)
         # 工具 修复：绑定窗口时不自动激活窗口，避免干扰用户操作
         # 注释掉自动激活逻辑，只在实际执行任务时才激活窗口
         # if hwnd and hwnd != 0:
@@ -323,7 +337,7 @@ class GlobalSettingsDialogWindowCrudMixin:
         #         self.parent()._activate_window_if_needed(hwnd, window_title)
         logger.info(f"绑定窗口完成，未激活窗口: {window_title} (HWND: {hwnd})")
 
-    def _add_window_silently(self, window_title: str, hwnd: int = 0):
+    def _add_window_silently(self, window_title: str, hwnd: int = 0, probe_plugin: bool | None = None):
         """静默添加窗口（不显示对话框，全面异常保护）"""
         try:
             hwnd = as_hwnd(hwnd)
@@ -333,7 +347,7 @@ class GlobalSettingsDialogWindowCrudMixin:
                 logger.info(f"跳过重复窗口: {window_title} (HWND: {hwnd})")
                 return
             logger.info(f"成功添加窗口: {window_title} (HWND: {hwnd})")
-            self._append_bound_window(window_title, hwnd)
+            self._append_bound_window(window_title, hwnd, probe_plugin=probe_plugin)
             logger.info(f"窗口添加完成: {window_title} (HWND: {hwnd})")
         except Exception as e:
             logger.error(f"添加窗口时发生严重错误: {e}")
@@ -395,17 +409,7 @@ class GlobalSettingsDialogWindowCrudMixin:
             if reply != QMessageBox.StandardButton.Yes:
                 return
             logger.info(f"开始移除窗口: {window_title} (HWND: {hwnd})")
-            # 【修复卡顿】在后台线程注销OCR服务，避免阻塞UI
-            import threading
-            def unregister_ocr_background():
-                try:
-                    self._unregister_window_ocr_service(window_info)
-                except Exception as e:
-                    logger.error(f"注销OCR服务时出错: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-            ocr_cleanup_thread = threading.Thread(target=unregister_ocr_background, daemon=True, name=f"UnregisterOCR-{window_title}")
-            ocr_cleanup_thread.start()
+            self._unregister_window_ocr_service(window_info)
             # 从列表中移除窗口
             try:
                 self.bound_windows.pop(current_index)

@@ -3,10 +3,12 @@
 global _ib_pressed_keys := Map()
 global _ib_pressed_buttons := Map()
 global _ib_driver_name := ""
+global _ib_stop_path := ""
 
-IbWorkerMain(driverName, driverArg := "") {
-    global _ib_driver_name
+IbWorkerMain(driverName, driverArg, stopPath) {
+    global _ib_driver_name, _ib_stop_path
     _ib_driver_name := StrLower(Trim(driverName))
+    _ib_stop_path := stopPath
     try {
         ; Force mode=0 during bootstrap. Hook mode can fail in some packaged envs
         ; and is not required because IbSend() toggles hook per call.
@@ -59,13 +61,13 @@ _ib_handle_line(line) {
     method := parts[2]
     args := []
 
-    if parts.Length >= 3 {
-        Loop parts.Length - 2 {
-            args.Push(_ib_decode_token(parts[A_Index + 2]))
-        }
-    }
-
     try {
+        if parts.Length >= 3 {
+            Loop parts.Length - 2 {
+                args.Push(_ib_decode_token(parts[A_Index + 2]))
+            }
+        }
+
         tokens := _ib_dispatch(method, args)
         _ib_write_ok(reqId, tokens*)
     } catch as opErr {
@@ -74,6 +76,8 @@ _ib_handle_line(line) {
 }
 
 _ib_dispatch(method, args) {
+    if method != "release_all_inputs" && method != "exit" && method != "mouse_up" && method != "key_up"
+        _ib_check_stop()
     if method = "ping"
         return []
 
@@ -96,37 +100,34 @@ _ib_dispatch(method, args) {
     }
 
     if method = "move_mouse" {
-        x := _ib_to_int(_ib_arg(args, 1, 0), 0)
-        y := _ib_to_int(_ib_arg(args, 2, 0), 0)
-        absolute := _ib_to_bool(_ib_arg(args, 3, true), true)
+        x := _ib_to_int(_ib_arg(args, 1))
+        y := _ib_to_int(_ib_arg(args, 2))
+        absolute := _ib_to_bool(_ib_arg(args, 3))
         _ib_move_cursor(x, y, absolute)
         return []
     }
 
     if method = "click_mouse" {
-        x := _ib_arg(args, 1, "")
-        y := _ib_arg(args, 2, "")
-        button := _ib_normalize_button(_ib_arg(args, 3, "left"))
-        clicks := _ib_to_int(_ib_arg(args, 4, 1), 1)
-        intervalMs := _ib_to_int(_ib_to_number(_ib_arg(args, 5, 0.0), 0.0) * 1000.0, 0)
-        durationMs := _ib_to_int(_ib_to_number(_ib_arg(args, 6, 0.0), 0.0) * 1000.0, 0)
+        x := _ib_arg(args, 1)
+        y := _ib_arg(args, 2)
+        button := _ib_normalize_button(_ib_arg(args, 3))
+        clicks := _ib_to_int(_ib_arg(args, 4))
+        intervalMs := _ib_to_int(_ib_to_number(_ib_arg(args, 5)) * 1000.0)
+        durationMs := _ib_to_int(_ib_to_number(_ib_arg(args, 6)) * 1000.0)
 
         if x = "" || y = ""
             throw Error("MouseCoordinatesRequired")
-        tx := _ib_to_int(x, 0)
-        ty := _ib_to_int(y, 0)
+        tx := _ib_to_int(x)
+        ty := _ib_to_int(y)
 
         if clicks < 1
-            clicks := 1
+            throw Error("鼠标次数必须是正整数")
 
+        if intervalMs < 0 || durationMs < 0
+            throw Error("点击时间不能为负数")
         Loop clicks {
-            if durationMs > 0 {
-                _ib_mouse_down(button, tx, ty)
-                _ib_precise_hold_sleep_ms(durationMs)
-                _ib_mouse_up(button, tx, ty)
-            } else {
-                _ib_mouse_click(button, tx, ty)
-            }
+            holdMs := durationMs > 0 ? durationMs : _ib_random_atomic_click_hold_ms()
+            _ib_mouse_click(button, tx, ty, "", holdMs)
 
             if A_Index < clicks && intervalMs > 0
                 _ib_precise_sleep_ms(intervalMs)
@@ -135,66 +136,74 @@ _ib_dispatch(method, args) {
     }
 
     if method = "mouse_down" {
-        x := _ib_arg(args, 1, "")
-        y := _ib_arg(args, 2, "")
-        button := _ib_normalize_button(_ib_arg(args, 3, "left"))
+        x := _ib_arg(args, 1)
+        y := _ib_arg(args, 2)
+        button := _ib_normalize_button(_ib_arg(args, 3))
         if x = "" || y = ""
             throw Error("MouseCoordinatesRequired")
-        tx := _ib_to_int(x, 0)
-        ty := _ib_to_int(y, 0)
+        tx := _ib_to_int(x)
+        ty := _ib_to_int(y)
         _ib_mouse_down(button, tx, ty)
         return []
     }
 
     if method = "mouse_up" {
-        x := _ib_arg(args, 1, "")
-        y := _ib_arg(args, 2, "")
-        button := _ib_normalize_button(_ib_arg(args, 3, "left"))
+        x := _ib_arg(args, 1)
+        y := _ib_arg(args, 2)
+        button := _ib_normalize_button(_ib_arg(args, 3))
         if x = "" || y = ""
             throw Error("MouseCoordinatesRequired")
-        _ib_mouse_up(button, _ib_to_int(x, 0), _ib_to_int(y, 0))
+        _ib_mouse_up(button, _ib_to_int(x), _ib_to_int(y))
         return []
     }
 
     if method = "drag_mouse" {
-        sx := _ib_to_int(_ib_arg(args, 1, 0), 0)
-        sy := _ib_to_int(_ib_arg(args, 2, 0), 0)
-        ex := _ib_to_int(_ib_arg(args, 3, 0), 0)
-        ey := _ib_to_int(_ib_arg(args, 4, 0), 0)
-        button := _ib_normalize_button(_ib_arg(args, 5, "left"))
-        duration := _ib_to_number(_ib_arg(args, 6, 0.0), 0.0)
+        sx := _ib_to_int(_ib_arg(args, 1))
+        sy := _ib_to_int(_ib_arg(args, 2))
+        ex := _ib_to_int(_ib_arg(args, 3))
+        ey := _ib_to_int(_ib_arg(args, 4))
+        button := _ib_normalize_button(_ib_arg(args, 5))
+        duration := _ib_to_number(_ib_arg(args, 6))
 
         _ib_set_cursor(sx, sy)
         _ib_mouse_down(button, sx, sy)
 
-        _ib_drag_move_segment_with_py_profile(sx, sy, ex, ey, duration)
+        _ib_drag_move_segment_with_py_profile(sx, sy, ex, ey, duration, button)
 
         _ib_mouse_up(button, ex, ey)
         return []
     }
 
     if method = "drag_path" {
-        pointsText := _ib_arg(args, 1, "")
-        duration := _ib_to_number(_ib_arg(args, 2, 0.0), 0.0)
-        button := _ib_normalize_button(_ib_arg(args, 3, "left"))
-        timestampsText := _ib_arg(args, 4, "")
+        pointsText := _ib_arg(args, 1)
+        duration := _ib_to_number(_ib_arg(args, 2))
+        button := _ib_normalize_button(_ib_arg(args, 3))
+        timestampsText := _ib_arg(args, 4)
 
         points := _ib_parse_points(pointsText)
         if points.Length < 2
             throw Error("invalid drag path")
 
         ts := _ib_parse_numbers(timestampsText)
+        if ts.Length > 0 && ts.Length != points.Length
+            throw Error("拖拽时间戳数量与路径点数量不一致")
+        prevTime := 0
+        for _, stamp in ts {
+            if stamp < prevTime
+                throw Error("拖拽时间戳必须递增")
+            prevTime := stamp
+        }
 
         first := points[1]
         _ib_set_cursor(first[1], first[2])
         _ib_mouse_down(button, first[1], first[2])
 
         if ts.Length = points.Length {
-            prev := _ib_to_number(ts[1], 0.0)
+            prev := _ib_to_number(ts[1])
             prevPoint := points[1]
             Loop points.Length - 1 {
                 p := points[A_Index + 1]
-                cur := _ib_to_number(ts[A_Index + 1], prev)
+                cur := _ib_to_number(ts[A_Index + 1])
                 segDuration := cur - prev
                 if segDuration < 0
                     segDuration := 0
@@ -203,7 +212,8 @@ _ib_dispatch(method, args) {
                     prevPoint[2],
                     p[1],
                     p[2],
-                    segDuration
+                    segDuration,
+                    button
                 )
                 prev := cur
                 prevPoint := p
@@ -221,7 +231,8 @@ _ib_dispatch(method, args) {
                     prevPoint[2],
                     p[1],
                     p[2],
-                    segDuration
+                    segDuration,
+                    button
                 )
                 prevPoint := p
             }
@@ -233,17 +244,19 @@ _ib_dispatch(method, args) {
     }
 
     if method = "scroll_mouse" {
-        direction := StrLower(Trim(_ib_arg(args, 1, "down")))
-        clicks := _ib_to_int(_ib_arg(args, 2, 1), 1)
-        x := _ib_arg(args, 3, "")
-        y := _ib_arg(args, 4, "")
+        direction := StrLower(Trim(_ib_arg(args, 1)))
+        clicks := _ib_to_int(_ib_arg(args, 2))
+        x := _ib_arg(args, 3)
+        y := _ib_arg(args, 4)
 
         if clicks < 1
-            clicks := 1
+            throw Error("鼠标次数必须是正整数")
 
         if x != "" && y != ""
-            _ib_set_cursor(_ib_to_int(x, 0), _ib_to_int(y, 0))
+            _ib_set_cursor(_ib_to_int(x), _ib_to_int(y))
 
+        if direction != "up" && direction != "down"
+            throw Error("不支持的滚轮方向")
         wheelToken := direction = "up" ? "{WheelUp}" : "{WheelDown}"
         Loop clicks
             IbSend(wheelToken)
@@ -251,23 +264,23 @@ _ib_dispatch(method, args) {
     }
 
     if method = "key_down" {
-        _ib_key_down(_ib_arg(args, 1, ""))
+        _ib_key_down(_ib_arg(args, 1))
         return []
     }
 
     if method = "key_up" {
-        _ib_key_up(_ib_arg(args, 1, ""))
+        _ib_key_up(_ib_arg(args, 1))
         return []
     }
 
     if method = "press_key" {
-        key := _ib_normalize_key(_ib_arg(args, 1, ""))
-        holdMs := _ib_to_number(_ib_arg(args, 2, 0.0), 0.0) * 1000.0
+        key := _ib_normalize_key(_ib_arg(args, 1))
+        holdMs := _ib_to_number(_ib_arg(args, 2)) * 1000.0
         if key = ""
             throw Error("empty key")
 
         if holdMs < 0
-            holdMs := 0
+            throw Error("按键保持时间不能为负数")
 
         keyDownSent := false
         try {
@@ -286,18 +299,18 @@ _ib_dispatch(method, args) {
     }
 
     if method = "modified_key_press" {
-        key := _ib_normalize_key(_ib_arg(args, 1, ""))
-        holdMs := _ib_to_number(_ib_arg(args, 2, 0.0), 0.0) * 1000.0
+        key := _ib_normalize_key(_ib_arg(args, 1))
+        holdMs := _ib_to_number(_ib_arg(args, 2)) * 1000.0
         if key = ""
             throw Error("empty key")
 
         if holdMs < 0
-            holdMs := 0
+            throw Error("按键保持时间不能为负数")
 
         heldKeys := []
         if args.Length >= 3 {
             Loop args.Length - 2 {
-                heldKey := _ib_normalize_key(_ib_arg(args, A_Index + 2, ""))
+                heldKey := _ib_normalize_key(_ib_arg(args, A_Index + 2))
                 if heldKey != ""
                     heldKeys.Push(heldKey)
             }
@@ -348,14 +361,6 @@ _ib_dispatch(method, args) {
             keyName := keys[idx]
             _ib_key_up(keyName)
         }
-        return []
-    }
-
-    if method = "type_text" {
-        text := _ib_arg(args, 1, "")
-        if text = ""
-            return []
-        IbSend("{Text}" text)
         return []
     }
 
@@ -411,10 +416,10 @@ _ib_format_init_error(errObj) {
     return result
 }
 
-_ib_arg(args, index, defaultValue := "") {
-    if index >= 1 && index <= args.Length
-        return args[index]
-    return defaultValue
+_ib_arg(args, index) {
+    if index < 1 || index > args.Length
+        throw Error("输入请求缺少参数")
+    return args[index]
 }
 
 _ib_track_key_down(keyName) {
@@ -490,7 +495,7 @@ _ib_keyboard_repeat_interval_ms() {
 
 _ib_hold_with_typematic(key, holdMs) {
     ; 人手按住会先停顿再连发。罗技 HID 按住不会连发，必须在同一驱动通道上补 make/break。
-    targetMs := _ib_to_number(holdMs, 0.0)
+    targetMs := _ib_to_number(holdMs)
     if targetMs <= 0
         return
 
@@ -540,8 +545,8 @@ _ib_hold_with_typematic(key, holdMs) {
 _ib_track_mouse_button_down(buttonName, x := "", y := "") {
     global _ib_pressed_buttons
     button := _ib_normalize_button(buttonName)
-    tx := _ib_to_int(x, "")
-    ty := _ib_to_int(y, "")
+    tx := _ib_to_int(x)
+    ty := _ib_to_int(y)
     if tx = "" || ty = "" {
         _ib_pressed_buttons[button] := true
         return
@@ -558,60 +563,44 @@ _ib_track_mouse_button_up(buttonName) {
 
 _ib_release_all_inputs() {
     global _ib_pressed_keys, _ib_pressed_buttons
-
+    failures := []
     pendingKeys := []
     for keyName, _ in _ib_pressed_keys
         pendingKeys.Push(keyName)
-
     for _, keyName in pendingKeys {
         try _ib_key_up(keyName)
+        catch as err
+            failures.Push(err.Message)
     }
-
     pendingButtons := []
-    for buttonName, buttonMeta in _ib_pressed_buttons
-        pendingButtons.Push([buttonName, buttonMeta])
-
-    if pendingButtons.Length > 0 {
-        for _, item in pendingButtons {
-            buttonName := item[1]
-            buttonMeta := item[2]
-            releaseX := ""
-            releaseY := ""
-            if IsObject(buttonMeta) && buttonMeta.Length >= 2 {
-                releaseX := _ib_to_int(buttonMeta[1], "")
-                releaseY := _ib_to_int(buttonMeta[2], "")
-            }
-            if releaseX = "" || releaseY = ""
-                MouseGetPos(&releaseX, &releaseY)
-            try _ib_mouse_up(buttonName, releaseX, releaseY)
-        }
+    for buttonName, _ in _ib_pressed_buttons
+        pendingButtons.Push(buttonName)
+    for _, buttonName in pendingButtons {
+        try _ib_mouse_up(buttonName)
+        catch as err
+            failures.Push(err.Message)
     }
-
-    _ib_pressed_keys := Map()
-    _ib_pressed_buttons := Map()
+    if failures.Length > 0
+        throw Error("输入释放失败：" failures[1])
 }
 
 _ib_normalize_button(name) {
     key := StrLower(Trim(name))
-    if key = "right" || key = "r" || key = "rbutton" || key = "右键"
-        return "right"
-    if key = "middle" || key = "m" || key = "mbutton" || key = "中键"
-        return "middle"
-    return "left"
+    if key != "left" && key != "right" && key != "middle"
+        throw Error("不支持的鼠标按钮：" name)
+    return key
 }
 
 _ib_mouse_down(button, x := "", y := "") {
-    ; 先登记再发包：发包抛错时兜底释放仍能找到这个键。
     _ib_track_mouse_button_down(button, x, y)
     _ib_mouse_click(button, x, y, "D")
 }
 
 _ib_mouse_up(button, x := "", y := "") {
-    try {
-        _ib_mouse_click(button, x, y, "U")
-    } finally {
-        _ib_track_mouse_button_up(button)
-    }
+    ; 弹起只有按钮事件：不校准、不移动，不受坐标查询失败影响。
+    normalized := _ib_normalize_button(button)
+    _ib_send_mouse_button_event(_ib_button_to_ahk_name(normalized), "U")
+    _ib_track_mouse_button_up(normalized)
 }
 
 _ib_send_mouse_button_event(btn, downOrUp) {
@@ -632,6 +621,30 @@ _ib_send_mouse_button_event(btn, downOrUp) {
     DllCall("IbInputSimulator\IbSend_mouse_event", "UInt", flags, "UInt", 0, "UInt", 0, "UInt", 0, "UPtr", 0)
 }
 
+_ib_send_mouse_move_with_button(button, dx, dy) {
+    ; 罗技报告的按钮位是每包状态。运行库的移动包不会自动继承按下位，
+    ; 拖拽移动必须在每个相对位移包里继续携带当前按钮。
+    normalized := _ib_normalize_button(button)
+    MOUSEEVENTF_MOVE := 0x0001
+    MOUSEEVENTF_LEFTDOWN := 0x0002
+    MOUSEEVENTF_RIGHTDOWN := 0x0008
+    MOUSEEVENTF_MIDDLEDOWN := 0x0020
+    if normalized = "right"
+        flags := MOUSEEVENTF_MOVE | MOUSEEVENTF_RIGHTDOWN
+    else if normalized = "middle"
+        flags := MOUSEEVENTF_MOVE | MOUSEEVENTF_MIDDLEDOWN
+    else
+        flags := MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN
+    DllCall(
+        "IbInputSimulator\IbSend_mouse_event",
+        "UInt", flags,
+        "UInt", dx,
+        "UInt", dy,
+        "UInt", 0,
+        "UPtr", 0
+    )
+}
+
 _ib_emit_button_event_at_target(btn, tx, ty, downOrUp) {
     ; D/U 事件始终携带目标坐标，禁止使用当前坐标发包。
     ; 这样即使发生瞬时指针扰动，也不会退化为“在原位置点击”。
@@ -650,92 +663,69 @@ _ib_button_to_ahk_name(button) {
     return "Left"
 }
 
-_ib_mouse_click(button, x := "", y := "", downOrUp := "") {
-    if downOrUp != "" && downOrUp != "D" && downOrUp != "U"
-        throw Error("UnsupportedMouseAction")
-    if x = "" || y = ""
-        throw Error("MouseCoordinatesRequired")
-
-    btn := _ib_button_to_ahk_name(button)
-    tx := _ib_to_int(x, 0)
-    ty := _ib_to_int(y, 0)
-    isDown := (downOrUp = "D")
-    isUp := (downOrUp = "U")
-    cursorClipped := false
-    downSent := false
-    mouseMoveBlocked := false
-    ; 弹起时按钮本来就是按着的（拖拽终点 / 兜底释放），校准函数不能因此拒绝，
-    ; 否则弹起永远发不出去，物理鼠标左键卡在按下状态。
-    if !_ib_ensure_cursor_at_point(tx, ty, 1, 5, isUp) {
-        if isUp {
-            ; 弹起不能被卡住：校准失败也要在当前位置把键松开，再报错让上层知道落点偏了。
-            _ib_emit_button_event_at_target(btn, tx, ty, "U")
-            throw Error("TargetVerifyFailed")
-        }
-        throw Error("TargetVerifyFailed")
+_ib_mouse_click(button, x := "", y := "", downOrUp := "", holdMs := 50) {
+    if downOrUp = "U" {
+        _ib_mouse_up(button)
+        return
     }
-    ; 校准失败直接禁止发送任何点击消息。
+    if downOrUp != "" && downOrUp != "D"
+        throw Error("不支持的鼠标动作")
+    if x = "" || y = ""
+        throw Error("鼠标操作需要坐标")
+    button := _ib_normalize_button(button)
+    btn := _ib_button_to_ahk_name(button)
+    tx := _ib_to_int(x)
+    ty := _ib_to_int(y)
+    if _ib_any_mouse_button_down() || !_ib_ensure_cursor_at_point(tx, ty, 1, 5)
+        throw Error("鼠标未到达点击位置或按钮尚未松开")
+
+    previousClip := _ib_clip_cursor_to_point(tx, ty)
+    if !IsObject(previousClip)
+        throw Error("无法限制点击期间的鼠标活动范围")
+    downSent := false
     try {
-        if downOrUp = "" {
-            cursorClipped := _ib_clip_cursor_to_point(tx, ty)
-            _ib_precise_sleep_ms(1)
-            ; 完整点击：按下->随机按住->弹起，并保证异常时必定补发弹起。
-            ; 期间阻止物理鼠标移动，避免微抖导致游戏判定为拖拽。
-            try {
-                BlockInput("MouseMove")
-                mouseMoveBlocked := true
-            } catch {
-                mouseMoveBlocked := false
-            }
-            _ib_emit_button_event_at_target(btn, tx, ty, "D")
-            downSent := true
-            _ib_precise_sleep_ms(_ib_random_atomic_click_hold_ms())
-            _ib_emit_button_event_at_target(btn, tx, ty, "U")
+        _ib_precise_sleep_ms(1)
+        _ib_track_mouse_button_down(button, tx, ty)
+        downSent := true
+        _ib_emit_button_event_at_target(btn, tx, ty, "D")
+        if downOrUp = "D" {
             downSent := false
             return
         }
-        if isDown {
-            cursorClipped := _ib_clip_cursor_to_point(tx, ty)
-            _ib_precise_sleep_ms(12)
-            _ib_emit_button_event_at_target(btn, tx, ty, downOrUp)
-            return
-        }
-        ; 显式长按流程弹起同样固定发往目标坐标。
-        cursorClipped := _ib_clip_cursor_to_point(tx, ty)
-        _ib_precise_sleep_ms(1)
-        _ib_emit_button_event_at_target(btn, tx, ty, downOrUp)
-        return
+        _ib_precise_hold_sleep_ms(holdMs)
     } finally {
-        if downSent {
-            try _ib_emit_button_event_at_target(btn, tx, ty, "U")
+        try {
+            if downSent
+                _ib_mouse_up(button)
+        } finally {
+            _ib_release_cursor_clip(previousClip)
         }
-        if mouseMoveBlocked {
-            try BlockInput("MouseMoveOff")
-        }
-        if cursorClipped
-            _ib_release_cursor_clip()
     }
 }
 
 _ib_clip_cursor_to_point(x, y) {
-    tx := _ib_to_int(x, 0)
-    ty := _ib_to_int(y, 0)
+    previousClip := Buffer(16, 0)
+    if !DllCall("User32\GetClipCursor", "Ptr", previousClip.Ptr, "Int")
+        return false
     rect := Buffer(16, 0)
-    NumPut("Int", tx, rect, 0)
-    NumPut("Int", ty, rect, 4)
-    NumPut("Int", tx + 1, rect, 8)
-    NumPut("Int", ty + 1, rect, 12)
-    return DllCall("User32\ClipCursor", "Ptr", rect.Ptr, "Int")
+    NumPut("Int", _ib_to_int(x), rect, 0)
+    NumPut("Int", _ib_to_int(y), rect, 4)
+    NumPut("Int", _ib_to_int(x) + 1, rect, 8)
+    NumPut("Int", _ib_to_int(y) + 1, rect, 12)
+    if !DllCall("User32\ClipCursor", "Ptr", rect.Ptr, "Int")
+        return false
+    return previousClip
 }
 
-_ib_release_cursor_clip() {
-    DllCall("User32\ClipCursor", "Ptr", 0, "Int")
+_ib_release_cursor_clip(previousClip) {
+    if !DllCall("User32\ClipCursor", "Ptr", previousClip.Ptr, "Int")
+        throw Error("无法恢复鼠标活动范围")
 }
 
 _ib_is_cursor_at_point(x, y, tolerance := 1) {
-    tx := _ib_to_int(x, 0)
-    ty := _ib_to_int(y, 0)
-    tol := _ib_to_int(tolerance, 1)
+    tx := _ib_to_int(x)
+    ty := _ib_to_int(y)
+    tol := _ib_to_int(tolerance)
     if tol < 0
         tol := 0
     MouseGetPos(&cx, &cy)
@@ -749,12 +739,12 @@ _ib_any_mouse_button_down() {
 }
 
 _ib_wait_cursor_stable_at_point(x, y, tolerance := 1, timeoutMs := 14, stableSamples := 2) {
-    tx := _ib_to_int(x, 0)
-    ty := _ib_to_int(y, 0)
-    maxMs := _ib_to_int(timeoutMs, 14)
+    tx := _ib_to_int(x)
+    ty := _ib_to_int(y)
+    maxMs := _ib_to_int(timeoutMs)
     if maxMs < 1
         maxMs := 1
-    requiredHits := _ib_to_int(stableSamples, 2)
+    requiredHits := _ib_to_int(stableSamples)
     if requiredHits < 1
         requiredHits := 1
     hitCount := 0
@@ -774,9 +764,9 @@ _ib_wait_cursor_stable_at_point(x, y, tolerance := 1, timeoutMs := 14, stableSam
 }
 
 _ib_ensure_cursor_at_point(x, y, tolerance := 1, attempts := 5, allowButtonDown := false) {
-    tx := _ib_to_int(x, 0)
-    ty := _ib_to_int(y, 0)
-    maxAttempts := _ib_to_int(attempts, 5)
+    tx := _ib_to_int(x)
+    ty := _ib_to_int(y)
+    maxAttempts := _ib_to_int(attempts)
     if maxAttempts < 1
         maxAttempts := 1
 
@@ -790,11 +780,7 @@ _ib_ensure_cursor_at_point(x, y, tolerance := 1, attempts := 5, allowButtonDown 
     Loop maxAttempts {
         if !allowButtonDown && _ib_any_mouse_button_down()
             break
-        try {
-            _ib_set_cursor(tx, ty)
-        } catch {
-            DllCall("User32\SetCursorPos", "Int", tx, "Int", ty)
-        }
+        _ib_set_cursor(tx, ty)
         if _ib_wait_cursor_stable_at_point(tx, ty, tolerance, 14, 2)
             return true
     }
@@ -807,17 +793,9 @@ _ib_is_logitech_driver() {
     return _ib_driver_name = "logitech" || _ib_driver_name = "logitechghubnew"
 }
 
-_ib_set_cursor(x, y) {
-    tx := _ib_to_int(x, 0)
-    ty := _ib_to_int(y, 0)
-    ; 注意：本函数不检查按键状态，拖拽中段移动依赖这一点。
-    ; 优先系统级瞬移，减少驱动移动路径对前台游戏视角的干扰。
-    DllCall("User32\SetCursorPos", "Int", tx, "Int", ty)
-    _ib_precise_sleep_ms(2)
-    if _ib_is_cursor_at_point(tx, ty, 1)
-        return
-    ; 罗技 DLL 把像素绝对坐标当成 0~65536 归一化，会塌到屏幕原点。
-    ; 失败时按当前光标算相对位移，禁止再走 AHK MouseMove hook。
+_ib_set_cursor(x, y, heldButton := "") {
+    tx := _ib_to_int(x)
+    ty := _ib_to_int(y)
     if _ib_is_logitech_driver() {
         Loop 4 {
             MouseGetPos(&cx, &cy)
@@ -825,20 +803,20 @@ _ib_set_cursor(x, y) {
             dy := ty - cy
             if Abs(dx) <= 1 && Abs(dy) <= 1
                 return
-            IbMouseMove(dx, dy, 0, "R")
+            if heldButton != ""
+                _ib_send_mouse_move_with_button(heldButton, dx, dy)
+            else
+                IbMouseMove(dx, dy, 0, "R")
             _ib_precise_sleep_ms(3)
             if _ib_is_cursor_at_point(tx, ty, 1)
                 return
         }
-        if !_ib_is_cursor_at_point(tx, ty, 1)
-            throw Error("DriverMoveFailed")
-        return
+    } else {
+        IbMouseMove(tx, ty, 0)
+        _ib_precise_sleep_ms(3)
     }
-    ; 回退到驱动绝对移动，确保在受限场景仍可落位。
-    IbMouseMove(tx, ty, 0)
-    _ib_precise_sleep_ms(3)
     if !_ib_is_cursor_at_point(tx, ty, 1)
-        throw Error("DriverMoveFailed")
+        throw Error("鼠标移动失败")
 }
 
 _ib_move_cursor(x, y, absolute := true) {
@@ -847,8 +825,8 @@ _ib_move_cursor(x, y, absolute := true) {
         return
     }
 
-    dx := _ib_to_int(x, 0)
-    dy := _ib_to_int(y, 0)
+    dx := _ib_to_int(x)
+    dy := _ib_to_int(y)
     if dx = 0 && dy = 0
         return
 
@@ -857,12 +835,12 @@ _ib_move_cursor(x, y, absolute := true) {
     IbMouseMove(dx, dy, 0, "R")
 }
 
-_ib_drag_move_segment_with_py_profile(startX, startY, endX, endY, durationSec) {
-    sx := _ib_to_int(startX, 0)
-    sy := _ib_to_int(startY, 0)
-    ex := _ib_to_int(endX, sx)
-    ey := _ib_to_int(endY, sy)
-    safeDuration := _ib_to_number(durationSec, 0.0)
+_ib_drag_move_segment_with_py_profile(startX, startY, endX, endY, durationSec, button := "") {
+    sx := _ib_to_int(startX)
+    sy := _ib_to_int(startY)
+    ex := _ib_to_int(endX)
+    ey := _ib_to_int(endY)
+    safeDuration := _ib_to_number(durationSec)
     if safeDuration < 0
         safeDuration := 0.0
 
@@ -870,22 +848,22 @@ _ib_drag_move_segment_with_py_profile(startX, startY, endX, endY, durationSec) {
     ; 1) duration <= 0.1 秒：直接到终点（近似瞬移）
     ; 2) 否则按每步最小 0.05 秒分段（约 20 FPS）
     if safeDuration <= 0.1 {
-        _ib_set_cursor(ex, ey)
+        _ib_set_cursor(ex, ey, button)
         return
     }
 
-    steps := _ib_to_int(safeDuration / 0.05, 1)
+    steps := _ib_to_int(safeDuration / 0.05)
     if steps < 1
         steps := 1
-    stepDelayMs := _ib_to_int((safeDuration * 1000.0) / steps, 1)
+    stepDelayMs := _ib_to_int((safeDuration * 1000.0) / steps)
     if stepDelayMs < 1
         stepDelayMs := 1
 
     Loop steps {
         ratio := A_Index / steps
-        nx := _ib_to_int(sx + (ex - sx) * ratio, sx)
-        ny := _ib_to_int(sy + (ey - sy) * ratio, sy)
-        _ib_set_cursor(nx, ny)
+        nx := _ib_to_int(sx + (ex - sx) * ratio)
+        ny := _ib_to_int(sy + (ey - sy) * ratio)
+        _ib_set_cursor(nx, ny, button)
         _ib_precise_sleep_ms(stepDelayMs)
     }
 }
@@ -934,12 +912,10 @@ _ib_parse_points(serialized) {
         return points
 
     for _, pair in StrSplit(text, ";") {
-        if pair = ""
-            continue
         xy := StrSplit(pair, ",")
-        if xy.Length < 2
-            continue
-        points.Push([_ib_to_int(xy[1], 0), _ib_to_int(xy[2], 0)])
+        if xy.Length != 2
+            throw Error("拖拽坐标格式无效")
+        points.Push([_ib_to_int(xy[1]), _ib_to_int(xy[2])])
     }
     return points
 }
@@ -952,8 +928,8 @@ _ib_parse_numbers(serialized) {
 
     for _, part in StrSplit(text, ";") {
         if part = ""
-            continue
-        values.Push(_ib_to_number(part, 0.0))
+            throw Error("拖拽时间戳格式无效")
+        values.Push(_ib_to_number(part))
     }
     return values
 }
@@ -969,7 +945,7 @@ _ib_random_atomic_click_hold_ms() {
 
 
 _ib_precise_sleep_ms(ms) {
-    targetMs := _ib_to_number(ms, 0.0)
+    targetMs := _ib_to_number(ms)
     if targetMs <= 0
         return
 
@@ -979,23 +955,15 @@ _ib_precise_sleep_ms(ms) {
         DllCall("Kernel32\QueryPerformanceFrequency", "Int64*", &freq)
         qpf := freq
     }
-    if qpf <= 0 {
-        Sleep(_ib_to_int(targetMs, 0))
-        return
-    }
+    if qpf <= 0
+        throw Error("高精度计时不可用")
 
     startCounter := 0
     DllCall("Kernel32\QueryPerformanceCounter", "Int64*", &startCounter)
     targetTicks := targetMs * qpf / 1000.0
 
-    ; 长时长先粗睡眠到截止前20ms，再用高精度轮询收尾，避免Windows调度导致超睡。
-    if targetMs >= 25.0 {
-        coarseMs := _ib_to_int(targetMs - 20.0, 0)
-        if coarseMs > 0
-            DllCall("Kernel32\Sleep", "UInt", coarseMs)
-    }
-
     Loop {
+        _ib_check_stop()
         nowCounter := 0
         DllCall("Kernel32\QueryPerformanceCounter", "Int64*", &nowCounter)
         elapsedTicks := (nowCounter - startCounter)
@@ -1003,13 +971,15 @@ _ib_precise_sleep_ms(ms) {
             break
         remainingTicks := (targetTicks - elapsedTicks)
         ; 剩余时间较长时让出调度，末段改为忙等待避免额外调度抖动
-        if remainingTicks > (qpf / 1000.0 * 0.8)
+        if remainingTicks > (qpf / 1000.0 * 20)
+            DllCall("Kernel32\Sleep", "UInt", 10)
+        else if remainingTicks > (qpf / 1000.0 * 0.8)
             DllCall("Kernel32\Sleep", "UInt", 0)
     }
 }
 
 _ib_precise_hold_sleep_ms(ms) {
-    targetMs := _ib_to_number(ms, 0.0)
+    targetMs := _ib_to_number(ms)
     if targetMs <= 0
         return
 
@@ -1019,10 +989,8 @@ _ib_precise_hold_sleep_ms(ms) {
         DllCall("Kernel32\QueryPerformanceFrequency", "Int64*", &freq)
         qpf := freq
     }
-    if qpf <= 0 {
-        _ib_precise_sleep_ms(targetMs)
-        return
-    }
+    if qpf <= 0
+        throw Error("高精度计时不可用")
 
     ; 对按住阶段启用高精度定时与更高线程优先级，压低高负载场景下的长尾抖动。
     timerRaised := false
@@ -1033,32 +1001,27 @@ _ib_precise_hold_sleep_ms(ms) {
     THREAD_PRIORITY_ERROR_RETURN := 2147483647
 
     try {
-        try {
-            beginResult := DllCall("Winmm\timeBeginPeriod", "UInt", 1, "UInt")
-            if beginResult = 0
-                timerRaised := true
-        } catch {
-        }
-
-        try {
-            threadHandle := DllCall("Kernel32\GetCurrentThread", "Ptr")
-            if threadHandle {
-                priority := DllCall("Kernel32\GetThreadPriority", "Ptr", threadHandle, "Int")
-                if priority != THREAD_PRIORITY_ERROR_RETURN {
-                    originalPriority := priority
-                    hasOriginalPriority := true
-                    if priority < THREAD_PRIORITY_HIGHEST
-                        DllCall("Kernel32\SetThreadPriority", "Ptr", threadHandle, "Int", THREAD_PRIORITY_HIGHEST)
-                }
-            }
-        } catch {
-        }
+        beginResult := DllCall("Winmm\timeBeginPeriod", "UInt", 1, "UInt")
+        if beginResult != 0
+            throw Error("无法设置保持阶段的计时精度")
+        timerRaised := true
+        threadHandle := DllCall("Kernel32\GetCurrentThread", "Ptr")
+        if !threadHandle
+            throw Error("无法读取当前输入线程")
+        priority := DllCall("Kernel32\GetThreadPriority", "Ptr", threadHandle, "Int")
+        if priority = THREAD_PRIORITY_ERROR_RETURN
+            throw Error("无法读取输入线程优先级")
+        originalPriority := priority
+        hasOriginalPriority := true
+        if priority < THREAD_PRIORITY_HIGHEST && !DllCall("Kernel32\SetThreadPriority", "Ptr", threadHandle, "Int", THREAD_PRIORITY_HIGHEST)
+            throw Error("无法设置输入线程优先级")
 
         startCounter := 0
         DllCall("Kernel32\QueryPerformanceCounter", "Int64*", &startCounter)
         targetTicks := targetMs * qpf / 1000.0
 
         Loop {
+            _ib_check_stop()
             nowCounter := 0
             DllCall("Kernel32\QueryPerformanceCounter", "Int64*", &nowCounter)
             elapsedTicks := (nowCounter - startCounter)
@@ -1070,7 +1033,9 @@ _ib_precise_hold_sleep_ms(ms) {
 
             ; 保持阶段优先精度：保留>=12ms的收口窗口，降低系统调度导致的超睡。
             if remainingMs > 18.0 {
-                sleepMs := _ib_to_int(remainingMs - 12.0, 0)
+                sleepMs := _ib_to_int(remainingMs - 12.0)
+                if sleepMs > 10
+                    sleepMs := 10
                 if sleepMs > 0
                     DllCall("Kernel32\Sleep", "UInt", sleepMs)
                 else
@@ -1080,41 +1045,34 @@ _ib_precise_hold_sleep_ms(ms) {
             }
         }
     } finally {
-        if hasOriginalPriority && threadHandle {
-            try DllCall("Kernel32\SetThreadPriority", "Ptr", threadHandle, "Int", originalPriority)
+        try {
+            if hasOriginalPriority && threadHandle && !DllCall("Kernel32\SetThreadPriority", "Ptr", threadHandle, "Int", originalPriority)
+                throw Error("无法恢复输入线程优先级")
+        } finally {
+            if timerRaised && DllCall("Winmm\timeEndPeriod", "UInt", 1, "UInt") != 0
+                throw Error("无法恢复计时精度")
         }
-        if timerRaised {
-            try DllCall("Winmm\timeEndPeriod", "UInt", 1, "UInt")
-        }
     }
 }
 
-_ib_to_int(value, defaultValue := 0) {
-    try {
-        return Round(value + 0)
-    } catch {
-        return defaultValue
-    }
+_ib_check_stop() {
+    global _ib_stop_path
+    if _ib_stop_path != "" && FileExist(_ib_stop_path)
+        throw Error("输入已停止")
 }
 
-_ib_to_number(value, defaultValue := 0.0) {
-    try {
-        return value + 0
-    } catch {
-        return defaultValue
-    }
+_ib_to_int(value) {
+    return Round(value + 0)
 }
 
-_ib_to_bool(value, defaultValue := false) {
-    if value = ""
-        return defaultValue
-    if IsNumber(value)
-        return (value + 0) != 0
+_ib_to_number(value) {
+    return value + 0
+}
 
-    text := StrLower(Trim(value))
-    if text = "" || text = "0" || text = "false" || text = "no"
-        return false
-    return true
+_ib_to_bool(value) {
+    if value != 0 && value != 1
+        throw Error("布尔参数无效")
+    return value = 1
 }
 
 _ib_decode_token(token) {
@@ -1127,11 +1085,11 @@ _ib_decode_token(token) {
     if prefix = "s:"
         return _ib_base64_decode(body)
     if prefix = "n:"
-        return _ib_to_number(body, 0)
-    if prefix = "b:"
+        return _ib_to_number(body)
+    if prefix = "b:" && (body = "0" || body = "1")
         return body = "1"
 
-    return token
+    throw Error("输入令牌格式无效")
 }
 
 _ib_encode_string_token(text) {
@@ -1177,6 +1135,5 @@ _ib_base64_decode(encoded) {
 
     return StrGet(outBuf, bytes, "UTF-8")
 }
-
 
 

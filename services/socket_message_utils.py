@@ -9,6 +9,7 @@ import select
 import socket
 import struct
 import threading
+import time
 import weakref
 from typing import Any, Dict, Optional, Tuple
 
@@ -23,6 +24,7 @@ from services.ipc_codec import (
 _SOCKET_LOCKS_GUARD = threading.Lock()
 _SOCKET_SEND_LOCKS: "weakref.WeakKeyDictionary[socket.socket, Any]" = weakref.WeakKeyDictionary()
 _SOCKET_RECV_LOCKS: "weakref.WeakKeyDictionary[socket.socket, Any]" = weakref.WeakKeyDictionary()
+_SOCKET_RECV_BUFFERS: "weakref.WeakKeyDictionary[socket.socket, bytearray]" = weakref.WeakKeyDictionary()
 
 
 class SocketMessageError(RuntimeError):
@@ -61,6 +63,8 @@ def _validate_timeout(timeout: float) -> float:
 
 
 def _abort_socket(sock: socket.socket) -> None:
+    with _SOCKET_LOCKS_GUARD:
+        _SOCKET_RECV_BUFFERS.pop(sock, None)
     try:
         sock.shutdown(socket.SHUT_RDWR)
     except OSError:
@@ -194,86 +198,63 @@ def recv_message_bytes_with_status(
 ) -> Tuple[Optional[bytes], str]:
     timeout_value = _validate_timeout(timeout)
     max_bytes = _validate_message_limit(max_message_bytes)
-    if not callable(getattr(sock, "recv_into", None)):
-        raise TypeError("sock must provide recv_into()")
-
-    length_buf = None
-    data_buf = None
-    view = None
     recv_lock = _get_socket_lock(sock, _SOCKET_RECV_LOCKS)
     with recv_lock:
-        def _recv_available(target_view: memoryview, max_bytes: int) -> Tuple[int, str]:
-            try:
-                readable, _, _ = select.select([sock], [], [], timeout_value)
-            except (OSError, TypeError, ValueError):
-                return 0, "error"
-            if not readable:
-                return 0, "timeout"
-            try:
-                received = sock.recv_into(target_view, max_bytes)
-            except (BlockingIOError, socket.timeout):
-                return 0, "timeout"
-            except OSError:
-                return 0, "error"
-            if not received:
-                return 0, "closed"
-            return int(received), "ok"
+        if not callable(getattr(sock, "recv_into", None)):
+            raise TypeError("sock must provide recv_into()")
 
+        with _SOCKET_LOCKS_GUARD:
+            buffer = _SOCKET_RECV_BUFFERS.get(sock)
+            if buffer is None:
+                buffer = bytearray()
+                _SOCKET_RECV_BUFFERS[sock] = buffer
+
+        deadline = time.monotonic() + timeout_value
         try:
-            length_buf = bytearray(4)
-            view = memoryview(length_buf)
-            read_len = 0
-            while read_len < 4:
-                chunk_size, status = _recv_available(view[read_len:], 4 - read_len)
-                if status != "ok":
-                    if status == "timeout" and read_len == 0:
-                        return None, "timeout"
-                    if read_len > 0 or status == "error":
+            while True:
+                if len(buffer) >= 4:
+                    size = struct.unpack("!I", buffer[:4])[0]
+                    if size <= 0 or size > max_bytes:
                         _abort_socket(sock)
-                    if status == "timeout":
-                        return None, "partial_timeout"
-                    if status == "closed" and read_len > 0:
-                        return None, "truncated"
-                    return None, status
-                read_len += chunk_size
-            del view
-            view = None
+                        return None, "invalid_size"
+                    packet_size = 4 + size
+                    if len(buffer) >= packet_size:
+                        payload = bytes(buffer[4:packet_size])
+                        del buffer[:packet_size]
+                        return payload, "ok"
 
-            size = struct.unpack("!I", bytes(length_buf))[0]
-            if size <= 0 or size > max_bytes:
-                _abort_socket(sock)
-                return None, "invalid_size"
-            del length_buf
-            length_buf = None
-
-            data_buf = bytearray(size)
-            view = memoryview(data_buf)
-            read_len = 0
-            while read_len < size:
-                chunk_size, status = _recv_available(
-                    view[read_len:],
-                    min(65536, size - read_len),
-                )
-                if status != "ok":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # Keep an incomplete frame for the next poll.  A short
+                    # read timeout is normal for the workflow reader and is
+                    # not evidence that the peer broke the protocol.
+                    return None, "timeout"
+                try:
+                    readable, _, _ = select.select([sock], [], [], remaining)
+                except (OSError, TypeError, ValueError):
                     _abort_socket(sock)
-                    if status == "timeout":
-                        return None, "partial_timeout"
-                    if status == "closed":
+                    return None, "error"
+                if not readable:
+                    return None, "timeout"
+                try:
+                    chunk_buffer = bytearray(65536)
+                    received = sock.recv_into(chunk_buffer, len(chunk_buffer))
+                except (BlockingIOError, socket.timeout):
+                    continue
+                except OSError:
+                    _abort_socket(sock)
+                    return None, "error"
+                if not received:
+                    if buffer:
+                        _abort_socket(sock)
                         return None, "truncated"
-                    return None, status
-                read_len += chunk_size
-
-            return bytes(data_buf), "ok"
+                    with _SOCKET_LOCKS_GUARD:
+                        _SOCKET_RECV_BUFFERS.pop(sock, None)
+                    return None, "closed"
+                buffer.extend(chunk_buffer[:received])
         except (OSError, ValueError):
             _abort_socket(sock)
             return None, "error"
-        finally:
-            if view is not None:
-                del view
-            if length_buf is not None:
-                del length_buf
-            if data_buf is not None:
-                del data_buf
 
 
 def recv_message_with_status(

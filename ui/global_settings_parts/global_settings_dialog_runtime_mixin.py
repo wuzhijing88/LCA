@@ -112,34 +112,24 @@ class GlobalSettingsDialogRuntimeMixin:
             import traceback
             logger.error(traceback.format_exc())
 
-    def _preregister_window_ocr_service(self, window_info):
-        """为窗口预注册OCR服务"""
-        try:
-            logger.debug(f"开始为窗口预注册OCR服务: {window_info}")
-            from services.multiprocess_ocr_pool import get_multiprocess_ocr_pool
-            window_title = window_info['title']
-            window_hwnd = window_info.get('hwnd')
-            if window_hwnd:
-                logger.debug("获取多OCR池实例...")
-                multi_ocr_pool = get_multiprocess_ocr_pool()
-                logger.debug(f"调用预注册方法: {window_title} (HWND: {window_hwnd})")
-                success = multi_ocr_pool.preregister_window(window_title, window_hwnd)
-                if success:
-                    logger.info(f"成功 为窗口预创建OCR服务成功: {window_title} (HWND: {window_hwnd})")
-                else:
-                    logger.warning(f"警告 为窗口预创建OCR服务失败: {window_title} (HWND: {window_hwnd})")
-            else:
-                logger.warning(f"窗口无有效句柄，跳过OCR服务预创建: {window_title}")
-        except ImportError as e:
-            logger.error(f"导入OCR服务模块失败: {e}")
-        except Exception as e:
-            logger.error(f"预注册OCR服务异常: {e}", exc_info=True)
     def _register_windows_to_handle_manager(self):
         """按当前绑定列表同步句柄管理器，已移除的窗口立即注销。"""
         try:
             from utils.window.window_handle_manager import get_window_handle_manager
+            import weakref
+
+            self._release_window_handle_callbacks()
             handle_manager = get_window_handle_manager()
-            handle_manager.add_user_notification_callback(self._handle_window_invalid_notification)
+            owner_ref = weakref.ref(self)
+
+            def notify(key, info):
+                owner = owner_ref()
+                if owner is not None:
+                    owner._handle_window_invalid_notification(key, info)
+
+            updates = {}
+            self._window_handle_subscription = (handle_manager, updates, notify)
+            handle_manager.add_user_notification_callback(notify)
             keep_keys = set()
             for i, window_info in enumerate(self.bound_windows):
                 hwnd = window_info.get('hwnd')
@@ -152,10 +142,13 @@ class GlobalSettingsDialogRuntimeMixin:
                         hwnd=hwnd,
                         title=title
                     )
-                    handle_manager.add_update_callback(
-                        key,
-                        lambda old_hwnd, new_hwnd, idx=i: self._handle_window_hwnd_update(idx, old_hwnd, new_hwnd)
-                    )
+                    def update(old_hwnd, new_hwnd, idx=i):
+                        owner = owner_ref()
+                        if owner is not None:
+                            owner._handle_window_hwnd_update(idx, old_hwnd, new_hwnd)
+
+                    updates[key] = update
+                    handle_manager.add_update_callback(key, update)
                     logger.info(f"注册窗口到句柄管理器: {title} (HWND: {hwnd})")
             for key in list(handle_manager.get_all_registered_windows()):
                 if key not in keep_keys:
@@ -164,15 +157,33 @@ class GlobalSettingsDialogRuntimeMixin:
                 handle_manager.start_monitoring(interval=10.0)
                 logger.info("窗口句柄管理器已注册并启动自动监控（间隔10秒）")
             else:
+                handle_manager.stop_monitoring()
                 logger.info("已注销全部绑定窗口的句柄监控")
         except Exception as e:
             logger.error(f"注册窗口到句柄管理器失败: {e}")
+            self._release_window_handle_callbacks()
+
+    def _release_window_handle_callbacks(self):
+        subscription = getattr(self, '_window_handle_subscription', None)
+        self._window_handle_subscription = None
+        if subscription is None:
+            return
+        manager, updates, notify = subscription
+        manager.remove_user_notification_callback(notify)
+        for key, callback in updates.items():
+            manager.remove_update_callback(key, callback=callback)
+
     def _handle_window_hwnd_update(self, window_index: int, old_hwnd: int, new_hwnd: int):
         """处理窗口句柄更新 - 使用Qt信号确保线程安全"""
         try:
             # 使用QTimer.singleShot确保在主线程中执行UI更新
             from PySide6.QtCore import QTimer
+            subscription = self._window_handle_subscription
+            if subscription is None:
+                return
             def update_in_main_thread():
+                if self._window_handle_subscription is not subscription:
+                    return
                 try:
                     if window_index < len(self.bound_windows):
                         window_info = self.bound_windows[window_index]
@@ -186,25 +197,10 @@ class GlobalSettingsDialogRuntimeMixin:
                             logger.debug(f"更新窗口特征失败: {e}")
                         if hasattr(self, '_save_bound_windows_config'):
                             self._save_bound_windows_config()
-                        # 同步OCR服务的句柄绑定，避免旧句柄残留导致OCR进程堆积
-                        try:
-                            import threading
-                            ocr_unregister_info = dict(window_info)
-                            ocr_unregister_info['hwnd'] = old_hwnd
-                            ocr_register_info = dict(window_info)
-                            def update_ocr_services():
-                                try:
-                                    self._unregister_window_ocr_service(ocr_unregister_info)
-                                    self._preregister_window_ocr_service(ocr_register_info)
-                                except Exception as e:
-                                    logger.error(f"OCR服务句柄更新失败: {e}")
-                            threading.Thread(
-                                target=update_ocr_services,
-                                daemon=True,
-                                name=f"OCR-HWND-Update-{old_title}"
-                            ).start()
-                        except Exception as e:
-                            logger.error(f"启动OCR句柄更新线程失败: {e}")
+                        # 注销只修改池内映射；新句柄会由正式 OCR 请求入口登记。
+                        ocr_unregister_info = dict(window_info)
+                        ocr_unregister_info['hwnd'] = old_hwnd
+                        self._unregister_window_ocr_service(ocr_unregister_info)
                         logger.info(f"窗口句柄已更新: {old_title} -> {old_hwnd} => {new_hwnd}")
                         # 刷新界面显示 - 在主线程中安全执行
                         if hasattr(self, '_refresh_bound_windows_combo'):
@@ -216,15 +212,20 @@ class GlobalSettingsDialogRuntimeMixin:
                 except Exception as e:
                     logger.error(f"主线程中处理窗口句柄更新失败: {e}")
             # 使用QTimer.singleShot在主线程中执行更新
-            QTimer.singleShot(0, update_in_main_thread)
+            QTimer.singleShot(0, self, update_in_main_thread)
         except Exception as e:
             logger.error(f"处理窗口句柄更新失败: {e}")
     def _handle_window_invalid_notification(self, key: str, window_info):
         """处理窗口句柄失效通知"""
         try:
             from PySide6.QtCore import QTimer
+            subscription = self._window_handle_subscription
+            if subscription is None:
+                return
 
             def show_notification_in_main_thread():
+                if self._window_handle_subscription is not subscription:
+                    return
                 try:
                     window_title = window_info.title if hasattr(window_info, 'title') else '未知窗口'
                     # 显示状态栏消息
@@ -243,7 +244,7 @@ class GlobalSettingsDialogRuntimeMixin:
                 except Exception as e:
                     logger.error(f"显示窗口失效通知失败: {e}")
             # 使用QTimer.singleShot确保在主线程中执行UI更新
-            QTimer.singleShot(0, show_notification_in_main_thread)
+            QTimer.singleShot(0, self, show_notification_in_main_thread)
         except Exception as e:
             logger.error(f"处理窗口失效通知失败: {e}")
     def _check_and_update_window_handles(self):

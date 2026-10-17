@@ -54,7 +54,7 @@ class _CatalogCheckRow(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            pos = event.position().toPoint()
             local = self.check.mapFrom(self, pos)
             if not self.check.rect().contains(local):
                 self.check.toggle()
@@ -130,7 +130,7 @@ class WorkspaceExportPickerDialog(QDialog):
             item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             item.setData(Qt.ItemDataRole.UserRole, sid)
             row = _CatalogCheckRow(title, path, checked=checked, parent=self._list)
-            row.check.toggled.connect(lambda *_: self._refresh_ok())
+            row.check.toggled.connect(self._refresh_ok)
             self._list.addItem(item)
             self._list.setItemWidget(item, row)
             item.setSizeHint(row.sizeHint())

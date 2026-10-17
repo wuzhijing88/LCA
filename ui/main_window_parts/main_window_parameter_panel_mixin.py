@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict
 from utils.window.hwnd_utils import as_hwnd
 from utils.window.window_binding_utils import get_active_bound_window_hwnd, get_active_target_window_title
@@ -17,6 +18,13 @@ from utils.window.window_activation_utils import show_and_raise_widget
 logger = logging.getLogger(__name__)
 
 class MainWindowParameterPanelMixin:
+
+    def _safe_show_parameter_panel(self, card_id: int) -> None:
+        """参数面板信号边界：卡片已关闭或资源失效时不让异常退出 Qt 事件循环。"""
+        try:
+            self._show_parameter_panel(card_id)
+        except Exception as exc:
+            logger.error("打开参数面板失败: %s", exc, exc_info=True)
 
     def _show_parameter_panel(self, card_id: int):
         """显示参数面板"""
@@ -167,6 +175,10 @@ class MainWindowParameterPanelMixin:
             dirs["images_dir"] = str(self._resolve_task_images_dir() or "")
         if not dirs.get("sounds_dir"):
             dirs["sounds_dir"] = str(self._resolve_task_sounds_dir() or "")
+        if not dirs.get("dicts_dir"):
+            images = str(dirs.get("images_dir") or "").strip()
+            if images:
+                dirs["dicts_dir"] = os.path.join(os.path.dirname(os.path.abspath(images)), "dicts")
         return dirs
 
     def _script_debug_context(self, card) -> Dict[str, Any]:
@@ -177,6 +189,7 @@ class MainWindowParameterPanelMixin:
         execution_mode = execution_mode or 'background_sendmessage'
         dirs = self._current_task_resource_dirs()
         from task_workflow.resource_context import bind_resource_dirs
+        from task_workflow.workflow_context import get_runtime_store
 
         bind_resource_dirs(dirs)
         return {
@@ -189,6 +202,9 @@ class MainWindowParameterPanelMixin:
             "replays_dir": dirs.get("replays_dir") or "",
             "plugins_dir": dirs.get("plugins_dir") or "",
             "card_id": getattr(card, "card_id", None),
+            # 调试线程有自己的线程上下文，必须把正式运行存储显式传入，
+            # 再由调试 worker 创建隔离副本。
+            "runtime_store": get_runtime_store(),
         }
 
     def _show_script_editor(self, card) -> None:
@@ -210,10 +226,7 @@ class MainWindowParameterPanelMixin:
             try:
                 source = str((card.parameters or {}).get("script_source") or "")
                 if hasattr(existing, "reload_source"):
-                    existing.reload_source(
-                        source,
-                        bool((card.parameters or {}).get("allow_external_components", False)),
-                    )
+                    existing.reload_source(source)
                 existing.raise_()
                 existing.activateWindow()
                 return
@@ -225,8 +238,7 @@ class MainWindowParameterPanelMixin:
             card_id=card.card_id,
             source=str(card_params.get("script_source") or ""),
             custom_name=getattr(card, "custom_name", None),
-            allow_external_components=bool(card_params.get("allow_external_components", False)),
-            on_applied=lambda source, allow: self._persist_script_source(card, source, allow),
+            on_applied=lambda source: self._persist_script_source(card, source),
             debug_context_provider=lambda: self._script_debug_context(card),
             parent=self,
         )
@@ -242,7 +254,7 @@ class MainWindowParameterPanelMixin:
         self._script_editors[card.card_id] = dialog
         dialog.show()
 
-    def _persist_script_source(self, card, source: str, allow_external_components: bool = False) -> None:
+    def _persist_script_source(self, card, source: str) -> None:
         """直接写回打开编辑器时的那张卡，不依赖 exec() 是否还活着。"""
         if card is None:
             logger.error("自定义脚本写入失败：卡片已失效")
@@ -252,7 +264,7 @@ class MainWindowParameterPanelMixin:
         card.parameters["script_source"] = str(source or "")
         from tasks.script_task import script_source_hash
         card.parameters["script_source_sha256"] = script_source_hash(source)
-        card.parameters["allow_external_components"] = bool(allow_external_components)
+        card.parameters.pop("allow_external_components", None)
         if hasattr(card, "_tooltip_needs_update"):
             card._tooltip_needs_update = True
         if hasattr(card, "_cached_tooltip"):
@@ -271,23 +283,10 @@ class MainWindowParameterPanelMixin:
         # 调试延迟模式相关参数
         if 'delay_mode' in new_parameters:
             logger.debug(f"主窗口参数更新: 卡片 {card_id}, delay_mode={new_parameters['delay_mode']}")
-        # 【关键修复】获取当前活动的 workflow_view
-        current_workflow_view = None
-        if hasattr(self, 'workflow_tab_widget') and self.workflow_tab_widget:
-            # 使用标签页系统
-            current_task_id = self.workflow_tab_widget.get_current_task_id()
-            if current_task_id is not None and current_task_id in self.workflow_tab_widget.task_views:
-                current_workflow_view = self.workflow_tab_widget.task_views[current_task_id]
-        # 回退到旧系统
+        current_task_id = self.workflow_tab_widget.get_current_task_id()
+        current_workflow_view = self.workflow_tab_widget.task_views.get(current_task_id)
         if current_workflow_view is None:
-            current_workflow_view = self.workflow_view
-        if not current_workflow_view:
-            logger.error("[主窗口] 无法找到当前的 workflow_view！")
-            return
-        # 【修复闪退】检查cards属性是否存在
-        if not hasattr(current_workflow_view, 'cards'):
-            logger.error("[主窗口] workflow_view没有cards属性！")
-            return
+            raise RuntimeError("参数更新失败：当前工作流标签页不存在")
         card = current_workflow_view.cards.get(card_id)
         if card:
             from ui.panels.parameter_compare import collect_changed_parameters
@@ -499,7 +498,7 @@ class MainWindowParameterPanelMixin:
         try:
             if not card.property("_mw_param_signal_connected"):
                 from PySide6.QtCore import Qt
-                card.edit_settings_requested.connect(self._show_parameter_panel, Qt.ConnectionType.UniqueConnection)
+                card.edit_settings_requested.connect(self._safe_show_parameter_panel, Qt.ConnectionType.UniqueConnection)
                 card.setProperty("_mw_param_signal_connected", True)
         except Exception:
             pass

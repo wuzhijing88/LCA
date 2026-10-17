@@ -35,10 +35,9 @@ class LazyTaskModuleDict(dict):
     def __getitem__(self, key):
         value = super().__getitem__(key)
         if isinstance(value, str):
+            metadata = TASK_CONTRACT_METADATA[key]
             module = _import_module_path(value)
-            canonical_type = TASK_TYPE_ALIASES.get(key, key)
-            metadata = TASK_CONTRACT_METADATA.get(canonical_type, {})
-            validate_task_module(module, canonical_type, executable=metadata.get("executable", True))
+            validate_task_module(module, key, executable=metadata["executable"])
             super().__setitem__(key, module)
             return module
         return value
@@ -78,33 +77,17 @@ _PRIMARY_TASK_MODULE_PATHS = {
 # 监控类节点不参与顺序执行，只在工作流启动时登记（见 tasks.contract.MonitorModule）。
 _MONITOR_TASK_TYPES = frozenset({"附加条件"})
 
-# 旧工作流文件里仍可能出现、但不再出现在“新建卡片”列表中的节点类型。
-_LEGACY_TASK_MODULE_PATHS = {
-    "图片点击": "tasks.image_match_click",
-}
-
-# 旧类型名 → 现行类型名；解析时按现行模块校验契约。
-TASK_TYPE_ALIASES = {
-    "字库识别": "点阵字库OCR",
-}
-
 TASK_CONTRACT_METADATA = {
     task_name: {
         "module": module_path,
         "executable": task_name not in _MONITOR_TASK_TYPES,
     }
-    for task_name, module_path in {**_PRIMARY_TASK_MODULE_PATHS, **_LEGACY_TASK_MODULE_PATHS}.items()
+    for task_name, module_path in _PRIMARY_TASK_MODULE_PATHS.items()
 }
 
 PRIMARY_TASK_MODULES = LazyTaskModuleDict(_PRIMARY_TASK_MODULE_PATHS)
 
-TASK_MODULES_DICT = LazyTaskModuleDict(
-    {
-        **_PRIMARY_TASK_MODULE_PATHS,
-        **_LEGACY_TASK_MODULE_PATHS,
-        **{alias: _PRIMARY_TASK_MODULE_PATHS[target] for alias, target in TASK_TYPE_ALIASES.items()},
-    }
-)
+TASK_MODULES_DICT = LazyTaskModuleDict(_PRIMARY_TASK_MODULE_PATHS)
 
 TASK_MODULES = TASK_MODULES_DICT
 
@@ -152,7 +135,7 @@ def get_available_tasks():
 
 
 def get_all_tasks():
-    """Return all task names (including compatibility entries)."""
+    """Return all current task names."""
     return list(TASK_MODULES_DICT.keys())
 
 
@@ -174,7 +157,6 @@ __all__ = [
     "TASK_MODULES_DICT",
     "PRIMARY_TASK_MODULES",
     "TASK_CONTRACT_METADATA",
-    "TASK_TYPE_ALIASES",
     "get_available_tasks",
     "get_all_tasks",
     "get_task_module",

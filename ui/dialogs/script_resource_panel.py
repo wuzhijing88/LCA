@@ -30,19 +30,20 @@ from ui.dialogs.script_resources import (
     MODEL_EXTS,
     delete_resource_file,
     import_resource_file,
+    is_managed_resource_file,
     list_script_resources,
     rename_resource_file,
     replace_resource_file,
     rewrite_resource_literal,
 )
 from ui.system_parts.menu_style import apply_unified_menu_style
-from utils.app_paths import get_app_root, get_plugin_dir, get_sounds_dir
 
 _IMAGE_FILTER = "图片 (*.bmp *.png *.jpg *.jpeg *.webp)"
 _MODEL_FILTER = "模型 (*.onnx)"
 _AUDIO_FILTER = "音频 (*.wav *.mp3 *.wma *.m4a *.ogg *.flac)"
 _REPLAY_FILTER = "回放 (*.replay.json)"
-_COMPONENT_FILTER = "外部组件 (*.dll *.exe *.py)"
+_COMPONENT_FILTER = "外部组件 (*.dll *.exe *.com *.py)"
+_PROGRAM_FILTER = "程序 (*.exe *.com)"
 _IMPORT_FILTER = f"{_IMAGE_FILTER};;{_MODEL_FILTER};;{_AUDIO_FILTER};;{_REPLAY_FILTER};;{_COMPONENT_FILTER};;所有文件 (*.*)"
 
 
@@ -86,6 +87,7 @@ class ScriptResourcePanel(QWidget):
         self._workflow_token = ""
         self._items: List[Dict[str, Any]] = []
         self._source = ""
+        self._binding_error = ""
         self._build_ui()
 
     def bind(
@@ -99,33 +101,34 @@ class ScriptResourcePanel(QWidget):
         replays_dir: str = "",
         plugins_dir: str = "",
     ) -> None:
-        from task_workflow.resource_context import bind_resource_dirs, current_resource_dirs
-
-        current = current_resource_dirs()
-        self._images_dir = str(images_dir or "") or current["images_dir"]
-        self._sounds_dir = str(sounds_dir or "").strip() or current["sounds_dir"] or get_sounds_dir("LCA")
-        self._dicts_dir = str(dicts_dir or "").strip() or current["dicts_dir"]
-        self._yolo_dir = str(yolo_dir or "").strip() or current["yolo_dir"]
-        self._replays_dir = str(replays_dir or "").strip() or current["replays_dir"]
-        self._plugins_dir = get_plugin_dir()
+        self._images_dir = str(images_dir or "").strip()
+        self._sounds_dir = str(sounds_dir or "").strip()
+        self._dicts_dir = str(dicts_dir or "").strip()
+        self._yolo_dir = str(yolo_dir or "").strip()
+        self._replays_dir = str(replays_dir or "").strip()
+        self._plugins_dir = str(plugins_dir or "").strip()
         self._card_id = card_id
         self._workflow_token = str(workflow_token or "")
-        bind_resource_dirs(
-            {
-                "images_dir": self._images_dir,
-                "sounds_dir": self._sounds_dir,
-                "dicts_dir": self._dicts_dir,
-                "yolo_dir": self._yolo_dir,
-                "replays_dir": self._replays_dir,
-                "plugins_dir": self._plugins_dir,
-            }
-        )
+        self._sync_buttons()
 
     def set_source(self, source: str) -> None:
         self._source = str(source or "")
         self.reload()
 
+    def set_binding_error(self, message: str) -> None:
+        self._binding_error = str(message)
+        self._status.setText(f"资源绑定失败：{message}" if message else "")
+
     def reload(self) -> None:
+        if not self._images_dir:
+            self._items = []
+            self._list.clear()
+            self._list.hide()
+            self._empty.setText("资源目录未绑定，绑定工程后可采集或导入资源。")
+            self._empty.show()
+            self._sync_buttons()
+            return
+        self._empty.setText("这张卡还没有资源。用上面的「截图」或「导入」。")
         selected = str((self.current_item() or {}).get("path") or "")
         self._items = list_script_resources(
             self._source,
@@ -163,6 +166,20 @@ class ScriptResourcePanel(QWidget):
         payload = row.data(Qt.ItemDataRole.UserRole) if row is not None else None
         return payload if isinstance(payload, dict) else None
 
+    def _is_external_program(self, item: Dict[str, Any]) -> bool:
+        return bool(item.get("kind") == "component" and os.path.splitext(str(item.get("path") or ""))[1].lower() in {".exe", ".com"})
+
+    def _is_managed_item(self, item: Dict[str, Any]) -> bool:
+        return is_managed_resource_file(
+            item,
+            images_dir=self._images_dir,
+            sounds_dir=self._sounds_dir,
+            dicts_dir=self._dicts_dir,
+            yolo_dir=self._yolo_dir,
+            replays_dir=self._replays_dir,
+            plugins_dir=self._plugins_dir,
+        )
+
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
@@ -170,7 +187,7 @@ class ScriptResourcePanel(QWidget):
         title = QLabel("本卡资源")
         title.setObjectName("scriptResourceTitle")
         layout.addWidget(title)
-        hint = QLabel("截图及导入的图、模型、音频和组件都在这里。双击插入到当前行。")
+        hint = QLabel("截图、导入的资源和程序路径都在这里。双击插入到当前行。")
         hint.setObjectName("scriptResourceHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -201,6 +218,7 @@ class ScriptResourcePanel(QWidget):
         self._buttons = {}
         for name, label, handler in (
             ("import", "导入", self._on_import),
+            ("program", "程序路径", self._on_import_program),
             ("insert", "插入", self._on_insert),
             ("replace", "替换", self._on_replace),
             ("rename", "重命名", self._on_rename),
@@ -219,6 +237,8 @@ class ScriptResourcePanel(QWidget):
 
     def _item_label(self, item: Dict[str, Any]) -> str:
         kind = {"model": "模型", "audio": "音频", "replay": "回放", "component": "组件"}.get(str(item.get("kind") or ""), "图片")
+        if self._is_external_program(item):
+            kind = "程序"
         name = str(item.get("name") or item.get("path") or "")
         if not item.get("exists"):
             state = "文件不在"
@@ -230,6 +250,8 @@ class ScriptResourcePanel(QWidget):
 
     def _item_tip(self, item: Dict[str, Any]) -> str:
         lines = [str(item.get("path") or ""), str(item.get("abs_path") or "")]
+        if self._is_external_program(item):
+            lines.append("外部程序只通过路径启动；资源栏不会修改或删除原文件。")
         if not item.get("exists"):
             lines.append("文件不在，插入后运行会找不到。")
         elif item.get("unused"):
@@ -247,14 +269,18 @@ class ScriptResourcePanel(QWidget):
         return None
 
     def _sync_buttons(self) -> None:
+        self._buttons["import"].setEnabled(bool(self._images_dir))
+        self._buttons["program"].setEnabled(True)
         item = self.current_item()
         has = item is not None
         exists = bool(item and item.get("exists"))
         used = bool(item and item.get("used"))
+        managed = bool(item and self._is_managed_item(item))
         self._buttons["insert"].setEnabled(has)
+        # 外部程序替换只更新脚本引用，不会覆盖原文件。
         self._buttons["replace"].setEnabled(has)
-        self._buttons["rename"].setEnabled(exists)
-        self._buttons["delete"].setEnabled(exists or has)
+        self._buttons["rename"].setEnabled(exists and managed)
+        self._buttons["delete"].setEnabled((exists or has) and managed)
         self._buttons["locate"].setEnabled(used)
 
     def _on_double_clicked(self, _item: QListWidgetItem) -> None:
@@ -271,22 +297,30 @@ class ScriptResourcePanel(QWidget):
         if item.get("kind") == "image" and item.get("exists"):
             menu.addAction("预览", lambda: self._preview(item))
         menu.addAction("替换", self._on_replace)
-        if item.get("exists"):
+        if item.get("exists") and self._is_managed_item(item):
             menu.addAction("重命名", self._on_rename)
-        menu.addAction("删除", self._on_delete)
+        if self._is_managed_item(item):
+            menu.addAction("删除", self._on_delete)
         menu.exec(self._list.mapToGlobal(pos))
 
     def _on_import(self) -> None:
         path, selected = QFileDialog.getOpenFileName(
             self,
             "导入资源",
-            self._images_dir or self._sounds_dir or self._yolo_dir or "",
+            self._images_dir or self._sounds_dir or self._yolo_dir or self._plugins_dir or "",
             _IMPORT_FILTER,
         )
         if not path:
             return
         try:
             kind = _detect_import_kind(path, selected)
+            is_external_program = kind == "component" and os.path.splitext(path)[1].lower() in {".exe", ".com"}
+            directory = {"image": self._images_dir, "model": self._yolo_dir,
+                         "audio": self._sounds_dir, "replay": self._replays_dir,
+                         "component": self._plugins_dir}[kind]
+            if not directory and not is_external_program:
+                self._status.setText("导入失败：该类资源目录未绑定")
+                return
         except ValueError as exc:
             self._status.setText(f"导入失败：{exc}")
             QMessageBox.warning(self, "导入", f"导入失败：{exc}")
@@ -325,6 +359,42 @@ class ScriptResourcePanel(QWidget):
             self._sync_buttons()
         self._status.setText(f"已导入：{imported.get('name') or imported.get('path') or ''}。双击资源或点击“插入”写入当前行。")
 
+    def _on_import_program(self) -> None:
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "选择启动程序",
+            "",
+            _PROGRAM_FILTER,
+        )
+        if not path:
+            return
+        absolute = os.path.abspath(path)
+        if os.path.splitext(absolute)[1].lower() not in {".exe", ".com"} or not os.path.isfile(absolute):
+            self._status.setText("程序路径无效：请选择存在的 .exe 或 .com 文件。")
+            return
+        item = {
+            "kind": "component",
+            "path": absolute.replace("\\", "/"),
+            "abs_path": absolute,
+            "name": os.path.basename(absolute),
+            "exists": True,
+            "used": 0,
+            "unused": True,
+            "spans": [],
+            "external_path": True,
+        }
+        row = QListWidgetItem(self._item_label(item))
+        row.setData(Qt.ItemDataRole.UserRole, item)
+        row.setToolTip(self._item_tip(item))
+        self._list.addItem(row)
+        self._items.append(item)
+        self._list.setCurrentItem(row)
+        self._empty.hide()
+        self._list.show()
+        self._sync_buttons()
+        self.insert_requested.emit(item)
+        self._status.setText(f"已插入程序路径：{absolute}")
+
     def _on_insert(self) -> None:
         item = self.current_item()
         if item:
@@ -342,16 +412,17 @@ class ScriptResourcePanel(QWidget):
             return
         if item.get("kind") == "model":
             filt = f"{_MODEL_FILTER};;所有文件 (*.*)"
-            start = self._yolo_dir or os.path.join(get_app_root(), "yolo")
+            start = self._yolo_dir
         elif item.get("kind") == "audio":
             filt = f"{_AUDIO_FILTER};;所有文件 (*.*)"
             start = self._sounds_dir or ""
         elif item.get("kind") == "replay":
             filt = f"{_REPLAY_FILTER};;所有文件 (*.*)"
-            start = self._replays_dir or os.path.join(get_app_root(), "replays")
+            start = self._replays_dir
         elif item.get("kind") == "component":
             filt = f"{_COMPONENT_FILTER};;所有文件 (*.*)"
-            start = get_plugin_dir()
+            current_path = str(item.get("path") or "")
+            start = os.path.dirname(current_path) if current_path and os.path.isabs(current_path) else self._plugins_dir
         else:
             filt = f"{_IMAGE_FILTER};;所有文件 (*.*)"
             start = self._images_dir or ""
@@ -359,7 +430,16 @@ class ScriptResourcePanel(QWidget):
         if not path:
             return
         try:
-            updated = replace_resource_file(item, path, self._images_dir, self._sounds_dir)
+            updated = replace_resource_file(
+                item,
+                path,
+                self._images_dir,
+                self._sounds_dir,
+                dicts_dir=self._dicts_dir,
+                yolo_dir=self._yolo_dir,
+                replays_dir=self._replays_dir,
+                plugins_dir=self._plugins_dir,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "替换", f"替换失败：{exc}")
             return
@@ -372,13 +452,23 @@ class ScriptResourcePanel(QWidget):
 
     def _on_rename(self) -> None:
         item = self.current_item()
-        if not item:
+        if not item or not self._is_managed_item(item):
             return
         name, ok = QInputDialog.getText(self, "重命名", "新文件名：", text=str(item.get("name") or ""))
         if not ok:
             return
         try:
-            source, _updated = rename_resource_file(item, name, self._source, self._images_dir, self._sounds_dir)
+            source, _updated = rename_resource_file(
+                item,
+                name,
+                self._source,
+                self._images_dir,
+                self._sounds_dir,
+                dicts_dir=self._dicts_dir,
+                yolo_dir=self._yolo_dir,
+                replays_dir=self._replays_dir,
+                plugins_dir=self._plugins_dir,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "重命名", f"重命名失败：{exc}")
             return
@@ -389,7 +479,7 @@ class ScriptResourcePanel(QWidget):
 
     def _on_delete(self) -> None:
         item = self.current_item()
-        if not item:
+        if not item or not self._is_managed_item(item):
             return
         used = int(item.get("used") or 0)
         name = str(item.get("name") or item.get("path") or "")
@@ -407,7 +497,15 @@ class ScriptResourcePanel(QWidget):
         if choice != QMessageBox.StandardButton.Yes:
             return
         try:
-            delete_resource_file(item)
+            delete_resource_file(
+                item,
+                images_dir=self._images_dir,
+                sounds_dir=self._sounds_dir,
+                dicts_dir=self._dicts_dir,
+                yolo_dir=self._yolo_dir,
+                replays_dir=self._replays_dir,
+                plugins_dir=self._plugins_dir,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "删除", f"删除失败：{exc}")
             return
@@ -435,6 +533,7 @@ class ScriptResourcePanel(QWidget):
         box = QVBoxLayout(dialog)
         box.addWidget(label)
         dialog.exec()
+        dialog.deleteLater()
 
     def _select_path(self, path: str) -> bool:
         needle = str(path or "")

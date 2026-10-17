@@ -2069,10 +2069,7 @@ class PlayerUiDesignerDialog(QDialog):
         self._install_edit_shortcuts()
         self._update_undo_actions()
         self._apply_shell_theme()
-        try:
-            get_theme_manager().register_theme_change_callback(self._apply_shell_theme)
-        except Exception:
-            pass
+        get_theme_manager().register_theme_change_callback(self._apply_shell_theme)
         self.resize(1140, 880)
         self.setMinimumSize(980, 760)
 
@@ -2468,15 +2465,19 @@ class PlayerUiDesignerDialog(QDialog):
         super().hideEvent(event)
 
     def closeEvent(self, event):
+        self._release_editor_resources()
+        super().closeEvent(event)
+
+    def done(self, result):
+        self._release_editor_resources()
+        super().done(result)
+
+    def _release_editor_resources(self):
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
         self._close_live_player()
-        try:
-            get_theme_manager().unregister_theme_change_callback(self._apply_shell_theme)
-        except Exception:
-            pass
-        super().closeEvent(event)
+        get_theme_manager().unregister_theme_change_callback(self._apply_shell_theme)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress and isinstance(obj, QWidget):

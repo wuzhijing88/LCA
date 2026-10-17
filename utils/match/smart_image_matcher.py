@@ -182,37 +182,42 @@ def match_template_all(
     rotation=0,
 ) -> list:
     """同一模板的全部命中，按分数从高到低，邻近峰会合并。"""
-    first = match_template(screenshot, template, confidence, roi, mode=mode, rotation=rotation)
-    if not first.found:
-        return []
-    search_match_image = normalize_match_image(screenshot if roi is None else screenshot[roi[1] : roi[1] + roi[3], roi[0] : roi[0] + roi[2]], mode)
+    if mode not in {"彩色", "灰度"}:
+        raise ValueError("图像模式必须是彩色或灰度")
+    if not np.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise ValueError("阈值必须在0到1之间")
+    if isinstance(max_count, bool) or not isinstance(max_count, int) or max_count <= 0:
+        raise ValueError("最多必须是正整数")
+    search = normalize_match_image(screenshot, mode)
+    if search is None:
+        raise ValueError("截图格式无效")
+    roi_x = roi_y = 0
+    if roi is not None:
+        roi_x, roi_y, roi_w, roi_h = roi
+        if roi_x < 0 or roi_y < 0 or roi_w <= 0 or roi_h <= 0 or roi_x + roi_w > search.shape[1] or roi_y + roi_h > search.shape[0]:
+            raise ValueError("区域超出截图范围")
+        search = search[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+    search_match_image = search
     template_match_image = normalize_match_image(template, mode)
-    if search_match_image is None or template_match_image is None:
-        return [first]
-    try:
-        # 多角度时逐角度收集，再按分数合并相邻峰。
-        angle_list = _angles(rotation)
-        heats = []
-        for angle in angle_list:
-            rotated = _rotate_template(template_match_image, angle)
-            if rotated.shape[0] <= search_match_image.shape[0] and rotated.shape[1] <= search_match_image.shape[1]:
-                heats.append((cv2.matchTemplate(search_match_image, rotated, cv2.TM_CCOEFF_NORMED), rotated))
-        if not heats:
-            return [first]
-        heat, template_match_image = max(heats, key=lambda item: float(cv2.minMaxLoc(item[0])[1]))
-    except Exception:
-        return [first]
-    template_h, template_w = template_match_image.shape[:2]
-    roi_x = int(roi[0]) if roi is not None else 0
-    roi_y = int(roi[1]) if roi is not None else 0
-    gap = max(8, min(template_w, template_h) // 2)
+    if template_match_image is None:
+        raise ValueError("模板格式无效")
+    heats = []
+    for angle in _angles(rotation):
+        rotated = _rotate_template(template_match_image, angle)
+        if rotated.shape[0] <= search.shape[0] and rotated.shape[1] <= search.shape[1]:
+            heat = cv2.matchTemplate(search_match_image, rotated, cv2.TM_CCOEFF_NORMED)
+            if not np.isfinite(heat).all():
+                raise ValueError("模板匹配产生无效分数")
+            heats.append((heat, rotated.shape[:2]))
+    if not heats:
+        raise ValueError("模板尺寸大于识别区域")
     found = []
-    work = heat.copy()
-    limit = max(1, min(int(max_count or 20), 50))
-    while len(found) < limit:
-        _, max_val, _, max_loc = cv2.minMaxLoc(work)
+    while len(found) < max_count:
+        candidates = [(cv2.minMaxLoc(work), index) for index, (work, _size) in enumerate(heats)]
+        (_min_val, max_val, _min_loc, max_loc), index = max(candidates, key=lambda candidate: candidate[0][1])
         if max_val < confidence:
             break
+        template_h, template_w = heats[index][1]
         left = int(max_loc[0]) + roi_x
         top = int(max_loc[1]) + roi_y
         found.append(
@@ -224,9 +229,11 @@ def match_template_all(
                 method="template",
             )
         )
-        x0 = max(0, int(max_loc[0]) - gap)
-        y0 = max(0, int(max_loc[1]) - gap)
-        x1 = min(work.shape[1], int(max_loc[0]) + gap)
-        y1 = min(work.shape[0], int(max_loc[1]) + gap)
-        work[y0:y1, x0:x1] = 0
+        center_x, center_y = max_loc[0] + template_w // 2, max_loc[1] + template_h // 2
+        gap = max(8, min(template_w, template_h) // 2)
+        for work, (height, width) in heats:
+            x, y = center_x - width // 2, center_y - height // 2
+            x0, y0 = max(0, x - gap), max(0, y - gap)
+            x1, y1 = min(work.shape[1], x + gap + 1), min(work.shape[0], y + gap + 1)
+            work[y0:y1, x0:x1] = -np.inf
     return found

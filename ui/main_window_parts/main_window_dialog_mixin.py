@@ -1,6 +1,10 @@
 import logging
 
 from PySide6.QtWidgets import QMessageBox
+from shiboken6 import isValid
+
+from ui.dialogs.dialog_manager import exec_dialog, get_dialog_manager
+from ui.system_parts.message_box_translator import show_warning_box
 
 from utils.window.window_coordinate_common import center_window_on_widget_screen
 from utils.window.window_activation_utils import show_and_activate_overlay
@@ -9,6 +13,27 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindowDialogMixin:
+    def open_child_session(self):
+        from utils.child_session.runtime import is_child_session_instance
+
+        if is_child_session_instance():
+            show_warning_box(self, "无法打开桌面分身", "当前已经在桌面分身会话中，不能再套一层。")
+            return
+        from ui.dialogs.child_session_window import ChildSessionWindow
+
+        def create_window():
+            window = ChildSessionWindow(self.config, self.save_config_func, parent=self)
+            window.destroyed.connect(self._on_child_session_window_closed)
+            self.child_session_window = window
+            return window
+
+        get_dialog_manager(self).show(
+            "child_session", create_window, present=lambda window: window.present(self),
+        )
+
+    def _on_child_session_window_closed(self, *_args):
+        self.child_session_window = None
+
     def open_ai_workflow_assistant(self):
         """打开独立的 AI 助手窗口。"""
         from ui.dialogs.ai_assistant_dialog import open_ai_assistant_dialog
@@ -19,7 +44,7 @@ class MainWindowDialogMixin:
         from ui.export_parts.export_dialog import StandaloneExportDialog
 
         dialog = StandaloneExportDialog(self)
-        dialog.exec()
+        exec_dialog(dialog)
 
     def open_control_center(self):
         """打开中控软件窗口"""
@@ -33,7 +58,7 @@ class MainWindowDialogMixin:
             execution_mode = resolve_control_center_execution_mode(self)
             if not control_center_allows_execution_mode(execution_mode):
                 logger.warning("前台模式禁止打开中控: mode=%s", execution_mode)
-                QMessageBox.warning(self, "无法打开中控", CONTROL_CENTER_FOREGROUND_BLOCK_MESSAGE)
+                show_warning_box(self, "无法打开中控", CONTROL_CENTER_FOREGROUND_BLOCK_MESSAGE)
                 return
             from ui.control_center_parts.control_center_shutdown import (
                 CONTROL_CENTER_SHUTDOWN_BLOCK_MESSAGE,
@@ -42,21 +67,19 @@ class MainWindowDialogMixin:
 
             if shutdown_blocks_execution(getattr(self, "_control_center_shutdown", None)):
                 logger.warning("拒绝打开中控: 关闭收尾尚未完成")
-                QMessageBox.warning(self, "无法打开中控", CONTROL_CENTER_SHUTDOWN_BLOCK_MESSAGE)
+                show_warning_box(self, "无法打开中控", CONTROL_CENTER_SHUTDOWN_BLOCK_MESSAGE)
                 return
-            existing = getattr(self, "control_center", None)
+            manager = get_dialog_manager(self)
+            existing = manager.find("control_center")
             if existing is not None:
                 center_window_on_widget_screen(existing, self)
                 show_and_activate_overlay(existing, log_prefix="中控窗口", focus=True)
                 return
             # 工具 关键修复：打开中控前验证窗口句柄是否仍然有效
             logger.info("准备打开中控，开始验证窗口句柄...")
-            try:
-                from utils.window.window_identity import refresh_bound_windows
+            from utils.window.window_identity import refresh_bound_windows
 
-                refresh_bound_windows(self.bound_windows)
-            except Exception as refresh_error:
-                logger.warning(f"打开中控前刷新绑定句柄失败: {refresh_error}")
+            refresh_bound_windows(self.bound_windows)
             valid_windows = []
             invalid_windows = []
             import win32gui
@@ -83,7 +106,7 @@ class MainWindowDialogMixin:
             logger.info(f"窗口句柄验证完成: 有效 {len(valid_windows)} 个, 无效 {len(invalid_windows)} 个")
             if invalid_windows:
                 # 弹出警告
-                reply = QMessageBox.warning(
+                reply = show_warning_box(
                     self,
                     "窗口句柄验证警告",
                     "以下窗口句柄已失效：\n\n" + "\n".join(f"  • {w}" for w in invalid_windows) +
@@ -98,24 +121,27 @@ class MainWindowDialogMixin:
             # 导入中控窗口类
             from ui.control_center_parts.control_center import ControlCenterWindow
             # 创建中控窗口
-            self.control_center = ControlCenterWindow(
-                bound_windows=self.bound_windows,
-                task_modules=self.task_modules,
-                parent=self
-            )
-            # 显示中控窗口
-            center_window_on_widget_screen(self.control_center, self)
-            show_and_activate_overlay(self.control_center, log_prefix='中控窗口', focus=True)
+            def create_window():
+                self.control_center = ControlCenterWindow(
+                    bound_windows=self.bound_windows,
+                    task_modules=self.task_modules,
+                    parent=self,
+                )
+                return self.control_center
+
+            def present_window(window):
+                center_window_on_widget_screen(window, self)
+                show_and_activate_overlay(window, log_prefix='中控窗口', focus=True)
+
+            manager.show("control_center", create_window, present=present_window)
             # 禁用主窗口的快捷键
             self._disable_main_window_hotkeys()
-            # 监听中控窗口关闭事件
-            self.control_center.destroyed.connect(self._on_control_center_closed)
             logging.info("中控软件已启动")
         except Exception as e:
             logging.error(f"启动中控软件失败: {e}")
             import traceback
             logging.error(traceback.format_exc())
-            QMessageBox.warning(self, "错误", f"启动中控软件失败: {e}")
+            show_warning_box(self, "错误", f"启动中控软件失败: {e}")
 
     def _on_control_center_closed(self):
         """中控窗口关闭时的回调"""
@@ -149,17 +175,9 @@ class MainWindowDialogMixin:
         self._poll_control_center_shutdown()
 
     def _is_control_center_runner_alive(self, runner) -> bool:
-        try:
-            from shiboken6 import isValid as _qt_is_valid
-
-            if not _qt_is_valid(runner):
-                return False
-        except Exception:
-            pass
-        try:
-            return bool(runner.isRunning())
-        except Exception:
+        if not isValid(runner):
             return False
+        return bool(runner.isRunning())
 
     def _poll_control_center_shutdown(self):
         from ui.control_center_parts.control_center_shutdown import (

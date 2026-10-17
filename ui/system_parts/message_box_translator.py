@@ -2,13 +2,44 @@
 """消息框翻译模块 - 确保所有对话框按钮都显示中文"""
 
 import logging
+from dataclasses import dataclass
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QMessageBox, QDialogButtonBox, QDialog, QWidget
 from PySide6.QtCore import QObject, QEvent, Qt, QTimer
+from shiboken6 import isValid
+
+from ui.dialogs.dialog_manager import exec_dialog
 
 logger = logging.getLogger(__name__)
 
-class MessageBoxTranslator(QObject):
+class _ApplicationEventFilter(QObject):
+    """随应用退出摘除全局过滤器，直接销毁时也卸载关联资源。"""
+
+    def __init__(self):
+        app = QApplication.instance()
+        if app is None:
+            raise RuntimeError("安装对话框过滤器前必须创建应用程序")
+        super().__init__(app)
+        self._application = app
+        self._disposed = False
+        self._quit_connection = app.aboutToQuit.connect(self.shutdown)
+        self.destroyed.connect(lambda: self.shutdown())
+
+    def shutdown(self):
+        if self._disposed:
+            return
+        self._disposed = True
+        self._release_resources()
+        app, self._application = self._application, None
+        if app is not None and isValid(app) and isValid(self):
+            app.removeEventFilter(self)
+        QObject.disconnect(self._quit_connection)
+
+    def _release_resources(self):
+        pass
+
+
+class MessageBoxTranslator(_ApplicationEventFilter):
     """消息框翻译器，自动将英文按钮翻译为中文"""
 
     def __init__(self):
@@ -56,31 +87,14 @@ class MessageBoxTranslator(QObject):
 
     def eventFilter(self, obj, event):
         """事件过滤器，拦截并翻译按钮文本"""
+        if self._disposed or not isinstance(obj, QWidget) or not isValid(obj):
+            return False
         try:
-            # 验证参数类型，防止TypeError崩溃
-            from PySide6.QtCore import QObject, QEvent
-
-            # 如果参数类型不正确，直接返回False
-            if not isinstance(obj, QObject):
-                logger.warning(f"eventFilter收到非QObject对象: {type(obj).__name__}")
-                return False
-
-            if not isinstance(event, QEvent):
-                logger.warning(f"eventFilter收到非QEvent事件: {type(event).__name__}")
-                return False
-
-            # 参数类型正确，执行翻译逻辑
             if event.type() == QEvent.Type.Show:
                 self.translate_widget_buttons(obj)
-
-            return super().eventFilter(obj, event)
-
-        except Exception as e:
-            # 捕获所有异常，防止崩溃
-            logger.error(f"eventFilter异常: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
+        except Exception:
+            logger.exception("对话框按钮翻译失败")
+        return False
 
     def translate_widget_buttons(self, widget):
         """翻译小部件中的所有按钮"""
@@ -101,8 +115,7 @@ class MessageBoxTranslator(QObject):
                 self.translate_button(button)
 
         except Exception:
-            # 静默处理翻译错误，避免影响正常功能
-            pass
+            logger.exception("窗口按钮翻译失败")
 
     def translate_message_box(self, message_box):
         """翻译 QMessageBox 的按钮"""
@@ -139,7 +152,7 @@ class MessageBoxTranslator(QObject):
                         button.setText(chinese_text)
 
         except Exception:
-            pass
+            logger.exception("消息框按钮翻译失败")
 
     def translate_button_box(self, button_box):
         """翻译 QDialogButtonBox 的按钮"""
@@ -171,7 +184,7 @@ class MessageBoxTranslator(QObject):
                     button.setText(chinese_text)
 
         except Exception:
-            pass
+            logger.exception("对话框按钮组翻译失败")
 
     def translate_button(self, button):
         """翻译单个按钮"""
@@ -180,18 +193,21 @@ class MessageBoxTranslator(QObject):
             if current_text in self.button_translations:
                 button.setText(self.button_translations[current_text])
         except Exception:
-            pass
+            logger.exception("按钮翻译失败")
 
 # 全局翻译器实例
-class GlobalDialogScreenFixer(QObject):
+class GlobalDialogScreenFixer(_ApplicationEventFilter):
     """Keep dialogs on the same screen as the triggering window."""
 
     def __init__(self):
         super().__init__()
         self._last_window = None
         self._last_non_dialog_window = None
+        self._pending_fixes = {}
 
     def eventFilter(self, obj, event):
+        if self._disposed:
+            return False
         try:
             if not isinstance(obj, QObject) or not isinstance(event, QEvent):
                 return False
@@ -201,45 +217,39 @@ class GlobalDialogScreenFixer(QObject):
                 self._remember_window(obj)
             elif event_type in (QEvent.Type.Show, QEvent.Type.ShowToParent):
                 self._schedule_fix(obj)
+            elif event_type == QEvent.Type.Hide and isinstance(obj, QDialog):
+                self._cancel_fix(obj)
 
             return False
         except Exception:
+            logger.exception("对话框屏幕定位失败")
             return False
 
     def _remember_window(self, obj):
-        if not isinstance(obj, QWidget):
+        if not isinstance(obj, QWidget) or not isValid(obj):
             return
 
-        try:
-            window = obj.window()
-        except Exception:
-            window = None
-
-        if not isinstance(window, QWidget) or not window.isWindow():
+        window = obj.window()
+        if not isValid(window) or not window.isWindow():
             return
 
-        self._last_window = window
+        import weakref
+
+        self._last_window = weakref.ref(window)
         if not isinstance(window, QDialog):
-            self._last_non_dialog_window = window
+            self._last_non_dialog_window = weakref.ref(window)
 
     def _schedule_fix(self, obj):
-        if not isinstance(obj, QWidget):
+        if self._disposed or not isinstance(obj, QWidget) or not isValid(obj):
             return
-
-        try:
-            dialog = obj.window()
-        except Exception:
-            dialog = obj
+        dialog = obj.window()
 
         if not self._should_fix(dialog):
             return
 
-        try:
-            if dialog.property("_lca_global_dialog_fix_pending"):
-                return
-            dialog.setProperty("_lca_global_dialog_fix_pending", True)
-        except Exception:
+        if dialog in self._pending_fixes:
             return
+        dialog.setProperty("_lca_global_dialog_fix_pending", True)
 
         def _first_pass():
             self._apply_fix(dialog)
@@ -248,74 +258,71 @@ class GlobalDialogScreenFixer(QObject):
             try:
                 self._apply_fix(dialog)
             finally:
-                try:
-                    dialog.setProperty("_lca_global_dialog_fix_pending", False)
-                except Exception:
-                    pass
+                self._cancel_fix(dialog)
 
-        QTimer.singleShot(0, _first_pass)
-        QTimer.singleShot(40, _second_pass)
+        timers = (QTimer(self), QTimer(self))
+        for timer in timers:
+            timer.setSingleShot(True)
+        timers[0].timeout.connect(_first_pass)
+        timers[1].timeout.connect(_second_pass)
+        destroyed_connection = dialog.destroyed.connect(lambda: self._cancel_fix(dialog))
+        self._pending_fixes[dialog] = (timers, destroyed_connection)
+        timers[0].start(0)
+        timers[1].start(40)
+
+    def _cancel_fix(self, dialog):
+        entry = self._pending_fixes.pop(dialog, None)
+        if entry is None:
+            return
+        timers, connection = entry
+        QObject.disconnect(connection)
+        for timer in timers:
+            if isValid(timer):
+                timer.stop()
+                timer.deleteLater()
+        if isValid(dialog):
+            dialog.setProperty("_lca_global_dialog_fix_pending", False)
+
+    def _release_resources(self):
+        for dialog in list(self._pending_fixes):
+            self._cancel_fix(dialog)
+        self._last_window = None
+        self._last_non_dialog_window = None
 
     def _should_fix(self, dialog):
-        if not isinstance(dialog, QDialog):
+        if self._disposed or not isinstance(dialog, QDialog) or not isValid(dialog):
             return False
         if not dialog.isWindow():
             return False
 
-        try:
-            if bool(dialog.property("_lca_screen_fix_disabled")):
-                return False
-        except Exception:
-            pass
-
-        try:
-            flags = dialog.windowFlags()
-            if flags & Qt.WindowType.Popup:
-                return False
-            if flags & Qt.WindowType.ToolTip:
-                return False
-        except Exception:
-            pass
-
-        try:
-            if dialog.isFullScreen():
-                return False
-        except Exception:
-            pass
-
-        return True
+        return not (
+            bool(dialog.property("_lca_screen_fix_disabled"))
+            or dialog.windowType() in (Qt.WindowType.Popup, Qt.WindowType.ToolTip)
+            or dialog.isFullScreen()
+        )
 
     def _resolve_reference_widget(self, dialog):
         candidates = []
 
-        try:
-            parent = dialog.parentWidget()
-            if parent is not None:
-                candidates.append(parent.window() if hasattr(parent, "window") else parent)
-        except Exception:
-            pass
+        parent = dialog.parentWidget()
+        if parent is not None and isValid(parent):
+            candidates.append(parent.window())
 
         app = QApplication.instance()
         if app is not None:
-            try:
-                focus_widget = app.focusWidget()
-                if focus_widget is not None:
-                    candidates.append(focus_widget.window())
-            except Exception:
-                pass
+            focus_widget = app.focusWidget()
+            if focus_widget is not None and isValid(focus_widget):
+                candidates.append(focus_widget.window())
+            active_window = app.activeWindow()
+            if active_window is not None and isValid(active_window) and active_window is not dialog:
+                candidates.append(active_window.window())
 
-            try:
-                active_window = app.activeWindow()
-                if active_window is not None and active_window is not dialog:
-                    candidates.append(active_window.window() if hasattr(active_window, "window") else active_window)
-            except Exception:
-                pass
-
-        candidates.extend([self._last_non_dialog_window, self._last_window])
+        candidates.extend(reference() for reference in (self._last_non_dialog_window, self._last_window)
+                          if reference is not None)
 
         seen = set()
         for candidate in candidates:
-            if not isinstance(candidate, QWidget):
+            if not isinstance(candidate, QWidget) or not isValid(candidate):
                 continue
             if candidate is dialog:
                 continue
@@ -332,10 +339,7 @@ class GlobalDialogScreenFixer(QObject):
         if not self._should_fix(dialog):
             return
 
-        try:
-            from utils.window.window_coordinate_common import center_window_on_widget_screen
-        except Exception:
-            return
+        from utils.window.window_coordinate_common import center_window_on_widget_screen
 
         reference_widget = self._resolve_reference_widget(dialog)
         center_window_on_widget_screen(dialog, reference_widget)
@@ -348,53 +352,39 @@ def setup_message_box_translations():
     """设置消息框翻译"""
     global _message_box_translator, _dialog_screen_fixer
 
-    try:
-        app = QApplication.instance()
-        if app:
-            if not _message_box_translator:
-                _message_box_translator = MessageBoxTranslator()
-                app.installEventFilter(_message_box_translator)
-
-            if not _dialog_screen_fixer:
-                _dialog_screen_fixer = GlobalDialogScreenFixer()
-                app.installEventFilter(_dialog_screen_fixer)
-
-            # 设置应用程序级别的按钮文本翻译
-            app.setProperty("chinese_buttons", True)
-
-    except Exception:
-        # 静默处理设置错误
-        pass
+    app = QApplication.instance()
+    if app is None:
+        raise RuntimeError("安装对话框过滤器前必须创建应用程序")
+    if _message_box_translator is None or not isValid(_message_box_translator) or _message_box_translator._disposed:
+        _message_box_translator = MessageBoxTranslator()
+        app.installEventFilter(_message_box_translator)
+    if _dialog_screen_fixer is None or not isValid(_dialog_screen_fixer) or _dialog_screen_fixer._disposed:
+        _dialog_screen_fixer = GlobalDialogScreenFixer()
+        app.installEventFilter(_dialog_screen_fixer)
+    app.setProperty("chinese_buttons", True)
 
 
 def _resolve_message_box_reference_widget(parent=None, reference_widget=None):
     candidates = []
 
-    if isinstance(reference_widget, QWidget):
-        candidates.append(reference_widget.window() if hasattr(reference_widget, "window") else reference_widget)
+    if isinstance(reference_widget, QWidget) and isValid(reference_widget):
+        candidates.append(reference_widget.window())
 
-    if isinstance(parent, QWidget):
-        candidates.append(parent.window() if hasattr(parent, "window") else parent)
+    if isinstance(parent, QWidget) and isValid(parent):
+        candidates.append(parent.window())
 
     app = QApplication.instance()
     if app is not None:
-        try:
-            active_window = app.activeWindow()
-            if isinstance(active_window, QWidget):
-                candidates.append(active_window.window() if hasattr(active_window, "window") else active_window)
-        except Exception:
-            pass
-
-        try:
-            focus_widget = app.focusWidget()
-            if isinstance(focus_widget, QWidget):
-                candidates.append(focus_widget.window() if hasattr(focus_widget, "window") else focus_widget)
-        except Exception:
-            pass
+        active_window = app.activeWindow()
+        if isinstance(active_window, QWidget) and isValid(active_window):
+            candidates.append(active_window.window())
+        focus_widget = app.focusWidget()
+        if isinstance(focus_widget, QWidget) and isValid(focus_widget):
+            candidates.append(focus_widget.window())
 
     seen = set()
     for candidate in candidates:
-        if not isinstance(candidate, QWidget):
+        if not isinstance(candidate, QWidget) or not isValid(candidate):
             continue
         marker = id(candidate)
         if marker in seen:
@@ -406,19 +396,13 @@ def _resolve_message_box_reference_widget(parent=None, reference_widget=None):
 
 
 def place_dialog_on_screen(dialog, parent=None, reference_widget=None, global_pos=None):
-    if not isinstance(dialog, QWidget):
+    if not isinstance(dialog, QWidget) or not isValid(dialog):
         return False
 
     if global_pos is None:
-        try:
-            global_pos = QCursor.pos()
-        except Exception:
-            global_pos = None
+        global_pos = QCursor.pos()
 
-    try:
-        from utils.window.window_coordinate_common import center_window_on_widget_screen
-    except Exception:
-        return False
+    from utils.window.window_coordinate_common import center_window_on_widget_screen
 
     resolved_reference = _resolve_message_box_reference_widget(
         parent=parent,
@@ -440,7 +424,9 @@ def show_message_box(
     window_flags=None,
     reference_widget=None,
 ):
-    msg_parent = parent if isinstance(parent, QWidget) else None
+    if parent is not None and (not isinstance(parent, QWidget) or not isValid(parent)):
+        raise ValueError("消息框父窗口无效")
+    msg_parent = parent
     msg_box = QMessageBox(msg_parent)
     msg_box.setWindowTitle(title)
     msg_box.setText(text)
@@ -448,10 +434,7 @@ def show_message_box(
     msg_box.setStandardButtons(buttons)
 
     if default_button is not None:
-        try:
-            msg_box.setDefaultButton(default_button)
-        except Exception:
-            pass
+        msg_box.setDefaultButton(default_button)
 
     if informative_text:
         msg_box.setInformativeText(informative_text)
@@ -463,7 +446,36 @@ def show_message_box(
         msg_box.setWindowFlags(window_flags)
 
     place_dialog_on_screen(msg_box, parent=msg_parent, reference_widget=reference_widget)
-    return msg_box.exec()
+    return exec_dialog(msg_box)
+
+
+@dataclass(frozen=True)
+class RememberedQuestionResult:
+    accepted: bool
+    remember: bool
+
+
+def show_remembered_question(parent, title, text, *, remember_text):
+    """只返回明确的继续决定；取消、Esc 和关闭均不记住。"""
+    from PySide6.QtWidgets import QCheckBox
+
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setIcon(QMessageBox.Icon.Question)
+    remember = QCheckBox(remember_text, box)
+    box.setCheckBox(remember)
+    continue_button = box.addButton("继续执行", QMessageBox.ButtonRole.AcceptRole)
+    cancel_button = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(continue_button)
+    box.setEscapeButton(cancel_button)
+    place_dialog_on_screen(box, parent=parent)
+
+    def read_result(_result):
+        accepted = box.clickedButton() is continue_button
+        return RememberedQuestionResult(accepted, accepted and remember.isChecked())
+
+    return exec_dialog(box, read_result=read_result)
 
 
 def show_question_box(parent, title, text, buttons=None, default_button=None, reference_widget=None):

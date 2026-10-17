@@ -10,7 +10,6 @@ import re
 import sys
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT = PROJECT_ROOT / "build_assets" / "third_party" / "manifest.json"
 if str(PROJECT_ROOT) not in sys.path:
@@ -82,7 +81,7 @@ def collect_runtime_distribution_closure() -> dict[str, dict[str, object]]:
     否则清单声称的组件比实际发行的少。返回 规范化名 -> {name, version, direct, required_by}。
     """
     from importlib import metadata
-    from packaging.markers import Marker
+
     from packaging.requirements import Requirement
 
     direct = read_direct_runtime_requirements()
@@ -97,12 +96,12 @@ def collect_runtime_distribution_closure() -> dict[str, dict[str, object]]:
             continue
         try:
             dist = metadata.distribution(normalized)
-        except metadata.PackageNotFoundError:
-            # 直接依赖缺失是环境错误，由 verify 报；传递依赖缺失说明 marker 不匹配，跳过
-            if normalized in direct:
-                raise RuntimeError(f"运行依赖未安装: {normalized}")
-            continue
-        display_name = str(dist.metadata.get("Name") or normalized)
+        except metadata.PackageNotFoundError as exc:
+            required_by = f"（由 {parent} 引入）" if parent else ""
+            raise RuntimeError(f"运行依赖未安装: {normalized}{required_by}") from exc
+        display_name = dist.metadata.get("Name")
+        if not display_name or not display_name.strip():
+            raise RuntimeError(f"依赖元数据缺少名称: {normalized}")
         closure[normalized] = {
             "name": display_name,
             "version": str(dist.version),
@@ -111,13 +110,9 @@ def collect_runtime_distribution_closure() -> dict[str, dict[str, object]]:
         }
         for spec in dist.requires or []:
             req = Requirement(spec)
-            if req.marker is not None:
-                # 只跟进无 extra 的默认依赖；extra 依赖不会被 pip 默认安装
-                try:
-                    if not req.marker.evaluate({"extra": ""}):
-                        continue
-                except Exception:
-                    continue
+            # 只跟进无 extra 的默认依赖；extra 依赖不会被 pip 默认安装
+            if req.marker is not None and not req.marker.evaluate({"extra": ""}):
+                continue
             queue.append((_normalize_dist_name(req.name), normalized))
 
     return closure
@@ -210,7 +205,7 @@ def main() -> int:
         json.dumps(build_manifest(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"third_party_manifest={output}")
+    print(f"第三方依赖清单已生成: {output}")
     return 0
 
 

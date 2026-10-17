@@ -8,9 +8,11 @@ import re
 import threading
 from typing import Any, Callable, Dict, Optional
 
-from PySide6.QtCore import QCoreApplication, Qt, QTimer, QObject, QThread, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer, QObject, QThread, Signal
+from shiboken6 import isValid
 from PySide6.QtGui import QFont, QFontMetrics, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QGridLayout,
@@ -59,7 +61,6 @@ _ERROR_LINE_RE = re.compile(r"第\s*(\d+)\s*行")
 # 被 GC、PySide 连带删掉仍在运行的 QThread。
 _ORPHAN_DEBUG_THREADS: set = set()
 _ORPHAN_LOCK = threading.Lock()
-_ORPHAN_EXIT_HOOK_INSTALLED = False
 
 
 def _discard_orphan_debug_thread(thread) -> None:
@@ -70,38 +71,44 @@ def _discard_orphan_debug_thread(thread) -> None:
 
 
 def _drain_orphan_debug_threads() -> None:
-    # 进程退出前尽力停下并等待每个孤儿线程，避免退出瞬间析构在跑的 QThread。
+    # 退出前必须等阻塞调用返回并完成收尾，不能超时后带着运行中的 QThread 析构。
+    # 先处理仍挂在编辑器上的线程，退出信号各接收者的连接顺序不能决定是否漏收尾。
+    for widget in QApplication.allWidgets():
+        if isinstance(widget, ScriptEditorDialog) and isValid(widget) and getattr(widget, '_debug_thread', None) is not None:
+            widget._shutdown_debug_thread()
     with _ORPHAN_LOCK:
         threads = list(_ORPHAN_DEBUG_THREADS)
     for thread in threads:
-        controller = getattr(thread, "_debug_controller", None)
-        if controller is not None:
-            try:
-                controller.stop()
-            except Exception:
-                pass
+        if not isValid(thread):
+            _discard_orphan_debug_thread(thread)
+            continue
         try:
-            thread.wait(3000)
+            thread._debug_controller.stop()
         except Exception:
-            pass
+            logger.exception("退出时请求脚本调试停止失败，继续等待线程收尾")
+        thread.wait()
+        _discard_orphan_debug_thread(thread)
+        thread.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def _ensure_debug_shutdown_hook():
+    app = QCoreApplication.instance()
+    if app is None:
+        raise RuntimeError("托管脚本调试线程前必须创建应用程序")
+    if not app.property("_lca_debug_orphan_exit_hook"):
+        app.aboutToQuit.connect(_drain_orphan_debug_threads)
+        app.setProperty("_lca_debug_orphan_exit_hook", True)
 
 
 def _orphan_debug_thread(thread, controller) -> None:
     """登记一个仍在运行、已摘下的调试线程，保留强引用直到它结束。"""
-    global _ORPHAN_EXIT_HOOK_INSTALLED
-    try:
-        thread._debug_controller = controller  # 供退出钩子调用 stop()
-    except Exception:
-        pass
+    _ensure_debug_shutdown_hook()
+    thread._debug_controller = controller
     with _ORPHAN_LOCK:
         _ORPHAN_DEBUG_THREADS.add(thread)
     # 线程结束时（直接的 finished 发射，早于 deleteLater 的延迟删除）摘除引用。
     thread.finished.connect(lambda t=thread: _discard_orphan_debug_thread(t))
-    if not _ORPHAN_EXIT_HOOK_INSTALLED:
-        app = QCoreApplication.instance()
-        if app is not None:
-            app.aboutToQuit.connect(_drain_orphan_debug_threads)
-            _ORPHAN_EXIT_HOOK_INSTALLED = True
 
 
 class _DebugBridge(QObject):
@@ -124,6 +131,15 @@ class _ScriptDebugWorker(QObject):
         self.controller = controller
         self._params = dict(params or {})
         self._run_context = dict(run_context or {})
+        if "runtime_store" not in self._run_context:
+            # 在调用方线程捕获上下文；调试 worker 运行在另一个线程，不能在那里
+            # 再调用按线程绑定的 get_runtime_store()。
+            try:
+                from task_workflow.workflow_context import get_runtime_store
+
+                self._run_context["runtime_store"] = get_runtime_store()
+            except Exception as exc:
+                raise RuntimeError(f"获取脚本调试运行上下文失败：{exc}") from exc
 
     def run(self):
         from task_workflow.runtime_store import RuntimeStore
@@ -145,14 +161,18 @@ class _ScriptDebugWorker(QObject):
                 debugger=self.controller,
                 stop_checker=self.controller.stopped,
             )
-            # 用运行时存储的副本：可读取上次真实运行的卡片结果与变量，写入只落在
-            # 副本里，不会污染正在运行的工作流状态。取副本失败时回退到全新存储。
-            try:
-                from task_workflow.workflow_context import get_runtime_store
-
-                debug_store = get_runtime_store().copy_for_debug()
-            except Exception:
+            # 运行时存储由创建编辑器的工作流线程显式传入。调试线程不能直接调用
+            # get_runtime_store()，因为该 API 按线程绑定上下文，会得到一个空的默认存储。
+            # 副本中的写入不会污染正在运行的工作流状态。
+            source_store = ctx.get("runtime_store")
+            if source_store is None:
+                # 独立编辑器没有正式运行存储时，使用明确的新空存储。
                 debug_store = RuntimeStore()
+            else:
+                copy_for_debug = getattr(source_store, "copy_for_debug", None)
+                if not callable(copy_for_debug):
+                    raise RuntimeError("调试运行时存储不可用")
+                debug_store = copy_for_debug()
         except Exception as exc:
             # 构建上下文阶段就失败：run_script 尚未接管调试器生命周期，这里补一次 finish。
             self.controller.finish(False, str(exc))
@@ -222,8 +242,7 @@ class ScriptEditorDialog(QDialog):
         card_id: int,
         source: str = "",
         custom_name: Optional[str] = None,
-        allow_external_components: bool = False,
-        on_applied: Optional[Callable[[str, bool], None]] = None,
+        on_applied: Optional[Callable[[str], None]] = None,
         debug_context_provider: Optional[Callable[[], dict]] = None,
         parent=None,
     ):
@@ -231,8 +250,6 @@ class ScriptEditorDialog(QDialog):
         self._card_id = card_id
         self._initial_source = source if source else DEFAULT_SCRIPT_SOURCE
         self._saved_source = self._initial_source
-        self._initial_allow_external_components = bool(allow_external_components)
-        self._saved_allow_external_components = bool(allow_external_components)
         self._applied_source: Optional[str] = None
         self._on_applied = on_applied
         self._debug_context_provider = debug_context_provider
@@ -291,27 +308,12 @@ class ScriptEditorDialog(QDialog):
         return self.editor.toPlainText()
 
     def is_dirty(self) -> bool:
-        return (
-            self.editor.toPlainText() != self._saved_source
-            or self.external_components_enabled() != self._saved_allow_external_components
-        )
+        return self.editor.toPlainText() != self._saved_source
 
-    def external_components_enabled(self) -> bool:
-        checkbox = getattr(self, "_external_components_checkbox", None)
-        if checkbox is None:
-            return self._initial_allow_external_components
-        return bool(checkbox.isChecked())
-
-    def reload_source(self, source: str, allow_external_components: Optional[bool] = None) -> None:
+    def reload_source(self, source: str) -> None:
         text = str(source or "")
-        incoming_allow = (
-            self.external_components_enabled()
-            if allow_external_components is None
-            else bool(allow_external_components)
-        )
-        if text == self.editor.toPlainText() and incoming_allow == self.external_components_enabled():
+        if text == self.editor.toPlainText():
             self._saved_source = text
-            self._saved_allow_external_components = incoming_allow
             return
         if self.is_dirty():
             choice = QMessageBox.question(
@@ -326,12 +328,6 @@ class ScriptEditorDialog(QDialog):
         self.editor.replace_document_text(text)
         self._initial_source = text
         self._saved_source = text
-        self._saved_allow_external_components = incoming_allow
-        checkbox = getattr(self, "_external_components_checkbox", None)
-        if checkbox is not None:
-            checkbox.blockSignals(True)
-            checkbox.setChecked(incoming_allow)
-            checkbox.blockSignals(False)
         self._refresh_syntax_status()
         self._refresh_resources()
 
@@ -431,6 +427,7 @@ class ScriptEditorDialog(QDialog):
         param_bar = ScriptParamBar()
         param_bar.bind_editor(self.editor)
         layout.addWidget(param_bar)
+        self._param_bar = param_bar
         resources = ScriptResourcePanel()
         self._bind_resource_panel(resources)
         resources.insert_requested.connect(self._insert_resource)
@@ -438,7 +435,6 @@ class ScriptEditorDialog(QDialog):
         resources.source_rewrite_requested.connect(self._rewrite_source)
         layout.addWidget(resources)
         self._capture_bar = capture
-        self._param_bar = param_bar
         self._resource_panel = resources
         self._debug_panel = debug_panel
         self.editor.breakpoints_changed.connect(self._on_editor_breakpoints_changed)
@@ -494,37 +490,45 @@ class ScriptEditorDialog(QDialog):
             validate_script_source(source)
         except Exception as exc:
             self._syntax_ok = False; self._syntax_text = str(exc); self._refresh_status_bar(); self._jump_error_line(str(exc)); return
-        self._apply_external_component_trust(source)
         # 先清理上次状态，再启动控制器；否则 started 事件会被 clear() 立刻覆盖，
         # 导致暂停/继续/停止按钮看起来像没有反应。
         self._debug_panel.clear()
         self._debugger.start()
-        params = {
-            "script_source": source,
-            "allow_external_components": self.external_components_enabled(),
-        }
+        params = {"script_source": source}
         run_context: Dict[str, Any] = {}
         provider = self._debug_context_provider
         if callable(provider):
             try:
-                run_context = dict(provider() or {})
-            except Exception:
-                logger.debug("获取调试运行上下文失败", exc_info=True)
-                run_context = {}
+                provided_context = provider()
+                if not isinstance(provided_context, dict):
+                    raise TypeError("脚本调试运行上下文必须是字典")
+                run_context = dict(provided_context)
+            except Exception as exc:
+                logger.exception("获取调试运行上下文失败")
+                self._debugger.stop()
+                self._set_status(f"无法启动调试：{exc}", ok=False)
+                return
+        try:
+            worker = _ScriptDebugWorker(source, self._debugger, params, run_context)
+        except Exception as exc:
+            logger.exception("创建脚本调试工作对象失败")
+            self._debugger.stop()
+            self._set_status(f"无法启动调试：{exc}", ok=False)
+            return
         thread = QThread(self)
-        worker = _ScriptDebugWorker(source, self._debugger, params, run_context)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._debug_finished)
-        worker.finished.connect(thread.quit)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._debug_thread_done)
+        thread.finished.connect(thread.deleteLater)
         self._debug_thread, self._debug_worker = thread, worker
         self._set_status(
             self._status_text("调试运行使用运行时存储的副本：可读取上次运行的卡片结果，写入不会影响正式运行"),
             ok=True,
         )
+        _ensure_debug_shutdown_hook()
         thread.start()
 
     def _debug_finished(self, ok: bool, detail: str) -> None:
@@ -627,14 +631,6 @@ class ScriptEditorDialog(QDialog):
         self.status_label.mousePressEvent = self._on_status_clicked  # type: ignore[method-assign]
         footer.addWidget(self.status_label, 1)
 
-        external_box = QCheckBox("允许外部组件")
-        external_box.setObjectName("scriptAllowExternalComponents")
-        external_box.setChecked(self._initial_allow_external_components)
-        external_box.setToolTip("允许此脚本运行程序并加载 Python、COM 或 DLL")
-        external_box.toggled.connect(self._on_external_components_toggled)
-        self._external_components_checkbox = external_box
-        footer.addWidget(external_box)
-
         insert_btn = self._make_action_button("插入", "scriptActionButton")
         insert_btn.clicked.connect(self._help_panel.insert_current)
         self._insert_btn = insert_btn
@@ -656,43 +652,6 @@ class ScriptEditorDialog(QDialog):
         footer.addWidget(reset_btn)
 
         return footer
-
-    def _on_external_components_toggled(self, checked: bool) -> None:
-        if checked:
-            choice = QMessageBox.question(
-                self,
-                "允许外部组件",
-                "外部组件拥有当前用户权限，可以运行程序、读写文件并调用本机代码。\n"
-                "只对来源可信的脚本和组件启用。是否继续？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if choice != QMessageBox.StandardButton.Yes:
-                self._external_components_checkbox.blockSignals(True)
-                self._external_components_checkbox.setChecked(False)
-                self._external_components_checkbox.blockSignals(False)
-                return
-        self._sync_external_component_permission(bool(checked))
-
-    def _sync_external_component_permission(self, enabled: bool) -> None:
-        from task_workflow.external_component_trust import (
-            grant_external_script_trust,
-            revoke_external_script_trust,
-        )
-
-        current = self.editor.toPlainText()
-        saved = self._saved_source
-        if enabled:
-            grant_external_script_trust(saved)
-            if current != saved:
-                grant_external_script_trust(current)
-        else:
-            revoke_external_script_trust(saved)
-            if current != saved:
-                revoke_external_script_trust(current)
-        self._saved_allow_external_components = bool(enabled)
-        if callable(self._on_applied):
-            self._on_applied(saved, bool(enabled))
 
     def _bind_shortcuts(self) -> None:
         find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
@@ -756,7 +715,13 @@ class ScriptEditorDialog(QDialog):
         target = panel if panel is not None else getattr(self, "_resource_panel", None)
         if target is None:
             return
-        dirs = _task_resource_dirs_of(self)
+        try:
+            dirs = _task_resource_dirs_of(self)
+        except ValueError as exc:
+            target.bind()
+            target.set_binding_error(str(exc))
+            return
+        target.set_binding_error("")
         target.bind(
             dirs.get("images_dir") or "",
             self._card_id,
@@ -933,13 +898,11 @@ class ScriptEditorDialog(QDialog):
             QMessageBox.warning(self, "语法检查", str(exc))
             self._jump_error_line(str(exc))
             return False
-        self._apply_external_component_trust(source)
         self._applied_source = source
         self._saved_source = source
-        self._saved_allow_external_components = self.external_components_enabled()
         logger.info("自定义脚本已应用: 卡片=%s, 长度=%s", self._card_id, len(source))
         if callable(self._on_applied):
-            self._on_applied(source, self._saved_allow_external_components)
+            self._on_applied(source)
         self._syntax_ok = True
         self._syntax_text = "已同步到卡片。"
         self._refresh_syntax_status()
@@ -947,19 +910,6 @@ class ScriptEditorDialog(QDialog):
             self._syntax_text = "已同步到卡片。"
             self._refresh_status_bar()
         return True
-
-    def _apply_external_component_trust(self, source: str) -> None:
-        from task_workflow.external_component_trust import (
-            grant_external_script_trust,
-            revoke_external_script_trust,
-        )
-
-        if not self.external_components_enabled():
-            revoke_external_script_trust(self._saved_source)
-            if source != self._saved_source:
-                revoke_external_script_trust(source)
-            return
-        grant_external_script_trust(source)
 
     def _on_apply_and_close(self) -> None:
         if self._on_apply():
@@ -1002,9 +952,19 @@ class ScriptEditorDialog(QDialog):
         thread = self._debug_thread
         worker = self._debug_worker
         if thread is None:
+            try:
+                self._debugger.set_callback(None)
+            except Exception:
+                pass
             return
         if thread.isRunning():
             self._debugger.stop()
+            # 关闭流程开始后不再把事件投递到即将销毁的编辑器；线程仍会由
+            # stop_checker/host.close 完成自己的资源收尾。
+            try:
+                self._debugger.set_callback(None)
+            except Exception:
+                pass
             thread.quit()
             thread.wait(1500)
             if thread.isRunning():
@@ -1022,14 +982,14 @@ class ScriptEditorDialog(QDialog):
                     thread.finished.disconnect(self._debug_thread_done)
                 except (RuntimeError, TypeError):
                     pass
-                # 断开调试器回调，避免脚本继续运行时事件回调去触碰即将销毁的桥对象。
-                try:
-                    self._debugger.set_callback(None)
-                except Exception:
-                    pass
                 # 登记为孤儿线程，保留强引用直到它结束；保留 thread.finished→
                 # deleteLater、worker.finished→(quit, deleteLater)，让线程自行清理。
                 _orphan_debug_thread(thread, self._debugger)
+        else:
+            try:
+                self._debugger.set_callback(None)
+            except Exception:
+                pass
         self._debug_thread = None
         self._debug_worker = None
 
@@ -1039,3 +999,15 @@ class ScriptEditorDialog(QDialog):
             return
         self._shutdown_debug_thread()
         super().closeEvent(event)
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._shutdown_debug_thread()
+            param_bar = getattr(self, "_param_bar", None)
+            if param_bar is not None:
+                param_bar.bind_editor(None)
+            for name in ("_resource_timer", "_syntax_timer"):
+                timer = getattr(self, name, None)
+                if timer is not None:
+                    timer.stop()
+        return super().event(event)

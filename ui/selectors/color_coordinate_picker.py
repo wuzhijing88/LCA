@@ -2032,59 +2032,22 @@ class ColorCoordinatePickerWidget(QWidget):
         return color_str
 
     def set_color_string(self, color_string: str):
-        """从颜色字符串解析并设置颜色点"""
-        try:
-            self.color_points = []
-
-            if not color_string:
-                self._update_button_text()
-                return
-
-            # 检查是否是多点格式
-            if '|' in color_string:
-                # 多点定位格式: R,G,B|offsetX,offsetY,R,G,B|...
-                parts = color_string.split('|')
-
-                # 【闪退修复】使用try-except保护颜色解析
+        """完整校验颜色串后再替换，损坏的偏移点不得被静默丢弃。"""
+        if not isinstance(color_string, str):
+            raise TypeError("颜色数据必须是字符串")
+        points = []
+        if color_string:
+            for index, part in enumerate(color_string.split('|')):
                 try:
-                    # 第一个点（基准点）
-                    base_parts = [int(c.strip()) for c in parts[0].split(',')]
-                    if len(base_parts) != 3:
-                        logger.error(f"基准点格式错误: 期望3个值，实际{len(base_parts)}个，输入: {parts[0]}")
-                        return
-
-                    r0, g0, b0 = base_parts
-                except (ValueError, IndexError) as e:
-                    logger.error(f"基准点颜色值解析失败: {parts[0] if parts else color_string}, 错误: {e}")
-                    return
-
-                x0, y0 = 0, 0  # 基准点坐标需要在实际点击时确定
-                self.color_points.append((x0, y0, r0, g0, b0))
-
-                # 后续偏移点
-                for i in range(1, len(parts)):
-                    try:
-                        offset_parts = [int(c.strip()) for c in parts[i].split(',')]
-                        if len(offset_parts) != 5:
-                            logger.warning(f"偏移点{i}格式错误: 期望5个值，实际{len(offset_parts)}个，输入: {parts[i]}")
-                            continue
-
-                        offset_x, offset_y, r, g, b = offset_parts
-                    except (ValueError, IndexError) as e:
-                        logger.error(f"偏移点{i}解析失败: {parts[i]}, 错误: {e}")
-                        continue
-
-                    x = x0 + offset_x
-                    y = y0 + offset_y
-                    self.color_points.append((x, y, r, g, b))
-            else:
-                # 单颜色格式: R,G,B
-                parts = [int(c.strip()) for c in color_string.split(',')]
-                if len(parts) == 3:
-                    r, g, b = parts
-                    self.color_points.append((0, 0, r, g, b))
-
-            self._update_button_text()
-
-        except Exception as e:
-            logger.error(f"解析颜色字符串失败: {e}")
+                    values = [int(value.strip()) for value in part.split(',')]
+                except ValueError as exc:
+                    raise ValueError(f"第{index + 1}个颜色点包含无效整数") from exc
+                expected = 3 if index == 0 else 5
+                if len(values) != expected:
+                    raise ValueError(f"第{index + 1}个颜色点需要{expected}个整数")
+                if any(value < 0 or value > 255 for value in values[-3:]):
+                    raise ValueError(f"第{index + 1}个颜色点的颜色分量必须在0到255之间")
+                x, y = (0, 0) if index == 0 else values[:2]
+                points.append((x, y, *values[-3:]))
+        self.color_points = points
+        self._update_button_text()

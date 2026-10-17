@@ -1,11 +1,9 @@
 import logging
 
-from PySide6.QtWidgets import QMessageBox
-
-try:
-    import win32gui
-except ImportError:
-    win32gui = None
+from ui.system_parts.message_box_translator import (
+    show_remembered_question,
+    show_warning_box,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +26,7 @@ class MainWindowWindowValidationMixin:
         if not hasattr(self, 'bound_windows') or not self.bound_windows:
             logger.warning("定时/启动检查：还没有绑定任何窗口")
             if interactive:
-                QMessageBox.warning(
+                show_warning_box(
                     self,
                     "未绑定窗口",
                     "还没有绑定任何窗口！\n\n请先在 '全局设置' 中绑定目标窗口。"
@@ -42,7 +40,7 @@ class MainWindowWindowValidationMixin:
         if not enabled_windows:
             logger.warning("定时/启动检查：所有窗口都已禁用")
             if interactive:
-                QMessageBox.warning(
+                show_warning_box(
                     self,
                     "没有启用的窗口",
                     "所有窗口都已禁用！\n\n请在 '全局设置' 中至少启用一个窗口。"
@@ -95,15 +93,15 @@ class MainWindowWindowValidationMixin:
 
             logger.warning("定时/启动检查：所有绑定窗口句柄都已失效")
             if interactive:
-                QMessageBox.warning(self, "窗口句柄失效", error_msg)
+                show_warning_box(self, "窗口句柄失效", error_msg)
             return False
 
         # 部分窗口失效，给出警告但允许继续
 
         if invalid_windows:
-            if not interactive:
+            if not interactive or not self.config["confirm_partial_window_failure"]:
                 logger.warning(
-                    "定时启动：部分窗口句柄失效，仅在有效窗口继续: %s",
+                    "启动检查：部分窗口句柄失效，按当前启动策略继续: %s",
                     invalid_windows,
                 )
                 return True
@@ -112,13 +110,24 @@ class MainWindowWindowValidationMixin:
                 warning_msg += f"  - {w}\n"
             warning_msg += f"\n有效窗口: {len(valid_windows)} 个\n"
             warning_msg += "是否继续执行？（仅在有效窗口上执行）"
-            reply = QMessageBox.question(
+            choice = show_remembered_question(
                 self, "部分窗口失效", warning_msg,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes
+                remember_text="以后遇到部分窗口失效时自动继续，不再询问",
             )
-            if reply != QMessageBox.StandardButton.Yes:
+            if not choice.accepted:
                 return False
+            if choice.remember:
+                from app_core.config_store import save_config
+
+                settings = dict(self.config)
+                settings["confirm_partial_window_failure"] = False
+                try:
+                    save_config(settings)
+                except RuntimeError as exc:
+                    logger.error("保存窗口失效提示设置失败: %s", exc)
+                    show_warning_box(self, "设置未保存", f"未能记住本次选择，本次启动已取消。\n\n{exc}")
+                    return False
+                self.config["confirm_partial_window_failure"] = False
 
         return True
 
@@ -438,7 +447,6 @@ class MainWindowWindowValidationMixin:
         """处理所有窗口都失效的情况"""
 
         from PySide6.QtCore import QTimer
-        from PySide6.QtWidgets import QMessageBox
 
         try:
 
@@ -452,7 +460,7 @@ class MainWindowWindowValidationMixin:
 
             # 在主线程中显示警告
 
-            QTimer.singleShot(0, lambda: QMessageBox.warning(
+            QTimer.singleShot(0, self, lambda: show_warning_box(
 
                 self,
 

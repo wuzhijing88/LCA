@@ -225,7 +225,7 @@ class MainWindowExecutionFlowJumpMixin:
 
         step_log_connected = False
 
-        if hasattr(task, "step_log") and hasattr(self, "_floating_window") and self._floating_window:
+        if hasattr(task, "step_log") and hasattr(self, "_execution_log_panel") and self._execution_log_panel:
 
             task.step_log.connect(self._forward_step_log)
 
@@ -252,3 +252,4 @@ class MainWindowExecutionFlowJumpMixin:
         """任务移除后，解绑运行时信号。"""
 
         self._disconnect_task_runtime_signals(task_id)
+

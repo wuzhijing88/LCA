@@ -8,7 +8,7 @@ import os
 import threading
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from themes import get_theme_manager, theme_color
 
 from ui.dialogs.script_capture_text import apply_script_capture, peek_click_coords, peek_find_image_path
 from utils.window.window_activation_utils import (
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 CAPTURE_BUTTONS = (
     ("image", "截图", "框选模板图。每次单独存一张；当前行已是找图时追加成多图。"),
     ("color", "取色", "可连点多个颜色，再点「完成取色」。多点写成 红,绿,蓝|偏移X,偏移Y,红,绿,蓝。"),
-    ("coord", "取坐标", "点一下客户区坐标，写入点击/移动/拖拽/滚轮。"),
+    ("coord", "取坐标", "点一下客户区坐标，写入点击/移动/拖拽/滚轮。拖拽先取起点再取终点；点选 x1/y1 或 x2/y2 可重取对应端点。"),
     ("offset", "选偏移", "从基准点拖到要点的位置，写入固定偏移。找图行会先定位图片中心。"),
     ("region", "框选区域", "框选识别范围，写入 区域.设置；已在检测/找图行上则改该行区域。"),
     ("element", "拾取元素", "鼠标放到控件上，右键确认，写入点元素。"),
@@ -130,14 +131,39 @@ class ScriptCaptureController(QObject):
         self._dialog_delete_on_close = None
         self._overlay = None
         self._element_host: Optional[_ScriptElementCapture] = None
+        self._pending_capture: Optional[tuple[str, Optional[int]]] = None
+        self._launch_timer = QTimer(self)
+        self._launch_timer.setSingleShot(True)
+        self._launch_timer.setInterval(200)
+        self._launch_timer.timeout.connect(self._launch_pending)
         bar.capture_requested.connect(self.start)
+        dialog.finished.connect(self._on_dialog_finished)
+        dialog.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._dialog and event.type() == QEvent.Type.DeferredDelete:
+            self._finish(restore_editor=False)
+        return super().eventFilter(obj, event)
+
+    def _on_dialog_finished(self, _result: int) -> None:
+        self._finish(restore_editor=False)
+
+    def _launch_pending(self) -> None:
+        pending = self._pending_capture
+        self._pending_capture = None
+        if self._busy and pending is not None:
+            self._launch(*pending)
 
     def start(self, kind: str) -> None:
         if self._busy:
             return
         hwnd = None
         if kind != "element":
-            hwnd = resolve_script_capture_hwnd(self._dialog)
+            try:
+                hwnd = resolve_script_capture_hwnd(self._dialog)
+            except Exception as exc:
+                QMessageBox.warning(self._dialog, "采集", f"读取绑定窗口失败：{exc}")
+                return
             if not hwnd:
                 QMessageBox.warning(
                     self._dialog,
@@ -155,8 +181,13 @@ class ScriptCaptureController(QObject):
                 return
         self._busy = True
         self._bar.set_busy(True)
-        self._hide_host_windows()
-        QTimer.singleShot(200, lambda: self._launch(kind, hwnd))
+        self._pending_capture = (kind, hwnd)
+        try:
+            self._hide_host_windows()
+            self._launch_timer.start()
+        except Exception as exc:
+            logger.error("准备采集失败: %s", exc, exc_info=True)
+            self._finish(error=f"准备采集失败: {exc}")
 
     def _hide_host_windows(self) -> None:
         """先解除对话框模态再隐藏，否则覆盖层收不到框选。"""
@@ -180,6 +211,7 @@ class ScriptCaptureController(QObject):
         self._hider = None
         if hider is not None:
             hider.restore_all()
+            hider.clear()
         dialog = self._dialog
         modality = self._dialog_modality
         delete_on_close = self._dialog_delete_on_close
@@ -194,6 +226,8 @@ class ScriptCaptureController(QObject):
             dialog.activateWindow()
 
     def _launch(self, kind: str, hwnd: Optional[int]) -> None:
+        if not self._busy:
+            return
         try:
             if kind == "image":
                 self._start_image(hwnd)
@@ -308,39 +342,54 @@ class ScriptCaptureController(QObject):
     def _start_element(self) -> None:
         host = _ScriptElementCapture(self._dialog)
         host.finished.connect(self._on_element_finished)
+        host.failed.connect(self._on_element_failed)
         self._element_host = host
         host.start()
 
+    def _on_element_failed(self, message: str) -> None:
+        if self.sender() is self._element_host:
+            self._finish(error=message)
+
     def _on_element_finished(self, name: object) -> None:
+        if self.sender() is not self._element_host:
+            return
         if name is None:
             self._finish()
             return
-        if not str(name).strip():
+        if not name:
             self._finish(error="没有读到控件名称，请再试一次。")
             return
-        self._finish(kind="element", value=str(name))
+        self._finish(kind="element", value=name)
 
     def _on_overlay_gone(self, *_args) -> None:
         if self._busy:
             self._finish()
 
     def _apply(self, kind: str, value: Any) -> None:
+        cursor = self._editor.textCursor()
         plan = apply_script_capture(
             self._editor.toPlainText(),
-            self._editor.textCursor().blockNumber(),
+            cursor.blockNumber(),
             kind,
             value,
+            column=cursor.positionInBlock(),
         )
         self._editor.apply_edit_plan(plan)
+        if "selection" in plan:
+            self._editor.select_line_span(*plan["selection"])
         refresh = getattr(self._dialog, "_refresh_syntax_status", None)
         if callable(refresh):
             refresh()
 
-    def _finish(self, kind: Optional[str] = None, value: Any = None, error: Optional[str] = None) -> None:
+    def _finish(
+        self, kind: Optional[str] = None, value: Any = None, error: Optional[str] = None,
+        *, restore_editor: bool = True,
+    ) -> None:
+        self._launch_timer.stop()
+        self._pending_capture = None
         if not self._busy:
             return
         self._busy = False
-        self._restore_host_windows()
         overlay = self._overlay
         self._overlay = None
         if overlay is not None:
@@ -355,7 +404,15 @@ class ScriptCaptureController(QObject):
         element_host = self._element_host
         self._element_host = None
         if element_host is not None:
+            element_host.finished.disconnect(self._on_element_finished)
+            element_host.failed.disconnect(self._on_element_failed)
             element_host.stop()
+            element_host.deleteLater()
+        self._restore_host_windows()
+        if not restore_editor:
+            self._bar.set_busy(False)
+            self._dialog.hide()
+            return
         if value is not None and kind:
             try:
                 self._apply(kind, value)
@@ -383,6 +440,13 @@ class _ElementOverlay(QWidget):
         sync_overlay_geometry(self)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self._make_click_through()
+        manager = get_theme_manager()
+        callback = self._on_theme_changed
+        manager.register_theme_change_callback(callback)
+        self.destroyed.connect(lambda _obj=None: manager.unregister_theme_change_callback(callback))
+
+    def _on_theme_changed(self, _theme=None) -> None:
+        self.update()
 
     def _make_click_through(self) -> None:
         import ctypes
@@ -414,15 +478,22 @@ class _ElementOverlay(QWidget):
         draw_selection_overlay(
             painter,
             draw_rect,
-            border_color=QColor(255, 0, 0),
+            border_color=QColor(theme_color("picker_crosshair_inner")),
             border_width=3,
-            fill_color=QColor(255, 0, 0, 30),
+            fill_color=self._highlight_fill(),
         )
+
+    @staticmethod
+    def _highlight_fill() -> QColor:
+        color = QColor(theme_color("picker_crosshair_inner"))
+        color.setAlpha(30)
+        return color
 
 
 class _ScriptElementCapture(QObject):
     finished = Signal(object)
     highlight = Signal(object)
+    failed = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -430,18 +501,28 @@ class _ScriptElementCapture(QObject):
         self._overlay: Optional[_ElementOverlay] = None
         self._thread: Optional[threading.Thread] = None
         self._emitted = False
+        self._cancel = threading.Event()
         self.highlight.connect(self._set_highlight)
 
     def start(self) -> None:
+        if self._thread is not None:
+            raise ValueError("元素采集已经启动")
         self._active = True
         overlay = _ElementOverlay()
         self._overlay = overlay
         show_and_activate_overlay(overlay, log_prefix="脚本元素拾取覆盖层", focus=True)
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="lca-script-element-capture", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._active = False
+        self._cancel.set()
+        self._emitted = True
+        self.blockSignals(True)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        self._thread = None
         overlay = self._overlay
         self._overlay = None
         if overlay is not None:
@@ -454,15 +535,22 @@ class _ScriptElementCapture(QObject):
                 logger.debug("关闭元素拾取覆盖层失败", exc_info=True)
 
     def _emit(self, name: Optional[str]) -> None:
-        if self._emitted:
+        if self._emitted or self._cancel.is_set():
             return
         self._emitted = True
         self._active = False
         self.finished.emit(name)
 
+    def _fail(self, message: str) -> None:
+        if self._emitted or self._cancel.is_set():
+            return
+        self._emitted = True
+        self._active = False
+        self.failed.emit(message)
+
     def _loop(self) -> None:
         import ctypes
-        import time
+        import ctypes.wintypes
 
         from utils.input.uiautomation_runtime import import_uiautomation, uiautomation_thread_context
 
@@ -470,12 +558,13 @@ class _ScriptElementCapture(QObject):
             auto = import_uiautomation()
         except Exception as exc:
             logger.error("元素拾取初始化失败: %s", exc)
-            self._emit(None)
+            self._fail(f"元素拾取初始化失败：{exc}")
             return
 
         user32 = ctypes.windll.user32
         while self._active and user32.GetAsyncKeyState(0x02) & 0x8000:
-            time.sleep(0.02)
+            if self._cancel.wait(0.02):
+                return
 
         last_rect = None
         current = None
@@ -486,23 +575,25 @@ class _ScriptElementCapture(QObject):
                         self._emit(None)
                         return
                     if current is not None and user32.GetAsyncKeyState(0x02) & 0x8000:
-                        self._emit(_element_name(current))
+                        self._emit(_element_selector(current))
                         return
-                    time.sleep(0.02)
+                    if self._cancel.wait(0.02):
+                        return
                     point = ctypes.wintypes.POINT()
                     user32.GetCursorPos(ctypes.byref(point))
                     element = auto.ControlFromPoint(point.x, point.y)
                     rect = _element_rect(element)
                     if rect is None:
                         continue
+                    current = element
                     if rect != last_rect:
                         last_rect = rect
-                        current = element
                         self.highlight.emit(rect)
-                    time.sleep(0.04)
+                    if self._cancel.wait(0.04):
+                        return
         except Exception as exc:
             logger.error("元素拾取失败: %s", exc, exc_info=True)
-            self._emit(None)
+            self._fail(f"元素拾取失败：{exc}")
 
     def _set_highlight(self, rect) -> None:
         if self._overlay is not None:
@@ -518,15 +609,12 @@ def _element_rect(element) -> Optional[tuple]:
     return (rect.left, rect.top, rect.width(), rect.height())
 
 
-def _element_name(element) -> str:
-    for attr in ("Name", "AutomationId", "ClassName"):
-        try:
-            value = str(getattr(element, attr, "") or "").strip()
-        except Exception:
-            value = ""
-        if value:
-            return value
-    return ""
+def _element_selector(element) -> dict:
+    selector = {name: str(getattr(element, attr, "") or "").strip()
+                for name, attr in (("名称", "Name"), ("自动化ID", "AutomationId"), ("类名", "ClassName"))}
+    if not any(selector.values()):
+        raise ValueError("没有读到控件名称、自动化ID或类名")
+    return selector
 
 
 def _resolve_offset_base(dialog, editor, hwnd: int):
@@ -545,69 +633,20 @@ def _resolve_offset_base(dialog, editor, hwnd: int):
             hwnd,
             card_id=getattr(dialog, "_card_id", None),
         )
-    except Exception:
-        logger.debug("选偏移时定位图片失败", exc_info=True)
-        return None, None
+    except Exception as exc:
+        raise ValueError(f"无法定位偏移基准图片：{exc}") from exc
     if not found or not location:
-        return None, None
+        raise ValueError("没有找到偏移基准图片，无法选偏移")
     left, top, width, height = location[:4]
     center = (int(left + width / 2), int(top + height / 2))
     return center, (int(left), int(top), int(width), int(height))
 
 
 def resolve_script_capture_hwnd(dialog) -> Optional[int]:
+    from utils.window.window_binding_utils import resolve_live_target_hwnd
+
     main_window = _main_window_of(dialog)
-    hwnd = _tab_target_hwnd(main_window)
-    if hwnd and _hwnd_is_bound(main_window, hwnd):
-        return int(hwnd)
-    config = getattr(main_window, "config", None) if main_window is not None else None
-    if config:
-        from utils.window.window_binding_utils import get_active_bound_window_hwnd
-
-        hwnd = get_active_bound_window_hwnd(config)
-        if hwnd:
-            return int(hwnd)
-    if main_window is not None and hasattr(main_window, "validate_hwnd_or_get_first"):
-        try:
-            hwnd, _is_original = main_window.validate_hwnd_or_get_first(hwnd)
-            if hwnd:
-                return int(hwnd)
-        except Exception:
-            logger.debug("校验绑定窗口失败", exc_info=True)
-    windows = getattr(main_window, "bound_windows", None) or []
-    for item in windows:
-        if not isinstance(item, dict) or not item.get("enabled", True):
-            continue
-        candidate = item.get("hwnd")
-        if candidate:
-            return int(candidate)
-    return None
-
-
-def _tab_target_hwnd(main_window) -> Optional[int]:
-    if main_window is None:
-        return None
-    tab = getattr(main_window, "workflow_tab_widget", None)
-    if tab is None:
-        return None
-    try:
-        task_id = tab.get_current_task_id()
-        manager = getattr(tab, "task_manager", None)
-        task = manager.get_task(task_id) if manager and task_id is not None else None
-        hwnd = getattr(task, "target_hwnd", None) if task is not None else None
-        return int(hwnd) if hwnd else None
-    except Exception:
-        return None
-
-
-def _hwnd_is_bound(main_window, hwnd: int) -> bool:
-    checker = getattr(main_window, "is_hwnd_bound", None)
-    if not callable(checker):
-        return True
-    try:
-        return bool(checker(hwnd))
-    except Exception:
-        return False
+    return resolve_live_target_hwnd(main_window)
 
 
 def _main_window_of(dialog):
@@ -619,66 +658,54 @@ def _main_window_of(dialog):
 
 def _task_resource_dirs_of(dialog) -> dict:
     main_window = _main_window_of(dialog)
-    dirs = {}
     if main_window is not None and hasattr(main_window, "_current_task_resource_dirs"):
-        try:
-            dirs = dict(main_window._current_task_resource_dirs() or {})
-        except Exception:
-            logger.debug("读取当前任务资源目录失败", exc_info=True)
-            dirs = {}
-    if not str(dirs.get("images_dir") or "").strip():
-        dirs["images_dir"] = _images_dir_of(dialog)
-    if not str(dirs.get("sounds_dir") or "").strip():
-        dirs["sounds_dir"] = _sounds_dir_of(dialog)
+        dirs = dict(main_window._current_task_resource_dirs())
+    else:
+        from task_workflow.resource_context import resource_dirs_from_mapping
+
+        task = _current_capture_task(dialog)
+        dirs = resource_dirs_from_mapping(task) if task is not None else {
+            key: str(getattr(main_window, key, "") or "").strip()
+            for key in ("images_dir", "sounds_dir", "dicts_dir", "yolo_dir", "replays_dir", "plugins_dir")
+        }
+        if task is None and not any(dirs.values()):
+            return {}
+    for key in ("images_dir", "sounds_dir"):
+        if not str(dirs.get(key) or "").strip():
+            raise ValueError("当前任务的图片或音频资源目录未绑定")
     return dirs
 
 
-def _sounds_dir_of(dialog) -> str:
+def _current_capture_task(dialog):
     main_window = _main_window_of(dialog)
-    try:
-        tab = getattr(main_window, "workflow_tab_widget", None)
-        if tab is not None:
-            task_id = tab.get_current_task_id()
-            manager = getattr(tab, "task_manager", None)
-            task = manager.get_task(task_id) if manager is not None and task_id is not None else None
-            task_sounds = str(getattr(task, "sounds_dir", "") or "").strip() if task is not None else ""
-            if task_sounds:
-                return task_sounds
-    except Exception:
-        logger.debug("读取当前任务 sounds_dir 失败", exc_info=True)
-    if main_window is not None and hasattr(main_window, "_resolve_task_sounds_dir"):
-        try:
-            candidate = str(main_window._resolve_task_sounds_dir() or "").strip()
-            if candidate:
-                return candidate
-        except Exception:
-            logger.debug("读取主窗口 sounds_dir 失败", exc_info=True)
-    from utils.app_paths import get_sounds_dir
+    tab = getattr(main_window, "workflow_tab_widget", None)
+    if tab is None:
+        return None
+    task_id = tab.get_current_task_id()
+    if task_id is None:
+        return None
+    task = tab.task_manager.get_task(task_id)
+    if task is None:
+        raise ValueError("当前任务不存在")
+    return task
 
-    return get_sounds_dir("LCA")
+
+def _sounds_dir_of(dialog) -> str:
+    task = _current_capture_task(dialog)
+    owner = task if task is not None else _main_window_of(dialog)
+    directory = str(getattr(owner, "sounds_dir", "") or "").strip()
+    if not directory:
+        raise ValueError("音频资源目录未绑定")
+    return directory
 
 
 def _images_dir_of(dialog) -> str:
-    main_window = _main_window_of(dialog)
-    # 优先当前任务标签页的 images_dir，和运行时、通用参数面板保持一致，
-    # 避免采集写到全局目录、运行时却在任务目录找不到图。
-    try:
-        tab = getattr(main_window, "workflow_tab_widget", None)
-        if tab is not None:
-            task_id = tab.get_current_task_id()
-            manager = getattr(tab, "task_manager", None)
-            task = manager.get_task(task_id) if manager is not None and task_id is not None else None
-            task_images = str(getattr(task, "images_dir", "") or "").strip() if task is not None else ""
-            if task_images:
-                return task_images
-    except Exception:
-        logger.debug("读取当前任务 images_dir 失败", exc_info=True)
-    candidate = str(getattr(main_window, "images_dir", "") or "").strip()
-    if candidate:
-        return candidate
-    from utils.app_paths import get_images_dir
-
-    return get_images_dir("LCA")
+    task = _current_capture_task(dialog)
+    owner = task if task is not None else _main_window_of(dialog)
+    directory = str(getattr(owner, "images_dir", "") or "").strip()
+    if not directory:
+        raise ValueError("图片资源目录未绑定")
+    return directory
 
 
 def _workflow_token_of(dialog) -> str:
@@ -697,9 +724,6 @@ def _workflow_token_of(dialog) -> str:
 
 
 def _screenshot_format() -> str:
-    try:
-        from app_core.config_store import load_config
+    from app_core.config_store import load_config
 
-        return str(load_config().get("screenshot_format") or "bmp")
-    except Exception:
-        return "bmp"
+    return str(load_config()["screenshot_format"])

@@ -338,12 +338,26 @@ def safe_imread(image_path: str, flags=cv2.IMREAD_COLOR) -> Optional[np.ndarray]
         if image_path.startswith('memory://'):
             image_bytes = None
             try:
-                from utils.match.template_preloader import get_memory_image_provider
-                provider = get_memory_image_provider()
-                if callable(provider):
-                    image_bytes = provider(image_path)
+                from task_workflow.resource_context import current_package_session
+
+                package_session = current_package_session()
             except Exception:
-                image_bytes = None
+                package_session = None
+
+            if package_session is not None:
+                try:
+                    image_bytes = package_session.get_bytes(image_path)
+                except Exception:
+                    image_bytes = None
+            else:
+                try:
+                    from utils.match.template_preloader import get_memory_image_provider
+
+                    provider = get_memory_image_provider()
+                    if callable(provider):
+                        image_bytes = provider(image_path)
+                except Exception:
+                    image_bytes = None
 
             if not image_bytes:
                 return None

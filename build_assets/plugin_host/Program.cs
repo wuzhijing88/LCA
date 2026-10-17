@@ -9,8 +9,8 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.IO.Pipes;
-using System.Reflection;
 using System.Runtime.InteropServices;
+using ComTypes = System.Runtime.InteropServices.ComTypes;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -34,6 +34,8 @@ internal static class Program
     static string ExtraCode = "";
     static IClassFactory DmClassFactory;
     static IntPtr DmModule;
+    static ComTypes.ITypeInfo DmTypeInfo;
+    static Guid DmInterfaceId;
     static readonly Guid DmClassId = new Guid("26037A0E-7CBD-4FFF-9C63-56F2D0770214");
     static readonly Guid UnknownId = new Guid("00000000-0000-0000-C000-000000000046");
     static readonly Guid ClassFactoryId = new Guid("00000001-0000-0000-C000-000000000046");
@@ -233,32 +235,6 @@ internal static class Program
         };
     }
 
-    [ComImport]
-    [Guid("00020400-0000-0000-C000-000000000046")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface IComDispatch
-    {
-        [PreserveSig]
-        int GetTypeInfoCount(out int pctinfo);
-
-        [PreserveSig]
-        int GetTypeInfo(int iTInfo, int lcid, out IntPtr info);
-
-        [PreserveSig]
-        int GetIDsOfNames(ref Guid riid, IntPtr names, int nameCount, int lcid, IntPtr dispIds);
-
-        [PreserveSig]
-        int Invoke(
-            int dispId,
-            ref Guid riid,
-            int lcid,
-            ushort flags,
-            ref DispatchParams dispParams,
-            IntPtr result,
-            IntPtr excepInfo,
-            IntPtr argErr);
-    }
-
     [StructLayout(LayoutKind.Sequential)]
     struct DispatchParams
     {
@@ -298,31 +274,41 @@ internal static class Program
         int hr = DmClassFactory.CreateInstance(IntPtr.Zero, ref iid, out dm);
         if (hr < 0 || dm == null)
             throw new InvalidOperationException("无法创建 dm.dmsoft");
-        try { Invoke(dm, "SetShowErrorMsg", 0); } catch (Exception) { }
-        int authCode;
-        if (!Authorize(dm, RegCode, ExtraCode, out authCode))
+        try
         {
-            try { Marshal.FinalReleaseComObject(dm); } catch (Exception) { }
-            throw new InvalidOperationException(AuthorizeErrorMessage(authCode));
+            // 无窗口宿主必须关闭厂商弹窗；接口失败时立即停止初始化。
+            Invoke(dm, "SetShowErrorMsg", 0);
+            int authCode;
+            if (!Authorize(dm, RegCode, ExtraCode, out authCode))
+                throw new InvalidOperationException(AuthorizeErrorMessage(authCode));
+            Registrations++;
+            return dm;
         }
-        Registrations++;
-        return dm;
+        catch
+        {
+            Marshal.FinalReleaseComObject(dm);
+            throw;
+        }
     }
 
     static string _lastVerText = "";
+    static string _lastAuthorizeError = "";
 
     static bool Authorize(object dm, string regCode, string extraCode, out int authCode)
     {
         authCode = 0;
         _lastVerText = "";
+        _lastAuthorizeError = "";
         // 免注册仅指不写 COM 注册表；大漠注册码授权仍按官方 Reg 流程执行。
         try
         {
             object verObj = Invoke(dm, "Ver");
             _lastVerText = Convert.ToString(verObj) ?? "";
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            _lastAuthorizeError = FormatException(ex);
+            return false;
         }
         try
         {
@@ -330,18 +316,27 @@ internal static class Program
             authCode = ToInt(reg);
             return authCode == 1;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            _lastAuthorizeError = FormatException(ex);
         }
         return false;
+    }
+
+    static string FormatException(Exception ex)
+    {
+        Exception inner = ex == null ? null : (ex.InnerException ?? ex);
+        if (inner == null)
+            return "";
+        string detail = inner.GetType().Name + ": " + (inner.Message ?? "");
+        return detail.Length > 240 ? detail.Substring(0, 240) : detail;
     }
 
     static int ToInt(object value)
     {
         if (value == null || value is string)
-            return 0;
-        try { return Convert.ToInt32(value); }
-        catch (Exception) { return 0; }
+            throw new InvalidOperationException("插件授权返回值不是整数");
+        return Convert.ToInt32(value);
     }
 
     static string AuthorizeErrorMessage(int code)
@@ -369,7 +364,8 @@ internal static class Program
             default: detail = "未知原因"; break;
         }
         string verPart = string.IsNullOrEmpty(_lastVerText) ? "ver=空" : ("ver=" + _lastVerText);
-        return "插件授权失败 code=" + code + "（" + detail + "；" + verPart + "）";
+        string invokePart = string.IsNullOrEmpty(_lastAuthorizeError) ? "" : ("；调用=" + _lastAuthorizeError);
+        return "插件授权失败 code=" + code + "（" + detail + "；" + verPart + invokePart + "）";
     }
 
     sealed class RpcWork
@@ -390,6 +386,23 @@ internal static class Program
     [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
     static extern IntPtr GetProcAddress(IntPtr module, string name);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool FreeLibrary(IntPtr module);
+
+    [DllImport("oleaut32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    static extern void LoadTypeLibEx(string file, int kind, out ComTypes.ITypeLib typeLib);
+
+    [DllImport("oleaut32.dll", ExactSpelling = true)]
+    static extern int DispInvoke(
+        IntPtr instance,
+        ComTypes.ITypeInfo typeInfo,
+        int dispId,
+        ushort flags,
+        ref DispatchParams parameters,
+        IntPtr result,
+        IntPtr exception,
+        out int argError);
+
     [DllImport("oleaut32.dll", ExactSpelling = true)]
     static extern void VariantClear(IntPtr pvarg);
 
@@ -397,29 +410,141 @@ internal static class Program
     {
         if (DmClassFactory != null)
             return;
-        DmModule = LoadLibraryW(dmPath);
-        if (DmModule == IntPtr.Zero)
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "无法加载 dm.dll");
-        IntPtr entry = GetProcAddress(DmModule, "DllGetClassObject");
-        if (entry == IntPtr.Zero)
-            throw new InvalidOperationException("dm.dll 缺少 DllGetClassObject");
-        DllGetClassObjectDelegate getClassObject =
-            (DllGetClassObjectDelegate)Marshal.GetDelegateForFunctionPointer(
-                entry, typeof(DllGetClassObjectDelegate));
-        IntPtr factoryPtr;
-        Guid classId = DmClassId;
-        Guid interfaceId = ClassFactoryId;
-        int hr = getClassObject(ref classId, ref interfaceId, out factoryPtr);
-        if (hr < 0 || factoryPtr == IntPtr.Zero)
-            throw new InvalidOperationException("无法从 dm.dll 获取 COM 类工厂，HRESULT=0x" + hr.ToString("X8"));
         try
         {
-            DmClassFactory = (IClassFactory)Marshal.GetObjectForIUnknown(factoryPtr);
+            LoadEmbeddedTypeInfo(dmPath);
+            DmModule = LoadLibraryW(dmPath);
+            if (DmModule == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "无法加载 dm.dll");
+            IntPtr entry = GetProcAddress(DmModule, "DllGetClassObject");
+            if (entry == IntPtr.Zero)
+                throw new InvalidOperationException("dm.dll 缺少 DllGetClassObject");
+            DllGetClassObjectDelegate getClassObject =
+                (DllGetClassObjectDelegate)Marshal.GetDelegateForFunctionPointer(
+                    entry, typeof(DllGetClassObjectDelegate));
+            IntPtr factoryPtr;
+            Guid classId = DmClassId;
+            Guid interfaceId = ClassFactoryId;
+            int hr = getClassObject(ref classId, ref interfaceId, out factoryPtr);
+            try
+            {
+                if (hr < 0 || factoryPtr == IntPtr.Zero)
+                    throw new InvalidOperationException("无法从 dm.dll 获取 COM 类工厂，HRESULT=0x" + hr.ToString("X8"));
+                DmClassFactory = (IClassFactory)Marshal.GetObjectForIUnknown(factoryPtr);
+            }
+            finally
+            {
+                if (factoryPtr != IntPtr.Zero) Marshal.Release(factoryPtr);
+            }
+        }
+        catch
+        {
+            ReleasePluginRuntime();
+            throw;
+        }
+    }
+
+    static void LoadEmbeddedTypeInfo(string dmPath)
+    {
+        ComTypes.ITypeLib library = null;
+        ComTypes.ITypeInfo classInfo = null;
+        ComTypes.ITypeInfo interfaceInfo = null;
+        try
+        {
+            // REGKIND_NONE：只读当前 DLL 的内置类型库，不查询或写入 COM 注册表。
+            LoadTypeLibEx(dmPath, 2, out library);
+            Guid classId = DmClassId;
+            library.GetTypeInfoOfGuid(ref classId, out classInfo);
+            IntPtr classAttr;
+            classInfo.GetTypeAttr(out classAttr);
+            int interfaceCount;
+            try
+            {
+                ComTypes.TYPEATTR attr = (ComTypes.TYPEATTR)Marshal.PtrToStructure(classAttr, typeof(ComTypes.TYPEATTR));
+                if (attr.typekind != ComTypes.TYPEKIND.TKIND_COCLASS)
+                    throw new InvalidOperationException("插件类型库缺少 dmsoft 类定义");
+                interfaceCount = attr.cImplTypes;
+            }
+            finally { classInfo.ReleaseTypeAttr(classAttr); }
+
+            for (int i = 0; i < interfaceCount; i++)
+            {
+                ComTypes.IMPLTYPEFLAGS flags;
+                classInfo.GetImplTypeFlags(i, out flags);
+                if ((flags & ComTypes.IMPLTYPEFLAGS.IMPLTYPEFLAG_FDEFAULT) == 0
+                    || (flags & ComTypes.IMPLTYPEFLAGS.IMPLTYPEFLAG_FSOURCE) != 0)
+                    continue;
+                int reference;
+                classInfo.GetRefTypeOfImplType(i, out reference);
+                classInfo.GetRefTypeInfo(reference, out interfaceInfo);
+                ComTypes.ITypeInfo selected = interfaceInfo;
+                IntPtr interfaceAttr;
+                selected.GetTypeAttr(out interfaceAttr);
+                try
+                {
+                    ComTypes.TYPEATTR attr = (ComTypes.TYPEATTR)Marshal.PtrToStructure(interfaceAttr, typeof(ComTypes.TYPEATTR));
+                    if (attr.typekind != ComTypes.TYPEKIND.TKIND_DISPATCH
+                        || (attr.wTypeFlags & ComTypes.TYPEFLAGS.TYPEFLAG_FDUAL) == 0)
+                        throw new InvalidOperationException("插件类型库默认接口不是双接口");
+                    DmInterfaceId = attr.guid;
+                    DmTypeInfo = interfaceInfo;
+                    interfaceInfo = null;
+                    return;
+                }
+                finally { selected.ReleaseTypeAttr(interfaceAttr); }
+            }
+            throw new InvalidOperationException("插件类型库缺少默认调用接口");
         }
         finally
         {
-            Marshal.Release(factoryPtr);
+            if (interfaceInfo != null) Marshal.FinalReleaseComObject(interfaceInfo);
+            if (classInfo != null) Marshal.FinalReleaseComObject(classInfo);
+            if (library != null) Marshal.FinalReleaseComObject(library);
         }
+    }
+
+    static void ReleasePluginRuntime()
+    {
+        if (DmTypeInfo != null)
+        {
+            Marshal.FinalReleaseComObject(DmTypeInfo);
+            DmTypeInfo = null;
+        }
+        DmInterfaceId = Guid.Empty;
+        if (DmClassFactory != null)
+        {
+            Marshal.FinalReleaseComObject(DmClassFactory);
+            DmClassFactory = null;
+        }
+        if (DmModule != IntPtr.Zero)
+        {
+            FreeLibrary(DmModule);
+            DmModule = IntPtr.Zero;
+        }
+    }
+
+    static void ReleaseDmSlots()
+    {
+        HashSet<DmSlot> all = new HashSet<DmSlot>(Slots.Values);
+        all.UnionWith(FreeSlots);
+        if (Primary != null) all.Add(Primary);
+        foreach (DmSlot slot in all)
+        {
+            try { TryUnbind(slot); }
+            finally
+            {
+                if (slot.Dm != null)
+                {
+                    Marshal.FinalReleaseComObject(slot.Dm);
+                    slot.Dm = null;
+                }
+            }
+        }
+        Slots.Clear();
+        FreeSlots.Clear();
+        Primary = null;
+        LastSlot = null;
+        Inited = false;
     }
 
     [STAThread]
@@ -440,9 +565,16 @@ internal static class Program
         finally
         {
             Stopping = true;
-            UnbindAll();
-            if (Map != null)
-                Map.Dispose();
+            try { ReleaseDmSlots(); }
+            finally
+            {
+                if (Map != null)
+                {
+                    Map.Dispose();
+                    Map = null;
+                }
+                ReleasePluginRuntime();
+            }
         }
         return 0;
     }
@@ -581,17 +713,21 @@ internal static class Program
             string dmPath = Path.Combine(pluginDir, "dm.dll");
             if (!File.Exists(dmPath))
                 throw new InvalidOperationException("缺少 dm.dll: " + dmPath);
-            LoadClassFactory(dmPath);
-            object dm = CreateAuthorizedDm();
-            if (dm == null)
-                throw new InvalidOperationException("无法创建 dm.dmsoft");
-            // 宿主没有窗口：大漠自带的错误弹窗不可见，只会让 RPC 卡到超时，必须关掉。
-            try { Invoke(dm, "SetShowErrorMsg", 0); } catch (Exception) { }
-            Primary = new DmSlot { Dm = dm };
-            Primary.Touch();
-            Registrations = 1;
-            Map = MemoryMappedFile.CreateOrOpen(MapNameFromPipe(PipeName), FrameMapSize);
-            Inited = true;
+            try
+            {
+                LoadClassFactory(dmPath);
+                Primary = new DmSlot { Dm = CreateAuthorizedDm() };
+                Primary.Touch();
+                Registrations = 1;
+                Map = MemoryMappedFile.CreateOrOpen(MapNameFromPipe(PipeName), FrameMapSize);
+                Inited = true;
+            }
+            catch
+            {
+                try { ReleaseDmSlots(); }
+                finally { ReleasePluginRuntime(); }
+                throw;
+            }
         }
     }
 
@@ -901,8 +1037,7 @@ internal static class Program
         int height;
         if (!TryGetClientSize(dm, hwnd, out width, out height))
         {
-            width = 0;
-            height = 0;
+            throw new InvalidOperationException("获取插件窗口客户区大小失败");
         }
         return new Dictionary<string, object>
         {
@@ -935,8 +1070,8 @@ internal static class Program
             case "find_double": return Invoke(dm, "FindDouble", hwnd, GetString(args, "range"), GetRequiredDouble(args, "min"), GetRequiredDouble(args, "max"));
             case "find_string": return Invoke(dm, "FindString", hwnd, GetString(args, "range"), GetString(args, "value"), GetRequiredInt(args, "type"));
             case "find_data": return Invoke(dm, "FindData", hwnd, GetString(args, "range"), GetString(args, "value"));
-            case "virtual_alloc": return Invoke(dm, "VirtualAllocEx", hwnd, addr, GetRequiredInt(args, "size"), GetRequiredInt(args, "allocation_type"));
-            case "virtual_free": return Invoke(dm, "VirtualFreeEx", hwnd, addr);
+            case "virtual_alloc": return Invoke(dm, "VirtualAllocEx", hwnd, GetAbsoluteMemoryAddress(args), GetRequiredInt(args, "size"), GetRequiredInt(args, "allocation_type"));
+            case "virtual_free": return Invoke(dm, "VirtualFreeEx", hwnd, GetAbsoluteMemoryAddress(args));
             case "free_process_memory": return Invoke(dm, "FreeProcessMemory", hwnd);
             case "asm_add": return Invoke(dm, "AsmAdd", GetString(args, "instruction"));
             case "asm_clear": return Invoke(dm, "AsmClear");
@@ -1170,20 +1305,13 @@ internal static class Program
 
     static int LastError(object dm)
     {
-        try
-        {
-            return Convert.ToInt32(Invoke(dm, "GetLastError"));
-        }
-        catch (Exception)
-        {
-            return 0;
-        }
+        return Convert.ToInt32(Invoke(dm, "GetLastError"));
     }
 
     static string MouseMethod(string button, string action)
     {
         string prefix;
-        switch ((button ?? "left").Trim().ToLowerInvariant())
+        switch (button)
         {
             case "right":
                 prefix = "Right";
@@ -1191,9 +1319,11 @@ internal static class Program
             case "middle":
                 prefix = "Middle";
                 break;
-            default:
+            case "left":
                 prefix = "Left";
                 break;
+            default:
+                throw new InvalidOperationException("插件鼠标按钮无效：" + button);
         }
         // 双击不走这里：大漠只有 LeftDoubleClick，由 DoMouseDoubleClick 单独处理
         switch (action)
@@ -1202,8 +1332,10 @@ internal static class Program
                 return prefix + "Down";
             case "up":
                 return prefix + "Up";
-            default:
+            case "click":
                 return prefix + "Click";
+            default:
+                throw new InvalidOperationException("插件鼠标动作无效：" + action);
         }
     }
 
@@ -1229,12 +1361,8 @@ internal static class Program
 
     static object Invoke(object target, string name, params object[] invokeArgs)
     {
-        return target.GetType().InvokeMember(
-            name,
-            BindingFlags.InvokeMethod,
-            null,
-            target,
-            invokeArgs ?? new object[0]);
+        object[] args = invokeArgs ?? new object[0];
+        return InvokeByRef(target, name, args, new bool[args.Length]);
     }
 
     const int VariantSize = 16;
@@ -1248,30 +1376,22 @@ internal static class Program
             Marshal.WriteByte(pointer, i, 0);
     }
 
-    static int GetDispId(IComDispatch dispatch, string name)
+    static int GetDispId(string name)
     {
-        Guid iid = Guid.Empty;
-        IntPtr namePtr = Marshal.StringToCoTaskMemUni(name);
-        IntPtr names = Marshal.AllocCoTaskMem(IntPtr.Size);
-        IntPtr ids = Marshal.AllocCoTaskMem(4);
+        int[] ids = new int[1];
         try
         {
-            Marshal.WriteIntPtr(names, namePtr);
-            int hr = dispatch.GetIDsOfNames(ref iid, names, 1, 0x0400, ids);
-            if (hr < 0)
-                throw new InvalidOperationException("找不到插件方法 " + name + " HRESULT=0x" + hr.ToString("X8"));
-            return Marshal.ReadInt32(ids);
+            DmTypeInfo.GetIDsOfNames(new[] { name }, 1, ids);
+            return ids[0];
         }
-        finally
+        catch (COMException ex)
         {
-            Marshal.FreeCoTaskMem(namePtr);
-            Marshal.FreeCoTaskMem(names);
-            Marshal.FreeCoTaskMem(ids);
+            throw new InvalidOperationException("找不到插件方法 " + name + " HRESULT=0x" + ex.HResult.ToString("X8"), ex);
         }
     }
 
-    // 大漠 GetClientSize / GetScreenDataBmp 的出参是变参。Type.InvokeMember + ParameterModifier
-    // 对 IDispatch 不会把值写回 args，必须按 VT_BYREF 调 IDispatch.Invoke。
+    // 用 DLL 内置双接口类型信息直接调用 vtable，避开 IDispatch 对注册类型库的依赖。
+    // GetClientSize / GetScreenDataBmp 的出参使用 VT_BYREF | VT_VARIANT 写回。
     static object InvokeByRef(object target, string name, object[] args, bool[] byref)
     {
         if (target == null)
@@ -1280,18 +1400,26 @@ internal static class Program
             args = new object[0];
         if (byref == null || byref.Length != args.Length)
             throw new InvalidOperationException("变参标记长度与参数不一致");
-        IComDispatch dispatch = target as IComDispatch;
-        if (dispatch == null)
-            throw new InvalidOperationException("插件对象不支持 IDispatch");
+        if (DmTypeInfo == null)
+            throw new InvalidOperationException("插件调用类型信息尚未加载");
 
-        int dispId = GetDispId(dispatch, name);
+        int dispId = GetDispId(name);
         int count = args.Length;
         IntPtr argVars = IntPtr.Zero;
-        IntPtr resultVar = Marshal.AllocHGlobal(VariantSize);
-        ZeroMemory(resultVar, VariantSize);
+        IntPtr resultVar = IntPtr.Zero;
+        IntPtr unknown = IntPtr.Zero;
+        IntPtr instance = IntPtr.Zero;
+        IntPtr exception = IntPtr.Zero;
         IntPtr[] varStores = count > 0 ? new IntPtr[count] : null;
         try
         {
+            resultVar = Marshal.AllocHGlobal(VariantSize);
+            ZeroMemory(resultVar, VariantSize);
+            exception = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(ComTypes.EXCEPINFO)));
+            ZeroMemory(exception, Marshal.SizeOf(typeof(ComTypes.EXCEPINFO)));
+            unknown = Marshal.GetIUnknownForObject(target);
+            Guid interfaceId = DmInterfaceId;
+            Marshal.ThrowExceptionForHR(Marshal.QueryInterface(unknown, ref interfaceId, out instance));
             if (count > 0)
             {
                 argVars = Marshal.AllocHGlobal(VariantSize * count);
@@ -1321,18 +1449,22 @@ internal static class Program
             dispParams.NamedArgs = IntPtr.Zero;
             dispParams.ArgCount = count;
             dispParams.NamedArgCount = 0;
-            Guid iid = Guid.Empty;
-            int hr = dispatch.Invoke(
+            int argError;
+            int hr = DispInvoke(
+                instance,
+                DmTypeInfo,
                 dispId,
-                ref iid,
-                0x0400,
-                DispatchMethod | 2,
+                DispatchMethod,
                 ref dispParams,
                 resultVar,
-                IntPtr.Zero,
-                IntPtr.Zero);
+                exception,
+                out argError);
             if (hr < 0)
-                throw new InvalidOperationException(name + " 调用失败 HRESULT=0x" + hr.ToString("X8"));
+            {
+                ComTypes.EXCEPINFO info = (ComTypes.EXCEPINFO)Marshal.PtrToStructure(exception, typeof(ComTypes.EXCEPINFO));
+                throw new COMException(name + " 调用失败 HRESULT=0x" + hr.ToString("X8")
+                    + (string.IsNullOrEmpty(info.bstrDescription) ? "" : "；" + info.bstrDescription), hr);
+            }
 
             for (int src = 0; src < count; src++)
             {
@@ -1360,8 +1492,18 @@ internal static class Program
                     }
                 }
             }
-            VariantClear(resultVar);
-            Marshal.FreeHGlobal(resultVar);
+            if (resultVar != IntPtr.Zero)
+            {
+                VariantClear(resultVar);
+                Marshal.FreeHGlobal(resultVar);
+            }
+            if (exception != IntPtr.Zero)
+            {
+                Marshal.DestroyStructure(exception, typeof(ComTypes.EXCEPINFO));
+                Marshal.FreeHGlobal(exception);
+            }
+            if (instance != IntPtr.Zero) Marshal.Release(instance);
+            if (unknown != IntPtr.Zero) Marshal.Release(unknown);
         }
     }
 
@@ -1512,16 +1654,28 @@ internal static class Program
     static int GetInt(Dictionary<string, object> map, string key, int fallback = 0)
     {
         object value = GetValue(map, key);
-        if (value == null || value is DBNull || value is string && string.IsNullOrWhiteSpace((string)value))
+        if (value == null || value is DBNull)
             return fallback;
-        try
+        return GetRequiredInt(map, key);
+    }
+
+    static long GetAbsoluteMemoryAddress(Dictionary<string, object> map)
+    {
+        object value = GetValue(map, "addr");
+        long address;
+        if (value is string text)
         {
-            return Convert.ToInt32(value);
+            if (!long.TryParse(text, System.Globalization.NumberStyles.AllowHexSpecifier,
+                System.Globalization.CultureInfo.InvariantCulture, out address) || address < 0)
+                throw new InvalidOperationException("内存申请和释放地址必须是非负 64 位十六进制绝对地址");
+            return address;
         }
-        catch (Exception)
+        if (value is int || value is long)
         {
-            return fallback;
+            address = Convert.ToInt64(value);
+            if (address >= 0) return address;
         }
+        throw new InvalidOperationException("内存申请和释放地址必须是地址文本或非负 64 位整数");
     }
 
     static int GetRequiredInt(Dictionary<string, object> map, string key)
@@ -1529,6 +1683,8 @@ internal static class Program
         object value = GetValue(map, key);
         if (value == null || value is DBNull)
             throw new InvalidOperationException("缺少整数参数: " + key);
+        if (!(value is int) && !(value is long))
+            throw new InvalidOperationException("整数参数无效: " + key);
         try { return Convert.ToInt32(value); }
         catch (Exception ex) { throw new InvalidOperationException("整数参数无效: " + key, ex); }
     }
@@ -1549,15 +1705,7 @@ internal static class Program
             return fallback;
         if (value is bool flag)
             return flag;
-        string text = Convert.ToString(value);
-        if (string.IsNullOrWhiteSpace(text))
-            return fallback;
-        text = text.Trim().ToLowerInvariant();
-        if (text == "true" || text == "1" || text == "yes" || text == "on")
-            return true;
-        if (text == "false" || text == "0" || text == "no" || text == "off")
-            return false;
-        return fallback;
+        throw new InvalidOperationException("布尔参数无效: " + key);
     }
 
 }

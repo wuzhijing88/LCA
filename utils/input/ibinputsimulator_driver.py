@@ -4,6 +4,7 @@
 import atexit
 import base64
 import ctypes
+import math
 import logging
 import os
 import queue
@@ -173,25 +174,17 @@ class IbInputSimulatorDriver:
         self._worker_core_source_mtime_ns: int = 0
         self._runtime_base_dir: Optional[Path] = None
         self._runtime_session_dir: Optional[Path] = None
+        self._worker_stop_path: Optional[Path] = None
 
         self._startup_timeout = 8.0
         self._request_timeout = 8.0
         self._mouse_request_timeout = 20.0
         self._response_poll_interval = 0.05
-        self._alignment_fast_retry_count = 1
-        self._alignment_fast_retry_sleep = 0.004
-        self._alignment_recovery_budget_seconds = 0.12
-        self._alignment_rebuild_cooldown = 0.35
-        self._alignment_rebuild_failure_threshold = 2
-        self._alignment_consecutive_failures = 0
-        self._last_alignment_rebuild_ts = 0.0
         try:
             if getattr(sys, "frozen", False):
                 self._startup_timeout = 15.0
         except Exception:
             pass
-
-        atexit.register(self.close)
 
     def _get_file_mtime_ns(self, path: Optional[Path]) -> int:
         try:
@@ -254,6 +247,7 @@ class IbInputSimulatorDriver:
                 )
                 self._runtime_base_dir = runtime_base
                 self._runtime_session_dir = runtime_dir
+                self._worker_stop_path = runtime_dir / "input_stop.request"
                 wrapper_content = self._build_wrapper_script(include_file, core_script)
                 self._wrapper_script_path = self._write_temp_script(
                     content=wrapper_content,
@@ -285,6 +279,8 @@ class IbInputSimulatorDriver:
 
                 self._wait_ready(self._startup_timeout)
                 self._ready = True
+                atexit.unregister(self.close)
+                atexit.register(self.close)
                 self._last_error_message = ""
                 self._worker_core_source_path = source_core_script
                 self._worker_core_source_mtime_ns = source_core_mtime_ns
@@ -439,6 +435,9 @@ class IbInputSimulatorDriver:
         core_path = self._escape_ahk_string(str(core_script))
         driver_name = self._escape_ahk_string(self._runtime_driver_name)
         driver_arg = self._escape_ahk_string(self._driver_arg)
+        if self._worker_stop_path is None:
+            raise RuntimeError("输入进程停止路径未初始化")
+        stop_path = self._escape_ahk_string(str(self._worker_stop_path))
 
         return (
             "#Requires AutoHotkey v2.0\n"
@@ -446,7 +445,7 @@ class IbInputSimulatorDriver:
             "#NoTrayIcon\n"
             f"#Include \"{include_path}\"\n"
             f"#Include \"{core_path}\"\n"
-            f"IbWorkerMain(\"{driver_name}\", \"{driver_arg}\")\n"
+            f"IbWorkerMain(\"{driver_name}\", \"{driver_arg}\", \"{stop_path}\")\n"
         )
 
     def _write_temp_script(self, content: str, preferred_dir: Optional[Path] = None) -> str:
@@ -949,23 +948,16 @@ class IbInputSimulatorDriver:
     def _decode_token(self, token: str) -> Any:
         if token == "~":
             return None
-        if token.startswith("b:"):
-            return token[2:] == "1"
+        if token in ("b:0", "b:1"):
+            return token == "b:1"
         if token.startswith("n:"):
-            number_text = token[2:]
-            try:
-                if any(ch in number_text for ch in (".", "e", "E")):
-                    return float(number_text)
-                return int(number_text)
-            except Exception:
-                return 0
+            value = float(token[2:])
+            if not math.isfinite(value):
+                raise ValueError("工作线程返回的数值无效")
+            return value
         if token.startswith("s:"):
-            payload = token[2:]
-            try:
-                return base64.b64decode(payload).decode("utf-8")
-            except Exception:
-                return ""
-        return token
+            return base64.b64decode(token[2:], validate=True).decode("utf-8")
+        raise ValueError("工作线程返回的令牌格式无效")
 
     def _ensure_ready(self) -> None:
         if self._ready and self._is_alive():
@@ -1069,118 +1061,19 @@ class IbInputSimulatorDriver:
                 logger.error(f"[IbInputSimulator][relative] timeout req={req_id} driver={self._driver_name}")
             raise TimeoutError("worker response timeout")
 
-    def _is_retryable_mouse_alignment_error(self, error: Exception) -> bool:
-        text = str(error or "").strip().lower().replace(" ", "")
-        if not text:
-            return False
-        keywords = (
-            "targetverifyfailed",
-            "drivermovefailed",
-            "setcursorposfailed",
-            "mousemovefailed",
-        )
-        return any(keyword in text for keyword in keywords)
-
-    def _request_with_mouse_alignment_recovery(self, method: str, *args: Any, timeout: Optional[float] = None) -> bool:
-        recovery_start_ts = time.monotonic()
-
-        def _invoke_request() -> Tuple[bool, Optional[Exception]]:
-            try:
-                self._request(method, *args, timeout=timeout)
-                return True, None
-            except Exception as req_error:
-                return False, req_error
-
-        def _budget_exceeded() -> bool:
-            try:
-                budget = max(0.0, float(self._alignment_recovery_budget_seconds))
-            except Exception:
-                budget = 0.0
-            if budget <= 0:
-                return False
-            return (time.monotonic() - recovery_start_ts) > budget
-
-        ok, first_error = _invoke_request()
-        if ok:
-            self._alignment_consecutive_failures = 0
-            return True
-
-        if first_error is None:
-            return False
-
-        self._last_error_message = str(first_error or "").strip()
-        if isinstance(first_error, RequestAbortedError):
-            return False
-        if not self._is_retryable_mouse_alignment_error(first_error):
-            self._alignment_consecutive_failures = 0
-            return False
-
-        retry_count = max(0, int(self._alignment_fast_retry_count))
-        fast_retry_error: Exception = first_error
-        for _ in range(retry_count):
-            if _budget_exceeded():
-                break
-            if self._alignment_fast_retry_sleep > 0:
-                _shared_precise_sleep(self._alignment_fast_retry_sleep)
-            retry_ok, retry_error = _invoke_request()
-            if retry_ok:
-                self._alignment_consecutive_failures = 0
-                return True
-            if retry_error is None:
-                return False
-            self._last_error_message = str(retry_error or "").strip()
-            if isinstance(retry_error, RequestAbortedError):
-                return False
-            fast_retry_error = retry_error
-            if not self._is_retryable_mouse_alignment_error(retry_error):
-                self._alignment_consecutive_failures = 0
-                return False
-
-        self._alignment_consecutive_failures = min(
-            1000,
-            int(self._alignment_consecutive_failures) + 1,
-        )
-
-        if self._abort_request_event.is_set():
-            return False
-
-        if _budget_exceeded():
-            return False
-
-        if self._alignment_consecutive_failures < int(self._alignment_rebuild_failure_threshold):
-            return False
-
-        now_ts = time.monotonic()
-        if (now_ts - self._last_alignment_rebuild_ts) < self._alignment_rebuild_cooldown:
-            return False
-
+    def _request_mouse_once(self, method: str, *args: Any, timeout: Optional[float] = None) -> bool:
         try:
-            self.close()
-        except Exception:
-            return False
-
-        try:
-            if not self.initialize():
-                return False
-            self._last_alignment_rebuild_ts = time.monotonic()
             self._request(method, *args, timeout=timeout)
-            self._last_error_message = ""
-            self._alignment_consecutive_failures = 0
             return True
-        except Exception as rebuild_error:
-            if rebuild_error is not None:
-                self._last_error_message = str(rebuild_error or "").strip()
-            elif fast_retry_error is not None:
-                self._last_error_message = str(fast_retry_error or "").strip()
+        except Exception as exc:
+            self._last_error_message = str(exc)
             return False
 
     def _normalize_button(self, button: str) -> str:
-        key = str(button or "left").strip().lower()
-        if key in {"right", "r", "rbutton", "右键"}:
-            return "right"
-        if key in {"middle", "m", "mbutton", "中键"}:
-            return "middle"
-        return "left"
+        key = str(button).strip().lower()
+        if key not in {"left", "right", "middle"}:
+            raise ValueError(f"不支持的鼠标按钮：{button}")
+        return key
 
     def _normalize_key(self, key: str) -> str:
         text = str(key or "").strip()
@@ -1291,19 +1184,16 @@ class IbInputSimulatorDriver:
         MAPVK_VK_TO_VSC_EX = 4
         scan_raw = int(ctypes.windll.user32.MapVirtualKeyW(int(vk_code), MAPVK_VK_TO_VSC_EX) or 0)
         if not scan_raw:
-            scan_raw = int(ctypes.windll.user32.MapVirtualKeyW(int(vk_code), 0) or 0)
+            return False
 
         lower_key = str(key or "").strip().lower()
         extended = lower_key in {"rctrl", "ralt", "lwin", "rwin", "win"} or scan_raw > 0xFF
         scan_code = scan_raw & 0xFF
-        if scan_code:
-            flags = KEYEVENTF_SCANCODE
-            wvk = 0
-            wscan = scan_code
-        else:
-            flags = 0
-            wvk = int(vk_code)
-            wscan = 0
+        if not scan_code:
+            return False
+        flags = KEYEVENTF_SCANCODE
+        wvk = 0
+        wscan = scan_code
         if extended:
             flags |= KEYEVENTF_EXTENDEDKEY
         if not key_down:
@@ -1327,7 +1217,7 @@ class IbInputSimulatorDriver:
         point = wintypes.POINT()
         if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
             return int(point.x), int(point.y)
-        return 0, 0
+        raise RuntimeError("无法读取鼠标位置")
 
     def _request_logitech_absolute_pixels(
         self,
@@ -1340,12 +1230,6 @@ class IbInputSimulatorDriver:
         """罗技只发相对位移。像素绝对包会被 DLL 塌到屏幕原点。"""
         target_x = int(x)
         target_y = int(y)
-        try:
-            ctypes.windll.user32.SetCursorPos(target_x, target_y)
-            _shared_precise_sleep(0.002)
-        except Exception:
-            pass
-        last_error: Optional[Exception] = None
         for _ in range(4):
             current_x, current_y = self._read_system_cursor_pos()
             kind, delta_x, delta_y = plan_logitech_absolute_move(
@@ -1358,7 +1242,7 @@ class IbInputSimulatorDriver:
                 return True
             try:
                 if recover:
-                    if not self._request_with_mouse_alignment_recovery(
+                    if not self._request_mouse_once(
                         "move_mouse",
                         delta_x,
                         delta_y,
@@ -1368,15 +1252,14 @@ class IbInputSimulatorDriver:
                         return False
                 else:
                     self._request("move_mouse", delta_x, delta_y, False, timeout=timeout)
-            except Exception as exc:
-                last_error = exc
-                continue
+            except Exception:
+                if recover:
+                    return False
+                raise
         current_x, current_y = self._read_system_cursor_pos()
         kind, _, _ = plan_logitech_absolute_move(target_x, target_y, current_x, current_y)
         if kind == "noop":
             return True
-        if last_error is not None and not recover:
-            raise last_error
         return False
 
     def _sendinput_set_key_state(self, key: Any, key_down: bool) -> bool:
@@ -1396,8 +1279,8 @@ class IbInputSimulatorDriver:
     def _serialize_points(self, points: Sequence[Sequence[Any]]) -> str:
         serialized: List[str] = []
         for item in points:
-            if not item or len(item) < 2:
-                continue
+            if not item or len(item) != 2:
+                raise ValueError("拖拽路径点格式无效")
             serialized.append(f"{int(item[0])},{int(item[1])}")
         return ";".join(serialized)
 
@@ -1413,7 +1296,7 @@ class IbInputSimulatorDriver:
             if target_x is not None and target_y is not None:
                 tx = int(target_x)
                 ty = int(target_y)
-                return self._request_with_mouse_alignment_recovery(
+                return self._request_mouse_once(
                     method_name,
                     tx,
                     ty,
@@ -1432,30 +1315,26 @@ class IbInputSimulatorDriver:
         for item in timestamps:
             try:
                 values.append(f"{float(item):.6f}")
-            except Exception:
-                values.append("0")
+            except Exception as exc:
+                raise ValueError("拖拽时间戳无效") from exc
         return ";".join(values)
 
     def get_screen_size(self) -> Tuple[int, int]:
         payload = self._request("get_screen_size")
         if len(payload) >= 2:
             return int(payload[0]), int(payload[1])
-        from utils.window.multi_monitor_manager import get_primary_screen_size
-        return get_primary_screen_size()
+        raise RuntimeError("驱动未返回屏幕尺寸")
 
     def get_mouse_position(self) -> Tuple[int, int]:
         payload = self._request("get_mouse_position")
         if len(payload) >= 2:
             return int(payload[0]), int(payload[1])
-        point = wintypes.POINT()
-        if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
-            return int(point.x), int(point.y)
-        return 0, 0
+        raise RuntimeError("驱动未返回鼠标位置")
 
     def move_mouse(self, x: int, y: int, absolute: bool = True) -> bool:
         with self._mouse_lock:
             if bool(absolute) and self._uses_logitech_mouse():
-                self._request_logitech_absolute_pixels(int(x), int(y), recover=False)
+                return self._request_logitech_absolute_pixels(int(x), int(y), recover=False)
             else:
                 self._request("move_mouse", int(x), int(y), bool(absolute))
         return True
@@ -1464,18 +1343,11 @@ class IbInputSimulatorDriver:
         if x is None or y is None:
             return False
 
-        try:
-            safe_clicks = max(1, int(clicks))
-        except Exception:
-            safe_clicks = 1
-        try:
-            safe_interval = max(0.0, float(interval))
-        except Exception:
-            safe_interval = 0.0
-        try:
-            safe_duration = max(0.0, float(duration))
-        except Exception:
-            safe_duration = _DEFAULT_CLICK_HOLD_SECONDS
+        safe_clicks = int(clicks)
+        safe_interval = float(interval)
+        safe_duration = float(duration)
+        if safe_clicks <= 0 or safe_clicks != float(clicks) or not math.isfinite(safe_interval) or not math.isfinite(safe_duration) or safe_interval < 0 or safe_duration < 0:
+            raise ValueError("点击次数或时间参数无效")
         if safe_duration <= 0:
             safe_duration = _DEFAULT_CLICK_HOLD_SECONDS
 
@@ -1484,19 +1356,23 @@ class IbInputSimulatorDriver:
         normalized_button = self._normalize_button(button)
 
         with self._mouse_lock:
+            if self._pressed_mouse_buttons:
+                return False
             try:
-                for i in range(safe_clicks):
-                    if i > 0 and safe_interval > 0:
-                        _shared_precise_sleep(safe_interval)
-                    if not self._move_mouse_for_click(target_x, target_y):
-                        return False
-                    if not self._dispatch_mouse_button_event("mouse_down", normalized_button, target_x, target_y):
-                        return False
-                    if safe_duration > 0:
-                        _shared_precise_sleep(safe_duration)
-                    if not self._dispatch_mouse_button_event("mouse_up", normalized_button, target_x, target_y):
-                        return False
-            except Exception:
+                if not self._move_mouse_for_click(target_x, target_y):
+                    return False
+                # 整次点击交给同一个 worker 请求，夹取覆盖按下、保持和弹起。
+                # 请求超时不能重放点击；在收到完整成功响应前保留待释放记录。
+                self._pressed_mouse_buttons.add(normalized_button)
+                self._request(
+                    "click_mouse", target_x, target_y, normalized_button,
+                    safe_clicks, safe_interval, safe_duration,
+                    timeout=max(self._mouse_request_timeout, safe_clicks * safe_duration + (safe_clicks - 1) * safe_interval + 5.0),
+                )
+                self._pressed_mouse_buttons.discard(normalized_button)
+            except Exception as exc:
+                self._last_error_message = str(exc)
+                self.release_all_inputs()
                 return False
 
         return True
@@ -1509,7 +1385,7 @@ class IbInputSimulatorDriver:
                 recover=True,
                 timeout=self._mouse_request_timeout,
             )
-        return self._request_with_mouse_alignment_recovery(
+        return self._request_mouse_once(
             "move_mouse",
             int(target_x),
             int(target_y),
@@ -1526,9 +1402,10 @@ class IbInputSimulatorDriver:
         with self._mouse_lock:
             if not self._move_mouse_for_click(target_x, target_y):
                 return False
-            if not self._dispatch_mouse_button_event("mouse_down", normalized_button, target_x, target_y):
-                return False
             self._pressed_mouse_buttons.add(normalized_button)
+            if not self._dispatch_mouse_button_event("mouse_down", normalized_button, target_x, target_y):
+                self.release_all_inputs()
+                return False
         return True
 
     def mouse_up(self, x=None, y=None, button='left') -> bool:
@@ -1538,8 +1415,6 @@ class IbInputSimulatorDriver:
         target_y = int(y)
         normalized_button = self._normalize_button(button)
         with self._mouse_lock:
-            if not self._move_mouse_for_click(target_x, target_y):
-                return False
             if not self._dispatch_mouse_button_event("mouse_up", normalized_button, target_x, target_y):
                 return False
             self._pressed_mouse_buttons.discard(normalized_button)
@@ -1570,12 +1445,16 @@ class IbInputSimulatorDriver:
         if not points_text:
             raise ValueError("drag_path 参数无效")
         normalized_button = self._normalize_button(button)
-        total_duration = float(duration or 0.0)
-        if timestamps:
-            try:
-                total_duration = max(total_duration, float(timestamps[-1]))
-            except Exception:
-                pass
+        total_duration = float(duration)
+        if not math.isfinite(total_duration) or total_duration < 0:
+            raise ValueError("拖拽时间无效")
+        if timestamps is not None:
+            if len(timestamps) != len(points):
+                raise ValueError("拖拽时间戳数量与路径点数量不一致")
+            values = [float(value) for value in timestamps]
+            if any(not math.isfinite(value) or value < 0 for value in values) or any(a > b for a, b in zip(values, values[1:])):
+                raise ValueError("拖拽时间戳无效")
+            total_duration = max(total_duration, values[-1])
         with self._mouse_lock:
             self._pressed_mouse_buttons.add(normalized_button)
             self._request(
@@ -1591,10 +1470,9 @@ class IbInputSimulatorDriver:
 
     def _drag_request_timeout(self, duration: Any) -> float:
         """拖拽是长操作，超时要覆盖整段时长，否则慢拖拽会在中途被判超时并留下按下状态。"""
-        try:
-            seconds = max(0.0, float(duration or 0.0))
-        except Exception:
-            seconds = 0.0
+        seconds = float(duration)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("拖拽时间无效")
         return max(float(self._mouse_request_timeout), seconds + 5.0)
 
     def scroll_mouse(self, direction, clicks=1, x=None, y=None) -> bool:
@@ -1699,13 +1577,6 @@ class IbInputSimulatorDriver:
                 self._pressed_keys.discard(key_name)
         return True
 
-    def type_text(self, text: str, **_kwargs) -> bool:
-        content = str(text or "")
-        if content == "":
-            return True
-        self._request("type_text", content)
-        return True
-
     def release_all_inputs(self) -> bool:
         """释放当前驱动记录的全部按下输入。"""
         pending_keys = list(self._pressed_keys)
@@ -1716,49 +1587,40 @@ class IbInputSimulatorDriver:
             return True
 
         try:
+            # 先通知正在保持的 worker 弹起，再等待响应锁；不能等长按结束才释放。
+            if self._worker_stop_path is not None:
+                self._worker_stop_path.touch()
             if self._abort_request_event.is_set():
                 for key_name in reversed(pending_sendinput_keys):
-                    self._sendinput_key_event(key_name, False)
-                self._sendinput_pressed_keys.clear()
-                self._pressed_keys.clear()
-                self._pressed_mouse_buttons.clear()
+                    if self._sendinput_key_event(key_name, False):
+                        self._sendinput_pressed_keys.discard(key_name)
                 return False
 
             self._request(
                 "release_all_inputs",
                 timeout=min(2.0, max(0.5, float(self._request_timeout))),
             )
-            for key_name in reversed(pending_sendinput_keys):
-                self._sendinput_key_event(key_name, False)
-            self._sendinput_pressed_keys.clear()
             self._pressed_keys.clear()
             self._pressed_mouse_buttons.clear()
-            return True
-        except Exception:
-            release_ok = True
-            for key_name in pending_keys:
-                try:
-                    self._request(
-                        "key_up",
-                        key_name,
-                        timeout=min(1.0, max(0.5, float(self._request_timeout))),
-                    )
-                except Exception:
-                    release_ok = False
+            released = True
             for key_name in reversed(pending_sendinput_keys):
-                try:
-                    if not self._sendinput_key_event(key_name, False):
-                        release_ok = False
-                except Exception:
-                    release_ok = False
-            self._sendinput_pressed_keys.clear()
-            self._pressed_keys.clear()
-            self._pressed_mouse_buttons.clear()
-            return release_ok
+                if self._sendinput_key_event(key_name, False):
+                    self._sendinput_pressed_keys.discard(key_name)
+                else:
+                    released = False
+            if self._worker_stop_path is not None:
+                self._worker_stop_path.unlink(missing_ok=True)
+            return released
+        except Exception as exc:
+            self._last_error_message = str(exc)
+            logger.error("输入释放失败，保留待释放记录：%s", exc)
+            return False
 
     def close(self) -> None:
+        atexit.unregister(self.close)
         try:
-            self.release_all_inputs()
+            if not self.release_all_inputs():
+                logger.error("关闭输入进程时释放失败，按钮状态未知")
         except Exception:
             pass
         self._abort_request_event.set()
@@ -1836,11 +1698,9 @@ class IbInputSimulatorDriver:
             self._recent_stderr = []
             self._worker_core_source_path = None
             self._worker_core_source_mtime_ns = 0
-            self._alignment_consecutive_failures = 0
             self._runtime_base_dir = None
             self._runtime_session_dir = None
-            self._pressed_keys.clear()
-            self._pressed_mouse_buttons.clear()
+            self._worker_stop_path = None
 
     def __del__(self):
         try:

@@ -20,6 +20,7 @@ from tasks.ocr_region_recognition import (
     _handle_failure,
     _handle_success,
     _remember_ocr_source_for_jump,
+    _reset_ocr_capture_session,
     _resolve_region_params,
     _should_save_ocr_context,
 )
@@ -104,6 +105,15 @@ def _match_dict_target(
     return False, None
 
 
+def _reset_capture_after_dict_ocr_failure(hwnd: Optional[int]) -> None:
+    if not hwnd:
+        return
+    try:
+        _reset_ocr_capture_session(int(hwnd))
+    except Exception:
+        logger.debug("[字库OCR] 清理失效截图会话失败", exc_info=True)
+
+
 def _save_ocr_context(
     card_id: Optional[int],
     params: Dict[str, Any],
@@ -179,6 +189,7 @@ def execute_task(
     if not win32gui.IsWindow(int(target_hwnd)):
         return fail(f"窗口句柄无效: {target_hwnd}")
     if win32gui.IsIconic(int(target_hwnd)):
+        _reset_capture_after_dict_ocr_failure(int(target_hwnd))
         return fail("目标窗口已最小化")
     if not CAPTURE_AVAILABLE:
         return fail("截图引擎不可用")
@@ -197,6 +208,7 @@ def execute_task(
 
     window_image = _capture_window_for_ocr(int(target_hwnd), timeout=4.0)
     if window_image is None:
+        _reset_capture_after_dict_ocr_failure(int(target_hwnd))
         return fail(f"截图失败，窗口句柄={target_hwnd}")
     window_image = _align_window_image_to_client_area(window_image, target_hwnd)
     if window_image is None or window_image.size == 0:
@@ -444,9 +456,14 @@ def test_dict_ocr_output(params: Dict[str, Any], **kwargs) -> bool:
     import tempfile
 
     target_hwnd = kwargs.get("target_hwnd")
+    succeeded = False
     try:
         if not target_hwnd:
             logger.error("[字库OCR测试] 未找到目标窗口句柄")
+            return False
+        if PYWIN32_AVAILABLE and win32gui is not None and win32gui.IsIconic(int(target_hwnd)):
+            _reset_capture_after_dict_ocr_failure(int(target_hwnd))
+            logger.error("[字库OCR测试] 目标窗口已最小化")
             return False
         binding_mismatch_detail = get_recorded_region_binding_mismatch_detail(params, target_hwnd)
         if binding_mismatch_detail:
@@ -460,6 +477,7 @@ def test_dict_ocr_output(params: Dict[str, Any], **kwargs) -> bool:
         region_mode, region_x, region_y, region_width, region_height = _resolve_region_params(params)
         full_image = _capture_window_for_ocr(int(target_hwnd), timeout=4.0)
         if full_image is None:
+            _reset_capture_after_dict_ocr_failure(int(target_hwnd))
             logger.error("[字库OCR测试] 无法捕获窗口图像")
             return False
         full_image = _align_window_image_to_client_area(full_image, target_hwnd, diag_prefix="[字库OCR测试]")
@@ -518,11 +536,14 @@ def test_dict_ocr_output(params: Dict[str, Any], **kwargs) -> bool:
             temp_file = handle.name
         subprocess.Popen(["notepad.exe", temp_file])
         logger.info("[字库OCR测试] 已输出 %s 段文字", len(results))
+        succeeded = True
         return True
     except Exception as exc:
         logger.error("[字库OCR测试] 测试失败: %s", exc, exc_info=True)
         return False
     finally:
+        if not succeeded:
+            _reset_capture_after_dict_ocr_failure(target_hwnd)
         try:
             from utils.capture.screenshot_helper import clear_screenshot_cache
 

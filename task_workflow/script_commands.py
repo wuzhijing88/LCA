@@ -10,14 +10,22 @@ import os
 import random
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from task_workflow.runtime_store import RuntimeStore
+from task_workflow.script_parameters import (
+    boolean_parameter as _as_bool,
+    finite_seconds,
+    integer_parameter,
+    number_parameter,
+)
 
 logger = logging.getLogger(__name__)
 
 # 每个脚本宿主最多保留的用户线程数，避免长时间运行时无界创建线程耗尽资源。
-MAX_USER_THREADS = 32
+MAX_THREAD_RECORDS = 256
+MAX_THREAD_ERRORS = 256
 
 RESULT_FIELD_ALIASES = {
     "通过": "ok",
@@ -58,6 +66,10 @@ RESULT_FIELD_ALIASES = {
     "父句柄": "parent_hwnd",
     "深度": "depth",
     "运行": "running",
+    "已启动": "started",
+    "已完成": "completed",
+    "已超时": "timed_out",
+    "查询成功": "query_ok",
     "结果": "result",
     "错误": "error",
     "名字": "name",
@@ -70,6 +82,7 @@ RESULT_FIELD_ALIASES = {
     "状态码": "status",
     "头": "headers",
     "字节数": "bytes",
+    "截断": "truncated",
     "地址": "url",
     "勾选": "checked",
     "展开": "expanded",
@@ -198,11 +211,10 @@ def result_coords(value: Any) -> Optional[Tuple[Any, Any]]:
         if x is None or y is None:
             return None
         return x, y
-    for x_name, y_name in (("横坐标", "纵坐标"), ("x", "y")):
-        x = getattr(value, x_name, None)
-        y = getattr(value, y_name, None)
-        if x is not None and y is not None:
-            return x, y
+    x = getattr(value, "x", None)
+    y = getattr(value, "y", None)
+    if x is not None and y is not None:
+        return x, y
     return None
 
 
@@ -301,23 +313,13 @@ def point_in_result(
     return int(left + (right - left) * ratio_x), int(top + (bottom - top) * ratio_y)
 
 
-def _offset_alias(偏移x: Any, 偏移y: Any, 偏移横坐标: Any, 偏移纵坐标: Any) -> Tuple[Any, Any]:
-    return (偏移横坐标 if 偏移x is None else 偏移x, 偏移纵坐标 if 偏移y is None else 偏移y)
-
-
 def resolve_xy(
     x: Any = None,
     y: Any = None,
-    横坐标: Any = None,
-    纵坐标: Any = None,
     目标: Any = None,
 ) -> Optional[Tuple[int, int]]:
     if 目标 is not None and x is None:
         x = 目标
-    if 横坐标 is not None:
-        x = 横坐标
-    if 纵坐标 is not None:
-        y = 纵坐标
     if y is None:
         found = result_coords(x)
         if found is not None:
@@ -337,8 +339,6 @@ def resolve_drag(
     end = result_coords(y1)
     if start is not None and end is not None and x2 is None and y2 is None:
         return int(start[0]), int(start[1]), int(end[0]), int(end[1])
-    if start is not None and _is_number_like(y1) and _is_number_like(x2) and y2 is None:
-        return int(start[0]), int(start[1]), int(y1), int(x2)
     if _is_number_like(x1) and _is_number_like(y1) and _is_number_like(x2) and _is_number_like(y2):
         return int(x1), int(y1), int(x2), int(y2)
     return None
@@ -357,7 +357,6 @@ FORBIDDEN_TASK_TYPES = frozenset(
 )
 ALLOWED_TASK_TYPES = frozenset(
     {
-        "图片点击",
         "模拟鼠标操作",
         "模拟键盘操作",
         "延迟",
@@ -368,12 +367,10 @@ ALLOWED_TASK_TYPES = frozenset(
     }
 )
 _KIND_BY_TASK = {
-    "图片点击": "image",
     "OCR文字识别": "ocr",
     "点阵字库OCR": "ocr",
     "YOLO目标检测": "yolo",
 }
-MIN_WATCH_INTERVAL = 0.05
 
 
 def _is_stop_error(exc: BaseException) -> bool:
@@ -403,33 +400,23 @@ def task_succeeded(result: Any) -> bool:
     return bool(result)
 
 
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, str):
-        text = value.strip()
-        if text in {"真", "True", "true", "1", "是"}:
-            return True
-        if text in {"假", "False", "false", "0", "否", ""}:
-            return False
-    return bool(value)
-
-
-def _as_duration(value: Any, default: float = 0.5) -> float:
-    if value is None or value == "":
+def _as_duration(value: Any, default: float = 0.5, *, label: str = "时长") -> float:
+    if value is None:
         return float(default)
-    if isinstance(value, (tuple, list)) and len(value) >= 2:
-        low, high = float(value[0]), float(value[1])
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        low, high = finite_seconds(value[0], f"{label}起点"), finite_seconds(value[1], f"{label}终点")
         if high < low:
-            low, high = high, low
+            raise ValueError(f"{label}终点不能小于起点")
         if low == high:
             return low
         return random.uniform(low, high)
-    return float(value)
+    return finite_seconds(value, label)
 
 
 def _as_int(value: Any, default: int = 0) -> int:
-    if value is None or value == "":
+    if value is None:
         return int(default)
-    return int(value)
+    return integer_parameter(value, "整数参数")
 
 
 def _as_region(
@@ -444,7 +431,7 @@ def _as_region(
         if rect is None:
             raise ValueError(f"没有这个区域: {name}")
         return rect
-    if isinstance(区域, (tuple, list)) and len(区域) >= 4:
+    if isinstance(区域, (tuple, list)) and len(区域) == 4:
         try:
             left, top, width, height = int(区域[0]), int(区域[1]), int(区域[2]), int(区域[3])
         except (TypeError, ValueError) as exc:
@@ -480,10 +467,8 @@ def _is_number_like(value: Any) -> bool:
 
 def build_click_style_params(
     双击: Any = False,
-    偏移横坐标: Any = 0,
-    偏移纵坐标: Any = 0,
-    偏移x: Any = None,
-    偏移y: Any = None,
+    偏移x: Any = 0,
+    偏移y: Any = 0,
     随机: Any = None,
     随机横坐标: Any = None,
     随机纵坐标: Any = None,
@@ -493,12 +478,12 @@ def build_click_style_params(
     按住秒: Any = None,
     自动松开: Any = None,
 ) -> Dict[str, Any]:
-    偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
     double = _as_bool(双击)
-    fixed_x = _as_int(偏移横坐标, 0)
-    fixed_y = _as_int(偏移纵坐标, 0)
-    rand_x = _as_int(随机横坐标 if 随机横坐标 is not None else (0 if 随机 is None else 随机), 0)
-    rand_y = _as_int(随机纵坐标 if 随机纵坐标 is not None else (0 if 随机 is None else 随机), 0)
+    fixed_x = integer_parameter(偏移x, "偏移x")
+    fixed_y = integer_parameter(偏移y, "偏移y")
+    random_range = 0 if 随机 is None else integer_parameter(随机, "随机", minimum=0)
+    rand_x = random_range if 随机横坐标 is None else integer_parameter(随机横坐标, "随机横坐标", minimum=0)
+    rand_y = random_range if 随机纵坐标 is None else integer_parameter(随机纵坐标, "随机纵坐标", minimum=0)
     if fixed_x or fixed_y:
         mode = "固定偏移"
     elif rand_x or rand_y:
@@ -507,21 +492,33 @@ def build_click_style_params(
         mode = "精准坐标"
     action = "双击" if double else "完整点击"
     raw_action = str(动作 or "").strip()
-    if raw_action in {"仅按下", "按下"}:
+    if double and raw_action and raw_action != "双击":
+        raise ValueError("双击=真不能与其他点击动作同时使用")
+    if raw_action == "仅按下":
         action = "仅按下"
         double = False
-    elif raw_action in {"仅松开", "松开", "弹起", "释放"}:
+    elif raw_action == "仅松开":
         action = "仅松开"
         double = False
-    elif raw_action in {"双击"}:
+    elif raw_action == "双击":
         action = "双击"
         double = True
-    elif raw_action in {"完整点击", "单击"}:
+    elif raw_action == "完整点击":
         action = "完整点击"
         double = False
-    click_count = 2 if double else max(1, _as_int(次数, 1) if 次数 is not None else 1)
-    interval = 0.0 if 间隔 is None or 间隔 == "" else float(间隔)
-    hold = 0.0 if 按住秒 is None or 按住秒 == "" else _as_duration(按住秒, 0.0)
+    elif raw_action:
+        raise ValueError("点击动作只能是 完整点击、双击、仅按下 或 仅松开")
+    requested_count = 1 if 次数 is None else integer_parameter(次数, "次数", minimum=1)
+    if double and 次数 is not None and requested_count != 2:
+        raise ValueError("双击只支持次数=2；多次完整点击请省略双击")
+    if action in {"仅按下", "仅松开"} and requested_count != 1:
+        raise ValueError("仅按下或仅松开不支持重复次数")
+    click_count = 2 if double else requested_count
+    interval = 0.0 if 间隔 is None else finite_seconds(间隔, "间隔")
+    hold = 0.0 if 按住秒 is None else _as_duration(按住秒, 0.0, label="按住秒")
+    hold = finite_seconds(hold, "按住秒")
+    if action == "仅松开" and (hold or interval):
+        raise ValueError("仅松开不支持按住秒或间隔")
     if 自动松开 is None:
         auto_release = action != "仅按下"
     else:
@@ -574,30 +571,25 @@ def build_click_style_params(
     return params
 
 
-def collect_find_image_args(图片: Any, extra: Tuple[Any, ...] = ()) -> Tuple[list, Optional[float]]:
+def collect_find_image_args(图片: Any, extra: Tuple[Any, ...] = ()) -> list:
     items = []
     if 图片 is not None:
         items.append(图片)
     items.extend(extra)
     images = []
-    threshold = None
     for item in items:
         if item is None:
             continue
         if isinstance(item, (list, tuple)) and not isinstance(item, (str, bytes)):
-            nested, nested_threshold = collect_find_image_args(None, tuple(item))
-            images.extend(nested)
-            if nested_threshold is not None:
-                threshold = nested_threshold
+            images.extend(collect_find_image_args(None, tuple(item)))
             continue
-        if isinstance(item, (int, float)) and not isinstance(item, bool) and images:
-            threshold = float(item)
-            continue
-        text = str(item).strip()
+        if not isinstance(item, str):
+            raise ValueError("找图的图片必须是路径文本；阈值请使用阈值=参数")
+        text = item.strip()
         if not text:
             continue
         images.extend(part.strip() for part in text.replace(";", "\n").splitlines() if part.strip())
-    return images, threshold
+    return images
 
 
 def build_find_image_params(
@@ -606,8 +598,8 @@ def build_find_image_params(
     点击: Any = False,
     defaults: Optional[Dict[str, Any]] = None,
     双击: Any = False,
-    偏移横坐标: Any = 0,
-    偏移纵坐标: Any = 0,
+    偏移x: Any = 0,
+    偏移y: Any = 0,
     随机: Any = None,
     随机横坐标: Any = None,
     随机纵坐标: Any = None,
@@ -622,22 +614,29 @@ def build_find_image_params(
     图像模式: Any = "彩色",
     旋转: Any = 0,
 ) -> Dict[str, Any]:
-    images, inferred_threshold = collect_find_image_args(图片, extra_images)
-    if inferred_threshold is not None:
-        阈值 = inferred_threshold
+    images = collect_find_image_args(图片, extra_images)
+    if not images:
+        raise ValueError("找图至少需要一张图片")
     params = dict(defaults or {})
     params["image_path"] = str(images[0] if images else 图片 or "")
     params["_script_images"] = images
-    params["confidence"] = float(阈值)
+    params["confidence"] = float(number_parameter(阈值, "找图阈值"))
+    if not 0 <= params["confidence"] <= 1:
+        raise ValueError("找图阈值必须在0到1之间")
     params["enable_click"] = _as_bool(点击)
     try:
-        params["template_scale"] = max(0.25, min(4.0, float(缩放)))
+        scale = float(缩放)
+        if not math.isfinite(scale):
+            raise ValueError
+        if not 0.25 <= scale <= 4.0:
+            raise ValueError
+        params["template_scale"] = scale
     except (TypeError, ValueError):
         raise ValueError("图像缩放必须是 0.25 到 4 的数字")
-    mode = str(图像模式 or "彩色").strip()
-    if mode.casefold() not in {"彩色", "灰度", "gray", "grey", "grayscale"}:
+    mode = str(图像模式).strip()
+    if mode not in {"彩色", "灰度"}:
         raise ValueError("图像模式只能是 彩色 或 灰度")
-    params["image_mode"] = "灰度" if mode.casefold() in {"灰度", "gray", "grey", "grayscale"} else "彩色"
+    params["image_mode"] = mode
     raw_angles = 旋转 if isinstance(旋转, (list, tuple, set)) else [旋转]
     angles = []
     try:
@@ -653,8 +652,8 @@ def build_find_image_params(
     params.update(
         build_click_style_params(
             双击=双击,
-            偏移横坐标=偏移横坐标,
-            偏移纵坐标=偏移纵坐标,
+            偏移x=偏移x,
+            偏移y=偏移y,
             随机=随机,
             随机横坐标=随机横坐标,
             随机纵坐标=随机纵坐标,
@@ -683,10 +682,8 @@ def build_click_params(
     last: Optional[Dict[str, Any]] = None,
     defaults: Optional[Dict[str, Any]] = None,
     双击: Any = False,
-    偏移横坐标: Any = 0,
-    偏移纵坐标: Any = 0,
-    偏移x: Any = None,
-    偏移y: Any = None,
+    偏移x: Any = 0,
+    偏移y: Any = 0,
     随机: Any = None,
     随机横坐标: Any = None,
     随机纵坐标: Any = None,
@@ -696,7 +693,6 @@ def build_click_params(
     按住秒: Any = None,
     自动松开: Any = None,
 ) -> Dict[str, Any]:
-    偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
     params = dict(defaults or {})
     payload = last or {}
     if x is None and y is None and payload.get("ok") is False:
@@ -716,8 +712,8 @@ def build_click_params(
     params.update(
         build_click_style_params(
             双击=双击,
-            偏移横坐标=偏移横坐标,
-            偏移纵坐标=偏移纵坐标,
+            偏移x=偏移x,
+            偏移y=偏移y,
             随机=随机,
             随机横坐标=随机横坐标,
             随机纵坐标=随机纵坐标,
@@ -789,27 +785,23 @@ def build_key_params(
     params["input_type"] = "键盘按键"
     params["combo_key_sequence_text"] = str(按键内容 or "")
     raw = str(动作 or "").strip()
-    if raw in {"仅按下", "按下", "只按下"}:
+    if raw == "按下":
         params["combo_key_action"] = "只按下"
-    elif raw in {"仅松开", "松开", "弹起", "释放", "只释放"}:
+    elif raw == "松开":
         params["combo_key_action"] = "只释放"
+    elif raw:
+        raise ValueError("按键动作只能是 按下 或 松开，省略动作时执行完整按键")
     return params
 
 
 def build_type_params(
     文本: Any,
     defaults: Optional[Dict[str, Any]] = None,
-    方式: Any = None,
 ) -> Dict[str, Any]:
     params = dict(defaults or {})
     params["input_type"] = "文本输入"
     params["text_input_mode"] = "单组文本"
     params["text_to_type"] = str(文本 or "")
-    method = str(方式 or params.get("foreground_text_method") or "仿真输入").strip()
-    if method in {"粘贴", "复制粘贴", "clipboard", "paste"}:
-        params["foreground_text_method"] = "复制粘贴"
-    else:
-        params["foreground_text_method"] = "仿真输入"
     return params
 
 
@@ -963,8 +955,12 @@ def build_yolo_params(
     model = unwrap_resource_path(模型) or unwrap_resource_path(params.get("model_path")) or ""
     if model:
         params["model_path"] = model
-    params["confidence_threshold"] = float(阈值)
-    params["target_classes"] = str(类别) if 类别 else "全部类别"
+    params["confidence_threshold"] = float(number_parameter(阈值, "检测阈值"))
+    if not 0 <= params["confidence_threshold"] <= 1:
+        raise ValueError("检测阈值必须在0到1之间")
+    if 类别 is not None and not isinstance(类别, str):
+        raise ValueError("检测类别必须是模型中的类别名称文本")
+    params["target_classes"] = 类别.strip() if 类别 and 类别.strip() else "全部类别"
     strategy = _as_yolo_strategy(策略)
     if strategy:
         params["target_selection"] = strategy
@@ -1003,15 +999,12 @@ def build_find_color_params(
     区域: Any = None,
     defaults: Optional[Dict[str, Any]] = None,
     双击: Any = False,
-    偏移横坐标: Any = 0,
-    偏移纵坐标: Any = 0,
-    偏移x: Any = None,
-    偏移y: Any = None,
+    偏移x: Any = 0,
+    偏移y: Any = 0,
     随机: Any = None,
     随机横坐标: Any = None,
     随机纵坐标: Any = None,
 ) -> Dict[str, Any]:
-    偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
     params = dict(defaults or {})
     params["operation_mode"] = "找色功能"
     params["target_color"] = _as_color(颜色)
@@ -1019,8 +1012,8 @@ def build_find_color_params(
     params.update(
         build_click_style_params(
             双击=双击,
-            偏移横坐标=偏移横坐标,
-            偏移纵坐标=偏移纵坐标,
+            偏移x=偏移x,
+            偏移y=偏移y,
             随机=随机,
             随机横坐标=随机横坐标,
             随机纵坐标=随机纵坐标,
@@ -1074,14 +1067,22 @@ def build_scroll_params(
     ):
         y = x
         x = 步数
-        steps = abs(int(方向))
-        direction = "向上" if int(方向) < 0 else "向下"
+        amount = integer_parameter(方向, "滚轮步数")
+        if amount == 0:
+            raise ValueError("滚轮步数不能为0")
+        steps = abs(amount)
+        direction = "向上" if amount < 0 else "向下"
     elif isinstance(方向, (int, float)) and not isinstance(方向, bool):
-        steps = abs(int(方向))
-        direction = "向上" if int(方向) < 0 else "向下"
+        amount = integer_parameter(方向, "滚轮步数")
+        if amount == 0:
+            raise ValueError("滚轮步数不能为0")
+        steps = abs(amount)
+        direction = "向上" if amount < 0 else "向下"
     params["operation_mode"] = "鼠标滚轮"
-    params["scroll_direction"] = str(direction or "向下")
-    params["scroll_clicks"] = max(1, int(steps))
+    if direction not in {"向上", "向下"}:
+        raise ValueError("滚轮方向只能是向上或向下")
+    params["scroll_direction"] = direction
+    params["scroll_clicks"] = integer_parameter(steps, "滚轮步数", minimum=1)
     payload = last or {}
     resolved_x = payload.get("x") if x is None else x
     resolved_y = payload.get("y") if y is None else y
@@ -1095,15 +1096,12 @@ def build_text_click_params(
     键: Any = "左键",
     defaults: Optional[Dict[str, Any]] = None,
     双击: Any = False,
-    偏移横坐标: Any = 0,
-    偏移纵坐标: Any = 0,
-    偏移x: Any = None,
-    偏移y: Any = None,
+    偏移x: Any = 0,
+    偏移y: Any = 0,
     随机: Any = None,
     随机横坐标: Any = None,
     随机纵坐标: Any = None,
 ) -> Dict[str, Any]:
-    偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
     params = dict(defaults or {})
     params["operation_mode"] = "文字点击"
     params["text_enable_click"] = _as_bool(点击)
@@ -1112,8 +1110,8 @@ def build_text_click_params(
     params.update(
         build_click_style_params(
             双击=双击,
-            偏移横坐标=偏移横坐标,
-            偏移纵坐标=偏移纵坐标,
+            偏移x=偏移x,
+            偏移y=偏移y,
             随机=随机,
             随机横坐标=随机横坐标,
             随机纵坐标=随机纵坐标,
@@ -1242,9 +1240,9 @@ def build_element_click_params(
     params["element_automation_id"] = str(自动化ID or "")
     params["element_class_name"] = str(类名 or "")
     params["element_control_type"] = str(控件类型 or "")
-    params["element_found_index"] = max(0, _as_int(序号, 0))
-    params["element_search_depth"] = max(1, _as_int(搜索深度, 30))
-    params["element_timeout"] = max(0.0, float(超时 or 0))
+    params["element_found_index"] = integer_parameter(序号, "序号", minimum=0)
+    params["element_search_depth"] = integer_parameter(搜索深度, "搜索深度", minimum=1)
+    params["element_timeout"] = finite_seconds(超时, "超时")
     params["element_use_invoke"] = _as_bool(调用)
     # Script commands must not silently switch from Invoke/UIA to a mouse
     # coordinate or Click() fallback when the requested pattern is missing.
@@ -1294,6 +1292,8 @@ class CommandHost:
         self._replay_active = False
         self._regions: Dict[str, Tuple[int, int, int, int]] = {}
         self._regions_lock = threading.Lock()
+        self._owned_processes: Dict[int, Any] = {}
+        self._process_lock = threading.Lock()
 
     @staticmethod
     def _dm_memory_addr(value: Any) -> str:
@@ -1320,6 +1320,39 @@ class CommandHost:
         else:
             module, rest = body, ""
         return leading + module.rsplit("/", 1)[-1] + rest
+
+    @staticmethod
+    def _dm_int(value: Any, label: str, minimum: Optional[int] = None) -> int:
+        return integer_parameter(value, label, minimum=max(-2147483648, minimum) if minimum is not None else -2147483648, maximum=2147483647)
+
+    @classmethod
+    def _dm_address(cls, value: Any, label: str = "地址") -> str:
+        if label == "模块":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("模块必须是已加载的模块名称文本")
+            return value.strip()
+        if isinstance(value, bool):
+            raise ValueError(f"{label}必须是地址文本或非负整数")
+        if isinstance(value, int):
+            if value < 0 or value > 0x7FFFFFFFFFFFFFFF:
+                raise ValueError(f"{label}超出非负 64 位整数范围")
+            return format(value, "X")
+        if not isinstance(value, str):
+            raise ValueError(f"{label}必须是地址文本或非负整数")
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{label}不能为空")
+        return text
+
+    @classmethod
+    def _dm_range(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text or "-" not in text:
+            raise ValueError("范围必须是起始地址-结束地址")
+        start, end = text.split("-", 1)
+        if not start.strip() or not end.strip():
+            raise ValueError("范围必须是起始地址-结束地址")
+        return text
 
     def _dm_memory_call(self, operation: str, **arguments: Any) -> Any:
         from utils.plugin.bind_modes import normalize_plugin_bind_mode, normalize_plugin_keypad, normalize_plugin_mouse
@@ -1355,66 +1388,66 @@ class CommandHost:
         return session._client.memory_call(operation, hwnd, **arguments)
 
     def 大漠内存_模块基址(self, 模块: Any) -> Any:
-        return self._dm_memory_call("module_base", module=str(模块))
+        return self._dm_memory_call("module_base", module=self._dm_address(模块, "模块"))
 
     def 大漠内存_模块大小(self, 模块: Any) -> Any:
-        return self._dm_memory_call("module_size", module=str(模块))
+        return self._dm_memory_call("module_size", module=self._dm_address(模块, "模块"))
 
     def 大漠内存_读取整数(self, 地址: Any, 类型: Any = 0) -> Any:
-        return self._dm_memory_call("read_int", addr=str(地址), type=int(类型))
+        return self._dm_memory_call("read_int", addr=self._dm_address(地址), type=self._dm_int(类型, "类型"))
 
     def 大漠内存_读取单精度(self, 地址: Any) -> Any:
-        return self._dm_memory_call("read_float", addr=str(地址))
+        return self._dm_memory_call("read_float", addr=self._dm_address(地址))
 
     def 大漠内存_读取双精度(self, 地址: Any) -> Any:
-        return self._dm_memory_call("read_double", addr=str(地址))
+        return self._dm_memory_call("read_double", addr=self._dm_address(地址))
 
     def 大漠内存_读取文本(self, 地址: Any, 类型: Any, 长度: Any) -> Any:
-        return self._dm_memory_call("read_string", addr=str(地址), type=int(类型), length=int(长度))
+        return self._dm_memory_call("read_string", addr=self._dm_address(地址), type=self._dm_int(类型, "类型"), length=self._dm_int(长度, "长度", 1))
 
     def 大漠内存_读取数据(self, 地址: Any, 长度: Any) -> Any:
-        return self._dm_memory_call("read_data", addr=str(地址), length=int(长度))
+        return self._dm_memory_call("read_data", addr=self._dm_address(地址), length=self._dm_int(长度, "长度", 1))
 
     def 大漠内存_写入整数(self, 地址: Any, 类型: Any, 值: Any) -> ScriptResult:
-        raw = self._dm_memory_call("write_int", addr=str(地址), type=int(类型), value=int(值))
+        raw = self._dm_memory_call("write_int", addr=self._dm_address(地址), type=self._dm_int(类型, "类型"), value=self._dm_int(值, "值"))
         return ScriptResult({"ok": bool(raw), "value": raw})
 
     def 大漠内存_写入单精度(self, 地址: Any, 值: Any) -> ScriptResult:
-        raw = self._dm_memory_call("write_float", addr=str(地址), value=float(值))
+        raw = self._dm_memory_call("write_float", addr=self._dm_address(地址), value=float(值))
         return ScriptResult({"ok": bool(raw), "value": raw})
 
     def 大漠内存_写入双精度(self, 地址: Any, 值: Any) -> ScriptResult:
-        raw = self._dm_memory_call("write_double", addr=str(地址), value=float(值))
+        raw = self._dm_memory_call("write_double", addr=self._dm_address(地址), value=float(值))
         return ScriptResult({"ok": bool(raw), "value": raw})
 
     def 大漠内存_写入文本(self, 地址: Any, 类型: Any, 值: Any) -> ScriptResult:
-        raw = self._dm_memory_call("write_string", addr=str(地址), type=int(类型), value=str(值))
+        raw = self._dm_memory_call("write_string", addr=self._dm_address(地址), type=self._dm_int(类型, "类型"), value=str(值))
         return ScriptResult({"ok": bool(raw), "value": raw})
 
     def 大漠内存_写入数据(self, 地址: Any, 数据: Any) -> ScriptResult:
-        raw = self._dm_memory_call("write_data", addr=str(地址), value=str(数据))
+        raw = self._dm_memory_call("write_data", addr=self._dm_address(地址), value=str(数据))
         return ScriptResult({"ok": bool(raw), "value": raw})
 
     def 大漠内存_搜索整数(self, 范围: Any, 最小值: Any, 最大值: Any, 类型: Any = 0) -> Any:
-        return self._dm_memory_call("find_int", range=str(范围), min=int(最小值), max=int(最大值), type=int(类型))
+        return self._dm_memory_call("find_int", range=self._dm_range(范围), min=self._dm_int(最小值, "最小值"), max=self._dm_int(最大值, "最大值"), type=self._dm_int(类型, "类型"))
 
     def 大漠内存_搜索单精度(self, 范围: Any, 最小值: Any, 最大值: Any) -> Any:
-        return self._dm_memory_call("find_float", range=str(范围), min=float(最小值), max=float(最大值))
+        return self._dm_memory_call("find_float", range=self._dm_range(范围), min=float(最小值), max=float(最大值))
 
     def 大漠内存_搜索双精度(self, 范围: Any, 最小值: Any, 最大值: Any) -> Any:
-        return self._dm_memory_call("find_double", range=str(范围), min=float(最小值), max=float(最大值))
+        return self._dm_memory_call("find_double", range=self._dm_range(范围), min=float(最小值), max=float(最大值))
 
     def 大漠内存_搜索文本(self, 范围: Any, 文本: Any, 类型: Any) -> Any:
-        return self._dm_memory_call("find_string", range=str(范围), value=str(文本), type=int(类型))
+        return self._dm_memory_call("find_string", range=self._dm_range(范围), value=str(文本), type=self._dm_int(类型, "类型"))
 
     def 大漠内存_搜索数据(self, 范围: Any, 数据: Any) -> Any:
-        return self._dm_memory_call("find_data", range=str(范围), value=str(数据))
+        return self._dm_memory_call("find_data", range=self._dm_range(范围), value=str(数据))
 
     def 大漠内存_申请(self, 地址: Any, 大小: Any, 类型: Any) -> Any:
-        return self._dm_memory_call("virtual_alloc", addr=str(地址), size=int(大小), allocation_type=int(类型))
+        return self._dm_memory_call("virtual_alloc", addr=self._dm_address(地址), size=self._dm_int(大小, "大小", 1), allocation_type=self._dm_int(类型, "类型"))
 
     def 大漠内存_释放(self, 地址: Any) -> ScriptResult:
-        raw = self._dm_memory_call("virtual_free", addr=str(地址))
+        raw = self._dm_memory_call("virtual_free", addr=self._dm_address(地址))
         return ScriptResult({"ok": bool(raw), "value": raw})
 
     def 大漠内存_清理(self) -> ScriptResult:
@@ -1432,13 +1465,13 @@ class CommandHost:
         return ScriptResult({"ok": bool(raw), "value": raw})
 
     def 大漠汇编_调用(self, 模式: Any) -> Any:
-        return self._dm_memory_call("asm_call", mode=int(模式))
+        return self._dm_memory_call("asm_call", mode=self._dm_int(模式, "模式"))
 
     def 大漠汇编_基址调用(self, 模式: Any, 基址: Any) -> Any:
-        return self._dm_memory_call("asm_call_ex", mode=int(模式), addr=str(基址))
+        return self._dm_memory_call("asm_call_ex", mode=self._dm_int(模式, "模式"), addr=self._dm_address(基址, "基址"))
 
     def 大漠汇编_超时(self, 毫秒: Any, 参数: Any) -> ScriptResult:
-        raw = self._dm_memory_call("asm_timeout", timeout=int(毫秒), param=int(参数))
+        raw = self._dm_memory_call("asm_timeout", timeout=self._dm_int(毫秒, "毫秒", 0), param=self._dm_int(参数, "参数"))
         return ScriptResult({"ok": bool(raw), "value": raw})
 
     def _resolve_region(self, 区域: Any) -> Optional[Tuple[int, int, int, int]]:
@@ -1470,21 +1503,48 @@ class CommandHost:
 
         return constrain_script_path(str(path or ""), **self._resource_dirs())
 
-    def _resolve_component_entry(self, path: Any) -> str:
-        from task_workflow.script_resources import constrain_script_path, resolve_resource_path
+    def _resolve_component_entry(self, path: Any, component_type: Any = "") -> str:
+        from task_workflow.script_resources import _is_module_offset_literal
 
-        raw = str(path or "").strip()
+        raw = os.path.expandvars(os.path.expanduser(str(path or "").strip()))
         if not raw:
             raise ValueError("缺少组件入口")
-        dirs = self._resource_dirs()
-        relative = constrain_script_path(raw, **dirs)
-        located = resolve_resource_path(relative, enforce_jail=True, **dirs)
-        if located and os.path.isfile(located):
-            return os.path.abspath(located)
-        lowered = relative.replace("\\", "/").lower()
-        if lowered.startswith("plugins/"):
-            raise ValueError(f"找不到组件: {raw}")
-        return relative
+        if _is_module_offset_literal(raw):
+            raise ValueError("模块地址不能作为组件入口，请使用大漠内存或大漠汇编命令")
+        if component_type == "com":
+            if any(part in raw for part in ("/", "\\")) or os.path.splitdrive(raw)[0] or os.path.isfile(raw):
+                raise ValueError("COM 组件入口必须是已注册的 ProgID 或 CLSID，不能使用文件路径")
+            return raw
+        if component_type == "process":
+            from task_workflow.script_resources import resolve_script_program_path
+
+            return resolve_script_program_path(raw, require_file=True, **self._resource_dirs())
+        if os.path.isabs(raw):
+            absolute = os.path.abspath(raw)
+            if os.path.isfile(absolute):
+                return absolute
+            raise ValueError(f"找不到组件文件: {absolute}")
+        normalized = raw.replace("\\", "/").lower()
+        if "/" in raw and not normalized.startswith(("plugins/", "assets/components/")):
+            absolute = os.path.abspath(raw)
+            if os.path.isfile(absolute):
+                return absolute
+            raise ValueError(f"找不到组件文件: {absolute}")
+        if normalized.startswith(("plugins/", "assets/components/")):
+            from task_workflow.script_resources import resolve_resource_path
+
+            located = resolve_resource_path(raw, enforce_jail=False, **self._resource_dirs())
+            if located and os.path.isfile(located):
+                return os.path.abspath(located)
+            raise ValueError(f"找不到组件文件: {raw}")
+        if os.path.splitext(raw)[1].lower() == ".py":
+            absolute = os.path.abspath(raw)
+            if os.path.isfile(absolute):
+                return absolute
+            raise ValueError(f"找不到组件文件: {raw}")
+        if os.path.isfile(raw):
+            return os.path.abspath(raw)
+        return raw
 
     def _run_parallel_images(
         self,
@@ -1498,7 +1558,7 @@ class CommandHost:
 
         hwnd = self.context.get("target_hwnd")
         if not hwnd:
-            return []
+            raise ValueError("多图识别需要有效的目标窗口")
         mode = RecognitionMode.ALL_MATCHES if all_matches else RecognitionMode.FIRST_MATCH
         execution_mode = self._resolve_input_mode(模式, self.context.get("execution_mode", "foreground"))
         results = get_parallel_recognizer().recognize_images_parallel(
@@ -1510,6 +1570,15 @@ class CommandHost:
             get_image_data=self.context.get("get_image_data"),
             stop_checker=self.context.get("stop_checker"),
         )
+        if self.should_stop():
+            raise ValueError("已停止")
+        errors = [str(item.error_message) for item in results if item.error_message]
+        if errors or not results:
+            raise ValueError("多图识别失败: " + "；".join(errors or ["未返回查询结果"]))
+        if any(item.success and (item.center_x is None or item.center_y is None) for item in results):
+            raise ValueError("多图识别命中但坐标未知")
+        if (all_matches or not any(item.success for item in results)) and len(results) != len(images):
+            raise ValueError("多图识别结果不完整，目标状态未知")
         hits = [
             item
             for item in results
@@ -1524,11 +1593,12 @@ class CommandHost:
         first = hits[0] if hits else None
         payload = {
             "ok": bool(hits),
+            "query_ok": True,
             "kind": "image",
             "x": None if first is None else int(first.center_x),
             "y": None if first is None else int(first.center_y),
             "score": None if first is None else float(first.confidence),
-            "threshold": float(threshold or 0.8),
+            "threshold": float(threshold),
             "path": None if first is None else first.image_path,
         }
         if items is not None:
@@ -1543,25 +1613,19 @@ class CommandHost:
     @staticmethod
     def _resolve_input_mode(模式: Any, inherited: Any) -> str:
         """Resolve one explicit script input mode without silent mode fallback."""
-        aliases = {
-            "前台": "foreground_driver",
+        modes = {
             "前台驱动": "foreground_driver",
             "前台脚本": "foreground_py",
-            "后台": "background_sendmessage",
             "后台消息": "background_sendmessage",
-            "后台发送": "background_sendmessage",
             "后台投递": "background_postmessage",
-            "后台异步": "background_postmessage",
-            "foreground": "foreground_driver",
-            "foreground_driver": "foreground_driver",
-            "foreground_py": "foreground_py",
-            "background": "background_sendmessage",
-            "background_sendmessage": "background_sendmessage",
-            "background_postmessage": "background_postmessage",
         }
-        selected = inherited if 模式 is None or str(模式).strip() == "" else 模式
-        key = str(selected or "foreground").strip().lower()
-        resolved = aliases.get(key) or aliases.get(str(selected).strip())
+        if 模式 is None:
+            # 线程上下文使用执行器的内部模式标识；脚本参数只接受目录中文名。
+            resolved = "foreground_driver" if inherited == "foreground" else inherited
+            if resolved not in set(modes.values()):
+                raise ValueError("线程执行模式未知")
+            return resolved
+        resolved = modes.get(str(模式).strip())
         if not resolved:
             raise ValueError("执行模式只能是 前台驱动、前台脚本、后台消息、后台投递")
         return resolved
@@ -1573,10 +1637,8 @@ class CommandHost:
         阈值: Any = 0.8,
         点击: Any = False,
         双击: Any = False,
-        偏移横坐标: Any = 0,
-        偏移纵坐标: Any = 0,
-        偏移x: Any = None,
-        偏移y: Any = None,
+        偏移x: Any = 0,
+        偏移y: Any = 0,
         随机: Any = None,
         随机横坐标: Any = None,
         随机纵坐标: Any = None,
@@ -1586,15 +1648,14 @@ class CommandHost:
     ) -> ScriptResult:
         if kwargs:
             raise ValueError("找图不支持" + "、".join(str(name) for name in kwargs))
-        偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
         params = build_find_image_params(
             图片,
             阈值,
             点击,
-            self._defaults("图片点击"),
+            self._defaults("模拟鼠标操作"),
             双击=双击,
-            偏移横坐标=偏移横坐标,
-            偏移纵坐标=偏移纵坐标,
+            偏移x=偏移x,
+            偏移y=偏移y,
             随机=随机,
             随机横坐标=随机横坐标,
             随机纵坐标=随机纵坐标,
@@ -1618,8 +1679,8 @@ class CommandHost:
                         last={"ok": True, "x": first.center_x, "y": first.center_y},
                         defaults=self._defaults("模拟鼠标操作"),
                         双击=双击,
-                        偏移横坐标=偏移横坐标,
-                        偏移纵坐标=偏移纵坐标,
+                        偏移x=偏移x,
+                        偏移y=偏移y,
                         随机=随机,
                         随机横坐标=随机横坐标,
                         随机纵坐标=随机纵坐标,
@@ -1634,7 +1695,23 @@ class CommandHost:
         last = ScriptResult(ok=False)
         for image in images:
             params["image_path"] = image
-            last = self._run("图片点击", dict(params), 模式=模式)
+            image_params = dict(params)
+            image_params["operation_mode"] = "找图功能"
+            image_params["image_enable_click"] = bool(image_params.pop("enable_click", False))
+            image_params["button"] = "左键"
+            image_params["image_click_action"] = image_params.get("click_action", "完整点击")
+            image_params["interval"] = float(image_params.get("click_interval", 0.0) or 0.0)
+            image_params["image_hold_duration"] = float(
+                image_params.get("hold_duration", 0.0) or 0.0
+            )
+            image_params["image_enable_auto_release"] = bool(
+                image_params.get("enable_auto_release", True)
+            )
+            image_params["image_fixed_offset_x"] = int(image_params.get("fixed_offset_x", 0) or 0)
+            image_params["image_fixed_offset_y"] = int(image_params.get("fixed_offset_y", 0) or 0)
+            image_params["image_random_offset_x"] = int(image_params.get("random_offset_x", 0) or 0)
+            image_params["image_random_offset_y"] = int(image_params.get("random_offset_y", 0) or 0)
+            last = self._run("模拟鼠标操作", image_params, 模式=模式)
             if last:
                 return last
         return last
@@ -1644,14 +1721,10 @@ class CommandHost:
         x: Any = None,
         y: Any = None,
         键: Any = "左键",
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
         双击: Any = False,
-        偏移横坐标: Any = 0,
-        偏移纵坐标: Any = 0,
-        偏移x: Any = None,
-        偏移y: Any = None,
+        偏移x: Any = 0,
+        偏移y: Any = 0,
         随机: Any = None,
         随机横坐标: Any = None,
         随机纵坐标: Any = None,
@@ -1662,14 +1735,11 @@ class CommandHost:
         自动松开: Any = None,
         模式: Any = None,
     ) -> ScriptResult:
-        if 目标 is not None and x is None:
+        if 目标 is not None and (x is not None or y is not None):
+            raise ValueError("点击的目标与坐标不能同时提供")
+        if 目标 is not None:
             x = 目标
-        if 横坐标 is not None:
-            x = 横坐标
-        if 纵坐标 is not None:
-            y = 纵坐标
-        偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
-        if isinstance(x, str) and y is None and 横坐标 is None and not _is_number_like(x):
+        if isinstance(x, str) and y is None and not _is_number_like(x):
             raise ValueError('文字请用 点文字("...")，坐标请传入数字或找图结果')
         target = resolve_xy(x, y)
         if target is not None:
@@ -1683,8 +1753,8 @@ class CommandHost:
                 self.store.last(),
                 self._defaults("模拟鼠标操作"),
                 双击=双击,
-                偏移横坐标=偏移横坐标,
-                偏移纵坐标=偏移纵坐标,
+                偏移x=偏移x,
+                偏移y=偏移y,
                 随机=随机,
                 随机横坐标=随机横坐标,
                 随机纵坐标=随机纵坐标,
@@ -1701,12 +1771,10 @@ class CommandHost:
         self,
         x: Any = None,
         y: Any = None,
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
         模式: Any = None,
     ) -> bool:
-        target = resolve_xy(x, y, 横坐标, 纵坐标, 目标)
+        target = resolve_xy(x, y, 目标)
         if target is None:
             raise ValueError("移动缺少横坐标、纵坐标")
         end_x, end_y = target
@@ -1725,7 +1793,7 @@ class CommandHost:
 
     def 按键(
         self,
-        按键内容: Any,
+        按键: Any,
         秒: Any = None,
         动作: Any = None,
         模式: Any = None,
@@ -1733,46 +1801,51 @@ class CommandHost:
         间隔: Any = None,
     ) -> bool:
         action_text = str(动作 or "").strip()
-        hold_actions = {"仅按下", "按下", "只按下", "仅松开", "松开", "弹起", "释放", "只释放"}
+        if action_text not in {"", "按下", "松开"}:
+            raise ValueError("按键动作只能是 按下 或 松开，省略动作时执行完整按键")
+        if action_text == "松开" and (秒 is not None or 连发 is not None or 间隔 is not None):
+            raise ValueError("松开动作不支持 秒、连发 或 间隔")
         if 连发 is not None and 秒 is None:
             raise ValueError("连发只在按住时有效，请同时写 秒=")
         if 间隔 is not None and 秒 is None:
             raise ValueError("间隔只在按住连发时有效，请同时写 秒=")
-        if 连发 is not None and action_text in hold_actions:
-            raise ValueError("连发不能和 动作=按下/松开 一起用")
-        if 间隔 is not None and action_text in hold_actions:
-            raise ValueError("间隔不能和 动作=按下/松开 一起用")
-        if 秒 is not None and action_text not in hold_actions:
+        if 秒 is not None:
+            hold = _as_duration(秒, 0.5)
+            if not math.isfinite(hold) or hold < 0:
+                raise ValueError("按住时长必须是大于等于0的有限秒数")
             params = build_key_params(
-                build_hold_key_sequence(按键内容, 秒),
+                build_hold_key_sequence(按键, hold),
                 self._defaults("模拟键盘操作"),
             )
             params["combo_key_action"] = "完整执行"
-            params["combo_key_repeat"] = True if 连发 is None else _as_bool(连发)
+            params["combo_key_repeat"] = (action_text != "按下") if 连发 is None else _as_bool(连发)
             if 间隔 is not None:
                 if not params["combo_key_repeat"]:
                     raise ValueError("间隔只在连发=真时有效")
                 interval = float(间隔)
-                if interval <= 0:
+                if not math.isfinite(interval) or interval <= 0:
                     raise ValueError("间隔必须大于0")
                 params["combo_key_repeat_interval"] = interval
             return self._run("模拟键盘操作", params, 模式=模式)
-        return self._run("模拟键盘操作", build_key_params(按键内容, self._defaults("模拟键盘操作"), 动作=动作), 模式=模式)
+        return self._run("模拟键盘操作", build_key_params(按键, self._defaults("模拟键盘操作"), 动作=动作), 模式=模式)
 
-    def 输入(self, 文本: Any, 方式: Any = None, 模式: Any = None) -> bool:
-        return self._run("模拟键盘操作", build_type_params(文本, self._defaults("模拟键盘操作"), 方式=方式), 模式=模式)
+    def 输入(self, 文本: Any, 模式: Any = None) -> bool:
+        return self._run("模拟键盘操作", build_type_params(文本, self._defaults("模拟键盘操作")), 模式=模式)
 
     def 延时(self, 秒: Any) -> bool:
+        seconds = finite_seconds(秒, "延时秒数")
         if self._invoke is not None:
-            return self._run("延迟", build_delay_params(秒, {}))
-        return self._sleep_interruptible(float(秒))
+            return self._run("延迟", build_delay_params(seconds, {}))
+        return self._sleep_interruptible(seconds)
 
     def _sleep_interruptible(self, seconds: float) -> ScriptResult:
-        deadline = time.monotonic() + max(0.0, float(seconds))
+        deadline = time.monotonic() + finite_seconds(seconds, "延时秒数")
         stop = self.context.get("stop_checker")
         pause = self.context.get("pause_checker")
         while True:
             now = time.monotonic()
+            if self.should_stop():
+                raise ValueError("已停止")
             if callable(stop):
                 try:
                     if stop():
@@ -1930,8 +2003,9 @@ class CommandHost:
         return ScriptResult({"ok": True, "kind": "watch"})
 
     def 持续找图(self, 图片: Any, *更多图片: Any, 间隔: Any = 0.3, **kwargs: Any) -> ScriptResult:
-        kwargs.pop("点击", None)
-        kwargs.pop("双击", None)
+        unsupported = set(kwargs).intersection({"点击", "双击", "动作", "次数", "按住秒", "自动松开"})
+        if unsupported:
+            raise ValueError("持续找图只识别，不支持" + "、".join(sorted(unsupported)))
         self._start_watch(
             "image",
             间隔,
@@ -1959,9 +2033,6 @@ class CommandHost:
             current = self._user_threads.get(name)
             if current is not None and current.is_alive():
                 raise ValueError(f"线程已在跑：{name}")
-            active_count = sum(1 for thread in self._user_threads.values() if thread.is_alive())
-            if active_count >= MAX_USER_THREADS:
-                raise ValueError(f"脚本线程数已达上限（{MAX_USER_THREADS}）")
             stop = threading.Event()
             self._user_stops[name] = stop
             record: Dict[str, Any] = {
@@ -2002,11 +2073,26 @@ class CommandHost:
                         record["error"] = str(exc)
                         record["status"] = "failed"
                         self._user_thread_errors.append(f"{name}: {exc}")
+                        if len(self._user_thread_errors) > MAX_THREAD_ERRORS:
+                            del self._user_thread_errors[:-MAX_THREAD_ERRORS]
                 finally:
                     with self._thread_lock:
                         if record.get("finished_at") is None:
                             record["finished_at"] = time.time()
                         self._user_idents.pop(current_ident, None)
+                        # 保留最近的完成记录供“线程结果”查询，但清掉旧线程
+                        # 的控制对象和结果，避免脚本反复创建不同名字后无限增长。
+                        if len(self._user_thread_records) > MAX_THREAD_RECORDS:
+                            for old_name, old_record in list(self._user_thread_records.items()):
+                                if len(self._user_thread_records) <= MAX_THREAD_RECORDS:
+                                    break
+                                if old_record is record:
+                                    continue
+                                if str(old_record.get("status") or "") in {"starting", "running", "stopping"}:
+                                    continue
+                                self._user_thread_records.pop(old_name, None)
+                                self._user_stops.pop(old_name, None)
+                                self._user_threads.pop(old_name, None)
 
             thread = threading.Thread(target=runner, name=f"lca-script-fn-{name}", daemon=True)
             record["thread"] = thread
@@ -2119,34 +2205,36 @@ class CommandHost:
 
     def 注销热键(self, 名字: Any) -> bool:
         label = str(名字 or "").strip()
-        handle = self._script_hotkeys.pop(label, None)
+        handle = self._script_hotkeys.get(label)
         if handle is None:
             return False
         try:
             import keyboard
 
             keyboard.remove_hotkey(handle)
-        except Exception:
-            self.logger.debug("注销脚本热键失败", exc_info=True)
+        except Exception as exc:
+            raise ValueError(f"注销脚本热键失败: {exc}") from exc
+        self._script_hotkeys.pop(label, None)
         return True
 
     def 全部注销热键(self) -> int:
         labels = list(self._script_hotkeys)
+        errors = []
         for label in labels:
-            self.注销热键(label)
+            try:
+                self.注销热键(label)
+            except Exception as exc:
+                errors.append(f"{label}：{exc}")
+        if errors:
+            raise ValueError("注销热键失败：" + "；".join(errors))
         return len(labels)
 
     def 启动定时器(self, 名字: Any, 间隔: Any, 回调: Callable[[], Any], 次数: Any = 0) -> ScriptResult:
         label = str(名字 or "定时器").strip() or "定时器"
-        try:
-            seconds = float(间隔)
-            count = int(次数 or 0)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("定时器间隔和次数必须是数字") from exc
-        if not math.isfinite(seconds) or seconds <= 0:
-            raise ValueError("定时器间隔必须大于 0")
-        if count < 0:
-            raise ValueError("定时器次数不能小于 0")
+        seconds = finite_seconds(间隔, "定时器间隔", positive=True)
+        count = integer_parameter(次数, "定时器次数", minimum=0)
+        if not callable(回调):
+            raise ValueError("定时器回调必须是子程序")
         thread_name = f"定时器:{label}"
 
         def runner() -> None:
@@ -2166,23 +2254,101 @@ class CommandHost:
 
     def close(self) -> None:
         self._closed = True
-        self.停止回放()
+        errors = []
+
+        def release(label, callback):
+            try:
+                callback()
+                return True
+            except Exception as exc:
+                errors.append(f"{label}：{exc}")
+                return False
+
+        release("停止回放", self.停止回放)
+        from task_workflow.media_player import stop_owned_audio
+
+        release("停止音频", lambda: stop_owned_audio(self))
         for key in list(self._watch_stops):
             self._stop_watch(key, join=False)
         for name in list(self._user_stops):
             self._stop_user_thread(name, join=False)
-        self.全部注销热键()
+        release("注销热键", self.全部注销热键)
         for thread in list(self._watch_threads.values()) + list(self._user_threads.values()):
             if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-                thread.join(timeout=2.0)
+                thread.join()
+        self._watch_threads.clear()
+        self._watch_stops.clear()
+        self._user_threads.clear()
+        self._user_stops.clear()
+        self._user_idents.clear()
+        self._user_thread_records.clear()
+        self._latest.clear()
+        self._regions.clear()
+        release("关闭进程", self._close_owned_processes)
         manager = self._external_component_manager
-        self._external_component_manager = None
-        if manager is not None:
-            manager.shutdown()
+        if manager is not None and release("关闭外部组件", manager.shutdown):
+            self._external_component_manager = None
+        if errors:
+            raise ValueError("脚本资源释放失败：" + "；".join(errors))
+
+    def _register_process(self, process: Any) -> None:
+        pid = int(getattr(process, "pid", 0) or 0)
+        if pid <= 0:
+            return
+        with self._process_lock:
+            self._owned_processes[pid] = process
+
+    def _forget_process(self, process: Any) -> None:
+        pid = int(getattr(process, "pid", 0) or 0)
+        if pid <= 0:
+            return
+        with self._process_lock:
+            current = self._owned_processes.get(pid)
+            if current is process:
+                self._owned_processes.pop(pid, None)
+
+    def _close_owned_processes(self) -> None:
+        import subprocess
+
+        with self._process_lock:
+            processes = list(self._owned_processes.values())
+        errors = []
+        for process in processes:
+            process_error = None
+            try:
+                detached = bool(getattr(process, "_lca_detached", False))
+                if not detached and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait(timeout=2.0)
+                if not detached and process.poll() is None:
+                    raise ValueError("进程仍在运行")
+                for name in ("stdin", "stdout", "stderr"):
+                    stream = getattr(process, name, None)
+                    if stream is not None:
+                        stream.close()
+            except Exception as exc:
+                process_error = exc
+            close = getattr(process, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    process_error = exc if process_error is None else ValueError(f"{process_error}；{exc}")
+                finally:
+                    self._forget_process(process)
+            elif process_error is None:
+                self._forget_process(process)
+            if process_error is not None:
+                errors.append(f"进程{process.pid}：{process_error}")
+        if errors:
+            raise ValueError("；".join(errors))
 
     def _components(self):
-        if not bool(self.context.get("allow_external_components", False)):
-            raise ValueError("外部组件未在本机信任，请打开脚本编辑器勾选‘允许外部组件’")
         if self._external_component_manager is None:
             from task_workflow.external_components import ExternalComponentManager
 
@@ -2214,29 +2380,13 @@ class CommandHost:
         self,
         类型: Any,
         入口: Any,
-        调用约定: Any = "cdecl",
+        调用约定: Any = None,
         超时: Any = 10,
     ) -> ScriptResult:
-        entry = 入口
-        raw_entry = str(入口 or "").strip()
-        from task_workflow.script_resources import _is_module_offset_literal
-
-        if _is_module_offset_literal(raw_entry):
-            raise ValueError("这是模块地址，不能当外部组件加载")
-        lowered = raw_entry.replace("\\", "/").lower()
-        looks_like_resource = (
-            lowered.startswith("plugins/")
-            or lowered.endswith((".dll", ".py"))
-            or (
-                lowered.endswith(".exe")
-                and not os.path.isabs(raw_entry)
-                and "/" in lowered
-            )
-        )
-        if looks_like_resource:
-            entry = self._resolve_component_entry(入口)
+        component_type = str(类型 or "").strip().lower()
+        entry = self._resolve_component_entry(入口, component_type)
         try:
-            value = self._components().load(类型, entry, calling_convention=调用约定, timeout=超时)
+            value = self._components().load(component_type, entry, calling_convention=调用约定, timeout=超时)
         except Exception as exc:
             raise ValueError(f"外部组件加载失败: {exc}") from exc
         return self._component_result(value, handle=value.get("handle"), component_type=value.get("type"))
@@ -2247,13 +2397,13 @@ class CommandHost:
         方法: Any = "",
         *参数: Any,
         参数类型: Any = None,
-        返回类型: Any = "int32",
+        返回类型: Any = None,
         关键字参数: Any = None,
         超时: Any = 30,
         输入: Any = None,
         工作目录: Any = None,
         环境变量: Any = None,
-        编码: Any = "utf-8",
+        编码: Any = None,
     ) -> ScriptResult:
         handle = self._component_handle(句柄)
         if 关键字参数 is not None and not isinstance(关键字参数, dict):
@@ -2302,11 +2452,13 @@ class CommandHost:
         环境变量: Any = None,
         编码: Any = "utf-8",
     ) -> ScriptResult:
-        self._components()
         raw = str(程序 or "").strip()
         if raw.replace("\\", "/").lower().endswith(".dll"):
             raise ValueError('组件.运行只能运行程序（.exe）。DLL 请用 组件.加载("dll", 路径)')
-        loaded = self.组件加载("process", 程序, 超时=min(10.0, float(超时 or 30)))
+        resolved_program = self._resolve_component_entry(程序, "process")
+        if 工作目录 is None and os.path.isabs(resolved_program):
+            工作目录 = os.path.dirname(resolved_program)
+        loaded = self.组件加载("process", resolved_program, 超时=超时)
         handle = self._component_handle(loaded)
         try:
             result = self.组件调用(
@@ -2320,10 +2472,7 @@ class CommandHost:
                 编码=编码,
             )
         finally:
-            try:
-                self.组件关闭(handle)
-            except Exception:
-                pass
+            self.组件关闭(handle)
         return result
 
     def 组件关闭(self, 句柄: Any = None, 超时: Any = 5) -> ScriptResult:
@@ -2345,38 +2494,51 @@ class CommandHost:
             self._latest[kind] = dict(payload)
 
     def _start_watch(self, key: str, 间隔: Any, fn: Callable[[], Any]) -> None:
+        interval = finite_seconds(间隔, "后台识别间隔", positive=True)
+        if self._closed:
+            raise ValueError("已停止")
         self._stop_watch(key)
-        interval = max(MIN_WATCH_INTERVAL, float(间隔 or 0.3))
         stop = threading.Event()
         self._watch_stops[key] = stop
 
         def loop() -> None:
-            while not stop.is_set() and not self._closed:
-                if self._is_stopped():
-                    break
-                self._wait_if_paused()
-                if stop.is_set() or self._closed:
-                    break
-                try:
-                    fn()
-                except Exception as exc:
-                    if _is_stop_error(exc) or type(exc).__name__ == "ScriptOutcome":
+            ident = threading.get_ident()
+            with self._thread_lock:
+                self._user_idents[ident] = stop
+            try:
+                while not stop.is_set() and not self._closed:
+                    if self._is_stopped():
                         break
+                    self._wait_if_paused()
+                    if stop.is_set() or self._closed:
+                        break
+                    fn()
+                    if stop.wait(interval):
+                        break
+            except Exception as exc:
+                if not _is_stop_error(exc) and type(exc).__name__ != "ScriptOutcome":
                     self.logger.warning("[自定义脚本] 后台%s失败: %s", key, exc)
-                if stop.wait(interval):
-                    break
+                    with self._thread_lock:
+                        self._user_thread_errors.append(f"后台{key}: {exc}")
+                        del self._user_thread_errors[:-MAX_THREAD_ERRORS]
+            finally:
+                with self._thread_lock:
+                    self._user_idents.pop(ident, None)
 
         thread = threading.Thread(target=loop, name=f"lca-script-watch-{key}", daemon=True)
         self._watch_threads[key] = thread
         thread.start()
 
     def _stop_watch(self, key: str, join: bool = True) -> None:
-        event = self._watch_stops.pop(key, None)
+        event = self._watch_stops.get(key)
         if event is not None:
             event.set()
-        thread = self._watch_threads.pop(key, None)
+        thread = self._watch_threads.get(key)
         if join and thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
+            thread.join()
+        if thread is None or not thread.is_alive():
+            self._watch_stops.pop(key, None)
+            self._watch_threads.pop(key, None)
 
     def _stop_user_thread(self, name: str, join: bool = True) -> None:
         # Keep the cancellation mapping until the runner actually exits.  A
@@ -2404,8 +2566,8 @@ class CommandHost:
             return False
         try:
             return bool(checker())
-        except Exception:
-            return True
+        except Exception as exc:
+            raise ValueError(f"停止检查失败: {exc}") from exc
 
     def _is_stopped(self) -> bool:
         return self.should_stop()
@@ -2419,8 +2581,8 @@ class CommandHost:
                 return
             try:
                 paused = bool(checker())
-            except Exception:
-                return
+            except Exception as exc:
+                raise ValueError(f"暂停检查失败: {exc}") from exc
             if not paused:
                 return
             time.sleep(0.05)
@@ -2431,16 +2593,13 @@ class CommandHost:
         点击: Any = False,
         区域: Any = None,
         双击: Any = False,
-        偏移横坐标: Any = 0,
-        偏移纵坐标: Any = 0,
-        偏移x: Any = None,
-        偏移y: Any = None,
+        偏移x: Any = 0,
+        偏移y: Any = 0,
         随机: Any = None,
         随机横坐标: Any = None,
         随机纵坐标: Any = None,
         模式: Any = None,
     ) -> bool:
-        偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
         return self._run(
             "模拟鼠标操作",
             build_find_color_params(
@@ -2449,8 +2608,8 @@ class CommandHost:
                 self._resolve_region(区域),
                 self._defaults("模拟鼠标操作"),
                 双击=双击,
-                偏移横坐标=偏移横坐标,
-                偏移纵坐标=偏移纵坐标,
+                偏移x=偏移x,
+                偏移y=偏移y,
                 随机=随机,
                 随机横坐标=随机横坐标,
                 随机纵坐标=随机纵坐标,
@@ -2464,20 +2623,8 @@ class CommandHost:
         y1: Any = None,
         x2: Any = None,
         y2: Any = None,
-        起点横坐标: Any = None,
-        起点纵坐标: Any = None,
-        终点横坐标: Any = None,
-        终点纵坐标: Any = None,
         模式: Any = None,
     ) -> bool:
-        if 起点横坐标 is not None:
-            x1 = 起点横坐标
-        if 起点纵坐标 is not None:
-            y1 = 起点纵坐标
-        if 终点横坐标 is not None:
-            x2 = 终点横坐标
-        if 终点纵坐标 is not None:
-            y2 = 终点纵坐标
         drag = resolve_drag(x1, y1, x2, y2)
         if drag is None:
             raise ValueError("拖拽缺少起点或终点坐标")
@@ -2495,8 +2642,6 @@ class CommandHost:
         步数: Any = 3,
         x: Any = None,
         y: Any = None,
-        横坐标: Any = None,
-        纵坐标: Any = None,
         模式: Any = None,
     ) -> bool:
         target = None
@@ -2515,7 +2660,7 @@ class CommandHost:
                 steps = 方向
         elif 目标 is not None:
             target = 目标
-        point = resolve_xy(x, y, 横坐标, 纵坐标, target)
+        point = resolve_xy(x, y, target)
         if point is not None:
             x, y = point
         return self._run(
@@ -2531,10 +2676,8 @@ class CommandHost:
         键: Any = "左键",
         区域: Any = None,
         双击: Any = False,
-        偏移横坐标: Any = 0,
-        偏移纵坐标: Any = 0,
-        偏移x: Any = None,
-        偏移y: Any = None,
+        偏移x: Any = 0,
+        偏移y: Any = 0,
         随机: Any = None,
         随机横坐标: Any = None,
         随机纵坐标: Any = None,
@@ -2543,7 +2686,6 @@ class CommandHost:
         found = self.找字(目标=目标, 区域=区域)
         if not found:
             return found if isinstance(found, ScriptResult) else ScriptResult(ok=False)
-        偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
         return self._run(
             "模拟鼠标操作",
             build_text_click_params(
@@ -2551,8 +2693,8 @@ class CommandHost:
                 键,
                 self._defaults("模拟鼠标操作"),
                 双击=双击,
-                偏移横坐标=偏移横坐标,
-                偏移纵坐标=偏移纵坐标,
+                偏移x=偏移x,
+                偏移y=偏移y,
                 随机=随机,
                 随机横坐标=随机横坐标,
                 随机纵坐标=随机纵坐标,
@@ -2570,10 +2712,8 @@ class CommandHost:
         键: Any = "左键",
         区域: Any = None,
         双击: Any = False,
-        偏移横坐标: Any = 0,
-        偏移纵坐标: Any = 0,
-        偏移x: Any = None,
-        偏移y: Any = None,
+        偏移x: Any = 0,
+        偏移y: Any = 0,
         随机: Any = None,
         随机横坐标: Any = None,
         随机纵坐标: Any = None,
@@ -2582,7 +2722,6 @@ class CommandHost:
         found = self.找字库(目标=目标, 字库=字库, 颜色=颜色, 相似度=相似度, 区域=区域)
         if not found:
             return found if isinstance(found, ScriptResult) else ScriptResult(ok=False)
-        偏移横坐标, 偏移纵坐标 = _offset_alias(偏移x, 偏移y, 偏移横坐标, 偏移纵坐标)
         return self._run(
             "模拟鼠标操作",
             build_text_click_params(
@@ -2590,8 +2729,8 @@ class CommandHost:
                 键,
                 self._defaults("模拟鼠标操作"),
                 双击=双击,
-                偏移横坐标=偏移横坐标,
-                偏移纵坐标=偏移纵坐标,
+                偏移x=偏移x,
+                偏移y=偏移y,
                 随机=随机,
                 随机横坐标=随机横坐标,
                 随机纵坐标=随机纵坐标,
@@ -2717,13 +2856,26 @@ class CommandHost:
         )
 
     def _wait_found(self, finder, 超时: Any, 间隔: Any, 消失: bool = False) -> ScriptResult:
-        timeout = max(0.0, float(超时 if 超时 is not None else 8))
+        timeout = finite_seconds(超时, "超时")
         deadline = time.monotonic() + timeout
         last = ScriptResult(ok=False)
-        pause = max(0.05, float(间隔 if 间隔 is not None else 0.3))
+        pause = finite_seconds(间隔, "间隔", positive=True)
         while True:
+            if self.should_stop():
+                raise ValueError("已停止")
+            self._wait_if_paused()
+            if self.should_stop():
+                raise ValueError("已停止")
             last = finder()
             found = bool(last)
+            if isinstance(last, ScriptResult):
+                state = last._payload
+                if state.get("error") or state.get("query_ok") is False or (not found and state.get("query_ok") is not True):
+                    raise ValueError(str(state.get("error") or "查询失败，目标状态未知"))
+                if not found and state.get("matched") is True:
+                    raise ValueError("识别已命中，但后续动作失败")
+            elif not found:
+                raise ValueError("查询未返回明确状态，目标状态未知")
             if 消失 and not found:
                 return ScriptResult({"ok": True, "kind": "wait"})
             if not 消失 and found:
@@ -2732,27 +2884,34 @@ class CommandHost:
                 if 消失:
                     return ScriptResult({"ok": False, "kind": "wait"})
                 return last if isinstance(last, ScriptResult) else ScriptResult(ok=False)
-            self.延时(pause)
+            self.延时(min(pause, max(0.0, deadline - time.monotonic())))
 
     def 按下(
         self,
         x: Any = None,
         y: Any = None,
         键: Any = "左键",
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
         按键: Any = None,
         模式: Any = None,
+        秒: Any = None,
+        连发: Any = None,
+        间隔: Any = None,
         **kwargs: Any,
     ) -> ScriptResult:
+        if 秒 is not None:
+            return self.按住(
+                x, y, 秒=秒, 键=键,
+                目标=目标, 按键=按键, 模式=模式,
+                连发=False if 连发 is None else 连发, 间隔=间隔, **kwargs,
+            )
+        if 连发 is not None or 间隔 is not None:
+            raise ValueError("按下选择连发时必须同时写 秒=，到时自动松开；持续按下请省略这些参数")
         return self._press_or_release(
             "仅按下",
             x,
             y,
             键=键,
-            横坐标=横坐标,
-            纵坐标=纵坐标,
             目标=目标,
             按键=按键,
             自动松开=False,
@@ -2765,8 +2924,6 @@ class CommandHost:
         x: Any = None,
         y: Any = None,
         键: Any = "左键",
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
         按键: Any = None,
         模式: Any = None,
@@ -2777,8 +2934,6 @@ class CommandHost:
             x,
             y,
             键=键,
-            横坐标=横坐标,
-            纵坐标=纵坐标,
             目标=目标,
             按键=按键,
             模式=模式,
@@ -2791,29 +2946,28 @@ class CommandHost:
         y: Any = None,
         秒: Any = 0.5,
         键: Any = "左键",
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
         按键: Any = None,
         模式: Any = None,
+        连发: Any = False,
+        间隔: Any = None,
         **kwargs: Any,
     ) -> ScriptResult:
         hold = _as_duration(秒, 0.5)
+        if not math.isfinite(hold) or hold < 0:
+            raise ValueError("按住时长必须是大于等于0的有限秒数")
         key_name = 按键 if 按键 is not None else (x if y is None and 目标 is None and _looks_like_key(x) else None)
-        if key_name is not None and y is None and 横坐标 is None:
-            params = build_key_params(
-                build_hold_key_sequence(key_name, hold),
-                self._defaults("模拟键盘操作"),
-            )
-            params["combo_key_action"] = "完整执行"
-            return self._run("模拟键盘操作", params, 模式=模式)
+        if key_name is not None and y is None:
+            if kwargs:
+                raise ValueError("键盘按住不支持" + "、".join(str(name) for name in kwargs))
+            return self.按键(key_name, 秒=hold, 连发=连发, 间隔=间隔, 模式=模式)
+        if _as_bool(连发) or 间隔 is not None:
+            raise ValueError("连发和间隔只用于键盘按住，鼠标连续点击请使用 连点")
         return self._press_or_release(
             "仅按下",
             x,
             y,
             键=键,
-            横坐标=横坐标,
-            纵坐标=纵坐标,
             目标=目标,
             按住秒=hold,
             自动松开=True,
@@ -2828,8 +2982,6 @@ class CommandHost:
         次数: Any = 3,
         间隔: Any = 0.08,
         键: Any = "左键",
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
         模式: Any = None,
         **kwargs: Any,
@@ -2838,8 +2990,6 @@ class CommandHost:
             x,
             y,
             键=键,
-            横坐标=横坐标,
-            纵坐标=纵坐标,
             目标=目标,
             次数=次数,
             间隔=间隔,
@@ -2853,22 +3003,19 @@ class CommandHost:
         x: Any = None,
         y: Any = None,
         键: Any = "左键",
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
         按键: Any = None,
         **kwargs: Any,
     ) -> ScriptResult:
         模式 = kwargs.pop("模式", None)
-        key_name = 按键 if 按键 is not None else (x if y is None and 目标 is None and 横坐标 is None and _looks_like_key(x) else None)
+        key_name = 按键 if 按键 is not None else (x if y is None and 目标 is None and _looks_like_key(x) else None)
         if key_name is not None:
-            return self._run("模拟键盘操作", build_key_params(key_name, self._defaults("模拟键盘操作"), 动作=动作), 模式=模式)
+            key_action = "按下" if 动作 == "仅按下" else "松开"
+            return self._run("模拟键盘操作", build_key_params(key_name, self._defaults("模拟键盘操作"), 动作=key_action), 模式=模式)
         return self.点击(
             x,
             y,
             键=键,
-            横坐标=横坐标,
-            纵坐标=纵坐标,
             目标=目标,
             动作=动作,
             模式=模式,
@@ -2879,16 +3026,10 @@ class CommandHost:
         self,
         x: Any = None,
         y: Any = None,
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
     ) -> ScriptResult:
         if 目标 is not None and x is None:
             x = 目标
-        if 横坐标 is not None:
-            x = 横坐标
-        if 纵坐标 is not None:
-            y = 纵坐标
         target = result_coords(x)
         if target is not None and y is None:
             x, y = target
@@ -2915,8 +3056,6 @@ class CommandHost:
         y: Any = None,
         颜色: Any = None,
         偏色: Any = 20,
-        横坐标: Any = None,
-        纵坐标: Any = None,
         目标: Any = None,
     ) -> ScriptResult:
         expected = 颜色
@@ -2926,7 +3065,7 @@ class CommandHost:
         if expected is None and y is not None and not _is_number_like(y) and _parse_rgb(y) is not None:
             expected = y
             y = None
-        current = self.取色(x, y, 横坐标=横坐标, 纵坐标=纵坐标, 目标=目标)
+        current = self.取色(x, y, 目标=目标)
         matched = bool(current) and colors_match(getattr(current, "color", None), expected, 偏色)
         payload = dict(getattr(current, "_payload", {}) or {})
         payload["ok"] = matched
@@ -2943,11 +3082,15 @@ class CommandHost:
     ) -> ScriptResult:
         if kwargs:
             raise ValueError("找所有图不支持" + "、".join(str(name) for name in kwargs))
-        images, inferred = collect_find_image_args(图片, 更多图片)
-        threshold = float(inferred if inferred is not None else 阈值 or 0.8)
+        images = collect_find_image_args(图片, 更多图片)
+        if not images:
+            raise ValueError("找所有图至少需要一张图片")
+        threshold = float(阈值)
+        if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ValueError("找所有图阈值必须在0到1之间")
         region = self._resolve_region(区域)
         images = [self._constrain_path(image) for image in images if str(image or "").strip()]
-        limit = max(1, _as_int(最多, 20))
+        limit = self._dm_int(最多, "最多", 1)
         if len(images) > 1:
             params = build_find_image_params(
                 images[0],
@@ -2978,6 +3121,7 @@ class CommandHost:
         first = items[0] if items else {}
         payload = {
             "ok": bool(items),
+            "query_ok": True,
             "kind": "image",
             "items": items,
             "x": first.get("x"),
@@ -2994,76 +3138,31 @@ class CommandHost:
 
     def _collect_image_matches(self, image: Any, threshold: float, region: Any, limit: int, 缩放: Any = 1.0, 图像模式: Any = "彩色", 旋转: Any = 0) -> list:
         params = build_find_image_params(image, threshold, False, 区域=region, 缩放=缩放, 图像模式=图像模式, 旋转=旋转)
-        official = None
-        path = str(image or "")
-        try:
-            from tasks.image_match_click import locate_image_in_window
-
-            ok, loc, located_path = locate_image_in_window(
-                params,
-                self.context.get("target_hwnd"),
-                self.context.get("card_id"),
-            )
-            if located_path:
-                path = located_path
-            if ok and loc:
-                left, top, width, height = loc[0], loc[1], loc[2], loc[3]
-                official = {
-                    "ok": True,
-                    "kind": "image",
-                    "x": int(left + width // 2),
-                    "y": int(top + height // 2),
-                    "score": threshold,
-                    "threshold": threshold,
-                    "path": path,
-                }
-        except Exception:
-            official = None
-        extras = []
         template, loaded_path = _load_template_image(image, self.context.get("card_id"))
-        if loaded_path:
-            path = loaded_path
+        if template is None:
+            raise ValueError(f"找所有图失败：无法读取模板 {image}")
         frame = _capture_window_frame(self.context.get("target_hwnd"))
-        if template is not None and frame is not None:
-            try:
-                from utils.match.smart_image_matcher import match_template_all, normalize_match_image
-                import cv2
+        if frame is None:
+            raise ValueError("找所有图失败：无法获取窗口截图")
+        from utils.match.smart_image_matcher import match_template_all, normalize_match_image
+        import cv2
 
-                needle = normalize_match_image(template)
-                scale = float(params.get("template_scale", 1.0) or 1.0)
-                if abs(scale - 1.0) > 1e-6 and needle is not None:
-                    height, width = needle.shape[:2]
-                    needle = cv2.resize(needle, (max(1, int(round(width * scale))), max(1, int(round(height * scale)))), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
-                for match in match_template_all(frame, needle if needle is not None else template, threshold, region, limit, mode=params.get("image_mode", "彩色"), rotation=params.get("image_rotation", 0)):
-                    if not match.found or not match.center:
-                        continue
-                    extras.append(
-                        {
-                            "ok": True,
-                            "kind": "image",
-                            "x": int(match.center[0]),
-                            "y": int(match.center[1]),
-                            "score": float(match.confidence),
-                            "threshold": threshold,
-                            "path": path,
-                        }
-                    )
-            except Exception:
-                extras = []
-        items = []
-        if official:
-            items.append(official)
-            for item in extras:
-                if abs(int(item["x"]) - int(official["x"])) <= 8 and abs(int(item["y"]) - int(official["y"])) <= 8:
-                    official["score"] = item.get("score", official["score"])
-                    continue
-                items.append(item)
-        else:
-            items = extras
-        return items[: max(1, limit)]
+        needle = normalize_match_image(template)
+        if needle is None:
+            raise ValueError("找所有图失败：模板格式无效")
+        scale = float(params["template_scale"])
+        if abs(scale - 1.0) > 1e-6:
+            height, width = needle.shape[:2]
+            needle = cv2.resize(needle, (max(1, int(round(width * scale))), max(1, int(round(height * scale)))), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+        matches = match_template_all(frame, needle, threshold, region, limit,
+                                     mode=params["image_mode"], rotation=params["image_rotation"])
+        return [{"ok": True, "kind": "image", "x": int(match.center[0]),
+                 "y": int(match.center[1]), "score": float(match.confidence),
+                 "threshold": threshold, "path": loaded_path}
+                for match in matches]
 
     def 等毫秒(self, 毫秒: Any) -> bool:
-        return self.延时(max(0.0, float(毫秒 or 0) / 1000.0))
+        return self.延时(finite_seconds(毫秒, "毫秒") / 1000.0)
 
     def 鼠标位置(self) -> ScriptResult:
         try:
@@ -3104,7 +3203,8 @@ class CommandHost:
             return 0, 0
 
     def 播放(self, 文件: Any, 等待: Any = True) -> ScriptResult:
-        from task_workflow.media_player import play_audio
+        from task_workflow.media_player import audio_owner, play_audio
+        from task_workflow.script_resources import resolve_resource_path
 
         # 先判空再做路径约束，否则用户看到的是笼统的“缺少资源路径”而不是这条命令的用法
         if not str(文件 or "").strip():
@@ -3112,15 +3212,15 @@ class CommandHost:
         path = self._constrain_path(文件)
         if not path:
             raise ValueError('播放要写音频文件，例如 播放("提示.wav")')
+        resolved = resolve_resource_path(path, enforce_jail=False, **self._resource_dirs())
+        if not resolved:
+            raise ValueError(f"播放文件不存在: {文件}")
         try:
-            resolved = play_audio(
-                path,
-                wait=_as_bool(等待),
-                stop_checker=self.context.get("stop_checker"),
-            )
+            with audio_owner(self):
+                played = play_audio(resolved, wait=_as_bool(等待), stop_checker=self.should_stop)
         except FileNotFoundError as exc:
             raise ValueError(str(exc)) from exc
-        return ScriptResult({"ok": True, "kind": "audio", "path": resolved})
+        return ScriptResult({"ok": True, "kind": "audio", "path": played})
 
     def 停止播放(self) -> ScriptResult:
         from task_workflow.media_player import stop_audio
@@ -3210,7 +3310,7 @@ class CommandHost:
                 self._replay_stop.set()
             thread = self._replay_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
+            thread.join()
         return ScriptResult({"ok": True, "kind": "replay"})
 
     def _execute_replay(self, params: Dict[str, Any]) -> ScriptResult:
@@ -3269,10 +3369,12 @@ class CommandHost:
         dirs["images_dir"] = root
         name = str(文件 or "").strip().replace("\\", "/")
         if not name:
-            name = time.strftime("shot_%Y%m%d_%H%M%S.png")
+            import uuid
+
+            name = time.strftime("shot_%Y%m%d_%H%M%S_") + uuid.uuid4().hex + ".png"
         if not os.path.splitext(os.path.basename(name))[1]:
             name = f"{name}.png"
-        target = name if os.path.isabs(name) else os.path.join(root, os.path.basename(name))
+        target = name if os.path.isabs(name) else os.path.join(root, name)
         dest = constrain_script_path(target, **dirs)
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         try:
@@ -3281,7 +3383,11 @@ class CommandHost:
             image = frame
             if getattr(image, "ndim", 0) == 3 and image.shape[2] == 4:
                 image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-            wrote = bool(cv2.imwrite(dest, image))
+            extension = os.path.splitext(dest)[1]
+            wrote, encoded = cv2.imencode(extension, image)
+            if wrote:
+                with open(dest, "wb") as output:
+                    output.write(encoded.tobytes())
         except Exception as exc:
             raise ValueError(f"截图保存失败: {exc}") from exc
         if not wrote:
@@ -3307,7 +3413,7 @@ class CommandHost:
 
                 user32 = ctypes.windll.user32
                 down = all(int(user32.GetAsyncKeyState(int(vk))) & 0x8000 for vk in vks)
-            return ScriptResult({"ok": down, "kind": "key"})
+            return ScriptResult({"ok": down, "query_ok": True, "kind": "key"})
 
         return self._wait_found(_pressed, 超时, 间隔)
 
@@ -3361,6 +3467,43 @@ class CommandHost:
             raise ValueError(f"未找到能力: {task_type}")
         return module
 
+    @contextmanager
+    def _task_input_guard(self, task_type, params, module, context):
+        """脚本动作与卡片共用输入锁，整段拖拽期间不能交叉发送键鼠事件。"""
+        from utils.input.input_guard import (
+            acquire_input_guard,
+            get_input_lock_timeout_seconds,
+            get_input_lock_wait_warn_ms,
+            resolve_input_lock_resource,
+            task_requires_input_lock,
+        )
+
+        if not task_requires_input_lock(task_type, params, module):
+            yield
+            return
+        resource = resolve_input_lock_resource(
+            context["execution_mode"], context.get("target_hwnd"), task_type
+        )
+        owner = f"script={context.get('card_id')}, task={task_type}, thread={threading.get_ident()}, resource={resource}"
+        wait_slice = max(0.05, min(0.2, get_input_lock_timeout_seconds()))
+        total_wait_ms = 0.0
+        stop_checker = context.get("stop_checker")
+        while True:
+            if self.should_stop() or (callable(stop_checker) and stop_checker()):
+                raise ValueError("已停止")
+            self._wait_if_paused()
+            with acquire_input_guard(owner=owner, timeout=wait_slice, resource=resource) as (acquired, wait_ms):
+                total_wait_ms += max(0.0, float(wait_ms))
+                if not acquired:
+                    continue
+                # 等待期间可能收到停止请求，取得锁后仍不能发出输入。
+                if self.should_stop() or (callable(stop_checker) and stop_checker()):
+                    raise ValueError("已停止")
+                if total_wait_ms >= get_input_lock_wait_warn_ms():
+                    self.logger.warning("[输入调度] 脚本等待输入锁 %.1fms: %s", total_wait_ms, owner)
+                yield
+                return
+
     def _run(
         self,
         task_type: str,
@@ -3370,7 +3513,6 @@ class CommandHost:
         pause_checker: Any = None,
     ) -> ScriptResult:
         self._allowed(task_type)
-        before = self.store.last()
         module = self._module(task_type)
         execution_mode = self._resolve_input_mode(模式, self.context.get("execution_mode", "foreground"))
         context = dict(self.context, execution_mode=execution_mode)
@@ -3378,47 +3520,54 @@ class CommandHost:
             context["stop_checker"] = stop_checker
         if pause_checker is not None:
             context["pause_checker"] = pause_checker
-        if self._invoke is not None:
-            result = self._invoke(task_type, params, context)
-        else:
-            execute = getattr(module, "execute_task", None)
-            if not callable(execute):
-                raise ValueError(f"能力不可执行: {task_type}")
-            result = execute(
-                params=params,
-                counters=context.get("counters") if isinstance(context.get("counters"), dict) else {},
-                execution_mode=execution_mode,
-                target_hwnd=context.get("target_hwnd"),
-                window_region=context.get("window_region"),
-                card_id=context.get("card_id"),
-                get_image_data=context.get("get_image_data"),
-                stop_checker=context.get("stop_checker"),
-                pause_checker=context.get("pause_checker"),
-                executor=context.get("executor"),
-            )
-        ok = task_succeeded(result)
-        self.logger.info("[自定义脚本] %s => %s", task_type, ok)
-        after = self.store.last()
-        # 即使底层任务发布的感知结果与上一次完全相同，也必须把完整结果
-        # （尤其是找图的 x/y/path）返回给脚本。此前用字典相等判断“结果未变”，
-        # 会把重复找同一位置的成功结果裁剪成仅含 ok=True，导致 `结果.x`
-        # 抛出“没有字段: x”。
-        changed = after != before
-        # 感知类任务始终返回完整快照；重复识别同一目标时快照可能与上次
-        # 字典相等，但坐标/文本等字段仍是本次调用的有效结果。普通动作
-        # （延时、按键等）则不能沿用旧的感知字段。
-        perception_task = task_type in {"图片点击", "OCR文字识别", "点阵字库OCR", "YOLO目标检测"}
-        payload = dict(after) if (perception_task and ok) else {"ok": ok}
-        payload["ok"] = ok
-        payload["execution_mode"] = execution_mode
-        kind = _KIND_BY_TASK.get(task_type) or str(payload.get("kind") or "")
-        if kind:
-            remembered = dict(after)
-            remembered["ok"] = ok
-            remembered.setdefault("kind", kind)
-            if changed or remembered.get("x") is not None or remembered.get("items"):
-                self._remember(kind, remembered)
-            if changed:
-                payload = remembered
-        payload.setdefault("execution_mode", execution_mode)
-        return ScriptResult(payload)
+        operation = str(params.get("operation_mode") or "")
+        image_perception = task_type == "模拟鼠标操作" and operation == "找图功能"
+        color_perception = task_type == "模拟鼠标操作" and operation == "找色功能"
+        perception_task = image_perception or color_perception or task_type in {"OCR文字识别", "点阵字库OCR", "YOLO目标检测"}
+        kind = "image" if image_perception else (_KIND_BY_TASK.get(task_type) or "")
+        with self._task_input_guard(task_type, params, module, context):
+            if perception_task:
+                self.store.publish(context.get("card_id"), kind=kind, ok=False, query_ok=None)
+            before = self.store.last()
+            if self._invoke is not None:
+                result = self._invoke(task_type, params, context)
+            else:
+                execute = getattr(module, "execute_task", None)
+                if not callable(execute):
+                    raise ValueError(f"能力不可执行: {task_type}")
+                result = execute(
+                    params=params,
+                    counters=context.get("counters") if isinstance(context.get("counters"), dict) else {},
+                    execution_mode=execution_mode,
+                    target_hwnd=context.get("target_hwnd"),
+                    window_region=context.get("window_region"),
+                    card_id=context.get("card_id"),
+                    get_image_data=context.get("get_image_data"),
+                    stop_checker=context.get("stop_checker"),
+                    pause_checker=context.get("pause_checker"),
+                    executor=context.get("executor"),
+                )
+            ok = task_succeeded(result)
+            self.logger.info("[自定义脚本] %s => %s", task_type, ok)
+            after = self.store.last()
+            # 感知任务即使重复命中同一位置，也返回完整结果；普通动作不沿用旧字段。
+            changed = after != before
+            payload = dict(after) if perception_task else {"ok": ok}
+            payload["ok"] = ok
+            if perception_task:
+                payload["query_ok"] = True if ok else after.get("query_ok") is True
+                payload["matched"] = ok or (after.get("ok") is True and payload["query_ok"])
+                if not payload["query_ok"]:
+                    payload["error"] = after.get("error") or "识别执行失败，目标状态未知"
+            payload["execution_mode"] = execution_mode
+            kind = kind or str(payload.get("kind") or "")
+            if kind:
+                remembered = dict(payload) if perception_task else dict(after)
+                remembered["ok"] = ok
+                remembered.setdefault("kind", kind)
+                if perception_task or changed or remembered.get("x") is not None or remembered.get("items"):
+                    self._remember(kind, remembered)
+                if changed and not perception_task:
+                    payload = remembered
+            payload.setdefault("execution_mode", execution_mode)
+            return ScriptResult(payload)

@@ -1,27 +1,22 @@
 # -*- coding: utf-8 -*-
-"""点阵字库 OCR：兼容大漠文本字库、OP 文本字库和 OP 二进制 .dict。"""
+"""点阵字库 OCR：读取大漠文本字库、OP 文本字库和 OP 二进制 .dict。"""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 import struct
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-try:
-    import cv2
-
-    _CV2_AVAILABLE = True
-except Exception:
-    cv2 = None
-    _CV2_AVAILABLE = False
 
 DM_DEFAULT_HEIGHT = 11
 DICT_INFO_STRUCT = struct.Struct("<hhi")
@@ -37,7 +32,8 @@ _COLOR_PART_RE = re.compile(
 )
 
 _CACHE_LOCK = threading.RLock()
-_DICT_CACHE: Dict[str, Tuple[Tuple[int, int, int], "DictLibrary"]] = {}
+MAX_DICT_CACHE_LIBRARIES = 128
+_DICT_CACHE: OrderedDict[str, Tuple[Tuple[int, int, int], "DictLibrary"]] = OrderedDict()
 
 
 @dataclass(frozen=True)
@@ -75,6 +71,8 @@ class GlyphHit:
     w: int
     h: int
     score: float
+    scale: float = 1.0
+    match_score: float = -1.0
 
 
 def _hex_nibble(char: str) -> int:
@@ -94,9 +92,9 @@ def _is_hex(text: str) -> bool:
 
 def _decode_wchar_name(raw: bytes) -> str:
     try:
-        return raw.decode("utf-16-le", errors="ignore").split("\x00", 1)[0].strip()
-    except Exception:
-        return ""
+        return raw.decode("utf-16-le").split("\x00", 1)[0].strip()
+    except UnicodeDecodeError:
+        raise ValueError("OP 字库名称编码无效") from None
 
 
 def _bits_from_hex_msb(hex_text: str) -> List[int]:
@@ -154,11 +152,7 @@ def _choose_dm_height(total_bits: int, declared_height: int) -> int:
 
     if _valid(declared_height):
         return declared_height
-    if _valid(DM_DEFAULT_HEIGHT):
-        return DM_DEFAULT_HEIGHT
-    if 1 <= declared_height <= 255:
-        return declared_height
-    return DM_DEFAULT_HEIGHT
+    return 0
 
 
 def _make_glyph(text: str, bitmap: np.ndarray, bit_count: int = 0) -> Optional[Glyph]:
@@ -266,20 +260,21 @@ def parse_text_dict_entry(line: str) -> Optional[Glyph]:
 
 
 def _read_text_lines(raw: bytes) -> List[str]:
-    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", "latin-1"):
-        try:
-            return raw.decode(encoding).splitlines()
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("latin-1", errors="ignore").splitlines()
+    try:
+        return raw.decode("utf-8-sig").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError("字库文本必须使用 UTF-8 编码") from None
 
 
 def parse_text_dict_bytes(raw: bytes) -> List[Glyph]:
     glyphs: List[Glyph] = []
-    for line in _read_text_lines(raw):
+    for line_number, line in enumerate(_read_text_lines(raw), start=1):
+        if not line.strip() or line.strip().startswith(("#", "//")):
+            continue
         glyph = parse_text_dict_entry(line)
-        if glyph is not None:
-            glyphs.append(glyph)
+        if glyph is None:
+            raise ValueError(f"字库第 {line_number} 行格式无效")
+        glyphs.append(glyph)
     return glyphs
 
 
@@ -362,7 +357,7 @@ def parse_dict_bytes(raw: bytes, path: str = "") -> DictLibrary:
     if _is_op_binary_dict(raw):
         glyphs = parse_op_binary_dict(raw)
         format_name = "op_binary"
-    if not glyphs:
+    else:
         glyphs = parse_text_dict_bytes(raw)
         if glyphs:
             sample = raw.find(b"$")
@@ -642,7 +637,10 @@ def sort_glyphs_reading_order(items: Sequence[ExtractedGlyph]) -> List[Extracted
 
 
 def write_dict_text_file(path: str, glyphs: Sequence[Glyph], *, append: bool = True, fmt: str = "damo") -> int:
-    encoder = encode_op_text_entry if str(fmt).lower() in {"op", "op_text"} else encode_dm_text_entry
+    encoders = {"op": encode_op_text_entry, "damo": encode_dm_text_entry}
+    if fmt not in encoders:
+        raise ValueError("字库格式必须为大漠（damo）或 OP（op）")
+    encoder = encoders[fmt]
     lines = []
     existing = set()
     if append and os.path.isfile(path):
@@ -683,8 +681,6 @@ def resolve_dict_path(raw_path: str) -> Optional[str]:
     text = (unwrap_resource_path(raw_path) or "").strip().strip('"')
     if not text:
         return None
-    if os.path.isfile(text):
-        return os.path.abspath(text)
     located = resolve_resource_path(text, enforce_jail=False)
     if located and str(located).startswith("memory://"):
         return located
@@ -697,6 +693,8 @@ def load_dict_library(raw_path: str) -> DictLibrary:
     from task_workflow.script_resources import read_resource_bytes
 
     path = resolve_dict_path(raw_path)
+    if not path:
+        raise FileNotFoundError(f"找不到字库文件: {raw_path}")
     raw = b""
     cache_key = ""
     fingerprint = (0, 0, 0)
@@ -707,25 +705,31 @@ def load_dict_library(raw_path: str) -> DictLibrary:
         with _CACHE_LOCK:
             cached = _DICT_CACHE.get(cache_key)
             if cached and cached[0] == fingerprint:
+                _DICT_CACHE.move_to_end(cache_key)
                 return cached[1]
         with open(path, "rb") as handle:
             raw = handle.read()
     else:
-        raw = read_resource_bytes(raw_path) or b""
+        if not path.startswith("memory://"):
+            raise FileNotFoundError(f"找不到字库文件: {raw_path}")
+        raw = read_resource_bytes(path)
         if not raw:
             raise FileNotFoundError(f"找不到字库文件: {raw_path}")
-        cache_key = str(path or raw_path or "memory://dict")
-        fingerprint = (0, len(raw), int.from_bytes(raw[:8], "little", signed=False) if raw else 0)
+        cache_key = path
+        fingerprint = (0, len(raw), int.from_bytes(hashlib.sha256(raw).digest(), "big"))
         with _CACHE_LOCK:
             cached = _DICT_CACHE.get(cache_key)
             if cached and cached[0] == fingerprint:
+                _DICT_CACHE.move_to_end(cache_key)
                 return cached[1]
-        path = str(path or raw_path or "").strip() or "memory://dict"
     library = parse_dict_bytes(raw, path=path)
     if not library.glyphs:
         raise ValueError(f"字库为空或格式无法识别: {path}")
     with _CACHE_LOCK:
         _DICT_CACHE[cache_key] = (fingerprint, library)
+        _DICT_CACHE.move_to_end(cache_key)
+        while len(_DICT_CACHE) > MAX_DICT_CACHE_LIBRARIES:
+            _DICT_CACHE.popitem(last=False)
     logger.info("[字库OCR] 已加载 %s，共 %s 个字形，格式=%s", path, len(library), library.format_name)
     return library
 
@@ -777,42 +781,82 @@ def binarize_image(image: np.ndarray, color_format: str = "") -> np.ndarray:
         return mask.astype(np.uint8)
 
     if image.ndim == 3:
-        if _CV2_AVAILABLE:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = (
-                0.114 * image[:, :, 0]
-                + 0.587 * image[:, :, 1]
-                + 0.299 * image[:, :, 2]
-            ).astype(np.uint8)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image
-    if _CV2_AVAILABLE:
-        _, binary = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    else:
-        threshold = int(np.mean(gray))
-        binary = (gray > threshold).astype(np.uint8)
+    _, binary = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     if int(binary.sum()) > binary.size // 2:
         binary = 1 - binary
     return binary.astype(np.uint8)
 
 
-def _match_scores(binary: np.ndarray, glyph: Glyph) -> Optional[np.ndarray]:
-    height, width = binary.shape[:2]
-    if height < glyph.height or width < glyph.width:
-        return None
-    if _CV2_AVAILABLE:
-        scores = cv2.matchTemplate(
-            binary.astype(np.float32),
-            glyph.bitmap.astype(np.float32),
-            cv2.TM_CCORR,
-        )
-        return scores / float(max(glyph.bit_count, 1))
+_MAX_GLYPH_PEAKS = 64
 
-    ones = glyph.bitmap.astype(np.float32)
-    window = np.lib.stride_tricks.sliding_window_view(binary.astype(np.float32), ones.shape)
-    hits = np.einsum("ijkl,kl->ij", window, ones)
-    return hits / float(max(glyph.bit_count, 1))
+
+def _scaled_glyph_bitmap(glyph: Glyph, scale: float) -> Optional[np.ndarray]:
+    """按截图中的实际字形比例生成匹配模板。"""
+    safe_scale = float(scale)
+    if not np.isfinite(safe_scale) or safe_scale <= 0:
+        return None
+    if abs(safe_scale - 1.0) < 1e-6:
+        return np.where(glyph.bitmap > 0, np.uint8(1), np.uint8(0))
+    width = max(1, int(round(float(glyph.width) * safe_scale)))
+    height = max(1, int(round(float(glyph.height) * safe_scale)))
+    if width > 255 or height > 255:
+        return None
+    scaled = cv2.resize(
+        np.where(glyph.bitmap > 0, np.uint8(1), np.uint8(0)),
+        (width, height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    return np.where(scaled > 0, np.uint8(1), np.uint8(0))
+
+
+def _match_scores(
+    binary: np.ndarray,
+    glyph: Glyph,
+    scale: float = 1.0,
+) -> Optional[Tuple[np.ndarray, int, int, np.ndarray, np.ndarray]]:
+    height, width = binary.shape[:2]
+    template = _scaled_glyph_bitmap(glyph, scale)
+    if template is None:
+        return None
+    source = np.where(binary > 0, np.uint8(1), np.uint8(0))
+    template_h, template_w = template.shape[:2]
+    if height < template_h or width < template_w:
+        return None
+    # CCORR 只计算模板中的前景，较小字模可以在放大文字内部得到满分，
+    # 从而返回错误的左上角。归一化相关系数会同时比较字形轮廓和空白边缘。
+    # 全实心字模没有方差，CCOEFF 对它定义为 0，此时保留归一化相关匹配。
+    method = cv2.TM_CCORR_NORMED if np.all(template == template.flat[0]) else cv2.TM_CCOEFF_NORMED
+    scores = cv2.matchTemplate(source, template, method)
+    scores = np.nan_to_num(scores.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    foreground_count = max(int(np.count_nonzero(template)), 1)
+    coverage = cv2.matchTemplate(source, template, cv2.TM_CCORR).astype(np.float32)
+    coverage /= float(foreground_count)
+    coverage = np.clip(coverage, 0.0, 1.0)
+    return scores, int(template_w), int(template_h), template, coverage
+
+
+def _peak_positions(scores: np.ndarray, glyph: Glyph, threshold: float) -> List[Tuple[int, int, float]]:
+    mask = scores >= threshold
+    if not np.any(mask):
+        return []
+    kernel_h = max(1, int(glyph.height) | 1)
+    kernel_w = max(1, int(glyph.width) | 1)
+    dilated = cv2.dilate(scores, np.ones((kernel_h, kernel_w), np.uint8))
+    peak_mask = mask & (scores + 1e-6 >= dilated)
+    rows, cols = np.where(peak_mask)
+    if rows.size == 0:
+        return []
+    values = scores[rows, cols]
+    if rows.size > _MAX_GLYPH_PEAKS:
+        keep = np.argpartition(values, -_MAX_GLYPH_PEAKS)[-_MAX_GLYPH_PEAKS:]
+        rows = rows[keep]
+        cols = cols[keep]
+        values = values[keep]
+    order = np.argsort(-values)
+    return [(int(rows[index]), int(cols[index]), float(values[index])) for index in order]
 
 
 def find_glyph_hits(
@@ -826,33 +870,73 @@ def find_glyph_hits(
         wanted = {str(item) for item in texts if str(item)}
     hits: List[GlyphHit] = []
     threshold = min(1.0, max(0.1, float(similarity)))
+    # WGC/桌面合成可能按 DPI 对字形做非整数缩放；字库和截图不再要求像素级同高。
+    # 先尝试原尺寸，只有原尺寸没有命中时才尝试缩放模板，避免正常场景增加开销和误报。
+    scale_candidates = (0.75, 0.8, 0.9, 1.1, 1.2, 1.25, 1.333333, 1.5, 1.75, 2.0)
     for glyph in library.glyphs:
         if wanted is not None and glyph.text not in wanted:
             continue
-        scores = _match_scores(binary, glyph)
-        if scores is None:
-            continue
-        rows, cols = np.where(scores >= threshold)
-        if rows.size == 0:
-            continue
-        for row, col in zip(rows.tolist(), cols.tolist()):
-            hits.append(
-                GlyphHit(
-                    text=glyph.text,
-                    x=int(col),
-                    y=int(row),
-                    w=glyph.width,
-                    h=glyph.height,
-                    score=float(scores[row, col]),
-                )
+        match_variants = [(1.0, _match_scores(binary, glyph, 1.0))]
+        native_match = match_variants[0][1]
+        native_has_hit = False
+        if native_match is not None:
+            native_scores, native_w, native_h, native_template, _native_coverage = native_match
+            native_glyph = Glyph(
+                glyph.text,
+                native_w,
+                native_h,
+                int(np.count_nonzero(native_template)),
+                native_template,
             )
+            native_has_hit = bool(_peak_positions(native_scores, native_glyph, threshold))
+        if not native_has_hit:
+            match_variants.extend((scale, _match_scores(binary, glyph, scale)) for scale in scale_candidates)
+        for scale, matched in match_variants:
+            if matched is None:
+                continue
+            scores, matched_w, matched_h, matched_template, coverage = matched
+            matched_glyph = Glyph(
+                glyph.text,
+                matched_w,
+                matched_h,
+                int(np.count_nonzero(matched_template)),
+                matched_template,
+            )
+            for row, col, match_score in _peak_positions(scores, matched_glyph, threshold):
+                # 对外置信度保持字模前景覆盖率的语义。轮廓相关分数只用于
+                # 判断位置是否可靠，避免 DPI/抗锯齿差异把完整字形显示成 0.926。
+                score = float(np.clip(coverage[row, col], 0.0, 1.0))
+                if score >= 1.0 - 1e-6:
+                    score = 1.0
+                hits.append(
+                    GlyphHit(
+                        text=glyph.text,
+                        x=int(col),
+                        y=int(row),
+                        w=matched_w,
+                        h=matched_h,
+                        score=score,
+                        scale=float(scale),
+                        match_score=float(match_score),
+                    )
+                )
     return hits
 
 
 def _nms_hits(hits: Sequence[GlyphHit], overlap: float = 0.35) -> List[GlyphHit]:
     if not hits:
         return []
-    ordered = sorted(hits, key=lambda item: (-item.score, -(item.w * item.h), item.y, item.x))
+    # 不同 DPI 模板在同一个字形内可能都得到接近 1 的分数；按定位分数排序，
+    # 再保留覆盖范围更大的模板，避免把实际字形缩小框中的局部当成识别结果。
+    ordered = sorted(
+        hits,
+        key=lambda item: (
+            -round(float(item.match_score if item.match_score >= 0 else item.score), 2),
+            -(item.w * item.h),
+            item.y,
+            item.x,
+        ),
+    )
     kept: List[GlyphHit] = []
     for hit in ordered:
         blocked = False
@@ -872,8 +956,8 @@ def _nms_hits(hits: Sequence[GlyphHit], overlap: float = 0.35) -> List[GlyphHit]
     return kept
 
 
-def _bbox(x1: int, y1: int, x2: int, y2: int) -> List[List[int]]:
-    return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+def _bbox(x1: int, y1: int, x2: int, y2: int) -> List[int]:
+    return [x1, y1, x2, y1, x2, y2, x1, y2]
 
 
 def group_hits_as_lines(hits: Sequence[GlyphHit]) -> List[Dict[str, object]]:

@@ -1,3 +1,4 @@
+import datetime
 import os
 import sys
 
@@ -223,6 +224,13 @@ def get_logs_dir(app_name: str = "LCA") -> str:
     if slot <= 1:
         return _ensure_dir(os.path.join(get_user_data_dir(app_name), "logs"))
     return _ensure_dir(os.path.join(get_user_data_dir(app_name), "logs", f"instance-{slot}"))
+
+
+def get_system_log_path(app_name: str = "LCA") -> str:
+    return os.path.join(
+        get_logs_dir(app_name),
+        f"system_{datetime.date.today():%Y%m%d}.log",
+    )
 
 
 def get_runtime_data_dir(app_name: str = "LCA") -> str:

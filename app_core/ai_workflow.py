@@ -215,10 +215,6 @@ def build_workflow_from_proposal(
     if not isinstance(source_workflow, Mapping) or isinstance(source_workflow, (str, bytes)):
         raise ValueError("工作流数据不是字典")
     base = copy.deepcopy(dict(source_workflow))
-    if not isinstance(base.get("cards"), list):
-        base["cards"] = []
-    if not isinstance(base.get("connections"), list):
-        base["connections"] = []
     return apply_workflow_ops(base, ops, known_task_types=known_task_types)
 
 
@@ -450,10 +446,13 @@ def apply_editor_workflow(
     proposal_text: str,
     *,
     source_workflow: Optional[Mapping[str, Any]] = None,
+    mode: str = "replace",
 ) -> Dict[str, Any]:
-    """Validate ops against the live canvas or an uploaded workflow, then load the result."""
+    """Replace the canvas with the proposal result, or append an independent copy."""
     from app_core.ai_assistant import _current_editor_view
 
+    if mode not in {"replace", "append"}:
+        raise ValueError(f"工作流应用方式无效：{mode}")
     ops = parse_workflow_proposal(proposal_text)
     view, _task = _current_editor_view(main_window)
     serialize = getattr(view, "serialize_workflow", None)
@@ -469,28 +468,40 @@ def apply_editor_workflow(
     if not isinstance(modules, dict) or not modules:
         raise RuntimeError("当前编辑器没有现行卡片目录")
 
-    _close_editor_overlays(main_window)
     try:
         current = serialize()
     except Exception as exc:
         raise RuntimeError(f"无法读取当前工作流：{exc}") from exc
     if not isinstance(current, dict):
         raise RuntimeError("当前工作流数据不是字典")
+    self_contained = source_workflow is None and _is_self_contained_proposal(ops, modules)
     if source_workflow is None:
-        base = current
+        base = copy.deepcopy(current)
+        # 自包含的生成方案拥有自己的编号空间，不把默认起点当成生成方案的卡片。
+        if self_contained:
+            base["cards"] = []
+            base["connections"] = []
     else:
         if not isinstance(source_workflow, Mapping) or isinstance(source_workflow, (str, bytes)):
             raise ValueError("上传的工作流数据不是字典")
         base = copy.deepcopy(dict(source_workflow))
-        if not isinstance(base.get("cards"), list):
-            base["cards"] = []
-        if not isinstance(base.get("connections"), list):
-            base["connections"] = []
 
-    prepared = bind_proposal_camera(
-        apply_workflow_ops(base, ops, known_task_types=modules.keys()),
-        current,
-    )
+    proposed = apply_workflow_ops(base, ops, known_task_types=modules.keys())
+    if mode == "append":
+        from app_core.ai_workflow_merge import append_workflow_result
+
+        card_ids = None
+        if source_workflow is None and not self_contained:
+            card_ids = _affected_proposal_card_ids(base, ops).intersection(
+                card["id"] for card in proposed["cards"]
+            )
+        prepared = append_workflow_result(
+            current, proposed, task_modules=modules, card_ids=card_ids,
+        )
+        _validate_result_workflow(prepared, set(modules))
+    else:
+        prepared = bind_proposal_camera(proposed, current)
+    _close_editor_overlays(main_window)
     try:
         load(prepared)
     except Exception as exc:
@@ -513,3 +524,39 @@ def apply_editor_workflow(
         "cards": len(prepared.get("cards") or []),
         "connections": len(prepared.get("connections") or []),
     }
+
+
+def _is_self_contained_proposal(
+    ops: Sequence[Mapping[str, Any]], modules: Mapping[str, Any],
+) -> bool:
+    added_ids: Set[int] = set()
+    for item in ops:
+        if item["op"] == "add_card":
+            added_ids.add(item["id"])
+        elif "id" in item and item["id"] not in added_ids:
+            return False
+        if "start_card_id" in item and (
+            item["start_card_id"] not in added_ids or item["end_card_id"] not in added_ids
+        ):
+            return False
+    if not added_ids:
+        return False
+    from app_core.ai_workflow_merge import is_self_contained_card_references
+
+    return is_self_contained_card_references(ops, task_modules=modules)
+
+
+def _affected_proposal_card_ids(
+    base: Mapping[str, Any], ops: Sequence[Mapping[str, Any]],
+) -> Set[int]:
+    affected: Set[int] = set()
+    for item in ops:
+        if "id" in item:
+            affected.add(item["id"])
+        if "start_card_id" in item:
+            affected.update((item["start_card_id"], item["end_card_id"]))
+        if item["op"] == "remove_card":
+            for connection in base["connections"]:
+                if item["id"] in (connection["start_card_id"], connection["end_card_id"]):
+                    affected.update((connection["start_card_id"], connection["end_card_id"]))
+    return affected

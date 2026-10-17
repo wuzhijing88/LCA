@@ -32,10 +32,9 @@ class MainWindowInitStateMixin:
         self.executor_thread: Optional[QThread] = None # Thread for execution
         self.executor: Optional[WorkflowExecutor] = None # Executor instance
         self.config = copy.deepcopy(initial_config) # Store initial config
-        self._global_settings_dialog = None
+        self.child_session_window = None
         self.enable_card_snap = self.config.get('enable_card_snap', True)
         self.enable_parameter_panel_snap = self.config.get('enable_parameter_panel_snap', True)
-        self.enable_floating_status_window = self.config.get('enable_floating_status_window', True)
         self.enable_connection_line_animation = self.config.get('enable_connection_line_animation', True)
         if hasattr(self, '_set_line_animation_paused'):
             self._set_line_animation_paused("user_setting", not self.enable_connection_line_animation)

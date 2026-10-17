@@ -74,13 +74,11 @@ def resolve_sub_workflow_path(
     logical_path = path_text.replace("\\", "/").lstrip("/")
     if session is not None and session.get_bytes(logical_path) is not None:
         return "memory://" + logical_path
-
-    existing = _existing_file(path_text)
-    if existing:
-        return existing
+    if session is not None and logical_path.startswith("workflows/subs/"):
+        return None
 
     if os.path.isabs(path_text):
-        return None
+        return _existing_file(path_text)
     base_dir = get_workflow_base_dir(parent_workflow_file)
     if not base_dir:
         return None

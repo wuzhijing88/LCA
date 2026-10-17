@@ -14,6 +14,8 @@ _DICTS_DIR: ContextVar[str] = ContextVar("lca_workflow_dicts_dir", default="")
 _YOLO_DIR: ContextVar[str] = ContextVar("lca_workflow_yolo_dir", default="")
 _REPLAYS_DIR: ContextVar[str] = ContextVar("lca_workflow_replays_dir", default="")
 _PLUGINS_DIR: ContextVar[str] = ContextVar("lca_workflow_plugins_dir", default="")
+_PACKAGE_SESSION: ContextVar[Any] = ContextVar("lca_workflow_package_session", default=None)
+_PACKAGE_SESSION_UNSET = object()
 
 RESOURCE_DIR_KEYS = (
     "images_dir",
@@ -161,6 +163,11 @@ def current_resource_dirs() -> Dict[str, str]:
     }
 
 
+def current_package_session() -> Any:
+    """返回当前工作流绑定的工程包会话。"""
+    return _PACKAGE_SESSION.get()
+
+
 def resource_dirs_from_mapping(source: Any = None) -> Dict[str, str]:
     if isinstance(source, Mapping):
         return {key: _text(source.get(key)) for key in RESOURCE_DIR_KEYS}
@@ -177,7 +184,13 @@ def workflow_resource_scope(
     yolo_dir: str = "",
     replays_dir: str = "",
     plugins_dir: str = "",
+    package_session: Any = _PACKAGE_SESSION_UNSET,
 ) -> Iterator[None]:
+    session_value = (
+        _PACKAGE_SESSION.get()
+        if package_session is _PACKAGE_SESSION_UNSET
+        else package_session
+    )
     tokens = (
         _IMAGES_DIR.set(_text(images_dir)),
         _SOUNDS_DIR.set(_text(sounds_dir)),
@@ -185,6 +198,7 @@ def workflow_resource_scope(
         _YOLO_DIR.set(_text(yolo_dir)),
         _REPLAYS_DIR.set(_text(replays_dir)),
         _PLUGINS_DIR.set(_text(plugins_dir)),
+        _PACKAGE_SESSION.set(session_value),
     )
     try:
         yield
@@ -195,3 +209,4 @@ def workflow_resource_scope(
         _YOLO_DIR.reset(tokens[3])
         _REPLAYS_DIR.reset(tokens[4])
         _PLUGINS_DIR.reset(tokens[5])
+        _PACKAGE_SESSION.reset(tokens[6])

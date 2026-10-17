@@ -10,6 +10,10 @@ class MainWindowExecutorCleanupMixin:
         logging.info("_cleanup_references: QThread finished signal received. Clearing executor and thread references.")
         executor_ref = getattr(self, 'executor', None)
         thread_ref = getattr(self, 'executor_thread', None)
+        signal_source = self.sender()
+        if signal_source is not None and signal_source is not thread_ref:
+            logging.debug("忽略历史执行句柄的完成信号，保留当前执行器。")
+            return
         # 幂等保护：重复进入时直接返回，避免重复断连/重复日志噪音
         if executor_ref is None and thread_ref is None:
             logging.debug("_cleanup_references: already cleaned, skip duplicate call.")
@@ -30,9 +34,7 @@ class MainWindowExecutorCleanupMixin:
                 ('show_warning', self._show_warning_dialog),
                 ('step_log', self._forward_step_log),
             ):
-                signal_obj = getattr(executor_ref, signal_name, None)
-                if signal_obj is None:
-                    continue
+                signal_obj = getattr(executor_ref, signal_name)
                 try:
                     # PySide6 在未连接时可能抛 RuntimeWarning 而不是异常
                     with warnings.catch_warnings():
@@ -43,8 +45,7 @@ class MainWindowExecutorCleanupMixin:
                     pass
             try:
                 # 调用deleteLater确保对象被正确清理
-                if hasattr(executor_ref, 'deleteLater'):
-                    executor_ref.deleteLater()
+                executor_ref.deleteLater()
             except (RuntimeError, AttributeError) as e:
                 logging.warning(f"_cleanup_references: Error calling deleteLater on executor: {e}")
         self.executor = None
@@ -79,15 +80,12 @@ class MainWindowExecutorCleanupMixin:
             ("param_updated", self._handle_param_updated),
         ):
             try:
-                signal_obj = getattr(task, signal_name, None)
-                if signal_obj is not None:
-                    signal_obj.disconnect(handler)
+                getattr(task, signal_name).disconnect(handler)
             except (TypeError, RuntimeError):
                 pass
         if binding.get("step_log_connected", False):
             try:
-                if hasattr(task, "step_log"):
-                    task.step_log.disconnect(self._forward_step_log)
+                task.step_log.disconnect(self._forward_step_log)
             except (TypeError, RuntimeError):
                 pass
     def _shutdown_executor_on_close(self, timeout_ms: int = 3000) -> bool:
@@ -95,14 +93,13 @@ class MainWindowExecutorCleanupMixin:
         thread_ref = getattr(self, 'executor_thread', None)
         executor_ref = getattr(self, 'executor', None)
         try:
-            if executor_ref is not None and hasattr(executor_ref, 'request_stop'):
-                try:
-                    executor_ref.request_stop(force=True)
-                except TypeError:
-                    executor_ref.request_stop()
+            if executor_ref is not None:
+                executor_ref.request_stop(force=True)
         except Exception as e:
             logger.warning(f"关闭前请求执行器停止失败: {e}")
         if thread_ref is None:
+            if executor_ref is not None:
+                executor_ref.deleteLater()
             self.executor = None
             self._active_execution_task_id = None
             return True
@@ -122,11 +119,9 @@ class MainWindowExecutorCleanupMixin:
         except Exception as e:
             logger.error(f"关闭前等待执行线程失败: {e}")
             return False
-        finally:
-            try:
-                thread_ref.deleteLater()
-            except Exception:
-                pass
+        thread_ref.deleteLater()
+        if executor_ref is not None:
+            executor_ref.deleteLater()
         self.executor_thread = None
         self.executor = None
         self._active_execution_task_id = None

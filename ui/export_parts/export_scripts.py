@@ -59,7 +59,9 @@ def workspace_dirs_from_main(main: Any) -> List[str]:
         # 面板已创建但从未 show_favorites：主动从磁盘同步一次
         if (not raw) and hasattr(panel, "_sync_workspace_favorites_snapshot"):
             try:
-                workspaces, _favorites, _changed = panel._sync_workspace_favorites_snapshot()
+                workspaces, _favorites, _changed = panel._sync_workspace_favorites_snapshot(
+                    rebuild=False,
+                )
                 raw = workspaces
             except Exception:
                 raw = getattr(panel, "_favorite_workspaces", None)
@@ -79,7 +81,11 @@ def workspace_dirs_from_main(main: Any) -> List[str]:
         if not config_path:
             config_path = str(get_favorites_path() or "")
         if config_path and os.path.exists(config_path):
-            workspaces, *_rest = load_workspace_favorites_snapshot(config_path)
+            # 这里只需要工作区根目录；启动和窗口状态检查不能为此解包整个工作区。
+            workspaces, *_rest = load_workspace_favorites_snapshot(
+                config_path,
+                rebuild=False,
+            )
             return _normalize_workspace_dir_list(workspaces)
     except Exception:
         pass

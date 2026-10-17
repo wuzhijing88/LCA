@@ -1,19 +1,15 @@
 import logging
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QDialog,
-    QHBoxLayout,
-    QLabel,
     QMessageBox,
-    QPushButton,
     QSystemTrayIcon,
-    QVBoxLayout,
 )
 
+from themes import apply_rounded_popup
+from ui.dialogs.close_behavior_dialog import CloseBehaviorDialog
 from utils.window.window_coordinate_common import center_window_on_widget_screen
 from utils.window.window_activation_utils import show_and_activate_overlay
 
@@ -23,7 +19,7 @@ logger = logging.getLogger(__name__)
 class MainWindowCloseMixin:
     @Slot()
     def restore_main_window(self) -> None:
-        """统一恢复主窗口，兼容托盘和悬浮窗入口。"""
+        """统一从托盘恢复主窗口。"""
         try:
             current_state = self.windowState()
             if current_state & Qt.WindowState.WindowMinimized:
@@ -33,41 +29,43 @@ class MainWindowCloseMixin:
             logger.error(f"恢复主窗口失败: {exc}", exc_info=True)
     def closeEvent(self, event: QCloseEvent) -> None:
         """处理窗口关闭事件 - 立即关闭UI，后台清理资源"""
+        cancel_startup_load = getattr(self, "_cancel_startup_workflow_load", None)
+        if callable(cancel_startup_load):
+            cancel_startup_load()
         # 关闭行为选择：最小化到托盘 or 退出程序（可记住选择）
-        try:
-            config = getattr(self, "config", {}) or {}
-        except Exception:
-            config = {}
+        config = self.config
         remember_choice = getattr(self, "_close_behavior_remember", None)
         close_behavior = getattr(self, "_close_behavior", None)
         if remember_choice is None or close_behavior is None:
-            try:
-                remember_choice = bool(config.get("close_behavior_remember", False))
-                close_behavior = str(config.get("close_behavior", "ask"))
-            except Exception:
-                remember_choice = False
-                close_behavior = "ask"
-        try:
-            from utils.instance_runtime import create_app_settings
+            remember_choice = config["close_behavior_remember"]
+            close_behavior = config["close_behavior"]
+        from utils.instance_runtime import create_app_settings
 
-            settings = create_app_settings()
-            qs_remember = settings.value("close_behavior_remember", None)
-            qs_behavior = settings.value("close_behavior", None)
-            if qs_remember is not None:
-                remember_choice = bool(qs_remember in (True, "true", "1", 1))
-                if qs_behavior is not None:
-                    close_behavior = str(qs_behavior)
-        except Exception:
-            pass
+        settings = create_app_settings()
+        qs_remember = settings.value("close_behavior_remember", None)
+        qs_behavior = settings.value("close_behavior", None)
+        if qs_remember is not None:
+            # QSettings 跨进程读取布尔值时可能返回其原生字符串编码。
+            # 只允许 Qt 写出的 true/false，再通过类型接口读取，拒绝任意真值转换。
+            if type(qs_remember) is not bool and not (
+                type(qs_remember) is str and qs_remember in ("true", "false")
+            ):
+                raise ValueError("记住关闭方式的设置必须是布尔值")
+            remember_choice = settings.value("close_behavior_remember", type=bool)
+            if qs_behavior is not None:
+                close_behavior = qs_behavior
+        if type(remember_choice) is not bool:
+            raise ValueError("记住关闭方式的设置必须是布尔值")
+        if close_behavior not in ("ask", "tray", "exit"):
+            raise ValueError("关闭方式设置无效")
+        if getattr(self, "_exiting_after_child_session_logoff", False):
+            remember_choice = True
+            close_behavior = "exit"
         def _prepare_modal_popup(popup) -> None:
-            try:
-                popup.adjustSize()
-            except Exception:
-                pass
+            apply_rounded_popup(popup, frameless=False)
+            popup.adjustSize()
             center_window_on_widget_screen(popup, self)
         def _persist_close_choice(choice: str, remember: bool) -> None:
-            if not hasattr(self, "config") or self.config is None:
-                return
             if remember:
                 self._close_behavior = choice
                 self._close_behavior_remember = True
@@ -79,79 +77,57 @@ class MainWindowCloseMixin:
                 self._close_behavior_remember = False
                 self.config["close_behavior"] = "ask"
                 self.config["close_behavior_remember"] = False
-            if hasattr(self, "save_config_func") and callable(self.save_config_func):
-                try:
-                    self.save_config_func(self.config)
-                except Exception as exc:
-                    logger.debug("保存关闭行为失败: %s", exc)
-            try:
-                from utils.instance_runtime import create_app_settings
-
-                settings = create_app_settings()
-                settings.setValue("close_behavior", self.config.get("close_behavior", "ask"))
-                settings.setValue("close_behavior_remember", bool(self.config.get("close_behavior_remember", False)))
-            except Exception:
-                pass
+            self.save_config_func(self.config)
+            settings.setValue("close_behavior", self.config["close_behavior"])
+            settings.setValue("close_behavior_remember", self.config["close_behavior_remember"])
         def _minimize_to_tray() -> bool:
             if QSystemTrayIcon.isSystemTrayAvailable():
                 self.hide()
                 return True
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("系统托盘不可用")
-            msg_box.setText("当前系统托盘不可用，将直接退出程序。")
+            msg_box.setText("当前系统托盘不可用，无法最小化。请重新选择关闭方式。")
             msg_box.setIcon(QMessageBox.Icon.Information)
             msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
             _prepare_modal_popup(msg_box)
-            msg_box.exec()
+            try:
+                msg_box.exec()
+            finally:
+                msg_box.deleteLater()
             return False
         if remember_choice and close_behavior in ("tray", "exit"):
             if close_behavior == "tray":
                 if _minimize_to_tray():
                     event.ignore()
                     return
-                # 托盘不可用则清除记住状态并继续退出流程
+                # 托盘不可用时明确失败，清除选择并保留主窗口。
                 _persist_close_choice("ask", False)
+                event.ignore()
+                return
             else:
                 pass
         else:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("关闭程序")
-            dialog.setModal(True)
-            layout = QVBoxLayout(dialog)
-            layout.setContentsMargins(16, 16, 16, 16)
-            layout.setSpacing(10)
-            title_label = QLabel("请选择关闭方式：", dialog)
-            info_label = QLabel("最小化到托盘后程序仍在后台运行。", dialog)
-            remember_check = QCheckBox("记住选择", dialog)
-            layout.addWidget(title_label)
-            layout.addWidget(info_label)
-            layout.addWidget(remember_check)
-            button_layout = QHBoxLayout()
-            button_layout.addStretch()
-            tray_button = QPushButton("最小化到托盘", dialog)
-            exit_button = QPushButton("退出程序", dialog)
-            cancel_button = QPushButton("取消", dialog)
-            tray_button.clicked.connect(lambda: dialog.done(1))
-            exit_button.clicked.connect(lambda: dialog.done(2))
-            cancel_button.clicked.connect(lambda: dialog.done(0))
-            button_layout.addWidget(tray_button)
-            button_layout.addWidget(exit_button)
-            button_layout.addWidget(cancel_button)
-            layout.addLayout(button_layout)
+            dialog = CloseBehaviorDialog(self)
             _prepare_modal_popup(dialog)
-            result = dialog.exec()
+            try:
+                result = dialog.exec()
+                remember = dialog.remember_check.isChecked()
+            finally:
+                dialog.deleteLater()
             if result == 0:
                 event.ignore()
                 return
             if result == 1:
-                if remember_check.isChecked():
+                if remember:
                     _persist_close_choice("tray", True)
                 if _minimize_to_tray():
                     event.ignore()
                     return
-                # 托盘不可用则继续退出流程
+                _persist_close_choice("ask", False)
+                event.ignore()
+                return
             elif result == 2:
-                if remember_check.isChecked():
+                if remember:
                     _persist_close_choice("exit", True)
                 else:
                     _persist_close_choice("ask", False)
@@ -189,7 +165,10 @@ class MainWindowCloseMixin:
             msg_box.setEscapeButton(QMessageBox.StandardButton.Close)
             msg_box.button(QMessageBox.StandardButton.Close).hide()
             _prepare_modal_popup(msg_box)
-            reply = msg_box.exec()
+            try:
+                reply = msg_box.exec()
+            finally:
+                msg_box.deleteLater()
             if reply == QMessageBox.StandardButton.Save:
                 # 先同步所有工作流视图数据到任务对象
                 for task_id, workflow_view in self.workflow_tab_widget.task_views.items():
@@ -231,9 +210,34 @@ class MainWindowCloseMixin:
             self._timed_pause_resume_timer.stop()
             logger.info("已停止定时暂停恢复定时器")
         self._stop_main_schedule_clock()
+        child_session_window = getattr(self, "child_session_window", None)
+        if child_session_window is not None:
+            try:
+                waiting = child_session_window.request_close_after_logoff()
+            except Exception as exc:
+                logger.warning("关闭主窗口时注销桌面分身失败: %s", exc)
+                waiting = False
+            if waiting:
+                if not getattr(self, "_exiting_after_child_session_logoff", False):
+                    self._exiting_after_child_session_logoff = True
+                    child_session_window.destroyed.connect(
+                        lambda *_args: QTimer.singleShot(0, self.close)
+                    )
+                event.ignore()
+                return
+            try:
+                child_session_window.shutdown()
+            except Exception as exc:
+                logger.warning("关闭主窗口时释放桌面分身失败: %s", exc)
+            self.child_session_window = None
         # ========== 关闭前确定性回收（阻塞上限3秒） ==========
         if not self._shutdown_executor_on_close(timeout_ms=3000):
             logger.warning("关闭窗口时执行线程未在超时内退出")
+        execution_log_panel = getattr(self, "_execution_log_panel", None)
+        if execution_log_panel is not None:
+            execution_log_panel.cleanup()
+            execution_log_panel.deleteLater()
+            self._execution_log_panel = None
         logger.info("closeEvent: 接受关闭事件，UI立即退出，后台继续清理...")
         event.accept()
         # 显式调用 QApplication.quit()

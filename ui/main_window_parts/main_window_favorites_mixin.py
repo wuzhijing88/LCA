@@ -1,6 +1,9 @@
 import logging
 import os
+import time
 from typing import List
+
+from PySide6.QtCore import QTimer
 
 from task_workflow.workspace import (
     apply_updated_workflow_resource_dir,
@@ -13,6 +16,7 @@ from task_workflow.workspace import (
 )
 
 logger = logging.getLogger(__name__)
+startup_logger = logging.getLogger("workflow.startup")
 
 
 class MainWindowFavoritesMixin:
@@ -64,28 +68,136 @@ class MainWindowFavoritesMixin:
                 # 启动阶段强制与收藏勾选保持一致，避免混入最近工作流标签页
                 for tab_index in range(self.workflow_tab_widget.count() - 2, -1, -1):
                     self.workflow_tab_widget.close_tab_silent(tab_index)
-                first_task_id = None
-                for filepath in favorite_filepaths:
-                    task_id = self._open_workflow_reference(filepath, switch_to_tab=False)
-                    task = self.task_manager.get_task(task_id) if task_id is not None else None
-                    if first_task_id is None and task is not None:
-                        first_task_id = task_id
-                if first_task_id is not None:
-                    tab_index = self.workflow_tab_widget.task_to_tab.get(first_task_id)
-                    if tab_index is not None:
-                        self.workflow_tab_widget.setCurrentIndex(tab_index)
+                self._start_startup_workflow_load(favorite_filepaths, favorites=True)
+                return
             else:
-                self.workflow_tab_widget.auto_load_recent_workflows()
-            # 应用画布网格设置
-            grid_enabled = self.config.get('enable_canvas_grid', True)
-            self.workflow_tab_widget.set_all_grid_enabled(grid_enabled)
-            card_snap_enabled = self.config.get('enable_card_snap', True)
-            self.workflow_tab_widget.set_all_card_snap_enabled(card_snap_enabled)
-            if hasattr(self, 'parameter_panel') and self.parameter_panel:
-                self.parameter_panel.set_snap_to_parent_enabled(self.config.get('enable_parameter_panel_snap', True))
-            self._offer_workspace_if_missing()
+                recent_filepaths = self.workflow_tab_widget.load_recent_workflows()
+                self._start_startup_workflow_load(recent_filepaths, favorites=False)
         except Exception as e:
             logger.error(f"自动加载工作流时出错: {e}")
+            from PySide6.QtWidgets import QMessageBox
+
+            QMessageBox.critical(self, "自动加载失败", str(e))
+
+    def _start_startup_workflow_load(self, filepaths: List[str], *, favorites: bool) -> None:
+        """把启动工作流加载拆成多个事件循环片段，避免资源解包阻塞窗口消息。"""
+        queue = [str(filepath).strip() for filepath in filepaths if str(filepath).strip()]
+        if not queue:
+            self._finish_startup_workflow_load()
+            return
+
+        self._startup_workflow_load_queue = queue
+        self._startup_workflow_load_favorites = bool(favorites)
+        self._startup_workflow_load_total = len(queue)
+        self._startup_workflow_load_completed = 0
+        self._startup_workflow_load_first_task_id = None
+        self._startup_workflow_load_failed = []
+        self.workflow_tab_widget._is_auto_loading = True
+
+        timer = getattr(self, "_startup_workflow_load_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._load_next_startup_workflow)
+            self._startup_workflow_load_timer = timer
+        elif timer.isActive():
+            timer.stop()
+        startup_logger.info(
+            "启动工作流加载已分帧：数量=%s，来源=%s",
+            len(queue),
+            "收藏" if favorites else "最近记录",
+        )
+        timer.start(0)
+
+    def _load_next_startup_workflow(self) -> None:
+        queue = getattr(self, "_startup_workflow_load_queue", None)
+        if not queue:
+            self._finish_startup_workflow_load()
+            return
+
+        filepath = queue.pop(0)
+        index = getattr(self, "_startup_workflow_load_total", 0) - len(queue)
+        started_at = time.perf_counter()
+        task_id = None
+        try:
+            if getattr(self, "_startup_workflow_load_favorites", False):
+                task_id = self._open_workflow_reference(filepath, switch_to_tab=False)
+            else:
+                task_id = self.workflow_tab_widget.import_workflow(filepath, activate_tab=True)
+            if task_id is None:
+                self._startup_workflow_load_failed.append(filepath)
+            elif (
+                getattr(self, "_startup_workflow_load_favorites", False)
+                and getattr(self, "_startup_workflow_load_first_task_id", None) is None
+            ):
+                self._startup_workflow_load_first_task_id = task_id
+        except Exception as exc:
+            self._startup_workflow_load_failed.append(filepath)
+            logger.error("启动加载工作流失败: %s", filepath, exc_info=True)
+            self._startup_workflow_load_error = exc
+        finally:
+            self._startup_workflow_load_completed = index
+            elapsed = time.perf_counter() - started_at
+            startup_logger.info(
+                "启动工作流加载进度：%s/%s，耗时 %.3f 秒，文件=%s",
+                index,
+                getattr(self, "_startup_workflow_load_total", index),
+                elapsed,
+                filepath,
+            )
+
+        timer = getattr(self, "_startup_workflow_load_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        if queue:
+            if timer is not None:
+                timer.start(0)
+        else:
+            self._finish_startup_workflow_load()
+
+    def _finish_startup_workflow_load(self) -> None:
+        timer = getattr(self, "_startup_workflow_load_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+        workflow_tab_widget = getattr(self, "workflow_tab_widget", None)
+        if workflow_tab_widget is not None:
+            workflow_tab_widget._is_auto_loading = False
+
+        first_task_id = getattr(self, "_startup_workflow_load_first_task_id", None)
+        if first_task_id is not None and workflow_tab_widget is not None:
+            tab_index = workflow_tab_widget.task_to_tab.get(first_task_id)
+            if tab_index is not None:
+                workflow_tab_widget.setCurrentIndex(tab_index)
+
+        failed = list(getattr(self, "_startup_workflow_load_failed", []))
+        if failed:
+            logger.warning("启动工作流加载完成，但有 %s 个文件失败: %s", len(failed), failed)
+
+        # 应用画布网格设置
+        if workflow_tab_widget is not None:
+            workflow_tab_widget.set_all_grid_enabled(self.config.get('enable_canvas_grid', True))
+            workflow_tab_widget.set_all_card_snap_enabled(self.config.get('enable_card_snap', True))
+        if hasattr(self, 'parameter_panel') and self.parameter_panel:
+            self.parameter_panel.set_snap_to_parent_enabled(
+                self.config.get('enable_parameter_panel_snap', True)
+            )
+        self._offer_workspace_if_missing()
+        self._startup_workflow_load_queue = []
+
+    def _cancel_startup_workflow_load(self) -> None:
+        """关闭主窗口时停止尚未执行的启动加载计时器。"""
+        timer = getattr(self, "_startup_workflow_load_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+        workflow_tab_widget = getattr(self, "workflow_tab_widget", None)
+        if workflow_tab_widget is not None:
+            workflow_tab_widget._is_auto_loading = False
+        self._startup_workflow_load_queue = []
+
     def _load_checked_favorite_workflow_paths(self) -> List[str]:
         """读取收藏配置中勾选的工作流标识（去重后保持原顺序）。"""
         try:
@@ -93,7 +205,10 @@ class MainWindowFavoritesMixin:
             favorites_path = get_favorites_path()
             if not os.path.exists(favorites_path):
                 return []
-            workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(favorites_path)
+            workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(
+                favorites_path,
+                rebuild=False,
+            )
             if changed:
                 save_workspace_favorites_snapshot(
                     favorites_path,
@@ -193,7 +308,10 @@ class MainWindowFavoritesMixin:
             favorites_path = get_favorites_path()
             if not os.path.exists(favorites_path):
                 return False
-            workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(favorites_path)
+            workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(
+                favorites_path,
+                rebuild=False,
+            )
             if changed:
                 save_workspace_favorites_snapshot(
                     favorites_path,
@@ -260,6 +378,7 @@ class MainWindowFavoritesMixin:
             deactivate,
             get_active,
             get_active_path,
+            get_for_path,
             register,
         )
 
@@ -279,10 +398,25 @@ class MainWindowFavoritesMixin:
         if getattr(self, "workflow_tab_widget", None):
             current_id = self.workflow_tab_widget.get_current_task_id()
         should_activate = was_active or current_id == getattr(task, "task_id", None)
+        if str(filepath).startswith("memory://"):
+            session = get_for_path(old_path) if old_path else None
+            if session is None:
+                raise RuntimeError("子工作流工程会话未注册，无法刷新资源")
+            task.lca_session = session
+            tabs = getattr(self, "workflow_tab_widget", None)
+            if tabs is not None:
+                tabs._sync_host_package_session(task)
+            if should_activate:
+                activate(old_path)
+            return
         if is_lca_path(filepath) and os.path.isfile(filepath):
             try:
-                _payload, session = load_lca_project(filepath)
-                register(filepath, session)
+                session = get_for_path(filepath)
+                if session is None or not session.matches_source(filepath):
+                    if session is not None:
+                        clear_path(filepath)
+                    _payload, session = load_lca_project(filepath)
+                    register(filepath, session)
                 task.lca_session = session
                 task.lca_session_path = os.path.abspath(filepath)
                 if should_activate:

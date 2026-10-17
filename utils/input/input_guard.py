@@ -26,7 +26,6 @@ _GUARD_LOCAL = threading.local()
 _DEFAULT_INPUT_TASK_TYPES = {
     "模拟鼠标操作",
     "模拟键盘操作",
-    "图片点击",
     "录制回放",
 }
 

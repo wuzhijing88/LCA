@@ -439,7 +439,7 @@ end;
 
 function GetProgramRuntimeDirNames(): TArrayOfString;
 begin
-  SetArrayLength(Result, 54);
+  SetArrayLength(Result, 53);
   Result[0] := 'AutoHotkey';
   Result[1] := 'Interception';
   Result[2] := 'tools';
@@ -477,23 +477,22 @@ begin
   Result[34] := 'pynput';
   Result[35] := 'mss';
   Result[36] := 'dxcam';
-  Result[37] := 'pyperclip';
-  Result[38] := 'pyautogui';
-  Result[39] := 'pyscreeze';
-  Result[40] := 'pygetwindow';
-  Result[41] := 'pymsgbox';
-  Result[42] := 'pyrect';
-  Result[43] := 'pytweening';
-  Result[44] := 'win32';
-  Result[45] := 'win32com';
-  Result[46] := 'win32comext';
-  Result[47] := 'pythonwin';
-  Result[48] := 'pywin32_system32';
-  Result[49] := 'cffi';
-  Result[50] := 'pycparser';
-  Result[51] := 'coloredlogs';
-  Result[52] := 'humanfriendly';
-  Result[53] := 'packaging';
+  Result[37] := 'pyautogui';
+  Result[38] := 'pyscreeze';
+  Result[39] := 'pygetwindow';
+  Result[40] := 'pymsgbox';
+  Result[41] := 'pyrect';
+  Result[42] := 'pytweening';
+  Result[43] := 'win32';
+  Result[44] := 'win32com';
+  Result[45] := 'win32comext';
+  Result[46] := 'pythonwin';
+  Result[47] := 'pywin32_system32';
+  Result[48] := 'cffi';
+  Result[49] := 'pycparser';
+  Result[50] := 'coloredlogs';
+  Result[51] := 'humanfriendly';
+  Result[52] := 'packaging';
 end;
 
 procedure DeleteFilesByMask(const DirPath, Mask: String);

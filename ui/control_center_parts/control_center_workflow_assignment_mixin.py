@@ -4,12 +4,10 @@ import logging
 import os
 from typing import Any, Dict, List
 
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QMessageBox
 
 from app_core.control_plane import unwrap_assignment_record, wrap_assignment_record
-from app_core.lca_format.constants import LCA_FILE_FILTER
 from task_workflow.workflow_payload import load_workflow_file
-from utils.app_paths import get_workflows_dir
 
 logger = logging.getLogger(__name__)
 
@@ -25,13 +23,17 @@ def drop_assigned_workflow(workflows: List[Dict[str, Any]], index: int) -> List[
 
 class ControlCenterWorkflowAssignmentMixin:
     def _select_workflow_files(self, title: str):
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            title,
-            get_workflows_dir(),
-            LCA_FILE_FILTER
-        )
-        return file_paths
+        from task_workflow.workspace import load_workspace_favorites_snapshot
+        from .control_center_workspace_picker import pick_workspace_workflow_files
+
+        try:
+            config_path = self.parent_window.parameter_panel._favorites_config_path
+            _, favorites, _, _, _ = load_workspace_favorites_snapshot(config_path)
+            return pick_workspace_workflow_files(self, title, favorites)
+        except Exception as exc:
+            logger.error("读取工作区失败: %s", exc, exc_info=True)
+            QMessageBox.warning(self, "无法选择工作流", f"读取工作区失败：{exc}")
+            return []
 
     def _load_workflow_entries(self, file_paths: List[str]):
         workflow_entries: List[Dict[str, Any]] = []
@@ -271,45 +273,17 @@ class ControlCenterWorkflowAssignmentMixin:
 
 
     def _match_saved_window_id(self, saved_key: str) -> str:
-        key = str(saved_key or "").strip()
-        if not key:
-            return ""
-        scheduler = getattr(self, "scheduler", None)
-        if scheduler is not None:
-            resolved = scheduler.match_saved_key(key)
-            if resolved:
-                return resolved
-        for row, window_info in enumerate(self.sorted_windows):
-            bind_id = str(window_info.get("bind_id") or "").strip()
-            runtime_id = self._window_runtime_id(window_info, row)
-            if key in {bind_id, runtime_id}:
-                return runtime_id or key
-        return ""
+        return self.scheduler.match_saved_key(saved_key)
 
     def _persist_bound_window_identities(self):
         parent = getattr(self, "parent_window", None)
         if parent is None:
             return
-        store = getattr(parent, "_store_runtime_bound_windows_to_config", None)
-        if callable(store):
-            try:
-                store()
-            except Exception as e:
-                logger.warning("回写绑定窗口身份失败: %s", e)
-        config = getattr(parent, "config", None)
-        save_config_func = getattr(parent, "save_config_func", None)
-        if callable(save_config_func) and isinstance(config, dict):
-            try:
-                save_config_func(config)
-                return
-            except Exception as e:
-                logger.warning("保存绑定窗口身份失败: %s", e)
-        silent_save = getattr(parent, "_save_config_silent", None)
-        if callable(silent_save):
-            try:
-                silent_save()
-            except Exception as e:
-                logger.warning("静默保存绑定窗口身份失败: %s", e)
+        try:
+            parent._store_runtime_bound_windows_to_config()
+            parent.save_config_func(parent.config)
+        except Exception as e:
+            logger.warning("保存绑定窗口身份失败: %s", e)
 
     def _save_workflow_config(self):
         """保存工作流配置到临时文件"""
@@ -320,7 +294,9 @@ class ControlCenterWorkflowAssignmentMixin:
                 workflows = self.window_workflows.get(runtime_id)
                 if not workflows:
                     continue
-                persist_key = self._ensure_window_bind_id(window_info) or runtime_id
+                persist_key = self._ensure_window_bind_id(window_info)
+                if not persist_key:
+                    raise ValueError("窗口缺少绑定标识，无法保存工作流分配")
                 config_data[persist_key] = wrap_assignment_record(window_info, workflows)
 
             with open(self.temp_workflow_config_file, "w", encoding="utf-8") as f:
@@ -346,7 +322,9 @@ class ControlCenterWorkflowAssignmentMixin:
                 entry = loader(file_path, name=wf_info.get("name", ""))
                 if entry:
                     loaded.append(entry)
-                    continue
+                else:
+                    logger.warning("工作流不可用: %s", file_path)
+                continue
             if not file_path or not os.path.exists(file_path):
                 if file_path:
                     logger.warning(f"工作流文件不存在: {file_path}")

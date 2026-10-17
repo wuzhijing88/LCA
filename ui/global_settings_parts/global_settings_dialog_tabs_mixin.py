@@ -1,3 +1,5 @@
+import logging
+
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
@@ -39,6 +41,9 @@ from ..main_window_parts.main_window_support import (
     get_theme_color,
 )
 
+logger = logging.getLogger(__name__)
+
+
 def _about_label(text: str, *, color: str, size: int, weight: int = 400) -> QLabel:
     label = QLabel(text)
     label.setStyleSheet(
@@ -77,7 +82,13 @@ class GlobalSettingsDialogTabsMixin:
         # 窗口选择工具按钮
         self.batch_add_button = QPushButton("绑定工具")
         self.batch_add_button.setFixedWidth(100)
-        self.batch_add_button.setToolTip("点击后移动鼠标到需要绑定的窗口上\n第一次点击锁定窗口（黄色边框）\n第二次点击确认绑定\n右键取消锁定或退出")
+        self._bind_tool_tooltip = (
+            "点击后移动鼠标到需要绑定的窗口上\n"
+            "第一次点击锁定窗口（黄色边框）\n"
+            "第二次点击确认绑定\n"
+            "右键取消锁定或退出"
+        )
+        self.batch_add_button.setToolTip(self._bind_tool_tooltip)
         window_select_layout.addWidget(window_select_label)
         window_select_layout.addWidget(self.window_select_combo, 1)
         window_select_layout.addWidget(self.batch_add_button)
@@ -112,32 +123,47 @@ class GlobalSettingsDialogTabsMixin:
         self.canvas_grid_checkbox = QCheckBox("启用画布网格")
         self.canvas_grid_checkbox.setChecked(self.current_config.get('enable_canvas_grid', True))
         self.canvas_grid_checkbox.setToolTip("关闭后不显示网格，且不应用网格吸附")
-        self.floating_status_window_checkbox = QCheckBox("启用悬浮窗")
-        self.floating_status_window_checkbox.setChecked(self.current_config.get('enable_floating_status_window', True))
-        self.floating_status_window_checkbox.setToolTip("关闭后最小化主窗口时不再显示执行悬浮窗")
         self.connection_line_animation_checkbox = QCheckBox("启用连线动画")
         self.connection_line_animation_checkbox.setChecked(self.current_config.get('enable_connection_line_animation', True))
         self.connection_line_animation_checkbox.setToolTip("关闭后连线保持静态显示，不再播放流动动画")
+        self.execution_log_on_run_checkbox = QCheckBox("执行时显示日志框")
+        self.execution_log_on_run_checkbox.setChecked(self.current_config.get('enable_execution_log_on_run', True))
+        self.execution_log_on_run_checkbox.setToolTip("运行工作流时自动切换到日志框，停止后恢复主窗口")
+        self.confirm_partial_window_failure_checkbox = QCheckBox("窗口失效提示")
+        self.confirm_partial_window_failure_checkbox.setChecked(
+            self.current_config.get("confirm_partial_window_failure", True)
+        )
+        self.confirm_partial_window_failure_checkbox.setToolTip(
+            "关闭后，部分绑定窗口失效时自动继续并记录日志。\n"
+            "所有绑定窗口都失效时仍阻止启动。"
+        )
         card_snap_hint = QLabel("仅影响卡片与卡片对齐吸附")
-        card_snap_hint.setStyleSheet(f"color: {get_secondary_text_color()}; font-size: 9pt;")
         panel_snap_hint = QLabel("关闭后参数面板可独立拖动")
-        panel_snap_hint.setStyleSheet(f"color: {get_secondary_text_color()}; font-size: 9pt;")
         canvas_grid_hint = QLabel("关闭后不显示网格且不走网格吸附")
-        canvas_grid_hint.setStyleSheet(f"color: {get_secondary_text_color()}; font-size: 9pt;")
-        floating_status_window_hint = QLabel("关闭后不显示执行悬浮窗")
-        floating_status_window_hint.setStyleSheet(f"color: {get_secondary_text_color()}; font-size: 9pt;")
         connection_line_animation_hint = QLabel("关闭后连线静态显示，不再流动")
-        connection_line_animation_hint.setStyleSheet(f"color: {get_secondary_text_color()}; font-size: 9pt;")
+        execution_log_on_run_hint = QLabel("运行后自动显示，停止后恢复主窗口")
+        window_failure_hint = QLabel("部分窗口失效时询问是否继续")
+        for hint in (
+            card_snap_hint,
+            panel_snap_hint,
+            canvas_grid_hint,
+            connection_line_animation_hint,
+            execution_log_on_run_hint,
+            window_failure_hint,
+        ):
+            hint.setProperty("windowBehaviorHint", True)
         window_behavior_layout.addWidget(self.card_snap_checkbox, 0, 0)
         window_behavior_layout.addWidget(self.parameter_panel_snap_checkbox, 0, 1)
         window_behavior_layout.addWidget(self.canvas_grid_checkbox, 0, 2)
         window_behavior_layout.addWidget(card_snap_hint, 1, 0)
         window_behavior_layout.addWidget(panel_snap_hint, 1, 1)
         window_behavior_layout.addWidget(canvas_grid_hint, 1, 2)
-        window_behavior_layout.addWidget(self.floating_status_window_checkbox, 2, 0)
         window_behavior_layout.addWidget(self.connection_line_animation_checkbox, 2, 1)
-        window_behavior_layout.addWidget(floating_status_window_hint, 3, 0)
         window_behavior_layout.addWidget(connection_line_animation_hint, 3, 1)
+        window_behavior_layout.addWidget(self.execution_log_on_run_checkbox, 2, 0)
+        window_behavior_layout.addWidget(execution_log_on_run_hint, 3, 0)
+        window_behavior_layout.addWidget(self.confirm_partial_window_failure_checkbox, 2, 2)
+        window_behavior_layout.addWidget(window_failure_hint, 3, 2)
         window_behavior_layout.setColumnStretch(0, 1)
         window_behavior_layout.setColumnStretch(1, 1)
         window_behavior_layout.setColumnStretch(2, 1)
@@ -273,6 +299,43 @@ class GlobalSettingsDialogTabsMixin:
         mode_select_layout.addWidget(mode_label)
         mode_select_layout.addWidget(self.mode_combo)
         exec_mode_layout.addWidget(self.mode_select_widget)
+
+        self.background_options_widget = QWidget(self.exec_mode_group)
+        background_options_layout = QHBoxLayout(self.background_options_widget)
+        background_options_layout.setContentsMargins(86, 0, 0, 0)
+        background_options_layout.setSpacing(20)
+        self.background_hierarchy_broadcast_check = QCheckBox("层级广播", self.background_options_widget)
+        self.background_hierarchy_broadcast_check.setObjectName("background_hierarchy_broadcast_check")
+        self.background_hierarchy_broadcast_check.setChecked(
+            self.current_config.get("background_hierarchy_broadcast", False)
+        )
+        self.background_hierarchy_broadcast_check.setToolTip(
+            "勾选后沿主窗口到接收子窗口逐级发送键鼠消息；关闭时只发送绑定主窗口，不查询子窗口。"
+            "部分控件会自行向父窗口传递消息，开启广播可能重复响应。"
+        )
+        self.background_fake_active_check = QCheckBox("后台假激活", self.background_options_widget)
+        self.background_fake_active_check.setObjectName("background_fake_active_check")
+        self.background_fake_active_check.setChecked(
+            self.current_config.get("background_fake_active", False)
+        )
+        self.background_fake_active_check.setToolTip(
+            "勾选后在输入前模拟激活和焦点消息，动作结束或松开按键后解除；"
+            "关闭时不执行假激活或焦点关联。此选项不切换实际前台窗口。"
+        )
+        background_options_layout.addWidget(self.background_hierarchy_broadcast_check)
+        background_options_layout.addWidget(self.background_fake_active_check)
+        self.background_block_physical_mouse_check = QCheckBox("屏蔽物理鼠标", self.background_options_widget)
+        self.background_block_physical_mouse_check.setObjectName("background_block_physical_mouse_check")
+        self.background_block_physical_mouse_check.setChecked(
+            self.current_config.get("background_block_physical_mouse", False)
+        )
+        self.background_block_physical_mouse_check.setToolTip(
+            "后台输入期间屏蔽所有启用的绑定窗口及其子窗口的鼠标队列输入，保留窗口消息输入。"
+            "其他窗口和系统光标仍可正常操作；不屏蔽键盘，不支持直接读取设备的原始输入。"
+        )
+        background_options_layout.addWidget(self.background_block_physical_mouse_check)
+        background_options_layout.addStretch(1)
+        exec_mode_layout.addWidget(self.background_options_widget)
 
         self.native_input_panel = QWidget()
         self.input_backend_group = self.native_input_panel
@@ -494,7 +557,7 @@ class GlobalSettingsDialogTabsMixin:
         self.plugin_text_ime_check.setObjectName("plugin_text_ime_check")
         self.plugin_text_ime_check.setChecked(bool(self.current_config.get("plugin_text_ime", False)))
         self.plugin_text_ime_check.setToolTip(
-            "非 ASCII 文本用大漠 SendStringIme，绑定时附带 dx.public.input.ime。需要大漠付费功能。"
+            "开启后所有文字使用大漠 SendStringIme，绑定时附带 dx.public.input.ime；关闭时使用 SendString。输入法通道需要大漠付费功能，失败时直接报错。"
         )
 
         self.plugin_fake_active_check = QCheckBox("后台假激活", self)
@@ -504,11 +567,23 @@ class GlobalSettingsDialogTabsMixin:
             "绑定成功后调用 EnableFakeActive(1)，让窗口在非激活状态下也接受键鼠。"
         )
 
+        self.plugin_bind_auto_detect_check = QCheckBox("自动检测绑定参数", self)
+        self.plugin_bind_auto_detect_check.setObjectName("plugin_bind_auto_detect_check")
+        self.plugin_bind_auto_detect_check.setChecked(
+            bool(self.current_config.get("plugin_bind_auto_detect", True))
+        )
+        self.plugin_bind_auto_detect_check.setToolTip(
+            "勾选后立即生效，绑定工具会自动试各组大漠参数，不用点确定。\n"
+            "改过图色、鼠标、键盘或绑定模式会自动取消勾选，并立即按当前参数生效。\n"
+            "再勾选即可重新自动检测。"
+        )
+
         plugin_option_row = QWidget(self)
         plugin_option_row.setObjectName("plugin_option_row")
         plugin_option_layout = QHBoxLayout(plugin_option_row)
         plugin_option_layout.setContentsMargins(0, 0, 0, 0)
         plugin_option_layout.setSpacing(16)
+        plugin_option_layout.addWidget(self.plugin_bind_auto_detect_check)
         plugin_option_layout.addWidget(self.plugin_text_ime_check)
         plugin_option_layout.addWidget(self.plugin_fake_active_check)
         plugin_option_layout.addStretch(1)
@@ -557,6 +632,9 @@ class GlobalSettingsDialogTabsMixin:
         self.screenshot_engine_combo.currentIndexChanged.connect(self._on_screenshot_engine_changed)
         self._screenshot_engine_combo_ready = True
         self._sync_plugin_input_display_follow()
+        self._plugin_bind_params_ignore_edits = False
+        self._connect_plugin_bind_param_edit_watchers()
+        self.plugin_bind_auto_detect_check.toggled.connect(self._on_plugin_bind_auto_detect_toggled)
 
         exec_layout.addStretch(1)
 
@@ -603,35 +681,144 @@ class GlobalSettingsDialogTabsMixin:
             if hasattr(self, "plugin_bind_mode_combo"):
                 self.plugin_bind_mode_combo.setVisible(True)
             self._sync_plugin_input_display_follow()
+        self._sync_bind_tool_tooltip(use_plugin)
         if resize_dialog and self.isVisible():
-            QTimer.singleShot(0, self._adjust_dialog_height_only)
+            QTimer.singleShot(0, self, self._adjust_dialog_height_only)
 
     def _current_plugin_bind_kind(self) -> str:
-        from utils.plugin.bind_modes import PLUGIN_BIND_KIND_BASIC, normalize_plugin_bind_kind
+        from utils.plugin.bind_modes import normalize_plugin_bind_kind
 
-        if hasattr(self, "plugin_bind_kind_combo"):
-            try:
-                return normalize_plugin_bind_kind(self.plugin_bind_kind_combo.currentData())
-            except ValueError:
-                pass
-        return PLUGIN_BIND_KIND_BASIC
+        return normalize_plugin_bind_kind(self.plugin_bind_kind_combo.currentData())
 
     def _on_plugin_bind_kind_changed(self, *_args) -> None:
-        previous_kind = getattr(self, "_plugin_bind_kind_active", None)
-        if previous_kind:
-            self._remember_plugin_bind_kind_values(previous_kind)
-        kind = self._current_plugin_bind_kind()
-        preferred = getattr(self, "_plugin_bind_kind_values", {}).get(kind, {})
-        self._refresh_plugin_bind_param_combos(
-            preferred_mouse=preferred.get("mouse"),
-            preferred_keypad=preferred.get("keypad"),
-            preferred_display=preferred.get("display"),
-            preferred_mode=preferred.get("mode"),
-            preferred_shot=preferred.get("shot"),
-        )
-        self._plugin_bind_kind_active = kind
-        self._remember_plugin_bind_kind_values(kind)
-        self._sync_plugin_input_display_follow()
+        self._plugin_bind_params_ignore_edits = True
+        try:
+            previous_kind = getattr(self, "_plugin_bind_kind_active", None)
+            if previous_kind:
+                self._remember_plugin_bind_kind_values(previous_kind)
+            kind = self._current_plugin_bind_kind()
+            preferred = getattr(self, "_plugin_bind_kind_values", {}).get(kind, {})
+            self._refresh_plugin_bind_param_combos(
+                preferred_mouse=preferred.get("mouse"),
+                preferred_keypad=preferred.get("keypad"),
+                preferred_display=preferred.get("display"),
+                preferred_mode=preferred.get("mode"),
+                preferred_shot=preferred.get("shot"),
+            )
+            self._plugin_bind_kind_active = kind
+            self._remember_plugin_bind_kind_values(kind)
+            self._sync_plugin_input_display_follow()
+        finally:
+            self._plugin_bind_params_ignore_edits = False
+
+    def _connect_plugin_bind_param_edit_watchers(self) -> None:
+        for name in (
+            "plugin_bind_kind_combo",
+            "plugin_screenshot_engine_combo",
+            "plugin_input_display_combo",
+            "plugin_mouse_combo",
+            "plugin_keypad_combo",
+            "plugin_bind_mode_combo",
+        ):
+            combo = getattr(self, name, None)
+            if combo is None:
+                continue
+            combo.currentIndexChanged.connect(self._mark_plugin_bind_params_user_edited)
+
+    def _plugin_bind_auto_detect_enabled(self) -> bool:
+        check = getattr(self, "plugin_bind_auto_detect_check", None)
+        if check is None:
+            return True
+        return bool(check.isChecked())
+
+    def _on_plugin_bind_auto_detect_toggled(self, *_args) -> None:
+        if getattr(self, "_plugin_bind_params_ignore_edits", False):
+            return
+        self._persist_plugin_bind_live_settings(include_params=False)
+
+    def _mark_plugin_bind_params_user_edited(self, *_args) -> None:
+        if getattr(self, "_plugin_bind_params_ignore_edits", False):
+            return
+        check = getattr(self, "plugin_bind_auto_detect_check", None)
+        if check is not None and check.isChecked():
+            check.blockSignals(True)
+            try:
+                check.setChecked(False)
+            finally:
+                check.blockSignals(False)
+        self._persist_plugin_bind_live_settings(include_params=True)
+
+    def _plugin_bind_live_settings_patch(self, *, include_params: bool) -> dict:
+        patch = {"plugin_bind_auto_detect": self._plugin_bind_auto_detect_enabled()}
+        if not include_params:
+            return patch
+        settings = self.get_settings()
+        for key in (
+            "plugin_bind_kind",
+            "plugin_mouse",
+            "plugin_keypad",
+            "plugin_input_display",
+            "plugin_input_display_follow",
+            "plugin_bind_mode",
+            "screenshot_engine",
+            "plugin_public",
+            "plugin_text_ime",
+            "plugin_fake_active",
+        ):
+            patch[key] = settings[key]
+        return patch
+
+    def _persist_plugin_bind_live_settings(self, *, include_params: bool) -> None:
+        try:
+            patch = self._plugin_bind_live_settings_patch(include_params=include_params)
+        except Exception:
+            logger.warning("读取插件绑定参数失败，未即时保存", exc_info=True)
+            return
+        self.current_config.update(patch)
+        parent = self.parent()
+        parent_config = getattr(parent, "config", None) if parent is not None else None
+        previous = None
+        if isinstance(parent_config, dict):
+            from utils.plugin.settings_sync import plugin_settings_view
+
+            previous = plugin_settings_view(parent_config)
+            parent_config.update(patch)
+            target = parent_config
+        else:
+            from app_core.config_store import load_config
+
+            target = load_config()
+            target.update(patch)
+        try:
+            from app_core.config_store import save_config
+
+            save_config(target)
+        except Exception:
+            logger.warning("即时保存插件绑定参数失败", exc_info=True)
+            return
+        if (
+            include_params
+            and previous is not None
+            and hasattr(parent, "_sync_plugin_runtime_after_settings")
+        ):
+            try:
+                parent._sync_plugin_runtime_after_settings(previous)
+            except Exception:
+                logger.warning("即时同步插件运行时失败", exc_info=True)
+
+    def _sync_bind_tool_tooltip(self, use_plugin: bool) -> None:
+        button = getattr(self, "batch_add_button", None)
+        if button is None:
+            return
+        base = getattr(self, "_bind_tool_tooltip", "") or button.toolTip()
+        if use_plugin:
+            button.setToolTip(
+                base
+                + "\n插件模式下：勾选「自动检测绑定参数」时自动试绑定，勾选立即生效，不用点确定；"
+                "改过参数会取消勾选并立即按当前参数绑定。再勾选即可重新自动检测。"
+            )
+        else:
+            button.setToolTip(base)
 
     def _remember_plugin_bind_kind_values(self, kind: str) -> None:
         """Remember each BindWindow flavor independently while its controls are hidden."""
@@ -876,7 +1063,7 @@ class GlobalSettingsDialogTabsMixin:
         if getattr(self, "_wgc_desktop_warning_scheduled", False):
             return
         self._wgc_desktop_warning_scheduled = True
-        QTimer.singleShot(0, self._flush_wgc_desktop_engine_warning)
+        QTimer.singleShot(0, self, self._flush_wgc_desktop_engine_warning)
 
     def _flush_wgc_desktop_engine_warning(self) -> None:
         overlay = getattr(self, "window_picker_overlay", None)
@@ -888,7 +1075,7 @@ class GlobalSettingsDialogTabsMixin:
         if overlay_blocking or not self.isVisible():
             if retries < 20:
                 self._wgc_desktop_warning_retries = retries + 1
-                QTimer.singleShot(50, self._flush_wgc_desktop_engine_warning)
+                QTimer.singleShot(50, self, self._flush_wgc_desktop_engine_warning)
                 return
         self._wgc_desktop_warning_retries = 0
         self._wgc_desktop_warning_scheduled = False
@@ -1080,7 +1267,7 @@ class GlobalSettingsDialogTabsMixin:
         auth_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         plugin_hint = (
-            "插件运行库使用安装目录内 tools/plugin（PluginHost.exe / dm.dll / RegDll.dll）。"
+            "插件运行库使用安装目录内 tools/plugin（PluginHost.exe / dm.dll）。"
             "免注册加载不写 COM 注册表，但仍需注册码与附加码通过大漠授权验证；"
             "附加码对应大漠后台「您的附加码」，可空。"
         )
@@ -1226,24 +1413,44 @@ class GlobalSettingsDialogTabsMixin:
         self.about_copy_source_button.setFixedWidth(80)
         self.about_copy_source_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.about_copy_source_button.setToolTip("复制完整开源地址到剪贴板")
+        self.about_copy_source_button.setProperty("primary", True)
+        self.about_copy_source_button.style().unpolish(self.about_copy_source_button)
+        self.about_copy_source_button.style().polish(self.about_copy_source_button)
         self.about_copy_source_button.clicked.connect(self._copy_source_repository)
+        self.about_join_community_button = QPushButton("加入交流群")
+        self.about_join_community_button.setObjectName("aboutJoinCommunityButton")
+        self.about_join_community_button.setFixedWidth(80)
+        self.about_join_community_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.about_join_community_button.setToolTip("使用系统浏览器打开加群网页")
+        self.about_join_community_button.setProperty("primary", True)
+        self.about_join_community_button.style().unpolish(self.about_join_community_button)
+        self.about_join_community_button.style().polish(self.about_join_community_button)
+        self.about_join_community_button.clicked.connect(self._open_community_group)
         repo_layout.addWidget(self.about_source_label, 1)
         repo_layout.addWidget(self.about_open_source_button)
         repo_layout.addWidget(self.about_copy_source_button)
+        repo_layout.addWidget(self.about_join_community_button)
         about_layout.addWidget(repo_field)
 
         about_layout.addSpacing(16)
-        about_layout.addWidget(_about_label("许可证", color=secondary, size=11))
-        about_layout.addSpacing(4)
+        license_layout = QVBoxLayout()
+        license_layout.setContentsMargins(0, 0, 0, 0)
+        license_layout.setSpacing(0)
+        license_layout.addWidget(_about_label("许可证", color=secondary, size=11))
+        license_layout.addSpacing(4)
         self.about_license_label = _about_label(APP_LICENSE_NAME, color=text, size=12)
         self.about_license_label.setWordWrap(True)
-        about_layout.addWidget(self.about_license_label)
+        license_layout.addWidget(self.about_license_label)
 
         license_note = _about_label("对应源码通过上述仓库提供。", color=secondary, size=11)
         license_note.setContentsMargins(0, 4, 0, 0)
-        about_layout.addWidget(license_note)
+        license_layout.addWidget(license_note)
+        about_layout.addLayout(license_layout)
         about_layout.addStretch()
         self.tab_widget.addTab(about_tab, "关于")
+
+    def _open_community_group(self):
+        QDesktopServices.openUrl(QUrl("https://qm.qq.com/q/8n20EZ87bq"))
 
     def _open_source_repository(self):
         QDesktopServices.openUrl(QUrl(app_source_url()))
@@ -1260,4 +1467,4 @@ class GlobalSettingsDialogTabsMixin:
             except RuntimeError:
                 return
 
-        QTimer.singleShot(1500, restore)
+        QTimer.singleShot(1500, self, restore)

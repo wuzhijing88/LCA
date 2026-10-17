@@ -180,13 +180,14 @@ class BaseInputSimulator(ABC):
         """
     
     @abstractmethod
-    def send_text(self, text: str, stop_checker=None) -> bool:
+    def send_text(self, text: str, stop_checker=None, delay: Optional[float] = None) -> bool:
         """
         发送文本
         
         Args:
             text: 要发送的文本
             stop_checker: 停止检查函数，返回True表示需要停止
+            delay: 字符间隔秒数，None 使用后端默认间隔
             
         Returns:
             bool: 操作是否成功
@@ -360,4 +361,3 @@ class ElementNotFoundError(Exception):
 class InputSimulatorType:
     """输入模拟器类型枚举"""
     STANDARD_WINDOW = "standard_window"  # 普通窗口
-    EMULATOR_WINDOW = "emulator_window"  # 模拟器窗口

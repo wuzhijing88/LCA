@@ -43,6 +43,8 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
     IB_DRIVER_REVERSE_MAP = {v: k for k, v in IB_DRIVER_MAP.items()}
     def __init__(self, current_config: dict, parent=None):
         super().__init__(parent)
+        self._window_handle_subscription = None
+        self.destroyed.connect(lambda: self._release_window_handle_callbacks())
         self.setWindowTitle("全局设置")
         # 快捷键四列按键框默认 minWidth=140，窄于约 680 时右侧会被裁切
         self.setMinimumWidth(680)
@@ -55,8 +57,7 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         self.current_config = copy.deepcopy(dict(current_config or {}))
         self.bound_windows = self.current_config.get('bound_windows', [])  # 绑定的窗口列表
         if not isinstance(self.bound_windows, list):
-            self.bound_windows = []
-            self.current_config['bound_windows'] = self.bound_windows
+            raise ValueError("绑定窗口配置必须是列表")
         normalize_bound_windows_hwnds(self.bound_windows)
         self.window_binding_mode = self.current_config.get('window_binding_mode', 'single')  # 'single' 或 'multiple'
         # 调试：记录初始化时的绑定窗口信息
@@ -147,6 +148,21 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
     def _recenter_to_parent_screen(self) -> None:
         center_window_on_widget_screen(self, self.parentWidget())
 
+    def request_delete(self):
+        """试绑/授权线程仍在返回结果时保留信号桥，结束后统一释放。"""
+        from ui.dialogs.dialog_manager import retire_dialog
+
+        self._stop_plugin_bind_sweep()
+        bridge = getattr(self, "_plugin_auth_probe_bridge", None)
+        if bridge is not None:
+            bridge.finished.disconnect()
+        workers = (
+            getattr(self, "_plugin_bind_sweep_thread", None),
+            getattr(self, "_plugin_auth_probe_thread", None),
+            getattr(self, "_plugin_probe_discard_thread", None),
+        )
+        retire_dialog(self, workers)
+
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
         # 以插件配置打开时，首帧后再按内容拉高，避免执行页被卷进滚动区
@@ -155,4 +171,4 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
             if self._selected_input_backend() == "plugin":
                 from PySide6.QtCore import QTimer
 
-                QTimer.singleShot(0, self._adjust_dialog_height_only)
+                QTimer.singleShot(0, self, self._adjust_dialog_height_only)

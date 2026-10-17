@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from app_core.player.package import ensure_designer_ui
+from ui.dialogs.dialog_manager import exec_dialog
 from app_core.player.window_resolution import normalize_required_client_size
 from ui.export_parts.assembler import assemble_standalone_export, safe_export_name
 from ui.export_parts.player_dev_run import runtime_config_from_main
@@ -494,9 +495,13 @@ class StandaloneExportDialog(QDialog):
             preselected_ids=pre or None,
             parent=self,
         )
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        selected = exec_dialog(
+            dlg,
+            read_result=lambda result: dlg.selected_catalog() if result == QDialog.DialogCode.Accepted else None,
+        )
+        if selected is None:
             return False
-        self._export_catalog = dlg.selected_catalog()
+        self._export_catalog = selected
         self._draft_catalog_ids = [str(i.get("id") or "") for i in self._export_catalog if i.get("id")]
         self._persist_draft()
         return bool(self._export_catalog)
@@ -566,10 +571,15 @@ class StandaloneExportDialog(QDialog):
             live_run_context=self._live_run_context,
             script_catalog=self._session_catalog,
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        designed = exec_dialog(
+            dialog,
+            read_result=lambda result: (
+                dialog.result_ui, dict(dialog.result_asset_map or {})
+            ) if result == QDialog.DialogCode.Accepted else None,
+        )
+        if designed is None:
             return
-        self._ui_payload = dialog.result_ui
-        self._ui_asset_map = dict(dialog.result_asset_map or {})
+        self._ui_payload, self._ui_asset_map = designed
         self._refresh_design_status()
         self._persist_draft()
 
@@ -636,7 +646,7 @@ class StandaloneExportDialog(QDialog):
         )
         open_btn = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("稍后再说", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
+        exec_dialog(box)
         if box.clickedButton() == open_btn:
             QDesktopServices.openUrl(QUrl(INNO_SETUP_DOWNLOAD_PAGE))
 
@@ -669,7 +679,7 @@ class StandaloneExportDialog(QDialog):
         )
         open_btn = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("知道了", QMessageBox.ButtonRole.RejectRole)
-        box.exec()
+        exec_dialog(box)
         if box.clickedButton() == open_btn:
             QDesktopServices.openUrl(QUrl(INNO_CHINESE_LANG_HELP))
 

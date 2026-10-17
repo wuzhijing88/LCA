@@ -74,6 +74,13 @@ class ScriptDebugPanel(QWidget):
         self.step_button.setEnabled(running)
         self.stop_button.setEnabled(running)
 
+    def set_stopping(self) -> None:
+        """停止请求已发出，但工作线程尚未确认结束。"""
+        self.start_button.setEnabled(False)
+        self.start_button.setText("停止中")
+        for button in (self.pause_button, self.continue_button, self.step_button, self.stop_button):
+            button.setEnabled(False)
+
     def clear(self):
         self.set_running(False)
         self._set_variables(None)
@@ -86,7 +93,10 @@ class ScriptDebugPanel(QWidget):
             self._set_variables(payload.get("variables") if isinstance(payload, dict) else None)
         elif event == "continued":
             self._set_variables(None)
-        elif event in {"finished", "stopped"}:
+        elif event == "stopped":
+            self.set_stopping()
+            self._set_variables(None)
+        elif event == "finished":
             self.set_running(False)
             self._set_variables(None)
 

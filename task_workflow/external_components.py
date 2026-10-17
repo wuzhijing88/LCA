@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import math
 import secrets
 import socket
 import subprocess
@@ -19,9 +20,7 @@ from utils.app_paths import get_app_root
 
 
 WORKER_FLAG = "--external-component-worker"
-DEFAULT_START_TIMEOUT = 8.0
 DEFAULT_CALL_TIMEOUT = 30.0
-MAX_CALL_TIMEOUT = 3600.0
 
 
 class ExternalComponentError(RuntimeError):
@@ -37,17 +36,18 @@ class ExternalComponentManager:
         self._request_id = 0
         self._lock = threading.RLock()
 
-    def _start(self) -> None:
+    def _start(self, timeout: float) -> None:
         if self._process is not None and self._process.poll() is None and self._socket is not None:
             return
         self._teardown()
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         process = None
+        connection = None
         try:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind(("127.0.0.1", 0))
             server.listen(1)
-            server.settimeout(DEFAULT_START_TIMEOUT)
+            server.settimeout(timeout)
             port = int(server.getsockname()[1])
             command = build_worker_launch_command(
                 WORKER_FLAG,
@@ -68,16 +68,13 @@ class ExternalComponentManager:
             )
             register_worker_process(process, WORKER_FLAG)
             connection, _ = server.accept()
-            ready = recv_message(connection, timeout=DEFAULT_START_TIMEOUT)
+            ready = recv_message(connection, timeout=timeout)
             if not isinstance(ready, dict) or ready.get("type") != "ready" or ready.get("token") != self._token:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
                 raise ExternalComponentError("外部组件宿主启动握手失败")
             self._process = process
             self._socket = connection
             process = None
+            connection = None
         except Exception as exc:
             if process is not None:
                 try:
@@ -92,12 +89,26 @@ class ExternalComponentManager:
                 raise
             raise ExternalComponentError(f"外部组件宿主启动失败: {exc}") from exc
         finally:
-            server.close()
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                server.close()
 
     def _request(self, command: str, *, timeout: Any = DEFAULT_CALL_TIMEOUT, **payload: Any) -> Any:
-        wait_seconds = max(0.1, min(MAX_CALL_TIMEOUT, float(timeout or DEFAULT_CALL_TIMEOUT)))
+        if timeout is None:
+            wait_seconds = DEFAULT_CALL_TIMEOUT
+        else:
+            if isinstance(timeout, bool):
+                raise ValueError("组件超时必须是大于 0 的有限秒数")
+            try:
+                wait_seconds = float(timeout)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("组件超时必须是大于 0 的有限秒数") from exc
+            if not math.isfinite(wait_seconds) or wait_seconds <= 0:
+                raise ValueError("组件超时必须是大于 0 的有限秒数")
         with self._lock:
-            self._start()
+            self._start(wait_seconds)
             assert self._socket is not None
             assert self._process is not None
             self._request_id += 1
@@ -127,6 +138,7 @@ class ExternalComponentManager:
                 response, status = recv_message_with_status(
                     self._socket,
                     timeout=min(0.2, remaining),
+                    max_message_bytes=0xFFFFFFFF,
                 )
                 if status == "timeout":
                     continue
@@ -143,13 +155,13 @@ class ExternalComponentManager:
                     raise ExternalComponentError(str(response.get("error") or "外部组件调用失败"))
                 return response.get("result")
 
-    def load(self, component_type: Any, target: Any, *, calling_convention: Any = "cdecl", timeout: Any = 10) -> Dict[str, Any]:
+    def load(self, component_type: Any, target: Any, *, calling_convention: Any = None, timeout: Any = 10) -> Dict[str, Any]:
         result = self._request(
             "LOAD",
             timeout=timeout,
             component_type=component_type,
             target=target,
-            options={"calling_convention": calling_convention},
+            options={} if calling_convention is None else {"calling_convention": calling_convention},
         )
         if not isinstance(result, dict) or not result.get("handle"):
             raise ExternalComponentError("外部组件宿主没有返回有效句柄")
@@ -163,15 +175,14 @@ class ExternalComponentManager:
         timeout: Any = DEFAULT_CALL_TIMEOUT,
         kwargs: Optional[Dict[str, Any]] = None,
         arg_types: Any = None,
-        return_type: Any = "int32",
+        return_type: Any = None,
         action: str = "call",
         process_timeout: Any = None,
         stdin: Any = None,
         cwd: Any = None,
         env: Any = None,
-        encoding: Any = "utf-8",
+        encoding: Any = None,
     ) -> Any:
-        effective_process_timeout = process_timeout if process_timeout is not None else timeout
         return self._request(
             "CALL",
             timeout=timeout,
@@ -179,16 +190,17 @@ class ExternalComponentManager:
             member=member,
             args=list(args),
             kwargs=dict(kwargs or {}),
-            options={
+            options={key: value for key, value in {
+                "call_timeout": timeout,
                 "arg_types": arg_types,
                 "return_type": return_type,
                 "action": action,
-                "process_timeout": effective_process_timeout,
+                "process_timeout": process_timeout,
                 "stdin": stdin,
                 "cwd": cwd,
                 "env": env,
                 "encoding": encoding,
-            },
+            }.items() if value is not None},
         )
 
     def close(self, handle: Any = None, *, timeout: Any = 5) -> int:

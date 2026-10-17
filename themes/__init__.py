@@ -10,7 +10,6 @@ from .theme_manager import (
     ThemeWatcher,
     detect_system_theme,
     get_theme_manager,
-    reset_theme_manager,
     theme_color,
     theme_rgba,
 )
@@ -21,7 +20,6 @@ __all__ = [
     'apply_rounded_popup',
     'detect_system_theme',
     'get_theme_manager',
-    'reset_theme_manager',
     'theme_color',
     'theme_rgba',
 ]

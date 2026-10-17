@@ -68,9 +68,34 @@ class ScriptParamBar(QWidget):
         self._widgets: List[QWidget] = []
 
     def bind_editor(self, editor) -> None:
+        if self._editor is not None:
+            self._editor.cursorPositionChanged.disconnect(self._schedule_sync)
+            self._editor.textChanged.disconnect(self._schedule_sync)
+            self._editor.destroyed.disconnect(self._on_editor_destroyed)
+        self._timer.stop()
         self._editor = editor
-        editor.cursorPositionChanged.connect(self._timer.start)
-        editor.textChanged.connect(self._timer.start)
+        if editor is not None:
+            editor.cursorPositionChanged.connect(self._schedule_sync)
+            editor.textChanged.connect(self._schedule_sync)
+            editor.destroyed.connect(self._on_editor_destroyed)
+        self._schedule_sync()
+
+    def _schedule_sync(self) -> None:
+        if self.isVisible() and self._editor is not None:
+            self._timer.start()
+
+    def _on_editor_destroyed(self, *_args) -> None:
+        self._timer.stop()
+        self._editor = None
+        self._render(None)
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._schedule_sync()
 
     def _editors(self) -> List[QWidget]:
         return [widget for widget in self._widgets if isinstance(widget, (QLineEdit, QComboBox))]
@@ -223,8 +248,11 @@ class ScriptParamBar(QWidget):
         field = self._fields[index]
         start = int(field.get("start") or 0)
         end = int(field.get("end") or start)
-        if hasattr(self._editor, "select_line_span"):
-            self._editor.select_line_span(start, end)
+        raw = str(field.get("raw") or "")
+        if "=" in raw and raw.split("=", 1)[0].strip() == str(field.get("label") or ""):
+            offset = raw.index("=") + 1
+            start += offset + len(raw[offset:]) - len(raw[offset:].lstrip())
+        self._editor.select_line_span(start, end)
         self._highlight(index)
 
     def _on_field_changed(self) -> None:
@@ -244,7 +272,9 @@ class ScriptParamBar(QWidget):
         if updated == line:
             return
         self._syncing = True
-        self._editor.replace_current_line(updated)
-        parsed = parse_param_fields(updated, min(column, max(0, len(updated) - 1)))
-        self._render(parsed)
-        self._syncing = False
+        try:
+            self._editor.replace_current_line(updated)
+            parsed = parse_param_fields(updated, min(column, max(0, len(updated) - 1)))
+            self._render(parsed)
+        finally:
+            self._syncing = False

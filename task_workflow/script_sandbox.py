@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
-"""受控自定义脚本：中文命令调用现有能力，禁止 import 和直接读写文件。"""
+"""自定义脚本执行器：提供中文命令，并执行完整 Python 代码。"""
 
 from __future__ import annotations
 
 import ast
-import io
 import logging
 import math
 import random
 import threading
-import tokenize
 import time
 import json
 import os
@@ -17,32 +15,17 @@ import platform
 import sys
 from typing import Any, Dict, Optional, Tuple
 
-from task_workflow.runtime_store import RuntimeStore, _json_safe, normalize_var_name
-from task_workflow.script_commands import RESULT_FIELD_ALIASES, CommandHost, ScriptResult
+from task_workflow.runtime_store import RuntimeStore, normalize_var_value, normalize_var_name
+from task_workflow.script_commands import RESULT_FIELD_ALIASES, CommandHost, ScriptResult, finite_seconds, integer_parameter
+from task_workflow.script_parameters import (
+    add_numeric_values,
+    boolean_parameter as _as_bool,
+    number_parameter,
+    text_parameter as _text,
+)
 
 logger = logging.getLogger(__name__)
 
-
-def _as_bool(value: Any) -> bool:
-    """Normalize Chinese/boolean script values for sandbox APIs."""
-    if isinstance(value, str):
-        text = value.strip().casefold()
-        if text in {"", "0", "false", "no", "否", "假", "关闭", "隐藏"}:
-            return False
-        if text in {"1", "true", "yes", "是", "真", "开启", "显示"}:
-            return True
-    return bool(value)
-
-def _runtime_limit(name: str, default: float) -> float:
-    """Read script limits from environment; 0 means unlimited for trusted use."""
-    try:
-        value = float(os.getenv(name, str(default)))
-        return max(0.0, value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-MAX_SOURCE_CHARS = int(_runtime_limit("LCA_SCRIPT_MAX_SOURCE_CHARS", 20000))
 
 COMMAND_NAMES = (
     "找图",
@@ -163,24 +146,6 @@ _TRANSLATED_BUILTIN_CALLS = (
     "abs",
     "range",
 )
-_REMOVED_ENGLISH_BUILTINS = frozenset(
-    {
-        *_TRANSLATED_BUILTIN_CALLS,
-        "enumerate",
-        "zip",
-        "sorted",
-        "round",
-        "all",
-        "any",
-        "list",
-        "tuple",
-        "dict",
-        "set",
-        "sum",
-        "reversed",
-    }
-)
-
 _RESULT_METHODS = frozenset({"点", "随机点"})
 _EXCEPTION_NAMES = (
     "Exception",
@@ -330,56 +295,6 @@ _CN_IDENT_MAP = {
     "绝对值": "abs",
 }
 
-_FORBIDDEN_NODE_CN = {
-    "Import": "导入",
-    "ImportFrom": "导入",
-    "AsyncFunctionDef": "异步函数",
-    "ClassDef": "类定义",
-    "With": "with 语句",
-    "AsyncWith": "异步 with",
-    "Lambda": "匿名函数",
-    "Await": "await",
-    "Yield": "yield",
-    "YieldFrom": "yield from",
-    "Global": "global",
-    "Nonlocal": "nonlocal",
-    "Delete": "删除",
-    "AnnAssign": "类型注解",
-    "NamedExpr": "海象运算符",
-    "GeneratorExp": "生成器表达式",
-}
-_FORBIDDEN_ATTRS = frozenset(
-    {
-        "gi_frame",
-        "gi_code",
-        "gi_running",
-        "gi_yieldfrom",
-        "f_back",
-        "f_builtins",
-        "f_globals",
-        "f_locals",
-        "f_code",
-        "f_trace",
-        "f_lasti",
-        "f_lineno",
-        "cr_frame",
-        "cr_code",
-        "cr_await",
-        "cr_running",
-        "cr_origin",
-        "tb_frame",
-        "tb_next",
-        "tb_lasti",
-        "tb_lineno",
-        "co_code",
-        "co_consts",
-        "co_names",
-        "co_varnames",
-        "func_globals",
-        "func_code",
-    }
-)
-
 _SYNTAX_CN = (
     ("'break' outside loop", "中断 只能写在循环里"),
     ("'continue' not properly in loop", "继续 只能写在循环里"),
@@ -396,73 +311,6 @@ _SYNTAX_CN = (
     ("'return' outside function", "不能单独写返回，请用 成功() 或 失败()"),
 )
 FIELD_ALIASES = RESULT_FIELD_ALIASES
-
-ALLOWED_NODES = (
-    ast.Module,
-    ast.Expr,
-    ast.Assign,
-    ast.AugAssign,
-    ast.If,
-    ast.For,
-    ast.While,
-    ast.Break,
-    ast.Continue,
-    ast.Pass,
-    ast.FunctionDef,
-    ast.arguments,
-    ast.arg,
-    ast.Return,
-    ast.BoolOp,
-    ast.BinOp,
-    ast.UnaryOp,
-    ast.Compare,
-    ast.Name,
-    ast.Load,
-    ast.Store,
-    ast.Del,
-    ast.Constant,
-    ast.List,
-    ast.Tuple,
-    ast.Dict,
-    ast.Set,
-    ast.Subscript,
-    ast.Slice,
-    ast.Attribute,
-    ast.Call,
-    ast.keyword,
-    ast.And,
-    ast.Or,
-    ast.Not,
-    ast.Add,
-    ast.Sub,
-    ast.Mult,
-    ast.Div,
-    ast.FloorDiv,
-    ast.Mod,
-    ast.Pow,
-    ast.USub,
-    ast.UAdd,
-    ast.Eq,
-    ast.NotEq,
-    ast.Lt,
-    ast.LtE,
-    ast.Gt,
-    ast.GtE,
-    ast.In,
-    ast.NotIn,
-    ast.Is,
-    ast.IsNot,
-    ast.Try,
-    ast.ExceptHandler,
-    ast.Raise,
-    ast.JoinedStr,
-    ast.FormattedValue,
-    ast.ListComp,
-    ast.SetComp,
-    ast.DictComp,
-    ast.comprehension,
-    ast.IfExp,
-)
 
 
 class ScriptError(ValueError):
@@ -717,7 +565,7 @@ def normalize_script_punctuation(source: str) -> str:
 
 
 def translate_cn_script(source: str) -> str:
-    """把中文关键字/内置名译成 Python，字符串和注释里不改；英文内置由校验阶段拒绝。"""
+    """把中文关键字/内置名译成 Python，字符串和注释里不改。"""
     text = normalize_script_punctuation(str(source or ""))
     out: list[str] = []
     index = 0
@@ -765,7 +613,14 @@ def translate_cn_script(source: str) -> str:
                 cursor += 1
             ident = text[index:cursor]
             nxt = _peek_ident(text, cursor)
-            if ident == "是":
+            if ident in _BUILTIN_CALLS:
+                # 内置名也可能是命令的关键字参数或结果字段（例如 长度=64）。
+                # 只翻译独立的函数调用，不能改写这些参数名和属性名。
+                following = text[cursor:].lstrip()
+                previous = text[:index].rstrip()
+                is_call = following.startswith("(") and not previous.endswith(".")
+                out.append(_CN_IDENT_MAP.get(ident, ident) if is_call else ident)
+            elif ident == "是":
                 out.append("is" if nxt in {"空", "None"} else "==")
             elif ident == "不是":
                 out.append("is not" if nxt in {"空", "None"} else "not")
@@ -841,15 +696,11 @@ _PLACEHOLDER_NAMES = frozenset(
         "宽",
         "高",
         "双击",
-        "偏移横坐标",
-        "偏移纵坐标",
         "偏移x",
         "偏移y",
         "随机",
         "随机横坐标",
         "随机纵坐标",
-        "随机x",
-        "随机y",
         "区域",
         "大漠内存",
         "大漠汇编",
@@ -867,12 +718,6 @@ _PLACEHOLDER_NAMES = frozenset(
         "新",
         "分隔符",
         "字数",
-        "横坐标",
-        "纵坐标",
-        "起点横坐标",
-        "起点纵坐标",
-        "终点横坐标",
-        "终点纵坐标",
         "x",
         "y",
         "x1",
@@ -882,8 +727,8 @@ _PLACEHOLDER_NAMES = frozenset(
     }
 )
 _PLACEHOLDER_HINTS = {
-    "文件": "用资源栏导入，或写成 \"提示.wav\"",
-    "等待": "写成 真 或 假。真是播完再往下，假是接着跑",
+    "文件": "用资源栏导入，或填写当前工程内该命令所需的文件路径",
+    "等待": "写成 真 或 假。真表示执行完成后再往下，假表示启动后继续",
     "图片": "用工具栏「截图」选图，或写成 \"确定.png\"",
     "图片2": "第二张图。多张图并行识别，按顺序取第一张命中，阈值仍写 阈值=",
     "模型": "写成 onnx 路径，例如 \"yolo/xxx.onnx\"",
@@ -920,8 +765,6 @@ _PLACEHOLDER_HINTS = {
     "宽": "写成宽度数字",
     "高": "写成高度数字",
     "双击": "写成 真 或 假",
-    "偏移横坐标": "写成像素，正数向右",
-    "偏移纵坐标": "写成像素，正数向下",
     "偏移x": "写成像素，正数向右",
     "偏移y": "写成像素，正数向下",
     "随机": "写成随机半径，例如 5。和偏移一起写时先固定偏移再抖",
@@ -931,12 +774,6 @@ _PLACEHOLDER_HINTS = {
     "方向": "写成 \"向下\" 或 \"向上\"",
     "随机横坐标": "写成 X 随机范围，例如 5",
     "随机纵坐标": "写成 Y 随机范围，例如 5",
-    "横坐标": "用「取坐标」，或写成数字",
-    "纵坐标": "用「取坐标」，或写成数字",
-    "起点横坐标": "用「取坐标」，或写成数字",
-    "起点纵坐标": "用「取坐标」，或写成数字",
-    "终点横坐标": "用「取坐标」，或写成数字",
-    "终点纵坐标": "用「取坐标」，或写成数字",
     "x": "用「取坐标」，或写成数字",
     "y": "用「取坐标」，或写成数字",
     "x1": "用「取坐标」，或写成数字",
@@ -1070,12 +907,22 @@ class _ForCountWrap(ast.NodeTransformer):
 
 
 class _GuardInsert(ast.NodeTransformer):
+    @staticmethod
+    def _guard_ref() -> ast.Subscript:
+        return ast.Name(id="_lca_guard", ctx=ast.Load())
+
+    @classmethod
+    def _guard_call(cls) -> ast.Call:
+        return ast.Call(
+            func=cls._guard_ref(),
+            args=[],
+            keywords=[],
+        )
+
     def visit(self, node):
         node = super().visit(node)
         if isinstance(node, ast.stmt) and not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            guard_call = ast.Expr(
-                value=ast.Call(func=ast.Name(id="__guard", ctx=ast.Load()), args=[], keywords=[])
-            )
+            guard_call = ast.Expr(value=self._guard_call())
             ast.copy_location(guard_call, node)
             return [guard_call, node]
         return node
@@ -1094,7 +941,7 @@ class _GuardInsert(ast.NodeTransformer):
         stmt = ast.Expr(
             value=ast.Call(
                 func=ast.Attribute(
-                    value=ast.Name(id="__guard", ctx=ast.Load()),
+                    value=self._guard_ref(),
                     attr="loop",
                     ctx=ast.Load(),
                 ),
@@ -1185,25 +1032,16 @@ class _VarsApi:
 
     def 设置(self, 名字: Any, 值: Any) -> Any:
         key = normalize_var_name(名字)
-        stored = _json_safe(值)
+        stored = normalize_var_value(值)
         with self._lock:
             self._vars[key] = stored
         return stored
 
     def 增加(self, 名字: Any, 步长: Any = 1) -> Any:
         key = normalize_var_name(名字)
-        try:
-            delta = float(步长)
-        except (TypeError, ValueError):
-            raise ValueError("步长必须是数字") from None
         with self._lock:
             current = self._vars.get(key, 0)
-            try:
-                next_value = float(current) + delta
-            except (TypeError, ValueError):
-                next_value = delta
-            if float(next_value).is_integer():
-                next_value = int(next_value)
+            next_value = add_numeric_values(current, 步长)
             self._vars[key] = next_value
             return next_value
 
@@ -1372,145 +1210,18 @@ class _CommandSlot:
 
 
 class _ScriptNamespace(dict):
-    def __setitem__(self, key, value):
-        current = dict.get(self, key)
-        if isinstance(current, _CommandSlot):
-            current.bind(value)
-            return
-        if key in _PROTECTED_ASSIGN_NAMES:
-            raise ScriptError(f"不能给命令名赋值：{key}")
-        dict.__setitem__(self, key, value)
+    pass
 
     def install_command(self, name: str, callback: Any) -> None:
         dict.__setitem__(self, name, callback if isinstance(callback, _CommandSlot) else _CommandSlot(callback))
 
 
-def _reject_removed_english_builtins(source: str) -> None:
-    """Reject removed English builtin names before Chinese translation hides them."""
-    try:
-        tokens = tokenize.generate_tokens(io.StringIO(str(source or "")).readline)
-        for token in tokens:
-            if token.type == tokenize.NAME and token.string in _REMOVED_ENGLISH_BUILTINS:
-                raise ScriptError(
-                    f"英文内置已移除：{token.string}，请使用中文内置或中文编程工具",
-                    lineno=token.start[0],
-                )
-    except (tokenize.TokenError, IndentationError):
-        # Syntax validation below produces the canonical script error.
-        return
-
-
 def validate_script(source: str) -> None:
     text = str(source or "")
-    if MAX_SOURCE_CHARS > 0 and len(text) > MAX_SOURCE_CHARS:
-        raise ScriptError("内容过长")
-    _reject_removed_english_builtins(text)
     try:
-        tree = parse_script(text)
+        parse_script(text)
     except SyntaxError as exc:
         raise ScriptError(f"语法错误: {_syntax_error_text(exc)}", lineno=getattr(exc, "lineno", None)) from exc
-    user_funcs = set()
-    returns_in_func = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            user_funcs.add(node.name)
-            if node.name in _PROTECTED_FUNC_NAMES:
-                raise ScriptError(f"不能用命令名定义子程序：{node.name}", lineno=getattr(node, "lineno", None))
-            for child in ast.walk(node):
-                if isinstance(child, ast.Return):
-                    returns_in_func.add(id(child))
-    protected_assigns = _PROTECTED_ASSIGN_NAMES | user_funcs
-    for node in ast.walk(tree):
-        if not isinstance(node, ALLOWED_NODES):
-            name = type(node).__name__
-            raise ScriptError(f"不允许使用 {_FORBIDDEN_NODE_CN.get(name, name)}", lineno=getattr(node, "lineno", None))
-        if isinstance(node, ast.Return) and id(node) not in returns_in_func:
-            raise ScriptError("不能单独写返回，请用 成功() 或 失败()", lineno=getattr(node, "lineno", None))
-        if isinstance(node, ast.Name) and "__" in node.id:
-            raise ScriptError("禁止使用双下划线名称", lineno=getattr(node, "lineno", None))
-        if isinstance(node, ast.Attribute):
-            if "__" in node.attr:
-                raise ScriptError("禁止访问双下划线属性", lineno=getattr(node, "lineno", None))
-            if node.attr in _FORBIDDEN_ATTRS:
-                raise ScriptError("禁止访问该属性", lineno=getattr(node, "lineno", None))
-        if isinstance(node, ast.Call):
-            path = _call_path(node.func)
-            method = path.split(".")[-1] if path else ""
-            if (
-                path not in ALLOWED_CALLS
-                and path.split(".")[0] not in ALLOWED_CALL_ROOTS
-                and path not in user_funcs
-                and method not in _RESULT_METHODS
-            ):
-                raise ScriptError(f"不允许调用: {path or type(node.func).__name__}", lineno=getattr(node, "lineno", None))
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                for name in _assigned_names(target):
-                    if name in protected_assigns:
-                        raise ScriptError(f"不能给命令名赋值：{_display_ident(name)}", lineno=getattr(node, "lineno", None))
-        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-            if node.target.id in protected_assigns:
-                raise ScriptError(f"不能给命令名赋值：{_display_ident(node.target.id)}", lineno=getattr(node, "lineno", None))
-
-
-def _display_ident(name: str) -> str:
-    """校验发生在中文关键字译成 Python 之后；报错时把中文名一并带上，例如 range（范围）。"""
-    for chinese, english in _CN_IDENT_MAP.items():
-        if english == name and chinese != name:
-            return f"{name}（{chinese}）"
-    return name
-
-
-# 内置函数、异常名不能被当变量覆盖。命令名例外：`找字 = 找字(目标=...)` 是刻意支持的写法，
-# 命名空间里的 _CommandSlot 会在同名赋值后仍保持可调用。
-_PROTECTED_ASSIGN_NAMES = frozenset(
-    {
-        *_BUILTIN_CALLS,
-        *_TRANSLATED_BUILTIN_CALLS,
-        *_EXCEPTION_NAMES,
-        "True",
-        "False",
-        "None",
-        "__guard",
-        "数据",
-        "变量",
-        "剪贴板",
-        "窗口",
-        "组件",
-        "网络",
-        "性能",
-        "区域",
-    }
-)
-_PROTECTED_FUNC_NAMES = frozenset({*COMMAND_NAMES, *_PROTECTED_ASSIGN_NAMES})
-
-
-def _assigned_names(target: ast.AST) -> list:
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names = []
-        for item in target.elts:
-            names.extend(_assigned_names(item))
-        return names
-    return []
-
-
-def _attr_path(node: ast.AST) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parent = _attr_path(node.value)
-        return f"{parent}.{node.attr}" if parent else node.attr
-    return ""
-
-
-def _call_path(node: ast.AST) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return _attr_path(node)
-    return ""
 
 
 def _script_lineno(exc: BaseException) -> Optional[int]:
@@ -1563,21 +1274,25 @@ def script_for_iterable(value: Any) -> Any:
 
 def script_random(*args: Any, 起点: Any = None, 终点: Any = None) -> Any:
     if 起点 is not None or 终点 is not None:
-        args = tuple(item for item in (起点, 终点) if item is not None)
+        if args:
+            raise ValueError("随机的位置范围与起点、终点不能同时传入")
+        if 起点 is None or 终点 is None:
+            raise ValueError("随机的起点和终点必须同时传入")
+        args = (起点, 终点)
+    if len(args) > 2:
+        raise ValueError("随机最多接受两个参数")
     if not args:
         return random.random()
     if len(args) == 1:
-        return random.randint(0, max(0, int(args[0]) - 1)) if int(args[0]) > 0 else 0
-    low, high = args[0], args[1]
-    if _is_int_range_bound(low) and _is_int_range_bound(high):
-        start, end = int(low), int(high)
-        if end < start:
-            start, end = end, start
-        return random.randint(start, end)
-    start, end = float(low), float(high)
+        return random.randrange(integer_parameter(args[0], "随机上限", minimum=1))
+    start, end = (number_parameter(item, label) for item, label in zip(args, ("随机起点", "随机终点")))
     if end < start:
-        start, end = end, start
-    return random.uniform(start, end)
+        raise ValueError("随机终点不能小于起点")
+    if isinstance(start, int) and isinstance(end, int):
+        return random.randint(start, end)
+    if not math.isfinite(float(end) - float(start)):
+        raise ValueError("随机区间跨度必须是有限数字")
+    return random.uniform(float(start), float(end))
 
 
 def script_sqrt(值: Any) -> float:
@@ -1605,37 +1320,37 @@ def script_clamp(值: Any, 下限: Any, 上限: Any) -> float:
 
 
 def script_contains(文本: Any, 片段: Any) -> bool:
-    return str(片段 or "") in str(文本 or "")
+    return _text(片段) in _text(文本)
 
 
 def script_slice(文本: Any, 起点: Any, 字数: Any = None) -> str:
-    source = str(文本 or "")
-    begin = max(0, int(起点 or 1) - 1)
-    if 字数 is None or 字数 == "":
+    source = _text(文本)
+    begin = integer_parameter(起点, "截取起点", minimum=1) - 1
+    if 字数 is None:
         return source[begin:]
-    return source[begin : begin + max(0, int(字数))]
+    return source[begin : begin + integer_parameter(字数, "截取字数", minimum=0)]
 
 
 def script_replace(文本: Any, 旧: Any, 新: Any, 次数: Any = None) -> str:
-    source = str(文本 or "")
-    if 次数 is None or 次数 == "":
-        return source.replace(str(旧 or ""), str(新 or ""))
-    return source.replace(str(旧 or ""), str(新 or ""), int(次数))
+    source = _text(文本)
+    if 次数 is None:
+        return source.replace(_text(旧), _text(新))
+    return source.replace(_text(旧), _text(新), integer_parameter(次数, "替换次数", minimum=0))
 
 
 def script_strip(文本: Any) -> str:
-    return str(文本 or "").strip()
+    return _text(文本).strip()
 
 
 def script_find(文本: Any, 片段: Any) -> int:
-    index = str(文本 or "").find(str(片段 or ""))
+    index = _text(文本).find(_text(片段))
     return 0 if index < 0 else index + 1
 
 
 def script_extract_number(文本: Any) -> Any:
     import re
 
-    match = re.search(r"-?\d+(?:\.\d+)?", str(文本 or ""))
+    match = re.search(r"-?\d+(?:\.\d+)?", _text(文本))
     if not match:
         return 0
     raw = match.group(0)
@@ -1643,7 +1358,7 @@ def script_extract_number(文本: Any) -> Any:
 
 
 def script_split(文本: Any, 分隔符: Any = None) -> list:
-    source = str(文本 or "")
+    source = _text(文本)
     if 分隔符 is None or 分隔符 == "":
         return source.split()
     return source.split(str(分隔符))
@@ -1655,7 +1370,7 @@ def script_now_ms() -> int:
 
 def script_json_parse(文本: Any) -> Any:
     try:
-        return json.loads(str(文本 or ""))
+        return json.loads(_text(文本))
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"JSON解析失败: {exc}") from exc
 
@@ -1688,7 +1403,7 @@ def script_list_append(列表: Any, 值: Any) -> int:
 def script_list_pop(列表: Any, 索引: Any = -1) -> Any:
     if not isinstance(列表, list):
         raise TypeError("列表弹出的目标必须是列表")
-    return 列表.pop(int(索引))
+    return 列表.pop(integer_parameter(索引, "列表索引"))
 
 
 def script_type(值: Any) -> str:
@@ -1719,32 +1434,37 @@ def script_list_extend(列表: Any, 数据: Any) -> int:
 
 
 def script_startswith(文本: Any, 前缀: Any) -> bool:
-    return str(文本 or "").startswith(str(前缀 or ""))
+    return _text(文本).startswith(_text(前缀))
 
 
 def script_endswith(文本: Any, 后缀: Any) -> bool:
-    return str(文本 or "").endswith(str(后缀 or ""))
+    return _text(文本).endswith(_text(后缀))
 
 
 def script_sort(列表: Any, 反向: Any = False) -> list:
     if not isinstance(列表, (list, tuple, set)):
         raise TypeError("排序的目标必须是列表")
-    return sorted(列表, reverse=bool(反向))
+    return sorted(列表, reverse=_as_bool(反向, "排序反向"))
 
 
 def script_round(数值: Any, 位数: Any = 0) -> Any:
-    return round(float(数值), int(位数))
+    from decimal import Decimal, ROUND_HALF_UP, localcontext
+
+    number = number_parameter(数值, "四舍五入数值")
+    places = integer_parameter(位数, "四舍五入位数", minimum=-308, maximum=308)
+    decimal = Decimal(str(number))
+    with localcontext() as context:
+        context.prec = max(32, len(decimal.as_tuple().digits) + abs(decimal.adjusted()) + abs(places) + 2)
+        result = decimal.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    if isinstance(number, int) and places <= 0:
+        return int(result)
+    rounded = float(result)
+    if not math.isfinite(rounded):
+        raise ValueError("四舍五入结果超出有限数值范围")
+    return rounded
 
 
 def clipboard_get() -> str:
-    try:
-        from PySide6.QtWidgets import QApplication
-
-        app = QApplication.instance()
-        if app is not None:
-            return str(app.clipboard().text() or "")
-    except Exception:
-        pass
     try:
         import win32clipboard
 
@@ -1754,29 +1474,20 @@ def clipboard_get() -> str:
                 return str(win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT) or "")
         finally:
             win32clipboard.CloseClipboard()
-    except Exception:
-        return ""
+    except Exception as exc:
+        raise ScriptError(f"剪贴板读取失败: {exc}") from exc
     return ""
 
 
 def clipboard_set(text: Any) -> str:
-    value = str(text or "")
-    try:
-        from PySide6.QtWidgets import QApplication
-
-        app = QApplication.instance()
-        if app is not None:
-            app.clipboard().setText(value)
-            return value
-    except Exception:
-        pass
+    value = "" if text is None else str(text)
     try:
         import win32clipboard
 
         win32clipboard.OpenClipboard()
         try:
             win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardText(value)
+            win32clipboard.SetClipboardText(value, win32clipboard.CF_UNICODETEXT)
         finally:
             win32clipboard.CloseClipboard()
     except Exception as exc:
@@ -1866,41 +1577,43 @@ class _PerformanceView:
 
 
 class _DataApi:
-    """脚本专属数据目录：只允许访问应用用户目录下的相对文件。"""
+    """脚本数据接口，直接使用调用方提供的文件路径。"""
 
-    _MAX_BYTES = 2 * 1024 * 1024
+    @classmethod
+    def _row_limit(cls, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("最多必须是大于 0 的整数")
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("最多必须是大于 0 的整数") from exc
+        if not math.isfinite(number) or not number.is_integer():
+            raise ValueError("最多必须是大于 0 的整数")
+        limit = int(number)
+        if limit < 1:
+            raise ValueError("最多必须是大于 0 的整数")
+        return limit
 
     def _path(self, name: Any) -> str:
-        from utils.app_paths import get_user_data_dir
-
         raw = str(name or "").replace("\\", "/").strip()
-        if not raw or raw.startswith("/") or ":" in raw:
-            raise ValueError("数据文件名必须是相对路径")
-        parts = [part for part in raw.split("/") if part not in ("", ".")]
-        if any(part == ".." for part in parts):
-            raise ValueError("数据文件不能访问上级目录")
-        root = os.path.realpath(os.path.join(get_user_data_dir("LCA"), "script_data"))
-        path = os.path.realpath(os.path.join(root, *parts))
-        if not path.casefold().startswith(root.casefold() + os.sep):
-            raise ValueError("数据文件路径越界")
-        return path
+        if not raw:
+            raise ValueError("数据文件路径不能为空")
+        return os.path.abspath(os.path.expanduser(raw))
 
     def 读取(self, 文件名: Any, 默认值: Any = "") -> str:
         path = self._path(文件名)
         try:
             with open(path, "rb") as handle:
-                content = handle.read(self._MAX_BYTES + 1)
-            if len(content) > self._MAX_BYTES:
-                raise ValueError("数据文件过大")
+                content = handle.read()
             return content.decode("utf-8")
         except FileNotFoundError:
-            return str(默认值 or "")
+            return _text(默认值)
 
     def 写入(self, 文件名: Any, 内容: Any) -> str:
         path = self._path(文件名)
         text = str(内容 if 内容 is not None else "")
-        if len(text.encode("utf-8")) > self._MAX_BYTES:
-            raise ValueError("数据文件过大")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         import tempfile
 
@@ -1916,8 +1629,11 @@ class _DataApi:
         return text
 
     def JSON读取(self, 文件名: Any, 默认值: Any = None) -> Any:
-        text = self.读取(文件名, "")
-        if not text.strip():
+        path = self._path(文件名)
+        try:
+            with open(path, "rb") as handle:
+                text = handle.read().decode("utf-8")
+        except FileNotFoundError:
             return 默认值
         return script_json_parse(text)
 
@@ -1932,8 +1648,8 @@ class _DataApi:
             with open(path, "r", encoding="utf-8") as handle:
                 parser.read_file(handle)
         except FileNotFoundError:
-            return str(默认值 or "")
-        return parser.get(str(节), str(键), fallback=str(默认值 or ""))
+            return _text(默认值)
+        return parser.get(str(节), str(键), fallback=_text(默认值))
 
     def INI写入(self, 文件名: Any, 节: Any, 键: Any, 值: Any) -> str:
         import configparser
@@ -1953,41 +1669,60 @@ class _DataApi:
         parser.write(output)
         return self.写入(文件名, output.getvalue())
 
-    def CSV读取(self, 文件名: Any, 标题行: Any = True, 最多: Any = 10000) -> list:
+    def CSV读取(self, 文件名: Any, 标题行: Any = True, 最多: Any = None) -> list:
         import csv
         path = self._path(文件名)
-        limit = max(1, min(100000, int(最多)))
+        limit = self._row_limit(最多)
+        field_limit = csv.field_size_limit()
+        csv.field_size_limit((1 << 31) - 1)
         try:
             with open(path, "r", encoding="utf-8-sig", newline="") as handle:
                 if _as_bool(标题行):
-                    rows = list(csv.DictReader(handle))
+                    reader = csv.DictReader(handle)
+                    rows = []
+                    for row in reader:
+                        if limit is not None and len(rows) >= limit:
+                            raise ValueError(f"CSV 结果行数超过最多 {limit} 行")
+                        rows.append(row)
                 else:
-                    rows = [list(row) for row in csv.reader(handle)]
+                    reader = csv.reader(handle)
+                    rows = []
+                    for row in reader:
+                        if limit is not None and len(rows) >= limit:
+                            raise ValueError(f"CSV 结果行数超过最多 {limit} 行")
+                        rows.append(row)
         except FileNotFoundError:
             return []
-        if len(rows) > limit:
-            raise ValueError("CSV 行数超过限制")
+        finally:
+            csv.field_size_limit(field_limit)
         return rows
 
-    def SQLite查询(self, 文件名: Any, SQL: Any, 参数: Any = (), 最多: Any = 10000) -> list:
+    def SQLite查询(self, 文件名: Any, SQL: Any, 参数: Any = (), 最多: Any = None) -> list:
         import sqlite3
         statement = str(SQL or "").strip()
-        if not statement or not statement.casefold().startswith(("select", "pragma", "with")):
+        if not statement:
+            raise ValueError("SQLite 语句不能为空")
+        keyword = statement.split(None, 1)[0].upper()
+        if keyword not in {"SELECT", "PRAGMA", "WITH"}:
             raise ValueError("SQLite 只允许 SELECT、PRAGMA 或 WITH 查询")
+        limit = self._row_limit(最多)
         values = tuple(参数) if isinstance(参数, (list, tuple)) else (() if 参数 is None else (参数,))
-        limit = max(1, min(100000, int(最多)))
         path = self._path(文件名)
         try:
-            uri = f"file:{path.replace(chr(92), '/') }?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=5) as conn:
-                conn.execute("PRAGMA query_only=ON")
-                cursor = conn.execute(statement, values)
-                columns = [item[0] for item in cursor.description or ()]
-                rows = [dict(zip(columns, row)) for row in cursor.fetchmany(limit + 1)]
+            from pathlib import Path
+            uri = Path(path).as_uri() + "?mode=ro"
+            from contextlib import closing
+            with closing(sqlite3.connect(uri, uri=True)) as conn:
+                with closing(conn.execute(statement, values)) as cursor:
+                    columns = [item[0] for item in cursor.description or ()]
+                    rows = []
+                    if columns:
+                        for row in cursor:
+                            if limit is not None and len(rows) >= limit:
+                                raise ValueError(f"SQLite 结果行数超过最多 {limit} 行")
+                            rows.append(dict(zip(columns, row)))
         except sqlite3.Error as exc:
             raise ValueError(f"SQLite 查询失败: {exc}") from exc
-        if len(rows) > limit:
-            raise ValueError("SQLite 结果行数超过限制")
         return rows
 
     def 存在(self, 文件名: Any) -> bool:
@@ -2120,56 +1855,54 @@ class _InputDeviceView:
         return ScriptResult({"ok": True, "kind": "hid", "available": True, "devices": devices})
 
     def HID读取(self, 路径: Any, 长度: Any = 64, 超时: Any = 1000) -> ScriptResult:
+        length = integer_parameter(长度, "HID 长度", minimum=1, maximum=4096)
+        timeout = integer_parameter(超时, "HID 超时（毫秒）", minimum=0, maximum=60000)
+        if not 路径:
+            raise ValueError("HID 路径不能为空")
         hid = self._hid()
         if hid is None:
             return ScriptResult({"ok": False, "kind": "hid_read", "available": False, "data": [], "error": "hidapi 未安装"})
         path = 路径
-        if not path:
-            raise ValueError("HID 路径不能为空")
-        try:
-            length = int(长度)
-            timeout = int(超时)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("HID 长度和超时必须是整数") from exc
-        if length < 1 or length > 4096:
-            raise ValueError("HID 长度必须在 1 到 4096 之间")
-        if timeout < 0 or timeout > 60000:
-            raise ValueError("HID 超时必须在 0 到 60000 毫秒之间")
         device = None
         try:
             device = hid.device()
             device.open_path(path)
+            if timeout == 0:
+                device.set_nonblocking(True)
             data = list(device.read(length, timeout))
             return ScriptResult({"ok": bool(data), "kind": "hid_read", "available": True, "data": data, "bytes": len(data)})
         except Exception as exc:
             return ScriptResult({"ok": False, "kind": "hid_read", "available": True, "data": [], "error": str(exc)})
         finally:
             if device is not None:
-                try: device.close()
-                except Exception: pass
+                try:
+                    device.close()
+                except Exception as exc:
+                    raise RuntimeError(f"HID 设备关闭失败，释放状态未知: {exc}") from exc
 
-    def HID写入(self, 路径: Any, 数据: Any, 超时: Any = 1000) -> ScriptResult:
-        if self._host is None or not bool(self._host.context.get("allow_external_components", False)):
-            raise ScriptError("HID 写入需要启用并信任外部组件")
-        hid = self._hid()
-        if hid is None:
-            return ScriptResult({"ok": False, "kind": "hid_write", "available": False, "bytes": 0, "error": "hidapi 未安装"})
+    def HID写入(self, 路径: Any, 数据: Any) -> ScriptResult:
         path = 路径
         if not path:
             raise ValueError("HID 路径不能为空")
         if isinstance(数据, (bytes, bytearray)):
             payload = bytes(数据)
         elif isinstance(数据, (list, tuple)):
-            try: payload = bytes(int(item) & 0xFF for item in 数据)
-            except (TypeError, ValueError) as exc: raise ValueError("HID 数据必须是字节列表") from exc
+            try:
+                values = []
+                for item in 数据:
+                    values.append(integer_parameter(item, "HID 数据字节"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("HID 数据必须是字节列表") from exc
+            if any(value < 0 or value > 255 for value in values):
+                raise ValueError("HID 数据字节必须在 0 到 255 之间")
+            payload = bytes(values)
         else:
             raise TypeError("HID 数据必须是字节列表")
         if not payload or len(payload) > 4096:
             raise ValueError("HID 数据长度必须在 1 到 4096 字节之间")
-        try: timeout_ms = int(超时)
-        except (TypeError, ValueError) as exc: raise ValueError("HID 超时必须是整数") from exc
-        if timeout_ms < 0 or timeout_ms > 60000:
-            raise ValueError("HID 超时必须在 0 到 60000 毫秒之间")
+        hid = self._hid()
+        if hid is None:
+            return ScriptResult({"ok": False, "kind": "hid_write", "available": False, "bytes": 0, "error": "hidapi 未安装"})
         device = None
         try:
             device = hid.device(); device.open_path(path)
@@ -2179,8 +1912,10 @@ class _InputDeviceView:
             return ScriptResult({"ok": False, "kind": "hid_write", "available": True, "bytes": 0, "error": str(exc)})
         finally:
             if device is not None:
-                try: device.close()
-                except Exception: pass
+                try:
+                    device.close()
+                except Exception as exc:
+                    raise RuntimeError(f"HID 设备关闭失败，释放状态未知: {exc}") from exc
 
     def 状态(self, 设备: Any = 0) -> ScriptResult:
         dll = self._winmm()
@@ -2193,35 +1928,47 @@ class _InputDeviceView:
         return ScriptResult({"ok": True, "kind": "joystick", "id": index, "connected": True, "x": int(info.dwXpos), "y": int(info.dwYpos), "z": int(info.dwZpos), "buttons": int(info.dwButtons), "pov": int(info.dwPOV)})
 
     def 等待按钮(self, 按钮: Any, 设备: Any = 0, 按下: Any = True, 超时: Any = 30, 间隔: Any = 0.05) -> ScriptResult:
-        if isinstance(按钮, bool):
-            raise ValueError("手柄按钮必须是整数编号（从 1 开始）")
-        try:
-            button_value = float(按钮)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("手柄按钮必须是整数编号（从 1 开始）") from exc
-        if not button_value.is_integer():
-            raise ValueError("手柄按钮必须是整数编号（从 1 开始）")
-        button = int(button_value)
-        if button < 1 or button > 32:
-            raise ValueError("手柄按钮编号必须在 1 到 32 之间")
-        timeout = max(0.0, min(86400.0, float(超时)))
-        pause = max(0.01, min(2.0, float(间隔)))
+        button = integer_parameter(按钮, "手柄按钮编号", minimum=1, maximum=32)
+        timeout = finite_seconds(超时, "手柄超时")
+        pause = finite_seconds(间隔, "手柄间隔", positive=True)
         device_index = self._index(设备)
         deadline = time.monotonic() + timeout
         mask = 1 << (button - 1)
         desired = _as_bool(按下)
         while True:
+            if self._host is not None:
+                if self._host.should_stop():
+                    raise ScriptError("手柄按钮等待已停止")
+                self._host._wait_if_paused()
             if self._winmm() is None:
                 return ScriptResult({"ok": False, "kind": "joystick_button", "id": device_index, "button": button, "pressed": False, "connected": False})
             state = self.状态(device_index)
-            pressed = bool(int(getattr(state, "buttons", 0) or 0) & mask) if state else False
+            if not state or not bool(getattr(state, "connected", False)):
+                return ScriptResult({
+                    "ok": False,
+                    "kind": "joystick_button",
+                    "id": device_index,
+                    "button": button,
+                    "pressed": False,
+                    "connected": False,
+                    "error": "输入设备未连接",
+                })
+            pressed = bool(int(getattr(state, "buttons", 0) or 0) & mask)
             if pressed == desired:
                 return ScriptResult({"ok": True, "kind": "joystick_button", "id": device_index, "button": button, "pressed": pressed, "connected": bool(getattr(state, "connected", False))})
             if self._host is not None and self._host.should_stop():
                 raise ScriptError("手柄按钮等待已停止")
             if time.monotonic() >= deadline:
                 return ScriptResult({"ok": False, "kind": "joystick_button", "id": device_index, "button": button, "pressed": pressed, "connected": bool(getattr(state, "connected", False))})
-            time.sleep(pause)
+            remaining = max(0.0, deadline - time.monotonic())
+            if self._host is not None:
+                self._host._sleep_interruptible(min(pause, remaining))
+            else:
+                time.sleep(min(pause, remaining))
+
+
+class _WindowNotFound(ValueError):
+    """查询确定窗口不存在；参数错误和查询失败不使用此类型。"""
 
 
 class _WindowView:
@@ -2261,15 +2008,15 @@ class _WindowView:
             win32gui.EnumWindows(callback, matches)
             if len(matches) != 1:
                 if not matches:
-                    raise ValueError(f"未找到窗口: {title}")
+                    raise _WindowNotFound(f"未找到窗口: {title}")
                 raise ValueError(f"窗口标题不唯一: {title}")
             target = matches[0]
         try:
-            hwnd = int(target)
+            hwnd = integer_parameter(target, "窗口句柄", minimum=1)
         except (TypeError, ValueError) as exc:
             raise ValueError("窗口目标必须是 HWND、窗口标题或窗口信息") from exc
-        if not hwnd or not win32gui.IsWindow(hwnd):
-            raise ValueError(f"窗口句柄无效: {hwnd}")
+        if not win32gui.IsWindow(hwnd):
+            raise _WindowNotFound(f"窗口句柄无效: {hwnd}")
         return hwnd
 
     @staticmethod
@@ -2393,14 +2140,19 @@ class _WindowView:
                 return
             child = win32gui.GetWindow(hwnd, 5)  # GW_CHILD
             while child:
+                current = child
                 try:
-                    if not visible_only or win32gui.IsWindowVisible(child):
-                        row = self.信息(child)
+                    if not visible_only or win32gui.IsWindowVisible(current):
+                        row = self.信息(current)
                         row["parent_hwnd"] = int(hwnd)
                         row["depth"] = depth
                         rows.append(row)
-                    walk(child, depth + 1)
-                    child = win32gui.GetWindow(child, 2)  # GW_HWNDNEXT
+                    walk(current, depth + 1)
+                except Exception:
+                    # 单个失效/拒绝访问的子窗口不能截断同级窗口遍历。
+                    pass
+                try:
+                    child = win32gui.GetWindow(current, 2)  # GW_HWNDNEXT
                 except Exception:
                     break
 
@@ -2440,8 +2192,20 @@ class _WindowView:
                 getter = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
             except Exception:
                 getter = None
-        dpi = int(getter(hwnd)) if callable(getter) else 96
-        return ScriptResult({"ok": dpi > 0, "kind": "window", "hwnd": hwnd, "dpi": dpi, "scale": dpi / 96.0})
+        if not callable(getter):
+            return ScriptResult({
+                "ok": False,
+                "kind": "window",
+                "hwnd": hwnd,
+                "dpi": None,
+                "scale": None,
+                "error": "系统不支持 GetDpiForWindow",
+            })
+        try:
+            dpi = int(getter(hwnd))
+        except Exception as exc:
+            return ScriptResult({"ok": False, "kind": "window", "hwnd": hwnd, "dpi": None, "scale": None, "error": str(exc)})
+        return ScriptResult({"ok": dpi > 0, "kind": "window", "hwnd": hwnd, "dpi": dpi if dpi > 0 else None, "scale": dpi / 96.0 if dpi > 0 else None})
 
     def 坐标转换(self, x: Any, y: Any, 方向: Any = "屏幕到客户区", 目标: Any = None) -> ScriptResult:
         """在屏幕坐标与目标窗口客户区坐标之间转换，保留负坐标以支持多显示器。"""
@@ -2510,7 +2274,6 @@ class _WindowView:
             payload["runtime"] = {
                 "python": platform.python_version(),
                 "user_threads": active_user,
-                "user_thread_limit": 32,
                 "watch_threads": active_watch,
                 "screenshot_worker_limit": int(get_screenshot_worker_limit()),
             }
@@ -2569,9 +2332,13 @@ class _WindowView:
             raise ValueError("窗口消息参数必须是整数") from exc
         if not -(2**31) <= wParam <= 0xFFFFFFFF or not -(2**31) <= lParam <= 0xFFFFFFFF:
             raise ValueError("窗口消息参数超出 32 位范围")
-        sender = win32gui.PostMessage if _as_bool(投递) else win32gui.SendMessage
+        posted = _as_bool(投递)
+        sender = win32gui.PostMessage if posted else win32gui.SendMessage
         result = sender(hwnd, code, wParam, lParam)
-        return ScriptResult({"ok": True, "kind": "window_message", "hwnd": hwnd, "message": code, "result": result, "posted": _as_bool(投递)})
+        # pywin32 的 PostMessage 成功时返回 None，失败会抛异常。
+        # SendMessage 的 0 则可能是消息本身的合法返回值。
+        ok = not (posted and result is False)
+        return ScriptResult({"ok": ok, "kind": "window_message", "hwnd": hwnd, "message": code, "result": result, "posted": posted})
 
     def 激活(self, 目标: Any = None) -> bool:
         from utils.window.window_activation_utils import activate_window
@@ -2611,15 +2378,15 @@ class _WindowView:
             "automation_id": str(自动化ID or "").strip() or None,
             "class_name": str(类名 or "").strip() or None,
             "control_type": control_type_map.get(value, value),
-            "search_depth": max(1, int(搜索深度)),
-            "timeout": max(0.0, float(超时)),
+            "search_depth": integer_parameter(搜索深度, "搜索深度", minimum=1),
+            "timeout": finite_seconds(超时, "超时"),
         }
 
     def 查找元素(self, 名称=None, 自动化ID=None, 类名=None, 控件类型=None, 序号=0, 搜索深度=30, 超时=5.0, 目标=None):
-        simulator = self._element_simulator(目标)
+        start = integer_parameter(序号, "序号", minimum=0)
         kwargs = self._element_kwargs(名称, 自动化ID, 类名, 控件类型, 搜索深度, 超时)
+        simulator = self._element_simulator(目标)
         elements = simulator.find_all_elements(**kwargs)
-        start = max(0, int(序号))
         rows = []
         for element in elements[start:]:
             row = {}
@@ -2637,10 +2404,10 @@ class _WindowView:
         return ScriptResult({"ok": bool(rows), "kind": "elements", "items": rows})
 
     def 元素文本(self, 名称=None, 自动化ID=None, 类名=None, 控件类型=None, 序号=0, 搜索深度=30, 超时=5.0, 目标=None):
-        simulator = self._element_simulator(目标)
+        index = integer_parameter(序号, "序号", minimum=0)
         kwargs = self._element_kwargs(名称, 自动化ID, 类名, 控件类型, 搜索深度, 超时)
+        simulator = self._element_simulator(目标)
         elements = simulator.find_all_elements(**kwargs)
-        index = max(0, int(序号))
         element = elements[index] if index < len(elements) else None
         if element is None:
             return ScriptResult({"ok": False, "kind": "element"})
@@ -2669,10 +2436,10 @@ class _WindowView:
         return ScriptResult({"ok": True, "kind": "element", "text": text or ""})
 
     def 设置元素值(self, 值, 名称=None, 自动化ID=None, 类名=None, 控件类型=None, 序号=0, 搜索深度=30, 超时=5.0, 目标=None):
-        simulator = self._element_simulator(目标)
+        index = integer_parameter(序号, "序号", minimum=0)
         kwargs = self._element_kwargs(名称, 自动化ID, 类名, 控件类型, 搜索深度, 超时)
+        simulator = self._element_simulator(目标)
         elements = simulator.find_all_elements(**kwargs)
-        index = max(0, int(序号))
         element = elements[index] if index < len(elements) else None
         if element is None:
             return ScriptResult({"ok": False, "kind": "element"})
@@ -2689,12 +2456,10 @@ class _WindowView:
 
     def _find_element_object(self, 名称=None, 自动化ID=None, 类名=None, 控件类型=None,
                              序号=0, 搜索深度=30, 超时=5.0, 目标=None):
-        simulator = self._element_simulator(目标)
+        index = integer_parameter(序号, "序号", minimum=0)
         kwargs = self._element_kwargs(名称, 自动化ID, 类名, 控件类型, 搜索深度, 超时)
+        simulator = self._element_simulator(目标)
         elements = simulator.find_all_elements(**kwargs)
-        index = int(序号)
-        if index < 0:
-            raise ValueError("序号不能小于 0")
         return (elements[index] if index < len(elements) else None), simulator
 
     @staticmethod
@@ -2801,7 +2566,7 @@ class _WindowView:
         hwnd = self._resolve_hwnd(目标)
         import win32con
 
-        return bool(win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0))
+        return win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0) is not False
 
     def 显示(self, 目标: Any = None) -> bool:
         _, win32gui, win32process = self._win32()
@@ -2860,24 +2625,234 @@ class _WindowView:
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise ScriptError("禁止访问该属性")
-        width, height = self._host.客户区尺寸()
         if name in {"宽", "宽度"}:
+            width, _ = self._client_size_or_error()
             return width
         if name in {"高", "高度"}:
+            _, height = self._client_size_or_error()
             return height
         raise ScriptError(f"没有字段: {name}")
+
+    def _client_size_or_error(self) -> Tuple[int, int]:
+        hwnd = int(self._host.context.get("target_hwnd") or 0)
+        if hwnd <= 0:
+            raise ValueError("窗口宽高缺少当前目标窗口")
+        try:
+            import win32gui
+
+            left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        except Exception as exc:
+            raise ValueError(f"读取窗口客户区尺寸失败: {exc}") from exc
+        width, height = int(right - left), int(bottom - top)
+        if width < 0 or height < 0:
+            raise ValueError("读取窗口客户区尺寸失败: 尺寸未知")
+        return width, height
 
 
 class _ClipboardApi:
     def 获取(self) -> str:
         return clipboard_get()
 
-    def 设置(self, text: Any) -> str:
-        return clipboard_set(text)
+    def 设置(self, 文本: Any) -> str:
+        return clipboard_set(文本)
+
+
+class _ElevationLaunchError(OSError):
+    """Raised when ShellExecuteExW cannot start an elevated process."""
+
+    def __init__(self, error_code: int, message: str) -> None:
+        super().__init__(int(error_code), message)
+        self.winerror = int(error_code)
+
+
+class _ElevatedProcess:
+    """Small Popen-compatible wrapper around a ShellExecuteEx process handle."""
+
+    def __init__(self, pid: int, handle: Any, api: Dict[str, Any], command: list[str]) -> None:
+        self.pid = int(pid)
+        self._handle = handle
+        self._api = api
+        self._command = command
+        self._lca_program_path = command[0]
+        self._returncode = None
+        self._closed = False
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+
+    @property
+    def returncode(self):
+        return self._returncode
+
+    def _exit_code(self) -> int:
+        import ctypes
+        from ctypes import wintypes
+
+        value = wintypes.DWORD()
+        if not self._api["get_exit_code"](self._handle, ctypes.byref(value)):
+            raise OSError(int(ctypes.get_last_error() or 1), "读取提权进程退出码失败")
+        return int(value.value)
+
+    def poll(self):
+        if self._returncode is not None:
+            return self._returncode
+        result = int(self._api["wait"](self._handle, 0))
+        if result == 0x00000102:  # WAIT_TIMEOUT
+            return None
+        if result != 0x00000000:  # WAIT_OBJECT_0
+            raise OSError("查询提权进程状态失败")
+        self._returncode = self._exit_code()
+        return self._returncode
+
+    def wait(self, timeout=None):
+        import subprocess
+
+        if self._returncode is not None:
+            return self._returncode
+        if timeout is None:
+            milliseconds = 0xFFFFFFFF
+        else:
+            milliseconds = max(0, int(float(timeout) * 1000))
+        result = int(self._api["wait"](self._handle, milliseconds))
+        if result == 0x00000102:  # WAIT_TIMEOUT
+            raise subprocess.TimeoutExpired(self._command, timeout)
+        if result != 0x00000000:
+            raise OSError("等待提权进程失败")
+        self._returncode = self._exit_code()
+        return self._returncode
+
+    def terminate(self) -> None:
+        if self.poll() is not None:
+            return
+        if not self._api["terminate"](self._handle, 1):
+            import ctypes
+
+            error_code = int(ctypes.get_last_error() or 1)
+            raise OSError(error_code, "终止提权进程失败")
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def communicate(self, input=None, timeout=None):
+        if input not in (None, b"", ""):
+            raise ValueError("提权启动不支持标准输入")
+        self.wait(timeout=timeout)
+        return "", ""
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._handle:
+            self._api["close"](self._handle)
+        self._closed = True
+        self._handle = None
+
+
+def _close_process_resources(process: Any) -> None:
+    errors = []
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+    close = getattr(process, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            errors.append(str(exc))
+    if errors:
+        raise ValueError("；".join(errors))
+
+
+def _launch_elevated_process(executable: str, args: list[str], working_directory: Optional[str]):
+    """Start a program with UAC only after CreateProcess reports ERROR_ELEVATION_REQUIRED."""
+    if os.name != "nt":
+        raise OSError(740, "Windows 管理员提权仅适用于 Windows")
+
+    import ctypes
+    import subprocess
+    from ctypes import wintypes
+
+    class ShellExecuteInfo(ctypes.Structure):
+        _fields_ = (
+            ("cbSize", wintypes.DWORD),
+            ("fMask", wintypes.ULONG),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", wintypes.LPVOID),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIcon", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        )
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    execute = shell32.ShellExecuteExW
+    execute.argtypes = (ctypes.POINTER(ShellExecuteInfo),)
+    execute.restype = wintypes.BOOL
+    get_process_id = kernel32.GetProcessId
+    get_process_id.argtypes = (wintypes.HANDLE,)
+    get_process_id.restype = wintypes.DWORD
+    wait_for_process = kernel32.WaitForSingleObject
+    wait_for_process.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    wait_for_process.restype = wintypes.DWORD
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    get_exit_code.restype = wintypes.BOOL
+    terminate_process = kernel32.TerminateProcess
+    terminate_process.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    terminate_process.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    execute_info = ShellExecuteInfo()
+    execute_info.cbSize = ctypes.sizeof(execute_info)
+    execute_info.fMask = 0x00000040 | 0x00000100  # SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    execute_info.lpVerb = "runas"
+    execute_info.lpFile = executable
+    execute_info.lpParameters = subprocess.list2cmdline(args)
+    execute_info.lpDirectory = working_directory or None
+    execute_info.nShow = 1  # SW_SHOWNORMAL
+    if not execute(ctypes.byref(execute_info)):
+        error_code = int(ctypes.get_last_error() or 1)
+        if error_code == 1223:  # ERROR_CANCELLED
+            raise _ElevationLaunchError(error_code, "用户取消了管理员授权")
+        raise _ElevationLaunchError(error_code, "ShellExecuteExW 启动提权程序失败")
+    if not execute_info.hProcess:
+        raise _ElevationLaunchError(1, "提权程序未返回进程句柄")
+
+    shell_handle = execute_info.hProcess
+    pid = int(get_process_id(shell_handle) or 0)
+    if pid <= 0:
+        close_handle(shell_handle)
+        error_code = int(ctypes.get_last_error() or 1)
+        raise _ElevationLaunchError(error_code, "无法读取提权进程号")
+    return _ElevatedProcess(
+        pid,
+        shell_handle,
+        {
+            "wait": wait_for_process,
+            "get_exit_code": get_exit_code,
+            "terminate": terminate_process,
+            "close": close_handle,
+        },
+        [executable, *args],
+    )
 
 
 class _ProcessView:
-    """Process helpers; starting/stopping processes requires trusted components."""
+    """Process inspection and control for custom scripts."""
 
     def __init__(self, host) -> None:
         self._host = host
@@ -2890,16 +2865,41 @@ class _ProcessView:
             raise ScriptError(f"进程 API 不可用: {exc}") from exc
         return psutil
 
+    @staticmethod
+    def _pid(value: Any) -> int:
+        try:
+            return integer_parameter(value, "进程号", minimum=1)
+        except ValueError as exc:
+            raise ValueError("进程号必须是正整数") from exc
+
+    def _resolve_program_path(self, value: Any, *, require_file: bool = False) -> str:
+        from task_workflow.script_resources import resolve_script_program_path
+
+        return resolve_script_program_path(
+            str(value or ""),
+            require_file=require_file,
+            **self._host._resource_dirs(),
+        )
+
     def 查找(self, 名称: Any = None) -> list:
         psutil = self._psutil()
-        needle = str(名称 or "").strip().casefold()
+        raw_needle = str(名称 or "").strip()
+        path_needle = ""
+        if raw_needle and (os.path.isabs(raw_needle) or "/" in raw_needle or "\\" in raw_needle):
+            path_needle = os.path.normcase(
+                os.path.abspath(self._resolve_program_path(raw_needle, require_file=False))
+            )
+        needle = raw_needle.casefold()
         rows = []
         for proc in psutil.process_iter(["pid", "name", "exe", "status"]):
             try:
                 info = proc.info
                 name = str(info.get("name") or "")
                 exe = str(info.get("exe") or "")
-                if needle and needle not in name.casefold() and needle not in exe.casefold():
+                if path_needle:
+                    if not exe or os.path.normcase(os.path.abspath(exe)) != path_needle:
+                        continue
+                elif needle and needle not in name.casefold() and needle not in exe.casefold():
                     continue
                 rows.append(
                     ScriptResult(
@@ -2919,7 +2919,7 @@ class _ProcessView:
     def 信息(self, 进程号: Any) -> dict:
         psutil = self._psutil()
         try:
-            proc = psutil.Process(int(进程号))
+            proc = psutil.Process(self._pid(进程号))
             with proc.oneshot():
                 return ScriptResult(
                     {
@@ -2937,56 +2937,93 @@ class _ProcessView:
     def 是否运行(self, 目标: Any) -> bool:
         psutil = self._psutil()
         if isinstance(目标, (int, float)) and not isinstance(目标, bool):
+            pid = self._pid(目标)
             try:
-                return bool(psutil.pid_exists(int(目标)))
-            except Exception:
-                return False
+                return bool(psutil.pid_exists(pid))
+            except Exception as exc:
+                raise ValueError(f"查询进程状态失败，状态未知: {pid}: {exc}") from exc
         return bool(self.查找(目标))
 
-    def _require_trust(self) -> None:
-        if not bool(self._host.context.get("allow_external_components", False)):
-            raise ScriptError("进程启动/关闭需要启用并信任外部组件")
-
     def 启动(self, 程序: Any, 参数: Any = None, 等待: Any = False, 超时: Any = 30) -> dict:
-        self._require_trust()
         import subprocess
 
-        executable = str(程序 or "").strip()
-        if not executable:
-            raise ValueError("程序不能为空")
-        from task_workflow.script_resources import _is_module_offset_literal
-
-        if _is_module_offset_literal(executable):
-            raise ValueError("这是模块地址，不能当程序启动")
+        wait_for_exit = _as_bool(等待, "进程等待")
+        timeout = finite_seconds(超时, "进程超时")
+        raw_program = os.path.expandvars(os.path.expanduser(str(程序 or "").strip()))
+        path_argument = os.path.isabs(raw_program) or "/" in raw_program or "\\" in raw_program
+        executable = self._resolve_program_path(程序, require_file=path_argument)
         if 参数 is None:
             args = []
         elif isinstance(参数, (list, tuple)):
             args = [str(item) for item in 参数]
         else:
             args = [str(参数)]
-        wait_for_exit = _as_bool(等待)
-        proc = subprocess.Popen(
-            [executable, *args],
-            shell=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE if wait_for_exit else subprocess.DEVNULL,
-            stderr=subprocess.PIPE if wait_for_exit else subprocess.DEVNULL,
-            text=True,
-        )
+        working_directory = os.path.dirname(executable) if os.path.isabs(executable) else None
+        try:
+            proc = subprocess.Popen(
+                [executable, *args],
+                shell=False,
+                cwd=working_directory,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE if wait_for_exit else subprocess.DEVNULL,
+                stderr=subprocess.PIPE if wait_for_exit else subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError as exc:
+            if int(getattr(exc, "winerror", 0) or 0) != 740:
+                raise ValueError(f"启动程序失败: {executable}: {exc}") from exc
+            try:
+                proc = _launch_elevated_process(executable, args, working_directory)
+            except _ElevationLaunchError as elevation_error:
+                if elevation_error.winerror == 1223:
+                    raise ValueError(f"启动程序失败: 用户取消了管理员授权: {executable}") from elevation_error
+                raise ValueError(
+                    f"启动程序失败: {executable}: 管理员提权启动失败: {elevation_error}"
+                ) from elevation_error
+            except OSError as elevation_error:
+                raise ValueError(
+                    f"启动程序失败: {executable}: 管理员提权启动失败: {elevation_error}"
+                ) from elevation_error
+        # 非等待启动是明确的脱离脚本启动：工作流结束后程序继续运行，
+        # 通过进程号或程序路径调用 进程.关闭 负责结束它。宿主仍登记对象，
+        # 以便立即关闭本地管道/句柄，但收尾时不终止脱离进程。
+        self._host._register_process(proc)
+        try:
+            proc._lca_program_path = executable
+            proc._lca_detached = not wait_for_exit
+        except AttributeError:
+            pass
         result = {
             "pid": int(proc.pid),
+            "path": executable,
             "running": proc.poll() is None,
             "exit_code": None,
             "stdout": "",
             "stderr": "",
+            "started": True,
+            "completed": False,
+            "timed_out": False,
+            "status": "running",
         }
+        if isinstance(proc, _ElevatedProcess):
+            result["output_captured"] = False
+            result["output_note"] = "管理员提权启动不支持捕获标准输出和错误输出"
+        result["detached"] = not wait_for_exit
+        self._host.logger.info(
+            "[自定义脚本] 进程已启动: pid=%s, path=%s, detached=%s",
+            result["pid"],
+            executable,
+            result["detached"],
+        )
         if wait_for_exit:
             try:
-                stdout, stderr = proc.communicate(timeout=max(0.0, float(超时)))
+                stdout, stderr = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 result["running"] = True
                 result["stdout"] = ""
                 result["stderr"] = ""
+                result["timed_out"] = True
+                result["status"] = "timeout"
             else:
                 result.update(
                     {
@@ -2994,40 +3031,121 @@ class _ProcessView:
                         "exit_code": proc.returncode,
                         "stdout": stdout or "",
                         "stderr": stderr or "",
+                        "completed": True,
+                        "status": "exited",
                     }
                 )
-        return ScriptResult(result, ok=True)
+                _close_process_resources(proc)
+                self._host._forget_process(proc)
+        ok = not wait_for_exit or (result["completed"] and result["exit_code"] == 0)
+        return ScriptResult(result, ok=ok)
 
     def 关闭(self, 进程号: Any, 强制: Any = False) -> bool:
-        self._require_trust()
+        import subprocess
+
         psutil = self._psutil()
+        target = 进程号
+        if isinstance(target, ScriptResult):
+            target = target.pid
+        elif isinstance(target, dict):
+            target = target.get("pid")
+        if target is None:
+            raise ValueError("关闭目标必须是进程号或程序路径")
         try:
-            proc = psutil.Process(int(进程号))
-            proc.kill() if _as_bool(强制) else proc.terminate()
+            try:
+                pid = self._pid(target)
+            except (TypeError, ValueError):
+                if isinstance(target, (int, float)):
+                    raise
+                try:
+                    float(str(target).strip())
+                except (TypeError, ValueError):
+                    pid = None
+                else:
+                    raise
+
+            with self._host._process_lock:
+                owned_by_pid = dict(self._host._owned_processes)
+
+            if pid is None:
+                path = self._resolve_program_path(target, require_file=True)
+                path_key = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+                owned_matches = [
+                    process
+                    for process in owned_by_pid.values()
+                    if os.path.normcase(
+                        os.path.abspath(str(getattr(process, "_lca_program_path", "")))
+                    ) == path_key
+                ]
+                if owned_matches:
+                    processes = [(process, process) for process in owned_matches]
+                else:
+                    matches = []
+                    for candidate_pid in psutil.pids():
+                        candidate = psutil.Process(candidate_pid)
+                        try:
+                            candidate_path = str(candidate.exe() or "")
+                            if candidate_path and os.path.normcase(
+                                os.path.abspath(os.path.normpath(candidate_path))
+                            ) == path_key:
+                                matches.append(candidate)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+                    matches = [item for item in matches if int(item.pid) not in owned_by_pid]
+                    if len(matches) > 1:
+                        raise ValueError("指定路径匹配到多个进程，请传入进程号")
+                    if not matches:
+                        raise ValueError(f"未找到指定程序对应的运行进程: {path}")
+                    processes = [(item, None) for item in matches]
+            else:
+                owned = owned_by_pid.get(pid)
+                processes = [(None, owned)] if owned is not None else [(psutil.Process(pid), None)]
+
+            for proc, owned in processes:
+                if owned is not None:
+                    current_pid = int(owned.pid)
+                    try:
+                        owned.kill() if _as_bool(强制) else owned.terminate()
+                        owned.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired as exc:
+                        raise ValueError(f"进程未在 5 秒内退出: {current_pid}") from exc
+                    try:
+                        _close_process_resources(owned)
+                    except Exception as exc:
+                        raise ValueError(f"关闭进程资源失败: {current_pid}: {exc}") from exc
+                    self._host._forget_process(owned)
+                    continue
+                current_pid = int(proc.pid)
+                try:
+                    proc.kill() if _as_bool(强制) else proc.terminate()
+                    proc.wait(timeout=5.0)
+                except psutil.NoSuchProcess:
+                    pass
+                except psutil.TimeoutExpired as exc:
+                    raise ValueError(f"进程未在 5 秒内退出: {current_pid}") from exc
             return True
         except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied) as exc:
-            raise ValueError(f"无法关闭进程: {进程号}") from exc
+            if isinstance(exc, ValueError) and str(exc).startswith(("指定路径匹配到多个进程", "未找到指定程序", "进程未在")):
+                raise
+            raise ValueError(f"无法关闭进程或程序: {进程号}: {exc}") from exc
 
 
 class _NetworkView:
-    """Bounded HTTP client for explicitly trusted scripts."""
+    """HTTP client exposed to custom scripts."""
 
     def __init__(self, host) -> None:
         self._host = host
 
-    def 请求(self, 地址: Any, 方法: Any = "GET", 数据: Any = None, 头: Any = None, 超时: Any = 15, 最大字节: Any = 2 * 1024 * 1024) -> ScriptResult:
-        if not bool(self._host.context.get("allow_external_components", False)):
-            raise ScriptError("网络请求需要启用并信任外部组件")
+    def 请求(self, 地址: Any, 方法: Any = "GET", 数据: Any = None, 头: Any = None, 超时: Any = 15, 最大字节: Any = None) -> ScriptResult:
         from urllib.parse import urlparse
+        from urllib.error import HTTPError
         from urllib.request import Request, urlopen
 
         url = str(地址 or "").strip()
         parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("网络地址只允许 http 或 https")
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("网络地址只支持 HTTP 或 HTTPS")
         method = str(方法 or "GET").strip().upper()
-        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
-            raise ValueError("网络方法不受支持")
         headers = {}
         if 头 is not None:
             if not isinstance(头, dict):
@@ -3040,24 +3158,35 @@ class _NetworkView:
                 headers.setdefault("Content-Type", "application/json; charset=utf-8")
             else:
                 body = str(数据).encode("utf-8")
-        limit = max(1, min(10 * 1024 * 1024, int(最大字节)))
+        timeout = finite_seconds(超时, "网络超时", positive=True)
+        max_bytes = None
+        if 最大字节 is not None:
+            if isinstance(最大字节, bool):
+                raise ValueError("最大字节必须是大于 0 的整数")
+            try:
+                max_bytes_float = float(最大字节)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("最大字节必须是大于 0 的整数") from exc
+            if not math.isfinite(max_bytes_float) or not max_bytes_float.is_integer() or max_bytes_float < 1:
+                raise ValueError("最大字节必须是大于 0 的整数")
+            max_bytes = int(max_bytes_float)
         try:
             request = Request(url, data=body, headers=headers, method=method)
-            with urlopen(request, timeout=max(0.1, min(120.0, float(超时)))) as response:
-                chunks = []
-                total = 0
-                while True:
-                    chunk = response.read(min(64 * 1024, limit - total))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total >= limit:
-                        break
-                raw = b"".join(chunks)
+            try:
+                response = urlopen(request, timeout=timeout)
+            except HTTPError as error:
+                response = error
+            with response:
+                if self._host.should_stop():
+                    raise ScriptError("网络请求已停止")
+                self._host._wait_if_paused()
+                raw = response.read() if max_bytes is None else response.read(max_bytes + 1)
+                truncated = max_bytes is not None and len(raw) > max_bytes
+                if truncated:
+                    raw = raw[:max_bytes]
                 charset = response.headers.get_content_charset() or "utf-8"
                 text = raw.decode(charset, errors="replace")
-                return ScriptResult({"ok": 200 <= int(response.status) < 400, "kind": "http", "status": int(response.status), "headers": dict(response.headers.items()), "text": text, "bytes": len(raw), "url": url})
+                return ScriptResult({"ok": 200 <= int(response.status) < 400, "kind": "http", "status": int(response.status), "headers": dict(response.headers.items()), "text": text, "bytes": len(raw), "url": url, "truncated": truncated})
         except Exception as exc:
             raise ValueError(f"网络请求失败: {exc}") from exc
 
@@ -3067,12 +3196,13 @@ class _EventView:
         self._host = host
 
     def _wait(self, check, 超时: Any, 间隔: Any, kind: str) -> ScriptResult:
-        timeout = max(0.0, min(86400.0, float(超时)))
-        pause = max(0.05, min(10.0, float(间隔)))
+        timeout = finite_seconds(超时, "事件超时")
+        pause = finite_seconds(间隔, "事件间隔", positive=True)
         deadline = time.monotonic() + timeout
         while True:
             if self._host.should_stop():
                 raise ScriptError("事件等待已停止")
+            self._host._wait_if_paused()
             value = check()
             if value:
                 if isinstance(value, ScriptResult):
@@ -3080,7 +3210,7 @@ class _EventView:
                 return ScriptResult({"ok": True, "kind": kind, "value": value})
             if time.monotonic() >= deadline:
                 return ScriptResult({"ok": False, "kind": kind})
-            time.sleep(pause)
+            self._host._sleep_interruptible(min(pause, max(0.0, deadline - time.monotonic())))
 
     def 等待窗口(self, 标题: Any, 完全匹配: Any = False, 超时: Any = 30, 间隔: Any = 0.3) -> ScriptResult:
         view = _WindowView(self._host)
@@ -3105,7 +3235,7 @@ class _EventView:
             try:
                 hwnd = view._resolve_hwnd(target)
                 return None if hwnd else True
-            except Exception:
+            except _WindowNotFound:
                 return True
         return self._wait(check, 超时, 间隔, "window_closed_event")
 
@@ -3163,7 +3293,7 @@ class _ExternalComponentApi:
     def __init__(self, host: CommandHost) -> None:
         self._host = host
 
-    def 加载(self, 类型: Any, 入口: Any, 调用约定: Any = "cdecl", 超时: Any = 10) -> ScriptResult:
+    def 加载(self, 类型: Any, 入口: Any, 调用约定: Any = None, 超时: Any = 10) -> ScriptResult:
         return self._host.组件加载(类型, 入口, 调用约定=调用约定, 超时=超时)
 
     def 调用(self, 句柄: Any, 方法: Any = "", *参数: Any, **选项: Any) -> ScriptResult:
@@ -3198,6 +3328,17 @@ def run_script(
     user_funcs = {
         node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
     }
+    debug_variable_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            debug_variable_names.add(node.id)
+        elif isinstance(node, ast.FunctionDef):
+            debug_variable_names.add(node.name)
+            debug_variable_names.update(arg.arg for arg in node.args.args)
+            debug_variable_names.update(arg.arg for arg in node.args.posonlyargs)
+            debug_variable_names.update(arg.arg for arg in node.args.kwonlyargs)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            debug_variable_names.add(str(node.name))
     tree = _ForCountWrap().visit(tree)
     tree = _GuardInsert().visit(tree)
     ast.fix_missing_locations(tree)
@@ -3216,7 +3357,15 @@ def run_script(
     )
 
     def _log(message: Any) -> None:
-        runtime_logger.info("[自定义脚本] %s", message)
+        execution_owner = runtime_context.get("executor")
+        extra = {"lca_execution_log": True}
+        if execution_owner is not None:
+            extra["lca_execution_owner_id"] = id(execution_owner)
+        runtime_logger.info(
+            "[自定义脚本] %s",
+            message,
+            extra=extra,
+        )
 
     def _ok(detail: Any = "") -> None:
         raise ScriptOutcome(True, str(detail or ""))
@@ -3253,8 +3402,9 @@ def run_script(
         return host.多线程(func, label)
 
     namespace = _ScriptNamespace({
-        "__builtins__": {},
+        "__builtins__": __builtins__,
         "__guard": guard,
+        "_lca_guard": guard,
         "__iter_count": script_for_iterable,
         "变量": _VarsApi(store),
         "区域": _RegionApi(host),
@@ -3333,6 +3483,8 @@ def run_script(
         "记录": _log,
         "成功": _ok,
         "失败": _fail,
+        # 脚本帮助中的“模式=无”表示沿用线程执行模式。
+        "无": None,
         # These Python names are internal targets of the Chinese aliases
         # above, not public script commands.
         "len": len,
@@ -3407,17 +3559,13 @@ def run_script(
     result = None
     previous_trace = None
     debugger = runtime_context.get("debugger")
-    if debugger is not None and callable(getattr(debugger, "start", None)):
-        # 只有完全没有生命周期管理（没有可调用 is_running）的简易/旧式调试器，才由
-        # run_script 代为启动。带 is_running() 的调试器 start/stop 归调用方所有：
-        # 若这里代它 start()，会把调用方在进入 run_script 前发出的 stop() 抹掉，
-        # 令“停止后仍继续运行”。
-        is_running = getattr(debugger, "is_running", None)
-        if not callable(is_running):
-            try:
-                debugger.start()
-            except Exception:
-                logger.debug("启动脚本调试器失败", exc_info=True)
+    if debugger is not None and callable(getattr(debugger, "set_variable_names", None)):
+        # 执行命名空间包含中文命令和完整 Python 运行时；只把脚本实际定义的
+        # 变量交给调试器，避免变量面板被内部对象淹没。
+        try:
+            debugger.set_variable_names(debug_variable_names)
+        except Exception:
+            runtime_logger.debug("设置脚本调试变量白名单失败", exc_info=True)
     try:
         try:
             # 调试器仅在本次脚本执行期间安装逐行追踪，结束后恢复宿主线程原有设置。
@@ -3470,13 +3618,21 @@ def run_script(
                 _raise_script_error("不能单独写返回，请用 成功() 或 失败()", exc)
             _raise_script_error(f"运行失败: {exc}", exc)
     finally:
+        pending = sys.exc_info()[1]
+        cleanup_error = None
+        try:
+            host.close()
+        except Exception as exc:
+            cleanup_error = ScriptError(f"{pending}；{exc}" if pending is not None else str(exc))
+        failure = host.thread_failure()
+        if failure and cleanup_error is None:
+            cleanup_error = ScriptError(f"线程失败: {failure}")
         if debugger is not None and callable(getattr(debugger, "finish", None)):
             try:
-                pending = sys.exc_info()[1]
-                if pending is not None:
+                if cleanup_error is not None or pending is not None:
                     # 有异常正在向外传播：以失败和异常文本收尾，避免用陈旧的 result
                     # 误报成功；同时保证异常路径上 finish 只在这里发生一次。
-                    debugger.finish(False, str(pending))
+                    debugger.finish(False, str(cleanup_error or pending))
                 else:
                     success = result[0] if isinstance(result, tuple) and result else None
                     detail = result[1] if isinstance(result, tuple) and len(result) > 1 else ""
@@ -3488,8 +3644,6 @@ def run_script(
                 sys.settrace(previous_trace)
             except Exception:
                 sys.settrace(None)
-        host.close()
-    failure = host.thread_failure()
-    if failure:
-        raise ScriptError(f"线程失败: {failure}")
+        if cleanup_error is not None:
+            raise cleanup_error
     return result if result is not None else (True, "")

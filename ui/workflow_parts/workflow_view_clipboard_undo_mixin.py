@@ -71,7 +71,7 @@ class WorkflowViewClipboardUndoMixin:
                 or getattr(connection, 'end_item', None) in selected_card_objects
             ):
                 continue
-            self._validate_connection_contract(connection)
+            self._connection_controller.assert_registered(connection)
             standalone_connections.append(connection)
             connection_states[id(connection)] = {
                 'start_card_id': connection.start_item.card_id,
@@ -113,7 +113,7 @@ class WorkflowViewClipboardUndoMixin:
         return deleted_count
 
     def handle_copy_card(self, card_id: int, parameters: dict):
-        """Stores the data of the card requested to be copied (单卡片复制，保持向后兼容)."""
+        """复制单张卡片的数据。"""
         card = self.cards.get(card_id)
         if card:
             safe_parameters = copy.deepcopy(parameters if isinstance(parameters, dict) else card.parameters)
@@ -212,12 +212,16 @@ class WorkflowViewClipboardUndoMixin:
         # 注释已清理（原注释编码损坏）
         is_single_card = type(self).copied_card_data.get('single_card', True)
 
-        if is_single_card:
-            # 单卡片粘贴（保持原有逻辑）
-            self._paste_single_card(scene_pos)
-        else:
-            # 批量卡片粘贴
-            self._paste_multiple_cards(scene_pos)
+        try:
+            if is_single_card:
+                # 单卡片粘贴（保持原有逻辑）
+                self._paste_single_card(scene_pos)
+            else:
+                # 批量卡片粘贴
+                self._paste_multiple_cards(scene_pos)
+        finally:
+            # 任意校验/连线错误都不能把后续编辑永久锁在粘贴状态。
+            self._pasting_card = False
 
         debug_print("--- [DEBUG] WorkflowView: handle_paste_card END ---")
 
@@ -371,7 +375,7 @@ class WorkflowViewClipboardUndoMixin:
             line_type = connection_data.get('line_type')
             if start_id not in original_ids or end_id not in original_ids:
                 raise ValueError(f"剪贴板连线端点无效: {start_id} -> {end_id}")
-            if line_type not in self._VALID_CONNECTION_TYPES:
+            if line_type not in PORT_TYPES:
                 raise ValueError(f"剪贴板包含无效连线类型: {line_type!r}")
 
         # 计算原始卡片的边界框，用于相对定位（即使只有1张卡片也使用真实最小值）
@@ -474,18 +478,11 @@ class WorkflowViewClipboardUndoMixin:
 
                 # 获取参数定义字典
                 param_definitions = {}
-                if hasattr(task_module, 'get_params_definition'):
-                    try:
-                        param_definitions = task_module.get_params_definition()
-                    except Exception as e:
-                        debug_print(f"  [调试] 获取参数定义失败 {new_card.task_type}：{e}")
-                        param_definitions = {}
-                elif hasattr(task_module, 'get_parameters'):
-                    try:
-                        param_definitions = task_module.get_parameters()
-                    except Exception as e:
-                        debug_print(f"  [调试] 获取参数定义失败 {new_card.task_type}：{e}")
-                        param_definitions = {}
+                try:
+                    param_definitions = task_module.get_params_definition()
+                except Exception as e:
+                    debug_print(f"  [调试] 获取参数定义失败 {new_card.task_type}：{e}")
+                    param_definitions = {}
 
                 if isinstance(param_definitions, list):
                     converted_defs = {}
@@ -702,37 +699,6 @@ class WorkflowViewClipboardUndoMixin:
             operation_logger.error("[撤回记录] 保存连线新增状态失败: %s", e, exc_info=True)
             logger.error(f"保存添加连接状态失败: {e}", exc_info=True)
 
-    def _save_modify_connection_state_for_undo(self, old_connection, new_start_card, new_end_card, new_line_type):
-        """保存修改连接的状态用于撤销（包含删除旧连接和添加新连接）。"""
-        try:
-            # 注释已清理（原注释编码损坏）
-            old_conn_data = {
-                'start_card_id': old_connection.start_item.card_id if old_connection.start_item else None,
-                'end_card_id': old_connection.end_item.card_id if old_connection.end_item else None,
-                'line_type': old_connection.line_type if hasattr(old_connection, 'line_type') else 'unknown'
-            }
-
-            # 新连接数据
-            new_conn_data = {
-                'start_card_id': new_start_card.card_id if new_start_card else None,
-                'end_card_id': new_end_card.card_id if new_end_card else None,
-                'line_type': new_line_type
-            }
-
-            # 保存复合撤销操作
-            self._save_undo_state('modify_connection', {
-                'old_connection_data': old_conn_data,
-                'new_connection_data': new_conn_data
-            })
-
-            debug_print("  [UNDO] Saved modify connection state for undo:")
-            debug_print(f"    Old: {old_conn_data['start_card_id']} -> {old_conn_data['end_card_id']} ({old_conn_data['line_type']})")
-            debug_print(f"    New: {new_conn_data['start_card_id']} -> {new_conn_data['end_card_id']} ({new_conn_data['line_type']})")
-
-        except Exception as e:
-            operation_logger.error("[撤回记录] 保存连线修改状态失败: %s", e, exc_info=True)
-            logger.error(f"保存修改连接状态失败: {e}", exc_info=True)
-
     def _save_add_card_state_for_undo(self, card_id: int, task_type: str, x: float, y: float, parameters: Optional[dict]):
         """保存添加卡片的状态用于撤销"""
         try:
@@ -897,8 +863,7 @@ class WorkflowViewClipboardUndoMixin:
             debug_print("  [UNDO] No custom name to restore")
 
         # 注释已清理（原注释编码损坏）
-        debug_print(f"  [UNDO] Scheduling connection restoration for card {card_id} in 500ms")
-        QTimer.singleShot(500, lambda: self._restore_card_connections(card_id, connections_data))
+        self._restore_card_connections(card_id, connections_data)
 
         debug_print(f"  [UNDO] Successfully restored card {card_id}")
 
@@ -944,79 +909,29 @@ class WorkflowViewClipboardUndoMixin:
                 raise RuntimeError(f"恢复批量删除连线失败: {key[0]} -> {key[1]} ({key[2]})")
 
     def _restore_card_connections(self, card_id: int, connections_data: List[Dict[str, Any]]):
-        """恢复卡片的连接"""
-        debug_print(f"  [UNDO] Starting connection restoration for card {card_id}")
-        debug_print(f"  [UNDO] Current cards in workflow: {list(self.cards.keys())}")
-
-        # 设置撤销操作标志，防止连接恢复过程中的操作触发新的撤销保存
-        was_undoing = getattr(self, '_undoing_operation', False)
+        """在同一次撤回事务中恢复连线，失败时也恢复撤销标记。"""
+        if card_id not in self.cards:
+            raise RuntimeError(f"恢复连线失败，找不到卡片：{card_id}")
+        was_undoing = self._undoing_operation
         self._undoing_operation = True
-        debug_print("  [UNDO] Set undoing operation flag to True for connection restoration")
-
-        restored_card = self.cards.get(card_id)
-        if not restored_card:
-            operation_logger.error("[撤回] 恢复连线失败，找不到卡片 card_id=%s", card_id)
-            debug_print(f"  [撤销] 错误：无法恢复连线，未找到卡片 {card_id}")
-            debug_print(f"  [UNDO] Available cards: {list(self.cards.keys())}")
-            return
-
-        debug_print(f"  [UNDO] Restoring {len(connections_data)} connections for card {card_id}")
-
-        successful_restorations = 0
-        failed_restorations = 0
-
-        for i, conn_data in enumerate(connections_data):
-            start_card_id = conn_data['start_card_id']
-            end_card_id = conn_data['end_card_id']
-            line_type = conn_data['line_type']
-
-            debug_print(f"    [CONN {i+1}/{len(connections_data)}] Restoring: {start_card_id} -> {end_card_id} ({line_type})")
-
-            start_card = self.cards.get(start_card_id)
-            end_card = self.cards.get(end_card_id)
-
-            if not start_card:
-                debug_print(f"      错误：未找到起始卡片 {start_card_id}")
-                failed_restorations += 1
-                continue
-
-            if not end_card:
-                debug_print(f"      错误：未找到结束卡片 {end_card_id}")
-                failed_restorations += 1
-                continue
-
-            # 检查连接是否已存在
-            existing_conn = None
-            for conn in self.connections:
-                if (isinstance(conn, ConnectionLine) and
-                    conn.start_item == start_card and
-                    conn.end_item == end_card and
-                    conn.line_type == line_type):
-                    existing_conn = conn
-                    break
-
-            if existing_conn:
-                debug_print("      Connection already exists, skipping")
-                successful_restorations += 1
-            else:
-                new_conn = self.add_connection(start_card, end_card, line_type)
-                if new_conn:
-                    debug_print("      SUCCESS: Restored connection")
-                    successful_restorations += 1
-                else:
-                    debug_print("      错误：创建连线失败")
-                    failed_restorations += 1
-
-        debug_print(f"  [UNDO] Connection restoration completed: {successful_restorations} success, {failed_restorations} failed")
-
-        # 如果有连接恢复，触发更新
-        if successful_restorations > 0:
-            debug_print("  [UNDO] Triggering sequence update after connection restoration")
-            self.update_card_sequence_display()
-
-        # 恢复撤销操作标志状态
-        self._undoing_operation = was_undoing
-        debug_print(f"  [UNDO] Restored undoing operation flag to {was_undoing} after connection restoration")
+        try:
+            for conn_data in connections_data:
+                start_card_id = conn_data['start_card_id']
+                end_card_id = conn_data['end_card_id']
+                line_type = conn_data['line_type']
+                start_card = self.cards.get(start_card_id)
+                end_card = self.cards.get(end_card_id)
+                if start_card is None or end_card is None:
+                    raise RuntimeError(f"恢复连线失败，缺少端点：{start_card_id} -> {end_card_id}")
+                if any(conn.start_item is start_card and conn.end_item is end_card
+                       and conn.line_type == line_type for conn in self.connections):
+                    continue
+                if self.add_connection(start_card, end_card, line_type) is None:
+                    raise RuntimeError(f"恢复连线失败：{start_card_id} -> {end_card_id}")
+            if connections_data:
+                self.update_card_sequence_display()
+        finally:
+            self._undoing_operation = was_undoing
 
     def _undo_delete_connection(self, operation_data: Dict[str, Any]):
         """撤销删除连接操作"""

@@ -112,12 +112,6 @@
       "bundled": true
     },
     {
-      "name": "pyperclip",
-      "version": "1.11.0",
-      "direct": true,
-      "bundled": true
-    },
-    {
       "name": "PySide6_Essentials",
       "version": "6.10.1",
       "direct": true,
@@ -353,6 +347,15 @@
       "bundled": false,
       "required_by": [
         "pyautogui"
+      ]
+    },
+    {
+      "name": "pyperclip",
+      "version": "1.11.0",
+      "direct": false,
+      "bundled": true,
+      "required_by": [
+        "mouseinfo"
       ]
     },
     {

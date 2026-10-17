@@ -1167,10 +1167,11 @@ class ParameterPanelFavoritesMixin:
 
         return normalized_favorites, changed
 
-    def _sync_workspace_favorites_snapshot(self) -> tuple[list[str], list[dict], bool]:
+    def _sync_workspace_favorites_snapshot(self, *, rebuild: bool = True) -> tuple[list[str], list[dict], bool]:
         """同步工作区收藏快照，并在必要时回写配置。"""
         workspaces, favorites, excluded_paths, extra_paths, changed = load_workspace_favorites_snapshot(
-            self._favorites_config_path
+            self._favorites_config_path,
+            rebuild=rebuild,
         )
         self._favorite_workspaces = workspaces
         self._favorite_excluded = excluded_paths

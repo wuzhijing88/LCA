@@ -240,7 +240,7 @@ class WorkflowViewIoMixin:
 
         connections = []
         for connection in self.connections:
-            start_card, end_card, line_type = self._validate_registered_connection(connection)
+            start_card, end_card, line_type = self._connection_controller.assert_registered(connection)
             connections.append({
                 "start_card_id": start_card.card_id,
                 "end_card_id": end_card.card_id,
@@ -304,12 +304,9 @@ class WorkflowViewIoMixin:
         if not isinstance(workflow_data, dict):
             raise TypeError("工作流数据必须是字典")
 
-        if 'workflow' in workflow_data and 'cards' not in workflow_data:
-            actual_workflow = workflow_data['workflow']
-        else:
-            actual_workflow = workflow_data
-        if not isinstance(actual_workflow, dict):
-            raise TypeError("工作流主体必须是字典")
+        if 'workflow' in workflow_data:
+            raise ValueError("工作流数据必须直接包含 cards 和 connections，不接受 workflow 包装")
+        actual_workflow = workflow_data
 
         cards = actual_workflow.get('cards')
         connections = actual_workflow.get('connections')
@@ -375,6 +372,12 @@ class WorkflowViewIoMixin:
 
     def _load_current_workflow(self, workflow_data: Dict[str, Any]):
         actual_workflow = self._validate_current_workflow_data(workflow_data)
+        if not isinstance(self.task_modules, dict):
+            raise TypeError("任务模块清单必须是字典")
+        for card_data in actual_workflow['cards']:
+            task_type = card_data['task_type'].strip()
+            if self.task_modules.get(task_type) is None:
+                raise ValueError(f"卡片 {card_data['id']} 的任务类型不可用: {task_type}")
         logger.info("[工作流加载] 开始")
 
         metadata = actual_workflow.get("metadata", {})
@@ -385,13 +388,8 @@ class WorkflowViewIoMixin:
         from task_workflow.workflow_sanitize import sanitize_card_parameters
 
         self.clear_workflow()
-        dropped_card_ids = set()
         for card_data in actual_workflow['cards']:
-            task_type = str(card_data['task_type'] or "").strip()
-            if self.task_modules.get(task_type) is None:
-                logger.warning("[工作流加载] 已清除未知卡片: ID=%s, 类型=%s", card_data['id'], task_type)
-                dropped_card_ids.add(card_data['id'])
-                continue
+            task_type = card_data['task_type'].strip()
             card = self.add_task_card(
                 x=card_data['pos_x'],
                 y=card_data['pos_y'],
@@ -407,22 +405,15 @@ class WorkflowViewIoMixin:
             if custom_name:
                 card.set_custom_name(custom_name.strip())
 
-        if dropped_card_ids:
-            self._clear_dropped_card_references(dropped_card_ids)
-
         self._update_card_render_cache_policy()
 
         for connection_data in actual_workflow['connections']:
             start_id = connection_data['start_card_id']
             end_id = connection_data['end_card_id']
-            if start_id not in self.cards or end_id not in self.cards:
-                logger.warning("[工作流加载] 已清除无效连线: %s -> %s", start_id, end_id)
-                continue
             restored_connection = self.add_connection(
                 self.cards[start_id],
                 self.cards[end_id],
                 connection_data['type'],
-                skip_duplicate_check=True,
             )
             if restored_connection is None:
                 raise RuntimeError(
@@ -487,23 +478,3 @@ class WorkflowViewIoMixin:
             QTimer.singleShot(100, self, self._place_start_card_at_viewport_top_left)
 
         logger.info("[工作流加载] 完成，卡片数量=%s，连线数量=%s", len(self.cards), len(self.connections))
-
-    def _clear_dropped_card_references(self, dropped_card_ids: set) -> None:
-        for card in self.cards.values():
-            for parameter_name in self._reference_parameter_names(card):
-                if card.parameters.get(parameter_name) in dropped_card_ids:
-                    card.parameters[parameter_name] = None
-            random_weights = card.parameters.get("random_weights")
-            if isinstance(random_weights, dict):
-                card.parameters["random_weights"] = {
-                    target_id: weight
-                    for target_id, weight in random_weights.items()
-                    if not (isinstance(target_id, str) and target_id.isdigit() and int(target_id) in dropped_card_ids)
-                }
-            random_connections = card.parameters.get("_random_connections")
-            if isinstance(random_connections, list):
-                card.parameters["_random_connections"] = [
-                    item
-                    for item in random_connections
-                    if not (isinstance(item, dict) and item.get("card_id") in dropped_card_ids)
-                ]

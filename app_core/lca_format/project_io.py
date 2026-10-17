@@ -25,7 +25,7 @@ from app_core.lca_format.session import (
     materialize_package_assets,
     register,
 )
-from task_workflow.workspace import workflow_resource_dirs
+from task_workflow.workspace import _resource_param_kind, workflow_resource_dirs
 from task_workflow.workflow_sanitize import sanitize_workflow_data
 
 logger = logging.getLogger(__name__)
@@ -97,7 +97,7 @@ def seal_workflow_package(
     if _workflow_contains_sub_workflow(workflow_data):
         raise LcaFormatError("子工作流不允许嵌套")
     source_path = Path(str(source_dir or "").strip() or ".")
-    collector = _ProjectCollector(source_path)
+    collector = _ProjectCollector(source_path, package_assets=True)
     cleaned = collector.collect(
         dict(workflow_data),
         source_session=source_session,
@@ -167,12 +167,14 @@ def _workflow_resource_path(kind: str, packaged_path: str) -> str:
 
 
 class _ProjectCollector:
-    def __init__(self, output_dir: Path):
+    def __init__(self, output_dir: Path, *, package_assets: bool = False):
         self.output_dir = output_dir
+        self.package_assets = bool(package_assets)
         self.files: Dict[str, bytes] = {}
         self.file_records = []
         self._used_paths = set()
         self._workflow_paths: Dict[Tuple[object, ...], str] = {}
+        self._packaged_assets: Dict[Tuple[object, ...], str] = {}
         self._missing = set()
 
     def collect(
@@ -279,8 +281,7 @@ class _ProjectCollector:
                         dicts_dir=local_dicts_dir,
                     )
                     continue
-                kind = _kind_for_path(str(value or ""), key)
-                if key not in PATH_PARAM_KEYS and not kind:
+                if key not in PATH_PARAM_KEYS and not _resource_param_kind(key):
                     continue
                 values = _path_values(value)
                 if not values:
@@ -369,6 +370,78 @@ class _ProjectCollector:
         if expected and rewritten != source:
             parameters["script_source_sha256"] = script_source_hash(rewritten)
 
+    @staticmethod
+    def _asset_folder(kind: str) -> str:
+        return {
+            "image": "images",
+            "audio": "sounds",
+            "model": "yolo",
+            "replay": "replays",
+            "component": "components",
+            "dict": "dicts",
+        }.get(str(kind or "").strip(), "misc")
+
+    def _source_session_asset(
+        self,
+        raw_path: str,
+        source_session: Optional[LcaPackageSession],
+        kind: str,
+    ) -> Optional[Tuple[Tuple[object, ...], str, bytes]]:
+        if source_session is None:
+            return None
+        normalized = str(raw_path or "").replace("\\", "/").strip().lstrip("/")
+        if normalized.startswith("memory://"):
+            normalized = normalized[len("memory://") :]
+        if not normalized:
+            return None
+        candidates = [normalized]
+        from app_core.lca_format.session import _package_alias_paths
+
+        candidates.extend(_package_alias_paths(normalized))
+        folder = self._asset_folder(kind)
+        name = Path(normalized).name
+        if name:
+            candidates.extend((f"{folder}/{name}", f"assets/{folder}/{name}"))
+            if folder == "yolo":
+                candidates.extend((f"models/{name}", f"assets/models/{name}"))
+        seen = set()
+        for candidate in candidates:
+            logical = str(candidate or "").replace("\\", "/").lstrip("/")
+            if not logical or logical in seen:
+                continue
+            seen.add(logical)
+            data = source_session.get_bytes(logical)
+            if data is not None:
+                canonical = logical
+                if name and folder != "misc":
+                    canonical = f"assets/{folder}/{name}"
+                return ("session", id(source_session), canonical.casefold()), logical, bytes(data)
+        return None
+
+    def _store_packaged_asset(
+        self,
+        raw_path: str,
+        kind: str,
+        data: bytes,
+        source_key: Tuple[object, ...],
+    ) -> str:
+        existing = self._packaged_assets.get(source_key)
+        if existing is not None:
+            return existing
+        folder = f"assets/{self._asset_folder(kind)}"
+        logical_path = self._unique_path(folder, Path(str(raw_path).replace("\\", "/")).name)
+        self.files[logical_path] = bytes(data)
+        self.file_records.append(
+            {
+                "path": logical_path,
+                "role": "asset",
+                "kind": kind,
+                "original": raw_path,
+            }
+        )
+        self._packaged_assets[source_key] = logical_path
+        return _workflow_resource_path(kind, logical_path)
+
     def _collect_asset(
         self,
         raw_path: str,
@@ -385,6 +458,15 @@ class _ProjectCollector:
         kind: str = "",
     ) -> str:
         kind = str(kind or "").strip() or _kind_for_path(raw_path, key) or "other"
+        from task_workflow.script_resources import is_direct_component_path
+
+        if is_direct_component_path(raw_path, kind):
+            return raw_path
+        if self.package_assets:
+            packaged = self._source_session_asset(raw_path, source_session, kind)
+            if packaged is not None:
+                source_key, _logical, data = packaged
+                return self._store_packaged_asset(raw_path, kind, data, source_key)
         resolved = self._resolve_disk_file(
             raw_path,
             source_dir,
@@ -397,6 +479,16 @@ class _ProjectCollector:
             dicts_dir=dicts_dir,
         )
         if resolved is not None:
+            if self.package_assets:
+                source_key = ("disk", os.path.normcase(str(resolved)))
+                try:
+                    data = resolved.read_bytes()
+                except OSError:
+                    data = None
+                if data is not None:
+                    return self._store_packaged_asset(raw_path, kind, data, source_key)
+                self._missing.add(raw_path)
+                return raw_path
             from task_workflow.script_resources import place_resource_file, script_path_for_file
 
             placed = place_resource_file(
@@ -421,6 +513,14 @@ class _ProjectCollector:
                 replays_dir=str(replays_dir or ""),
                 plugins_dir=str(plugins_dir or ""),
             )
+
+        # 工作区文件不存在时，再从当前工程会话取包内资源。这样保存未
+        # 预先落盘的工程时仍能保留资源，同时优先使用用户已经修改过的
+        # 工作区文件。
+        packaged = self._source_session_asset(raw_path, source_session, kind)
+        if packaged is not None:
+            source_key, _logical, data = packaged
+            return self._store_packaged_asset(raw_path, kind, data, source_key)
 
         self._missing.add(raw_path)
         return raw_path
@@ -458,6 +558,7 @@ class _ProjectCollector:
         nested, nested_dir, nested_session, identity, name, nested_source_path = loaded
         existing = self._workflow_paths.get(identity)
         if existing is not None:
+            nested_session.close()
             return existing
 
         logical_path = self._unique_path(
@@ -476,13 +577,16 @@ class _ProjectCollector:
             source_dir_text = str(nested_path.parent)
         elif nested_path is not None:
             source_dir_text = str(nested_path)
-        self.files[logical_path] = seal_workflow_package(
-            nested,
-            source_session=nested_session,
-            display_name=Path(name).stem,
-            source_dir=source_dir_text,
-            workflow_filepath=nested_filepath,
-        )
+        try:
+            self.files[logical_path] = seal_workflow_package(
+                nested,
+                source_session=nested_session,
+                display_name=Path(name).stem,
+                source_dir=source_dir_text,
+                workflow_filepath=nested_filepath,
+            )
+        finally:
+            nested_session.close()
         self.file_records.append({"path": logical_path, "role": "workflow", "original": raw_path})
         return logical_path
 
@@ -714,6 +818,31 @@ def load_lca_from_bytes(data: bytes) -> tuple[dict, LcaPackageSession]:
     return workflow_data, LcaPackageSession(files)
 
 
+def workflow_from_session(session: LcaPackageSession) -> dict:
+    """从已注册的工程会话读取入口工作流，避免再次解包磁盘工程。"""
+    if not isinstance(session, LcaPackageSession) or session._closed:
+        raise LcaFormatError(USER_ERROR_INVALID)
+    try:
+        manifest_data = session.get_bytes("manifest.json")
+        if manifest_data is None:
+            raise ValueError("manifest missing")
+        manifest = json.loads(manifest_data.decode("utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("format") != "lca_editor":
+            raise ValueError("invalid manifest")
+        entry = manifest.get("entry_workflow")
+        if not isinstance(entry, str) or not entry:
+            raise ValueError("entry missing")
+        workflow_data = session.get_bytes(entry)
+        if workflow_data is None:
+            raise ValueError("entry missing")
+        payload = json.loads(workflow_data.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("invalid workflow")
+        return payload
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+        raise LcaFormatError(USER_ERROR_INVALID) from None
+
+
 def workflow_from_embedded_bytes(data: bytes) -> dict:
     workflow_data, _session = load_lca_from_bytes(data)
     return workflow_data
@@ -741,7 +870,7 @@ def _iter_resource_literals(workflow_data: Mapping[str, Any]) -> Sequence[str]:
                     if text:
                         found.append(text)
         for key, value in parameters.items():
-            if key not in PATH_PARAM_KEYS:
+            if key not in PATH_PARAM_KEYS and not _resource_param_kind(key):
                 continue
             found.extend(_path_values(value))
     return found
@@ -799,6 +928,8 @@ def write_nested_workflow(
     *,
     source_session: Optional[LcaPackageSession] = None,
     display_name: str = "",
+    source_dir: str | Path = "",
+    workflow_filepath: str = "",
 ) -> None:
     host = Path(host_path)
     logical = str(logical_path or "").replace("\\", "/").lstrip("/")
@@ -810,6 +941,8 @@ def write_nested_workflow(
         workflow_data,
         source_session=source_session,
         display_name=display_name or Path(logical).stem,
+        source_dir=str(source_dir or ""),
+        workflow_filepath=str(workflow_filepath or ""),
     )
     files = unseal_lca_bytes(host.read_bytes())
     if logical not in files:
@@ -839,6 +972,7 @@ def write_nested_workflow(
                 pass
     payload, session = load_lca_from_bytes(sealed)
     _ = payload
+    session.bind_source(host)
     from app_core.lca_format.session import activate, get_active_path
 
     previous = get_active_path()
@@ -864,7 +998,15 @@ def _materialize_loaded_project(
             metadata = {}
             workflow_data["metadata"] = metadata
         metadata["custom_resource_path"] = root
-    materialize_package_assets(session, root)
+    materialized = materialize_package_assets(
+        session,
+        root,
+        logical_paths=_iter_resource_literals(workflow_data),
+    )
+    if materialized:
+        logger.info("工程资源按引用落盘完成: %s 个文件", materialized)
+    else:
+        logger.debug("工程资源按引用落盘完成: 0 个文件")
 
 
 def load_lca_project(path: str | Path) -> tuple[dict, LcaPackageSession]:
@@ -873,8 +1015,12 @@ def load_lca_project(path: str | Path) -> tuple[dict, LcaPackageSession]:
 
         converted = convert_project_file(path)
         workflow_data, session = load_lca_from_bytes(converted.read_bytes())
-        session.bind_source(path)
-        _materialize_loaded_project(path, workflow_data, session)
+        try:
+            session.bind_source(converted)
+            _materialize_loaded_project(converted, workflow_data, session)
+        except BaseException:
+            session.close()
+            raise
         return workflow_data, session
     except LcaFormatError:
         raise

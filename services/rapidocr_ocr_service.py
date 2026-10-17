@@ -230,11 +230,17 @@ class RapidOCROCRService:
                 numeric_score = float(score)
                 if numeric_score < score_threshold:
                     continue
-                raw_box = box.tolist() if hasattr(box, "tolist") else list(box)
-                converted_box = [
-                    [float(coordinate) for coordinate in point]
-                    for point in raw_box
-                ]
+                coordinates = np.asarray(box)
+                if (
+                    coordinates.shape != (4, 2)
+                    or not (
+                        np.issubdtype(coordinates.dtype, np.integer)
+                        or np.issubdtype(coordinates.dtype, np.floating)
+                    )
+                    or not np.isfinite(coordinates).all()
+                ):
+                    raise ValueError("OCR文字边界框必须是四个二维有限坐标点")
+                converted_box = coordinates.astype(float).reshape(8).tolist()
                 formatted_results.append(
                     {
                         "text": str(text),

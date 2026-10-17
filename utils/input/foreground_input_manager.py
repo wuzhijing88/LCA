@@ -8,6 +8,7 @@ import logging
 import os
 import time
 import ctypes
+import math
 import atexit
 from threading import RLock
 from typing import Optional, Tuple
@@ -31,14 +32,6 @@ _DEFAULT_ATOMIC_CLICK_HOLD_SECONDS = DEFAULT_CLICK_HOLD_SECONDS
 
 def _default_atomic_click_hold_seconds() -> float:
     return _DEFAULT_ATOMIC_CLICK_HOLD_SECONDS
-
-
-def _get_default_screen_size() -> Tuple[int, int]:
-    try:
-        from utils.window.multi_monitor_manager import get_primary_screen_size
-        return get_primary_screen_size()
-    except Exception:
-        return (0, 0)
 
 
 class _SplitForegroundDriverProxy:
@@ -147,38 +140,31 @@ class _SplitForegroundDriverProxy:
                 return bool(release_method())
             except Exception:
                 return False
-        release_method = getattr(self._keyboard_driver, "release_all_inputs", None)
-        if callable(release_method):
-            try:
-                return bool(release_method())
-            except Exception:
-                return False
-        return True
+        return False
 
     def release_all_inputs(self) -> bool:
+        keyboard_release = self.release_all_keys()
         release_ok = True
         mouse_release = getattr(self._mouse_driver, "release_all_inputs", None)
+        if not callable(mouse_release):
+            return False
         if callable(mouse_release):
             try:
                 release_ok = bool(mouse_release()) and release_ok
             except Exception:
                 release_ok = False
 
-        keyboard_release = self.release_all_keys()
         return release_ok and keyboard_release
-
-    def type_text(self, text, **kwargs):
-        return self._safe_call(self._keyboard_driver, "type_text", text, **kwargs)
 
     def get_screen_size(self):
         if self._mouse_driver and hasattr(self._mouse_driver, "get_screen_size"):
             return self._mouse_driver.get_screen_size()
-        return _get_default_screen_size()
+        raise RuntimeError("所选驱动无法读取屏幕尺寸")
 
     def get_mouse_position(self):
         if self._mouse_driver and hasattr(self._mouse_driver, "get_mouse_position"):
             return self._mouse_driver.get_mouse_position()
-        return (0, 0)
+        raise RuntimeError("所选驱动无法读取鼠标位置")
 
     def close(self):
         try:
@@ -267,9 +253,6 @@ class ForegroundInputManager:
     @staticmethod
     def _normalize_forced_mode(mode: str) -> str:
         normalized_mode = str(mode or "").strip().lower()
-        from utils.input.normal_hd_driver import normalize_normal_hd_backend
-
-        normalized_mode = normalize_normal_hd_backend(normalized_mode)
         if normalized_mode not in ('interception', 'pyautogui', 'ibinputsimulator', 'normal.hd'):
             raise ValueError(f"不支持的驱动模式: {mode!r}")
         return normalized_mode
@@ -284,13 +267,7 @@ class ForegroundInputManager:
                 return bool(release_fn())
             except Exception:
                 return False
-        release_keys_fn = getattr(driver, "release_all_keys", None)
-        if callable(release_keys_fn):
-            try:
-                return bool(release_keys_fn())
-            except Exception:
-                return False
-        return True
+        return False
 
     def release_all_inputs(self, include_cached_drivers: bool = False) -> bool:
         release_ok = True
@@ -640,7 +617,7 @@ class ForegroundInputManager:
             logger.error(f"准备前台驱动提示失败: {e}")
 
     def _initialize_pyautogui(self, set_active: bool = True) -> bool:
-        """降级到PyAutoGUI"""
+        """初始化用户选定的 PyAutoGUI 驱动。"""
         logger.info("正在初始化PyAutoGUI...")
 
         try:
@@ -677,7 +654,9 @@ class ForegroundInputManager:
                         return "right"
                     if key == "middle":
                         return "middle"
-                    return "left"
+                    if key == "left":
+                        return "left"
+                    raise ValueError(f"不支持的鼠标按钮：{button}")
 
                 def _button_flags(self, button: str):
                     key = self._normalize_button(button)
@@ -692,6 +671,9 @@ class ForegroundInputManager:
                     return str(key or "").strip().lower()
 
                 def _mouse_event_at(self, x: int, y: int, event_flag: int) -> None:
+                    if event_flag in {self.MOUSEEVENTF_LEFTUP, self.MOUSEEVENTF_RIGHTUP, self.MOUSEEVENTF_MIDDLEUP}:
+                        self._user32.mouse_event(int(event_flag), 0, 0, 0, 0)
+                        return
                     if not self._ensure_cursor_pos(int(x), int(y)):
                         raise RuntimeError("cursor not at target")
                     self._user32.mouse_event(int(event_flag), 0, 0, 0, 0)
@@ -736,20 +718,18 @@ class ForegroundInputManager:
 
                     return self._wait_cursor_pos(tx, ty, timeout=0.01, tolerance=tol)
 
-                def _clip_cursor_to_point(self, x: int, y: int) -> bool:
-                    try:
-                        tx = int(x)
-                        ty = int(y)
-                        rect = ctypes.wintypes.RECT(tx, ty, tx + 1, ty + 1)
-                        return bool(self._user32.ClipCursor(ctypes.byref(rect)))
-                    except Exception:
-                        return False
+                def _clip_cursor_to_point(self, x: int, y: int):
+                    previous_clip = ctypes.wintypes.RECT()
+                    if not self._user32.GetClipCursor(ctypes.byref(previous_clip)):
+                        return None
+                    rect = ctypes.wintypes.RECT(int(x), int(y), int(x) + 1, int(y) + 1)
+                    if not self._user32.ClipCursor(ctypes.byref(rect)):
+                        return None
+                    return previous_clip
 
-                def _release_cursor_clip(self) -> None:
-                    try:
-                        self._user32.ClipCursor(None)
-                    except Exception:
-                        pass
+                def _release_cursor_clip(self, previous_clip) -> None:
+                    if not self._user32.ClipCursor(ctypes.byref(previous_clip)):
+                        raise RuntimeError("无法恢复鼠标活动范围")
 
                 def get_screen_size(self):
                     size = pyautogui.size()
@@ -778,22 +758,17 @@ class ForegroundInputManager:
                         return False
                     tx = int(x)
                     ty = int(y)
-                    try:
-                        safe_clicks = max(1, int(clicks))
-                    except Exception:
-                        safe_clicks = 1
-                    try:
-                        safe_interval = max(0.0, float(interval))
-                    except Exception:
-                        safe_interval = 0.0
-                    try:
-                        safe_duration = max(0.0, float(duration))
-                    except Exception:
-                        safe_duration = 0.0
+                    safe_clicks = int(clicks)
+                    safe_interval = float(interval)
+                    safe_duration = float(duration)
+                    if safe_clicks <= 0 or safe_clicks != float(clicks) or not math.isfinite(safe_interval) or not math.isfinite(safe_duration) or safe_interval < 0 or safe_duration < 0:
+                        raise ValueError("点击次数或时间参数无效")
 
                     down_flag, up_flag = self._button_flags(button)
                     # 整个多击序列共用一把发送锁，避免双击间隔期间插入其它鼠标事件。
                     with self._send_lock:
+                        if self._pressed_buttons:
+                            return False
                         for i in range(safe_clicks):
                             if i > 0 and safe_interval > 0:
                                 _precise_sleep(safe_interval)
@@ -804,21 +779,26 @@ class ForegroundInputManager:
                             button_down = False
                             try:
                                 cursor_clipped = self._clip_cursor_to_point(tx, ty)
+                                if not cursor_clipped:
+                                    return False
                                 _precise_sleep(0.006)
-                                self._mouse_event_at(tx, ty, down_flag)
+                                self._pressed_buttons.add(self._normalize_button(button))
                                 button_down = True
+                                self._mouse_event_at(tx, ty, down_flag)
                                 if hold_seconds > 0:
                                     _precise_sleep(hold_seconds)
                                 self._mouse_event_at(tx, ty, up_flag)
+                                self._pressed_buttons.discard(self._normalize_button(button))
                                 button_down = False
                             finally:
                                 if button_down:
                                     try:
                                         self._mouse_event_at(tx, ty, up_flag)
+                                        self._pressed_buttons.discard(self._normalize_button(button))
                                     except Exception:
                                         pass
                                 if cursor_clipped:
-                                    self._release_cursor_clip()
+                                    self._release_cursor_clip(cursor_clipped)
 
                     return True
 
@@ -836,37 +816,26 @@ class ForegroundInputManager:
                             cursor_clipped = False
                             try:
                                 cursor_clipped = self._clip_cursor_to_point(tx, ty)
+                                if cursor_clipped is None:
+                                    return False
                                 _precise_sleep(0.012)
                                 self._mouse_event_at(tx, ty, down_flag)
                             finally:
                                 if cursor_clipped:
-                                    self._release_cursor_clip()
+                                    self._release_cursor_clip(cursor_clipped)
                             self._pressed_buttons.add(normalized_button)
                             return True
                     except Exception:
                         return False
 
                 def mouse_up(self, x, y, button='left'):
-                    if x is None or y is None:
-                        return False
-                    tx = int(x)
-                    ty = int(y)
                     _, up_flag = self._button_flags(button)
                     normalized_button = self._normalize_button(button)
                     try:
                         with self._send_lock:
-                            if not self._ensure_cursor_pos(tx, ty):
-                                return False
-                            cursor_clipped = False
-                            try:
-                                cursor_clipped = self._clip_cursor_to_point(tx, ty)
-                                _precise_sleep(0.012)
-                                self._mouse_event_at(tx, ty, up_flag)
-                            finally:
-                                if cursor_clipped:
-                                    self._release_cursor_clip()
+                            self._user32.mouse_event(int(up_flag), 0, 0, 0, 0)
                             self._pressed_buttons.discard(normalized_button)
-                            return True
+                        return True
                     except Exception:
                         return False
 
@@ -959,39 +928,32 @@ class ForegroundInputManager:
                         self._pressed_keys.discard(normalized_key)
                         return True
 
-                def type_text(self, text, **_kwargs):
-                    pyautogui.typewrite(text)
-                    return True
-
                 def release_all_keys(self):
+                    released = True
                     with self._send_lock:
-                        pending_keys = list(self._pressed_keys)
-                        self._pressed_keys.clear()
-                        for key_name in reversed(pending_keys):
+                        for key_name in reversed(list(self._pressed_keys)):
                             try:
                                 pyautogui.keyUp(key_name)
-                            except Exception:
-                                pass
-                    return True
+                                self._pressed_keys.discard(key_name)
+                            except Exception as exc:
+                                logger.error("前台二按键释放失败：%s", exc)
+                                released = False
+                    return released
 
                 def release_all_inputs(self):
+                    released = True
                     with self._send_lock:
-                        pending_buttons = list(self._pressed_buttons)
-                        self._pressed_buttons.clear()
-                        for button_name in pending_buttons:
-                            try:
-                                _, up_flag = self._button_flags(button_name)
-                                self._user32.mouse_event(int(up_flag), 0, 0, 0, 0)
-                            except Exception:
-                                pass
-                    return self.release_all_keys()
+                        for button_name in list(self._pressed_buttons):
+                            if not self.mouse_up(0, 0, button_name):
+                                released = False
+                    return self.release_all_keys() and released
 
                 def close(self):
                     try:
-                        self.release_all_inputs()
-                    except Exception:
-                        pass
-                    return True
+                        return bool(self.release_all_inputs())
+                    except Exception as exc:
+                        logger.error("关闭前台二驱动时输入释放失败：%s", exc)
+                        return False
 
             if self._pyautogui_driver is None:
                 self._pyautogui_driver = PyAutoGUIDriver()
@@ -1162,26 +1124,14 @@ class ForegroundInputManager:
             return False
 
     def get_screen_size(self) -> Tuple[int, int]:
-        """获取屏幕尺寸"""
-        if not self._active_driver:
-            if not self.initialize():
-                return _get_default_screen_size()
-
-        try:
-            return self._active_driver.get_screen_size()
-        except Exception:
-            return _get_default_screen_size()
+        if not self._active_driver and not self.initialize():
+            raise RuntimeError("前台驱动未就绪，无法读取屏幕尺寸")
+        return self._active_driver.get_screen_size()
 
     def get_mouse_position(self) -> Tuple[int, int]:
-        """获取鼠标位置"""
-        if not self._active_driver:
-            if not self.initialize():
-                return (0, 0)
-
-        try:
-            return self._active_driver.get_mouse_position()
-        except Exception:
-            return (0, 0)
+        if not self._active_driver and not self.initialize():
+            raise RuntimeError("前台驱动未就绪，鼠标位置未知")
+        return self._active_driver.get_mouse_position()
 
     def get_driver_type(self) -> Optional[str]:
         """
@@ -1260,7 +1210,6 @@ def _close_global_foreground_manager_on_exit() -> None:
 
 
 atexit.register(_close_global_foreground_manager_on_exit)
-
 
 
 

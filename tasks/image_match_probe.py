@@ -45,7 +45,7 @@ def _bind_probe_resource_dirs(main_window=None, parameter_panel=None) -> str:
     return images_dir
 
 
-def test_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None,
+def preview_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None,
                            main_window=None, parameter_panel=None):
     """
     统一测试图片识别功能，在绑定窗口上绘制找到的图片区域

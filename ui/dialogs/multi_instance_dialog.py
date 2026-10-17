@@ -86,6 +86,8 @@ class _LaunchWorkerKeeper(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._workers: list[_LaunchWorker] = []
+        self._pending_occupancies: set[MutexOccupancy] = set()
+        parent.aboutToQuit.connect(self.shutdown)
 
     def retain(self, worker: _LaunchWorker) -> None:
         if worker in self._workers:
@@ -104,7 +106,24 @@ class _LaunchWorkerKeeper(QObject):
         if worker not in self._workers:
             return
         self._workers.remove(worker)
+        worker.finished.disconnect(self._on_finished)
         worker.deleteLater()
+        for occupancy in tuple(self._pending_occupancies):
+            self.release_occupancy(occupancy)
+
+    def release_occupancy(self, occupancy: MutexOccupancy) -> None:
+        if any(worker._occupancy is occupancy for worker in self._workers):
+            self._pending_occupancies.add(occupancy)
+            return
+        self._pending_occupancies.discard(occupancy)
+        occupancy.close()
+
+    def shutdown(self) -> None:
+        for worker in tuple(self._workers):
+            worker.request_stop()
+        for worker in tuple(self._workers):
+            worker.wait()
+            self._release(worker)
 
 
 _worker_keeper_instance: Optional[_LaunchWorkerKeeper] = None
@@ -120,6 +139,11 @@ def _worker_keeper() -> _LaunchWorkerKeeper:
     return _worker_keeper_instance
 
 
+def watch_mutex_occupancy(owner: QObject, occupancy: MutexOccupancy) -> None:
+    keeper = _worker_keeper()
+    owner.destroyed.connect(lambda: keeper.release_occupancy(occupancy))
+
+
 class MultiInstanceDialog(QDialog):
     instances_ready = Signal(list)
 
@@ -128,6 +152,8 @@ class MultiInstanceDialog(QDialog):
         self.setObjectName("multiInstanceDialog")
         self.setWindowTitle("多开器")
         self._occupancy = occupancy if occupancy is not None else MutexOccupancy()
+        if occupancy is None:
+            watch_mutex_occupancy(self, self._occupancy)
         self._worker: Optional[_LaunchWorker] = None
         self._working_dir = ""
         self._started = 0
@@ -367,6 +393,12 @@ class MultiInstanceDialog(QDialog):
         self._detach_running_worker()
         self._save_settings()
         super().closeEvent(event)
+
+    def done(self, result) -> None:
+        # Esc 与按钮结束模态循环也必须释放正在运行的多开任务。
+        self._detach_running_worker()
+        self._save_settings()
+        super().done(result)
 
     def _settings_path(self) -> str:
         return os.path.join(get_user_data_dir("LCA"), _SETTINGS_NAME)

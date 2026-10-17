@@ -1,321 +1,24 @@
-import math
-import threading
-import time
-import weakref
+"""连线图元与显示运行时。拓扑修改和轨道规划不属于绘制层。"""
+from collections import Counter
 from enum import Enum
-from typing import TYPE_CHECKING
+from math import hypot, isfinite
+from time import perf_counter
+import weakref
 
 from PySide6.QtCore import QPointF, Qt, QTimer
-from PySide6.QtGui import QColor, QPainterPath, QPainterPathStroker, QPen
-from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsPathItem
-from shiboken6 import isValid as _is_valid_qt_object
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPainterPathStroker, QPen
+from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsObject
+from shiboken6 import isValid
 
-from ..workflow_parts.connection_router import _coincident_port_path
-from ..workflow_parts.task_card import PORT_TYPE_RANDOM, PORT_TYPE_SEQUENTIAL
+from themes import get_theme_manager, theme_color
+from .connection_geometry import LINE_TYPES, orthogonal_points
 
-
-_VALID_LINE_TYPES = frozenset(("sequential", "success", "failure", "random"))
-_DASH_PATTERN = (12.0, 8.0)
-_DASH_UNITS_PER_SECOND = 20.0
-_ANIMATION_INTERVAL_MS = 50
-_OVERVIEW_ZOOM_THRESHOLD = 0.45
-_LINE_ANIMATION_VIEWPORT_MARGIN = 40.0
-_CORNER_FILLET = 8.0
-_CORNER_FILLET_MIN_SEGMENT = _CORNER_FILLET * 2.0
-_POINT_EPS = 1e-9
-
-_animation_timer = None
 _animated_lines = weakref.WeakSet()
-_animated_lines_lock = threading.Lock()
-_animation_pause_reasons = set()
-_animation_pause_counts = {}
-_animation_pause_lock = threading.Lock()
-_dash_phase = 0.0
-_last_animation_tick_s = None
-_overview_mode_enabled = False
-_force_overview_mode = False
-_last_zoom_level = 1.0
-
-
-def _snapshot_registered_lines():
-    with _animated_lines_lock:
-        return list(_animated_lines)
-
-
-def _view_visible_scene_rect(view, viewport_rect_cache=None):
-    if viewport_rect_cache is not None and view in viewport_rect_cache:
-        return viewport_rect_cache[view]
-    visible = None
-    viewport = view.viewport()
-    if viewport is not None and viewport.isVisible() and not viewport.rect().isEmpty():
-        visible = view.mapToScene(viewport.rect()).boundingRect()
-    if viewport_rect_cache is not None:
-        viewport_rect_cache[view] = visible
-    return visible
-
-
-def _line_is_animatable(line, viewport_rect_cache=None) -> bool:
-    if line is None or not _is_valid_qt_object(line) or not line.isVisible():
-        return False
-    scene = line.scene()
-    if scene is None:
-        return False
-    try:
-        line_rect = line.sceneBoundingRect()
-    except RuntimeError:
-        return False
-    if line_rect.isEmpty():
-        return False
-    for view in scene.views():
-        if not _is_valid_qt_object(view) or not view.isVisible():
-            continue
-        visible = _view_visible_scene_rect(view, viewport_rect_cache)
-        if visible is None:
-            continue
-        anim_rect = visible.adjusted(
-            -_LINE_ANIMATION_VIEWPORT_MARGIN,
-            -_LINE_ANIMATION_VIEWPORT_MARGIN,
-            _LINE_ANIMATION_VIEWPORT_MARGIN,
-            _LINE_ANIMATION_VIEWPORT_MARGIN,
-        )
-        if line_rect.intersects(anim_rect):
-            return True
-    return False
-
-
-def _has_animatable_lines() -> bool:
-    viewport_rect_cache = {}
-    return any(_line_is_animatable(line, viewport_rect_cache) for line in _snapshot_registered_lines())
-
-
-def _is_animation_paused() -> bool:
-    with _animation_pause_lock:
-        return bool(_animation_pause_reasons)
-
-
-def _get_animation_timer(*, create: bool):
-    global _animation_timer
-    if _animation_timer is not None and not _is_valid_qt_object(_animation_timer):
-        _animation_timer = None
-    if _animation_timer is None and create:
-        app = QApplication.instance()
-        if app is None:
-            raise RuntimeError("创建连线动画计时器前必须先创建 QApplication")
-        timer = QTimer(app)
-        timer.setTimerType(Qt.TimerType.PreciseTimer)
-        timer.timeout.connect(animate_all_lines)
-        _animation_timer = timer
-    return _animation_timer
-
-
-def refresh_line_animation_state() -> None:
-    """根据当前可见连线启动或停止唯一的动画计时器。"""
-    global _last_animation_tick_s
-    should_run = (
-        not _is_animation_paused()
-        and not _force_overview_mode
-        and not _overview_mode_enabled
-        and _has_animatable_lines()
-    )
-    timer = _get_animation_timer(create=should_run)
-    if timer is None:
-        return
-    if should_run:
-        if not timer.isActive():
-            _last_animation_tick_s = None
-            timer.start(_ANIMATION_INTERVAL_MS)
-    elif timer.isActive():
-        timer.stop()
-        _last_animation_tick_s = None
-
-
-def _register_animated_line(line) -> None:
-    if not isinstance(line, ConnectionLine):
-        raise TypeError("动画注册对象必须是 ConnectionLine")
-    if line.scene() is None:
-        raise ValueError("未挂载到场景的连线不能注册动画")
-    with _animated_lines_lock:
-        _animated_lines.add(line)
-    refresh_line_animation_state()
-
-
-def _unregister_animated_line(line) -> None:
-    if not isinstance(line, ConnectionLine):
-        raise TypeError("动画注销对象必须是 ConnectionLine")
-    with _animated_lines_lock:
-        _animated_lines.discard(line)
-    refresh_line_animation_state()
-
-
-def _normalize_pause_reason(reason: str) -> str:
-    if not isinstance(reason, str):
-        raise TypeError("连线动画暂停原因必须是字符串")
-    normalized = reason.strip()
-    if not normalized:
-        raise ValueError("连线动画暂停原因不能为空")
-    return normalized
-
-
-def set_line_animation_paused(reason: str, paused: bool) -> None:
-    normalized_reason = _normalize_pause_reason(reason)
-    with _animation_pause_lock:
-        if paused:
-            _animation_pause_counts[normalized_reason] = _animation_pause_counts.get(normalized_reason, 0) + 1
-            _animation_pause_reasons.add(normalized_reason)
-        else:
-            remaining = _animation_pause_counts.get(normalized_reason, 0) - 1
-            if remaining <= 0:
-                _animation_pause_counts.pop(normalized_reason, None)
-                _animation_pause_reasons.discard(normalized_reason)
-            else:
-                _animation_pause_counts[normalized_reason] = remaining
-    refresh_line_animation_state()
-
-
-def pause_line_animation(reason: str = "default") -> None:
-    set_line_animation_paused(reason, True)
-
-
-def resume_line_animation(reason: str = "default") -> None:
-    set_line_animation_paused(reason, False)
-
-
-def _repaint_registered_lines() -> None:
-    viewport_rect_cache = {}
-    for line in _snapshot_registered_lines():
-        if _is_valid_qt_object(line) and _line_is_animatable(line, viewport_rect_cache):
-            line.update()
-
-
-def update_zoom_level(zoom_level: float) -> None:
-    global _last_zoom_level, _overview_mode_enabled
-    normalized_zoom = float(zoom_level)
-    if not math.isfinite(normalized_zoom) or normalized_zoom <= 0.0:
-        raise ValueError("连线缩放比例必须是正有限数")
-    _last_zoom_level = normalized_zoom
-    overview_enabled = normalized_zoom < _OVERVIEW_ZOOM_THRESHOLD
-    if overview_enabled == _overview_mode_enabled:
-        return
-    _overview_mode_enabled = overview_enabled
-    refresh_line_animation_state()
-    _repaint_registered_lines()
-
-
-def set_force_overview_mode(enabled: bool) -> None:
-    global _force_overview_mode
-    normalized_enabled = bool(enabled)
-    if normalized_enabled == _force_overview_mode:
-        return
-    _force_overview_mode = normalized_enabled
-    refresh_line_animation_state()
-    _repaint_registered_lines()
-
-
-def get_line_animation_stats():
-    timer = _get_animation_timer(create=False)
-    lines = _snapshot_registered_lines()
-    with _animation_pause_lock:
-        pause_reasons = sorted(_animation_pause_reasons)
-        pause_counts = dict(_animation_pause_counts)
-    return {
-        "registered_lines": len(lines),
-        "animatable_lines": sum(1 for line in lines if _line_is_animatable(line)),
-        "paused": bool(pause_reasons),
-        "pause_reasons": pause_reasons,
-        "pause_counts": pause_counts,
-        "timer_active": bool(timer is not None and timer.isActive()),
-        "interval_ms": _ANIMATION_INTERVAL_MS,
-    }
-
-
-def animate_all_lines() -> None:
-    global _dash_phase, _last_animation_tick_s
-    if _is_animation_paused() or _force_overview_mode or _overview_mode_enabled:
-        refresh_line_animation_state()
-        return
-
-    lines = _snapshot_registered_lines()
-    now_s = time.perf_counter()
-    if _last_animation_tick_s is None:
-        _last_animation_tick_s = now_s
-        return
-    elapsed_s = min(max(now_s - _last_animation_tick_s, 0.0), 0.25)
-    _last_animation_tick_s = now_s
-    if elapsed_s == 0.0:
-        return
-
-    _dash_phase = (_dash_phase + elapsed_s * _DASH_UNITS_PER_SECOND) % sum(_DASH_PATTERN)
-    updated_count = 0
-    stale_lines = []
-    viewport_rect_cache = {}
-    for line in lines:
-        if not _is_valid_qt_object(line):
-            stale_lines.append(line)
-            continue
-        if not _line_is_animatable(line, viewport_rect_cache) or line.path().isEmpty():
-            continue
-        line.dash_offset = _dash_phase
-        line.update()
-        updated_count += 1
-
-    if stale_lines:
-        with _animated_lines_lock:
-            for line in stale_lines:
-                _animated_lines.discard(line)
-    if updated_count == 0:
-        refresh_line_animation_state()
-
-
-if TYPE_CHECKING:
-    from ..workflow_parts.task_card import TaskCard
-
-
-def _point_toward(origin: tuple[float, float], target: tuple[float, float], distance: float) -> tuple[float, float]:
-    ox, oy = origin
-    tx, ty = target
-    if abs(oy - ty) < _POINT_EPS:
-        direction = 1.0 if tx > ox else -1.0
-        return (ox + direction * distance, oy)
-    if abs(ox - tx) < _POINT_EPS:
-        direction = 1.0 if ty > oy else -1.0
-        return (ox, oy + direction * distance)
-    raise ValueError("连线路径必须是水平或垂直折线")
-
-
-def painter_path_from_points(points: list) -> QPainterPath:
-    """把正交折线转成绘制路径；足够长的拐角用 8px 二次贝塞尔倒圆。"""
-    if not isinstance(points, list) or len(points) < 2:
-        raise ValueError("连线路径点不足")
-    converted: list[tuple[float, float]] = []
-    for raw in points:
-        if not isinstance(raw, (tuple, list)) or len(raw) != 2:
-            raise TypeError("连线路径点必须是 (x, y)")
-        x = float(raw[0])
-        y = float(raw[1])
-        if not math.isfinite(x) or not math.isfinite(y):
-            raise ValueError("连线路径点必须是有限数字")
-        if converted and abs(converted[-1][0] - x) < _POINT_EPS and abs(converted[-1][1] - y) < _POINT_EPS:
-            continue
-        converted.append((x, y))
-    if len(converted) < 2:
-        converted = _coincident_port_path(converted[0] if converted else (0.0, 0.0))
-    path = QPainterPath(QPointF(converted[0][0], converted[0][1]))
-    last_index = len(converted) - 1
-    for index in range(1, last_index):
-        prev = converted[index - 1]
-        curr = converted[index]
-        nxt = converted[index + 1]
-        first_len = math.hypot(curr[0] - prev[0], curr[1] - prev[1])
-        second_len = math.hypot(nxt[0] - curr[0], nxt[1] - curr[1])
-        if first_len >= _CORNER_FILLET_MIN_SEGMENT and second_len >= _CORNER_FILLET_MIN_SEGMENT:
-            start_fillet = _point_toward(curr, prev, _CORNER_FILLET)
-            end_fillet = _point_toward(curr, nxt, _CORNER_FILLET)
-            path.lineTo(QPointF(start_fillet[0], start_fillet[1]))
-            path.quadTo(QPointF(curr[0], curr[1]), QPointF(end_fillet[0], end_fillet[1]))
-        else:
-            path.lineTo(QPointF(curr[0], curr[1]))
-    path.lineTo(QPointF(converted[-1][0], converted[-1][1]))
-    return path
+_DASH_LENGTH = 24.0
+_DASH_GAP = 16.0
+_DASH_PERIOD = _DASH_LENGTH + _DASH_GAP
+_DASH_SPEED = 40.0
+_ANIMATION_INTERVAL_MS = 16
 
 
 class ConnectionType(Enum):
@@ -324,195 +27,425 @@ class ConnectionType(Enum):
     RANDOM = "random"
 
 
-class ConnectionLine(QGraphicsPathItem):
-    def __init__(self, start_item: "TaskCard", end_item: "TaskCard", line_type: str, parent=None):
-        if start_item is None or end_item is None:
-            raise ValueError("连线必须同时提供起点和终点")
-        if line_type not in _VALID_LINE_TYPES:
-            raise ValueError(f"不支持的连线类型: {line_type!r}")
-        super().__init__(parent)
-        self.start_item = start_item
-        self.end_item = end_item
-        self.line_type = line_type
-        self.dash_offset = 0.0
-        self._normal_width = 2.0
-        self._hover_width = 4.0
-        self._normal_color = self._color_for_line_type(line_type)
-        self._shape_cache = QPainterPath()
-        self._shape_cache_dirty = True
+def painter_path_from_points(points):
+    points = orthogonal_points(points)
+    path = QPainterPath(QPointF(*points[0]))
+    for previous, corner, following in zip(points, points[1:], points[2:]):
+        first = hypot(corner[0] - previous[0], corner[1] - previous[1])
+        second = hypot(following[0] - corner[0], following[1] - corner[1])
+        radius = min(8.0, first / 2, second / 2)
+        entry = QPointF(corner[0] + (previous[0] - corner[0]) * radius / first,
+                        corner[1] + (previous[1] - corner[1]) * radius / first)
+        exit_point = QPointF(corner[0] + (following[0] - corner[0]) * radius / second,
+                             corner[1] + (following[1] - corner[1]) * radius / second)
+        path.lineTo(entry)
+        path.quadTo(QPointF(*corner), exit_point)
+    path.lineTo(QPointF(*points[-1]))
+    return path
 
-        self.pen = QPen(self._normal_color)
-        self.pen.setWidthF(self._normal_width)
-        self.pen.setStyle(Qt.PenStyle.DashLine)
-        self.pen.setDashPattern(list(_DASH_PATTERN))
-        self.pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        self.pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        self.pen.setCosmetic(False)
-        self.setPen(self.pen)
-        self._paint_pen = QPen(self.pen)
-        self.setBrush(Qt.BrushStyle.NoBrush)
-        self.setZValue(5)
-        self.setCacheMode(QGraphicsPathItem.CacheMode.NoCache)
-        self.setAcceptHoverEvents(True)
-        self._route_points: list[tuple[float, float]] = []
+
+class _ConnectionDisplay:
+    """可见连线共用一个计时器；悬停优先于点击选中的聚焦状态。"""
+    def __init__(self):
+        self.mounted = weakref.WeakValueDictionary()
+        self.pauses = Counter()
+        self.timer = None
+        self.overview = False
+        self.zoom = 1.0
+        self.theme_registered = False
+        self.last_tick = None
+        self.application_ref = None
+        self.stopping = False
+
+    def attach(self, line):
+        if self.stopping:
+            raise RuntimeError("应用程序正在退出，无法挂载连线")
+        if self.application_ref is None:
+            app = QApplication.instance()
+            if app is None:
+                raise RuntimeError("挂载连线前必须创建应用程序")
+            self.application_ref = weakref.ref(app)
+            app.aboutToQuit.connect(self.shutdown)
+            app.destroyed.connect(self.shutdown)
+        self.mounted[id(line)] = line
+        line._mounted_scene_ref = weakref.ref(line.scene())
+        if not self.theme_registered:
+            get_theme_manager().register_theme_change_callback(self.theme_changed)
+            self.theme_registered = True
+        self.focus_changed(line.scene())
+
+    def forget(self, identity):
+        """解除 Python 登记，不访问正在销毁的 Qt 对象。"""
+        line = self.mounted.pop(identity, None)
+        scene = None
+        if line is not None:
+            line._hovered = False
+            _animated_lines.discard(line)
+            if line._mounted_scene_ref is not None:
+                scene = line._mounted_scene_ref()
+                line._mounted_scene_ref = None
+        return scene
+
+    def detach(self, identity):
+        self.focus_changed(self.forget(identity))
+
+    def stop_timer(self):
+        timer, self.timer = self.timer, None
+        self.last_tick = None
+        if timer is not None and isValid(timer):
+            timer.stop()
+            timer.timeout.disconnect(animate_all_lines)
+            timer.deleteLater()
+
+    def release_callbacks(self):
+        if self.theme_registered:
+            get_theme_manager().unregister_theme_change_callback(self.theme_changed)
+            self.theme_registered = False
+        if self.application_ref is not None:
+            app = self.application_ref()
+            self.application_ref = None
+            if app is not None and isValid(app):
+                app.aboutToQuit.disconnect(self.shutdown)
+                app.destroyed.disconnect(self.shutdown)
+
+    def shutdown(self):
+        """退出先停止显示运行时，后续图元销毁只解除登记。"""
+        self.stopping = True
+        for identity in tuple(self.mounted):
+            self.forget(identity)
+        _animated_lines.clear()
+        self.pauses.clear()
+        self.stop_timer()
+        self.release_callbacks()
+
+    def focus_changed(self, scene):
+        if self.stopping:
+            return
+        if scene is not None and isValid(scene):
+            lines = [line for line in self.mounted.values()
+                     if isValid(line) and not line._disposed and line.scene() is scene]
+            self.apply_focus(lines)
+        self.refresh()
 
     @staticmethod
-    def _color_for_line_type(line_type: str) -> QColor:
-        if line_type == ConnectionType.SUCCESS.value:
-            return QColor(60, 160, 60)
-        if line_type == ConnectionType.FAILURE.value:
-            return QColor(210, 80, 80)
-        if line_type == ConnectionType.RANDOM.value:
-            return QColor(147, 51, 234)
-        return QColor(60, 140, 210)
+    def focused_lines(lines):
+        visible = [line for line in lines if line.isVisible()]
+        hovered = {line for line in visible if line._hovered}
+        return hovered or {line for line in visible if line.isSelected()}
+
+    @classmethod
+    def apply_focus(cls, lines):
+        focused = cls.focused_lines(lines)
+        for line in lines:
+            opacity = 0.2 if focused and line not in focused else 1.0
+            z = -0.5 if line in focused else -1.0
+            if line.opacity() != opacity:
+                line.setOpacity(opacity)
+            if line.zValue() != z:
+                line.setZValue(z)
+        return focused
+
+    def theme_changed(self, _theme):
+        for line in tuple(self.mounted.values()):
+            if isValid(line):
+                line.set_line_color()
+
+    @staticmethod
+    def visible(line, rects):
+        if not isValid(line) or not line.isVisible():
+            return False
+        scene = line.scene()
+        if scene is None or not isValid(scene):
+            return False
+        for view in scene.views():
+            if not isValid(view) or not view.isVisible():
+                continue
+            viewport = view.viewport()
+            if viewport is None or not isValid(viewport) or not viewport.isVisible():
+                continue
+            if view not in rects:
+                rects[view] = view.mapToScene(viewport.rect()).boundingRect().adjusted(-30, -30, 30, 30)
+            local_rect = line.mapFromScene(rects[view]).boundingRect()
+            if line._shape.intersects(local_rect):
+                return True
+        return False
+
+    def refresh(self):
+        if self.stopping:
+            return
+        rects = {}
+        _animated_lines.clear()
+        scenes = {}
+        visible_lines = set()
+        cleared_hover_scenes = set()
+        for identity, line in tuple(self.mounted.items()):
+            if not isValid(line) or line._disposed:
+                self.forget(identity)
+            else:
+                scene = line.scene()
+                if scene is None or not isValid(scene):
+                    self.forget(identity)
+                    continue
+                scenes.setdefault(scene, []).append(line)
+                if self.visible(line, rects):
+                    visible_lines.add(line)
+                elif line._hovered:
+                    line._hovered = False
+                    line.update()
+                    cleared_hover_scenes.add(scene)
+        for scene, lines in scenes.items():
+            focused = self.apply_focus(lines) if scene in cleared_hover_scenes else self.focused_lines(lines)
+            _animated_lines.update(line for line in lines if line in visible_lines and (not focused or line in focused))
+        running = bool(_animated_lines) and not self.pauses and not self.overview and self.zoom >= 0.45
+        if running and self.timer is None:
+            app = QApplication.instance()
+            if app is None:
+                raise RuntimeError("创建连线动画前必须创建应用程序")
+            self.timer = QTimer(app)
+            self.timer.setTimerType(Qt.TimerType.PreciseTimer)
+            self.timer.setInterval(_ANIMATION_INTERVAL_MS)
+            self.timer.timeout.connect(animate_all_lines)
+            self.last_tick = perf_counter()
+            self.timer.start()
+        elif not running and self.timer is not None:
+            self.stop_timer()
+        if not self.mounted:
+            self.release_callbacks()
+
+    def tick(self):
+        self.refresh()
+        if self.timer is None:
+            return
+        now = perf_counter()
+        distance = min(now - self.last_tick, 0.1) * _DASH_SPEED
+        self.last_tick = now
+        for line in tuple(_animated_lines):
+            line._dash_offset = (line._dash_offset + distance) % _DASH_PERIOD
+            line.update()
+
+
+_display = _ConnectionDisplay()
+
+
+def refresh_line_animation_state():
+    _display.refresh()
+
+
+def clear_line_hover(scene):
+    """显式取消悬停聚焦，鼠标再次移动到连线上时重新激活。"""
+    for line in tuple(_display.mounted.values()):
+        if isValid(line) and line.scene() is scene and line._hovered:
+            line._hovered = False
+            line.update()
+    _display.focus_changed(scene)
+
+
+def set_line_animation_paused(reason, paused):
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("连线暂停原因必须是非空字符串")
+    if paused:
+        _display.pauses[reason] += 1
+    elif reason in _display.pauses:
+        _display.pauses[reason] -= 1
+        if _display.pauses[reason] == 0:
+            del _display.pauses[reason]
+    _display.refresh()
+
+
+def pause_line_animation(reason="default"):
+    set_line_animation_paused(reason, True)
+
+
+def resume_line_animation(reason="default"):
+    set_line_animation_paused(reason, False)
+
+
+def update_zoom_level(zoom_level):
+    if not isfinite(zoom_level) or zoom_level <= 0:
+        raise ValueError("连线缩放比例必须是正有限数")
+    _display.zoom = zoom_level
+    _display.refresh()
+
+
+def set_force_overview_mode(enabled):
+    _display.overview = bool(enabled)
+    _display.refresh()
+
+
+def get_line_animation_stats():
+    _display.refresh()
+    return {"registered_lines": len(_display.mounted), "animatable_lines": len(_animated_lines),
+            "paused": bool(_display.pauses), "pause_reasons": sorted(_display.pauses),
+            "pause_counts": dict(_display.pauses), "timer_active": _display.timer is not None,
+            "interval_ms": _ANIMATION_INTERVAL_MS}
+
+
+def animate_all_lines():
+    _display.tick()
+
+
+class ConnectionLine(QGraphicsObject):
+    """无箭头的圆角流动虚线，悬停及点击选中时淡化其他连线。"""
+    def __init__(self, start_item, end_item, line_type, parent=None):
+        if start_item is None or end_item is None:
+            raise ValueError("连线必须有起点和终点")
+        if line_type not in LINE_TYPES:
+            raise ValueError("不支持的连线类型")
+        super().__init__(parent)
+        self.start_item, self.end_item = start_item, end_item
+        self.line_type = line_type
+        self._points = ()
+        self._path = QPainterPath()
+        self._shape = QPainterPath()
+        self._dash_offset = 0.0
+        self._bounds = self._path.boundingRect()
+        self._hovered = False
+        self._disposed = False
+        self._mounted_scene_ref = None
+        self.pen = QPen(QColor(theme_color("connection_" + line_type)), 2.0)
+        self.pen.setDashPattern([_DASH_LENGTH / self.pen.widthF(), _DASH_GAP / self.pen.widthF()])
+        self.pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        self.pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        self.setAcceptHoverEvents(True)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setZValue(-1)
+        self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
+        identity = id(self)
+        reference = weakref.ref(self)
+        self.destroyed.connect(lambda: _release_destroyed_line(reference, identity))
 
     def itemChange(self, change, value):
         result = super().itemChange(change, value)
         if change == QGraphicsItem.GraphicsItemChange.ItemSceneHasChanged:
-            if value is None:
-                _unregister_animated_line(self)
+            if value is not None and not self._disposed:
+                _display.attach(self)
             else:
-                _register_animated_line(self)
+                _display.detach(id(self))
+        elif change == QGraphicsItem.GraphicsItemChange.ItemVisibleHasChanged:
+            _display.focus_changed(self.scene())
+        elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            _display.focus_changed(self.scene())
         return result
 
-    def set_line_color(self):
-        self._normal_color = self._color_for_line_type(self.line_type)
-        self.pen.setColor(self._normal_color)
-        self.setPen(self.pen)
+    def boundingRect(self):
+        return self._bounds
 
-    def get_start_pos(self) -> QPointF:
-        if self.start_item is None or not _is_valid_qt_object(self.start_item):
-            raise RuntimeError("连线起点已失效")
-        return self.start_item.get_output_port_scene_pos(self.line_type)
+    def shape(self):
+        return self._shape
 
-    def get_end_pos(self) -> QPointF:
-        if self.end_item is None or not _is_valid_qt_object(self.end_item):
-            raise RuntimeError("连线终点已失效")
-        input_type = PORT_TYPE_SEQUENTIAL if self.line_type == PORT_TYPE_RANDOM else self.line_type
-        return self.end_item.get_input_port_scene_pos(input_type)
+    def path(self):
+        return QPainterPath(self._path)
 
-    def _set_path(self, path: QPainterPath) -> None:
-        self.setPath(path)
-        self._shape_cache_dirty = True
+    def route_points(self):
+        return list(self._points)
 
-    def clear_path(self) -> None:
-        self._route_points = []
-        self._set_path(QPainterPath())
+    def clear_path(self):
+        self.prepareGeometryChange()
+        self._points = ()
+        self._path = QPainterPath()
+        self._shape = QPainterPath()
+        self._dash_offset = 0.0
+        self._bounds = self._path.boundingRect()
+        self.update()
 
-    def route_points(self) -> list[tuple[float, float]]:
-        return list(self._route_points)
-
-    def apply_route_points(self, points: list) -> bool:
-        if not isinstance(points, list) or len(points) < 2:
-            raise ValueError("连线路由点不足")
-        scene_points: list[tuple[float, float]] = []
-        for raw in points:
-            if not isinstance(raw, (tuple, list)) or len(raw) != 2:
-                raise TypeError("连线路由点必须是 (x, y)")
-            x = float(raw[0])
-            y = float(raw[1])
-            if not math.isfinite(x) or not math.isfinite(y):
-                raise ValueError("连线路由点必须是有限数字")
-            scene_points.append((x, y))
-        unique_scene: list[tuple[float, float]] = []
-        for point in scene_points:
-            if (
-                unique_scene
-                and abs(unique_scene[-1][0] - point[0]) < _POINT_EPS
-                and abs(unique_scene[-1][1] - point[1]) < _POINT_EPS
-            ):
-                continue
-            unique_scene.append(point)
-        if len(unique_scene) < 2:
-            unique_scene = _coincident_port_path(unique_scene[0] if unique_scene else scene_points[0])
-        if len(self._route_points) == len(unique_scene) and all(
-            abs(old[0] - new[0]) < _POINT_EPS and abs(old[1] - new[1]) < _POINT_EPS
-            for old, new in zip(self._route_points, unique_scene)
-        ):
+    def apply_route_points(self, points):
+        if self._disposed:
+            raise RuntimeError("已销毁的连线不能重新规划")
+        normalized = orthogonal_points(points)
+        if normalized == self._points:
             return False
-        origin = unique_scene[0]
-        local_points = [(x - origin[0], y - origin[1]) for x, y in unique_scene]
-        self._route_points = unique_scene
-        self.setPos(QPointF(origin[0], origin[1]))
-        self._set_path(painter_path_from_points(local_points))
+        origin = normalized[0]
+        path = painter_path_from_points([(x - origin[0], y - origin[1]) for x, y in normalized])
+        stroker = QPainterPathStroker()
+        stroker.setWidth(12.0)
+        shape = stroker.createStroke(path)
+        self.prepareGeometryChange()
+        self._points, self._path, self._shape = normalized, path, shape
+        self._bounds = shape.boundingRect().adjusted(-2, -2, 2, 2)
+        self.setPos(QPointF(*origin))
         self.update()
         return True
 
-    def update_path(self) -> None:
-        if self.start_item is None or self.end_item is None:
-            self.clear_path()
+    def get_start_pos(self):
+        if self.start_item is None or not isValid(self.start_item):
+            raise RuntimeError("连线起点已销毁")
+        return self.start_item.get_output_port_scene_pos(self.line_type)
+
+    def get_end_pos(self):
+        if self.end_item is None or not isValid(self.end_item):
+            raise RuntimeError("连线终点已销毁")
+        return self.end_item.get_input_port_scene_pos("sequential" if self.line_type == "random" else self.line_type)
+
+    def update_path(self):
+        if self._disposed:
             return
-        if not _is_valid_qt_object(self.start_item) or not _is_valid_qt_object(self.end_item):
-            self.clear_path()
-            return
-        if self.start_item.scene() is None or self.end_item.scene() is None:
-            self.clear_path()
-            return
-        if self.start_item.scene() is not self.end_item.scene():
-            raise RuntimeError("连线两端不在同一场景")
-        view = getattr(self.start_item, "view", None)
-        if view is None or not callable(getattr(view, "reroute_connections", None)):
-            raise RuntimeError("连线起点未绑定可路由的工作流视图")
-        if getattr(view, "_loading_workflow", False):
-            return
-        if getattr(view, "_rerouting_connections", False):
-            return
-        view.reroute_connections()
+        view = self.start_item.view
+        if not view._loading_workflow and not view._rerouting_connections:
+            view.reroute_connections((self.start_item, self.end_item))
+
+    def set_line_color(self):
+        self.pen.setColor(QColor(theme_color("connection_" + self.line_type)))
+        self.update()
 
     def paint(self, painter, option, widget=None):
-        path = self.path()
-        if path.isEmpty() or self.scene() is None:
+        if self._path.isEmpty():
             return
-        painter.setRenderHint(painter.RenderHint.Antialiasing, True)
-        if _overview_mode_enabled or _force_overview_mode:
-            draw_pen = QPen(self.pen)
-            draw_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            draw_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            draw_pen.setStyle(Qt.PenStyle.SolidLine)
-            zoom = max(0.05, _last_zoom_level)
-            zoom_ratio = min(1.0, zoom / _OVERVIEW_ZOOM_THRESHOLD)
-            draw_pen.setWidthF(max(self._normal_width * (0.75 + 0.15 * zoom_ratio), 0.55 / zoom))
-            painter.setPen(draw_pen)
-        else:
-            draw_pen = self._paint_pen
-            draw_pen.setColor(self.pen.color())
-            draw_pen.setWidthF(self.pen.widthF())
-            draw_pen.setDashOffset(-self.dash_offset)
-            painter.setPen(draw_pen)
-        painter.drawPath(path)
-
-    def shape(self):
-        if not self._shape_cache_dirty:
-            return self._shape_cache
-        path = self.path()
-        if path.isEmpty():
-            self._shape_cache = QPainterPath()
-        else:
-            stroker = QPainterPathStroker()
-            stroker.setWidth(10.0)
-            stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
-            stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            self._shape_cache = stroker.createStroke(path)
-        self._shape_cache_dirty = False
-        return self._shape_cache
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(self.pen)
+        pen.setWidthF(2.8 if self.isSelected() else 2.6 if self._hovered else 2.0)
+        # QPen 的虚线单位随线宽变化，按场景长度设置可避免悬停时节奏跳变。
+        pen.setDashPattern([_DASH_LENGTH / pen.widthF(), _DASH_GAP / pen.widthF()])
+        pen.setDashOffset(-self._dash_offset / pen.widthF())
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        # 交叉处保留细小的底色间隙，避免同色线路看起来像四向接点。
+        gap_pen = QPen(QColor(theme_color("background")), pen.widthF() + 3.0)
+        gap_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        gap_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(gap_pen)
+        painter.drawPath(self._path)
+        painter.setPen(pen)
+        painter.drawPath(self._path)
 
     def hoverEnterEvent(self, event):
-        self.pen.setWidthF(self._hover_width)
-        self.pen.setColor(self._normal_color.lighter(130))
-        self.setPen(self.pen)
+        self._hovered = True
+        _display.focus_changed(self.scene())
         self.update()
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
-        self.pen.setWidthF(self._normal_width)
-        self.pen.setColor(self._normal_color)
-        self.setPen(self.pen)
+        self._hovered = False
+        _display.focus_changed(self.scene())
         self.update()
         super().hoverLeaveEvent(event)
 
-    def cleanup(self) -> None:
-        if self.scene() is not None:
-            _unregister_animated_line(self)
-        self.start_item = None
-        self.end_item = None
+    def hoverMoveEvent(self, event):
+        if not self._hovered:
+            self._hovered = True
+            _display.focus_changed(self.scene())
+            self.update()
+        super().hoverMoveEvent(event)
+
+    def cleanup(self):
+        if self._disposed:
+            return
+        self._disposed = True
+        self._hovered = False
+        self.setSelected(False)
+        _display.detach(id(self))
+        self.start_item = self.end_item = None
         self.clear_path()
+
+
+def _release_destroyed_line(reference, identity):
+    line = reference()
+    if line is not None:
+        line.start_item = line.end_item = None
+        line._disposed = True
+        line._hovered = False
+        line._points = ()
+        line._path = QPainterPath()
+        line._shape = QPainterPath()
+        line._dash_offset = 0.0
+    _display.detach(identity)

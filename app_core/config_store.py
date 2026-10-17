@@ -28,7 +28,7 @@ _cache_value: Optional[dict] = None
 def _file_signature(config_file: str) -> Optional[tuple]:
     try:
         stat = os.stat(config_file)
-    except OSError:
+    except FileNotFoundError:
         return None
     return (config_file, stat.st_mtime_ns, stat.st_size)
 
@@ -61,6 +61,9 @@ _DEFAULT_CONFIG = {
     "target_window_title": None,
     "execution_mode": "background_sendmessage",
     "native_execution_mode": "background_sendmessage",
+    "background_hierarchy_broadcast": False,
+    "background_fake_active": False,
+    "background_block_physical_mouse": False,
     "foreground_mouse_driver_backend": "interception",
     "foreground_keyboard_driver_backend": "interception",
     "foreground_py_backend": "pyautogui",
@@ -82,6 +85,7 @@ _DEFAULT_CONFIG = {
     "plugin_bind_mode": 0,
     "plugin_text_ime": False,
     "plugin_fake_active": False,
+    "plugin_bind_auto_detect": True,
     "plugin_public": [],
     "plugin_reg_code": "",
     "plugin_extra_code": "",
@@ -91,8 +95,9 @@ _DEFAULT_CONFIG = {
     "enable_canvas_grid": True,
     "enable_card_snap": True,
     "enable_parameter_panel_snap": True,
-    "enable_floating_status_window": True,
     "enable_connection_line_animation": True,
+    "enable_execution_log_on_run": True,
+    "confirm_partial_window_failure": True,
     "close_behavior": "ask",
     "close_behavior_remember": False,
     **DEFAULT_HOTKEYS,
@@ -100,6 +105,7 @@ _DEFAULT_CONFIG = {
     "control_schedule": default_control_schedule_dict(),
     "multi_window_delay": 500,
     "recent_workflows": [],
+    "child_session": None,
 }
 
 _REMOVED_CONFIG_KEYS = (
@@ -117,29 +123,17 @@ _EXECUTION_MODES = (
     "background_postmessage",
 )
 _INPUT_BACKENDS = ("native", "plugin")
-_OPERATION_MODES = ("auto", "standard_window", "emulator_window")
+_OPERATION_MODES = ("auto", "standard_window")
 _SCREENSHOT_FORMATS = ("bmp", "png", "jpg", "jpeg")
 
 
 def _build_default_config() -> dict:
     """Return fresh defaults so mutable values are never shared."""
-    return deepcopy(_DEFAULT_CONFIG)
+    from utils.child_session.settings import default_child_session_config
 
-
-def _repair_factory_hotkey_collision(config: dict) -> None:
-    """Fix the known factory clash: pause and record both defaulted to F11."""
-    pause = str(config.get("pause_workflow_hotkey") or "").strip().upper()
-    record = str(config.get("record_hotkey") or "").strip().upper()
-    if pause != "F11" or record != "F11":
-        return
-    replacement = DEFAULT_HOTKEYS["record_hotkey"]
-    taken = {
-        str(config.get(key) or "").strip().upper()
-        for key in DEFAULT_HOTKEYS
-        if key != "record_hotkey"
-    }
-    if replacement.upper() not in taken:
-        config["record_hotkey"] = replacement
+    defaults = deepcopy(_DEFAULT_CONFIG)
+    defaults["child_session"] = default_child_session_config()
+    return defaults
 
 
 def _require_choice(config: dict, key: str, options: tuple, *, lower: bool = True) -> None:
@@ -193,6 +187,7 @@ def _validate_execution_settings(config: dict) -> None:
     _require_choice(config, "input_backend", _INPUT_BACKENDS)
     _require_choice(config, "operation_mode", _OPERATION_MODES)
     _require_choice(config, "screenshot_format", _SCREENSHOT_FORMATS)
+    _require_bool(config, "confirm_partial_window_failure")
 
     engine = str(config.get("screenshot_engine") or "").strip().lower()
     if not is_supported_screenshot_engine(engine):
@@ -230,7 +225,15 @@ def _validate_execution_settings(config: dict) -> None:
     if bind_mode not in plugin_bind_mode_options_for_kind(kind):
         raise ValueError(f"插件绑定 mode {bind_mode!r} 不属于绑定方式 {kind!r}")
     config["plugin_bind_mode"] = bind_mode
-    for key in ("plugin_input_display_follow", "plugin_text_ime", "plugin_fake_active"):
+    for key in (
+        "background_hierarchy_broadcast",
+        "background_fake_active",
+        "background_block_physical_mouse",
+        "plugin_input_display_follow",
+        "plugin_text_ime",
+        "plugin_fake_active",
+        "plugin_bind_auto_detect",
+    ):
         _require_bool(config, key)
     config["plugin_public"] = list(normalize_plugin_public(config.get("plugin_public")))
     for key in ("plugin_reg_code", "plugin_extra_code"):
@@ -264,32 +267,25 @@ def _normalize_config(config: Mapping) -> dict:
     normalized = deepcopy(dict(config))
     for key in _REMOVED_CONFIG_KEYS:
         normalized.pop(key, None)
-    # Flat keys are the only truth; lift section-only values before defaults.
+    # Flat keys are the only truth; rebuild section mirrors before defaults.
     normalized = apply_sections(normalized)
     for key, value in _build_default_config().items():
         normalized.setdefault(key, value)
-    _repair_factory_hotkey_collision(normalized)
     apply_schedule_schema(normalized)
     normalize_bound_windows_hwnds(normalized.get("bound_windows"))
     _validate_execution_settings(normalized)
+    from utils.child_session.settings import default_child_session_config, normalize_child_session_config
+
+    if "child_session" not in normalized or normalized.get("child_session") is None:
+        normalized["child_session"] = default_child_session_config()
+    else:
+        normalized["child_session"] = normalize_child_session_config(normalized.get("child_session"))
     return apply_sections(normalized)
 
 
 def load_config() -> dict:
     """读取并规范化主配置；返回的字典由调用方独占，可自由修改。"""
     defaults = _build_default_config()
-
-    def _repair_corrupted_config_file(cause: Exception):
-        config_file = _config_file()
-        if os.path.exists(config_file):
-            backup_path = f"{config_file}.corrupt.{int(time.time())}.bak"
-            try:
-                os.replace(config_file, backup_path)
-                logging.warning(f"检测到配置文件损坏，已备份到: {backup_path}")
-            except OSError as backup_err:
-                raise RuntimeError(f"备份损坏配置文件失败: {backup_err}") from backup_err
-        save_config(defaults)
-        logging.info(f"已重建默认配置文件: {config_file}")
 
     config_file = _config_file()
     signature = _file_signature(config_file)
@@ -312,10 +308,26 @@ def load_config() -> dict:
                 _store_cache(signature, normalized)
             return normalized
         except (json.JSONDecodeError, UnicodeDecodeError, OSError, TypeError, ValueError) as e:
-            logging.error(f"无法加载配置文件 {config_file}: {e}")
-            _repair_corrupted_config_file(e)
+            raise RuntimeError(f"无法加载配置文件 {config_file}: {e}") from e
 
     return defaults
+
+
+def _replace_config_file(tmp_path: str, config_file: str) -> None:
+    """Windows 上目标文件刚被写入时，替换可能短暂返回拒绝访问。"""
+    delay_seconds = 0.02
+    last_error = None
+    for _attempt in range(8):
+        try:
+            os.replace(tmp_path, config_file)
+            return
+        except OSError as exc:
+            last_error = exc
+            if getattr(exc, "winerror", None) not in (5, 32):
+                raise
+            time.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2, 0.2)
+    raise last_error
 
 
 def save_config(config_to_save: Mapping):
@@ -336,7 +348,7 @@ def save_config(config_to_save: Mapping):
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp_path, config_file)
+        _replace_config_file(tmp_path, config_file)
         _invalidate_cache()
         logging.info(f"配置已保存到 {config_file}")
     except OSError as e:
