@@ -132,6 +132,13 @@ class WorkflowView(
         self._render_cache_guard_timer.setInterval(15000)
         self._render_cache_guard_timer.timeout.connect(self._on_render_cache_guard_tick)
 
+        self._deferred_view_position_timer: Optional[QTimer] = QTimer(self)
+        self._deferred_view_position_timer.setSingleShot(True)
+        self._deferred_view_position_timer.setInterval(100)
+        self._deferred_view_position_timer.timeout.connect(self._apply_deferred_view_position)
+        self._deferred_view_position_pending = False
+        self._deferred_view_center: Optional[QPointF] = None
+
         # --- Demo Setup Removed --- 
         # The user will add cards manually now
 
@@ -178,6 +185,7 @@ class WorkflowView(
     def clear_workflow(self):
         if not self._loading_workflow and self._is_workflow_running():
             return False
+        self._cancel_deferred_view_position()
         self._cancel_canvas_panning()
         self._cleanup_drag_state()
         self._clear_all_snap_guide_lines(commit=False)
@@ -197,6 +205,7 @@ class WorkflowView(
             cleanup.callback(self._connection_controller.dispose)
             cleanup.callback(self.set_canvas_drag_paused, False)
             cleanup.callback(self._release_render_cache_guard)
+            cleanup.callback(self._release_deferred_view_position)
             cleanup.callback(self._connection_gesture.dispose)
             QApplication.instance().aboutToQuit.disconnect(self.dispose_resources)
             loading = self._loading_workflow
@@ -211,6 +220,13 @@ class WorkflowView(
         if timer is not None:
             timer.stop()
             timer.timeout.disconnect(self._on_render_cache_guard_tick)
+            timer.deleteLater()
+
+    def _release_deferred_view_position(self):
+        self._cancel_deferred_view_position()
+        timer, self._deferred_view_position_timer = self._deferred_view_position_timer, None
+        if timer is not None:
+            timer.timeout.disconnect(self._apply_deferred_view_position)
             timer.deleteLater()
 
     def closeEvent(self, event):

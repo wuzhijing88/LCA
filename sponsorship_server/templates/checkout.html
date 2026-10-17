@@ -1,9 +1,0 @@
-{% extends "base.html" %}
-{% block content %}
-<section class="card result"><span class="result-symbol" aria-hidden="true">↗</span><p class="eyebrow">谢谢你的心意</p><h1>正在前往付款页面</h1><p class="result-description">赞助金额 <strong>¥ {{ amount | money }}</strong><br>请在付款页面完成支付。</p>
-<form id="payment-checkout" action="{{ gateway }}" method="post">
-  {% for name, value in fields.items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
-  <button class="button primary" type="submit">继续付款 <span aria-hidden="true">↗</span></button>
-</form><a class="text-link" href="/">返回赞助首页</a></section>
-<script src="/assets/checkout.js" defer></script>
-{% endblock %}

@@ -469,12 +469,8 @@ class WorkflowViewIoMixin:
             ):
                 raise TypeError("工作流 view_center 必须是包含 2 个有限数字的列表")
             saved_center_point = QPointF(view_center_data[0], view_center_data[1])
-            QTimer.singleShot(
-                100,
-                self,
-                lambda point=saved_center_point: self._deferred_center_view(point),
-            )
+            self._schedule_deferred_view_position(saved_center_point)
         elif placing_start:
-            QTimer.singleShot(100, self, self._place_start_card_at_viewport_top_left)
+            self._schedule_deferred_view_position()
 
         logger.info("[工作流加载] 完成，卡片数量=%s，连线数量=%s", len(self.cards), len(self.connections))

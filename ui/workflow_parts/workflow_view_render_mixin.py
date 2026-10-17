@@ -200,15 +200,12 @@ class WorkflowViewRenderMixin:
             return
 
         # Pick grid-dot color based on current theme.
-        try:
-            from themes import get_theme_manager
-            theme_manager = get_theme_manager()
-            is_dark = theme_manager.is_dark_mode()
-            if is_dark:
-                dot_color = QColor(90, 90, 90, 110)
-            else:
-                dot_color = QColor(170, 170, 170, 120)
-        except Exception:
+        from themes import get_theme_manager
+        theme_manager = get_theme_manager()
+        is_dark = theme_manager.is_dark_mode()
+        if is_dark:
+            dot_color = QColor(90, 90, 90, 110)
+        else:
             dot_color = QColor(170, 170, 170, 120)
 
         spacing = self._grid_spacing
@@ -265,18 +262,18 @@ class WorkflowViewRenderMixin:
 
     def _refresh_thread_start_custom_names(self):
         """按当前起点数量统一命名：线程起点/2/3..."""
-        try:
-            start_cards = [
-                card for card in self.cards.values()
-                if self._is_start_task_type(getattr(card, "task_type", ""))
-            ]
-            start_cards.sort(key=lambda c: c.card_id)
-            for idx, card in enumerate(start_cards, 1):
-                desired_name = f"线程起点{idx}"
-                if getattr(card, "custom_name", None) != desired_name:
-                    card.set_custom_name(desired_name)
-        except Exception as e:
-            logger.warning(f"刷新线程起点名称失败: {e}")
+        # 按登记的整数 ID 排序，保持线程编号顺序。
+        start_cards = []
+        for card_id in sorted(self.cards):
+            card = self.cards[card_id]
+            if not isinstance(card, TaskCard):
+                raise TypeError(f"卡片登记对象必须是任务卡片: {card_id}")
+            if self._is_start_task_type(card.task_type):
+                start_cards.append(card)
+        for idx, card in enumerate(start_cards, 1):
+            desired_name = f"线程起点{idx}"
+            if card.custom_name != desired_name:
+                card.set_custom_name(desired_name)
 
     @staticmethod
     def _is_start_task_type(task_type: Any) -> bool:
@@ -284,8 +281,8 @@ class WorkflowViewRenderMixin:
 
     @staticmethod
     def _validate_special_connection_rule(start_card: TaskCard, end_card: TaskCard, line_type: str) -> Optional[str]:
-        start_task_type = getattr(start_card, "task_type", "")
-        end_task_type = getattr(end_card, "task_type", "")
+        start_task_type = start_card.task_type
+        end_task_type = end_card.task_type
         if is_valid_thread_window_limit_connection(start_task_type, end_task_type, line_type):
             return None
         if is_thread_window_limit_task_type(start_task_type):
@@ -337,7 +334,7 @@ class WorkflowViewRenderMixin:
         try:
             if not isValid(self):
                 return None
-            scene = getattr(self, "scene", None)
+            scene = self.scene
             if scene is None or not isValid(scene):
                 return None
             return scene
@@ -353,7 +350,7 @@ class WorkflowViewRenderMixin:
         starts = [
             card
             for card in self.cards.values()
-            if is_thread_start_task_type(getattr(card, "task_type", ""))
+            if is_thread_start_task_type(card.task_type)
         ]
         if len(starts) != 1:
             return
@@ -364,8 +361,8 @@ class WorkflowViewRenderMixin:
         top_left = self.mapToScene(margin, margin)
         x = top_left.x()
         y = top_left.y()
-        spacing = int(getattr(self, "_grid_spacing", 20) or 20)
-        if getattr(self, "_grid_enabled", False) and spacing > 0:
+        spacing = self._grid_spacing
+        if self._grid_enabled and spacing > 0:
             x = round(x / spacing) * spacing
             y = round(y / spacing) * spacing
         starts[0].setPos(x, y)
@@ -398,6 +395,34 @@ class WorkflowViewRenderMixin:
         except Exception as deferred_center_e:
              logger.error(f"Error during deferred centerOn or verification: {deferred_center_e}", exc_info=True)
 
+    def _schedule_deferred_view_position(self, center_point: Optional[QPointF] = None) -> None:
+        """用画布持有的计时器安排定位，确保编译方法在回调前不会被释放。"""
+        timer = self._deferred_view_position_timer
+        if timer is None or self._resources_cleaned_up:
+            raise RuntimeError("工作流视图已释放，无法安排画布定位")
+        self._deferred_view_center = QPointF(center_point) if center_point is not None else None
+        self._deferred_view_position_pending = True
+        if self.isVisible():
+            timer.start()
+
+    def _cancel_deferred_view_position(self) -> None:
+        timer = self._deferred_view_position_timer
+        if timer is not None:
+            timer.stop()
+        self._deferred_view_position_pending = False
+        self._deferred_view_center = None
+
+    def _apply_deferred_view_position(self) -> None:
+        if not self._deferred_view_position_pending or self._resources_cleaned_up or not self.isVisible():
+            return
+        center_point = self._deferred_view_center
+        self._deferred_view_position_pending = False
+        self._deferred_view_center = None
+        if center_point is None:
+            self._place_start_card_at_viewport_top_left()
+        else:
+            self._deferred_center_view(center_point)
+
     def resizeEvent(self, event: QResizeEvent):
         """Logs the view center when the view is resized."""
         super().resizeEvent(event) # Call base implementation first
@@ -416,9 +441,13 @@ class WorkflowViewRenderMixin:
             debug_print(f"  [VIEW_DEBUG] showEvent: Current scene center = {center_point}")
         except Exception as e:
             debug_print(f"  [VIEW_DEBUG] showEvent: Error getting center point: {e}")
+        if self._deferred_view_position_pending:
+            self._deferred_view_position_timer.start()
         self._refresh_viewport_animations()
 
     def hideEvent(self, event: QHideEvent):
+        if self._deferred_view_position_timer is not None:
+            self._deferred_view_position_timer.stop()
         self._cancel_canvas_panning()
         self._cleanup_drag_state()
         self._clear_all_snap_guide_lines()
@@ -446,20 +475,19 @@ class WorkflowViewRenderMixin:
         try:
             logging.info(f"[THEME_REFRESH] 开始刷新 {len(self.cards)} 个卡片的主题")
             for card_id, card in self.cards.items():
-                if hasattr(card, 'refresh_theme'):
-                    card.refresh_theme()
-                    logging.debug(f"[THEME_REFRESH] 已刷新卡片 {card_id}")
+                card.refresh_theme()
+                logging.debug(f"[THEME_REFRESH] 已刷新卡片 {card_id}")
             logging.info("[THEME_REFRESH] 完成刷新所有卡片的主题")
         except Exception as e:
             logging.error(f"[THEME_REFRESH] 刷新卡片主题时出错: {e}", exc_info=True)
 
     def _sync_scene_rect_to_content(self) -> None:
         """把场景矩形限制在卡片范围加两屏边距，避免长时间平移把场景撑得无限大。"""
-        if self._is_panning or getattr(self, "_drag_preview_mode", False):
+        if self._is_panning or self._drag_preview_mode:
             return
-        if getattr(self, "_loading_workflow", False) or getattr(self, "_rerouting_connections", False):
+        if self._loading_workflow or self._rerouting_connections:
             return
-        scene = getattr(self, "scene", None)
+        scene = self.scene
         if scene is None:
             return
         viewport = self.viewport()
@@ -506,7 +534,7 @@ class WorkflowViewRenderMixin:
         del value
         if self._is_panning or self._drag_preview_mode:
             return
-        if getattr(self, "_loading_workflow", False) or getattr(self, "_rerouting_connections", False):
+        if self._loading_workflow or self._rerouting_connections:
             return
         self._sync_scene_rect_to_content()
         self._refresh_viewport_animations()

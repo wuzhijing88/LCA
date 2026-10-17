@@ -8,6 +8,7 @@
 import logging
 import os
 import json
+from functools import partial
 from pathlib import Path
 from app_core.lca_format.constants import LCA_FILE_FILTER, LCA_SAVE_FILTER
 from task_workflow.workflow_payload import load_workflow_file
@@ -78,6 +79,7 @@ class WorkflowTabWidget(QTabWidget):
         self.task_views: Dict[int, WorkflowView] = {}
         # 任务运行时信号源缓存（用于移除时解绑，防止残留回调）
         self._task_runtime_signal_tasks: Dict[int, object] = {}
+        self._pending_task_view_inserts: set[int] = set()
 
         # 标志：是否正在删除标签页（阻止误触发导入对话框）
         self._is_removing_tab = False
@@ -780,7 +782,6 @@ class WorkflowTabWidget(QTabWidget):
         try:
             from task_workflow.workspace import (
                 blank_workflow_data,
-                ensure_workflow_resource_subdirs,
                 new_workflow_filepath,
             )
             from utils.app_paths import get_workflows_dir
@@ -808,7 +809,7 @@ class WorkflowTabWidget(QTabWidget):
 
             default_filepath = new_workflow_filepath(name, workspace_root)
             project_dir = os.path.dirname(os.path.abspath(default_filepath))
-            ensure_workflow_resource_subdirs(project_dir)
+            # 新建只在内存中预留路径，保存或实际导入资源时再创建目录。
             workflow_data = blank_workflow_data(project_dir)
 
             task_id = self.task_manager.add_task(name, default_filepath, workflow_data)
@@ -865,6 +866,9 @@ class WorkflowTabWidget(QTabWidget):
 
         from .connection_line import set_line_animation_paused
 
+        view_id = id(workflow_view)
+        self._pending_task_view_inserts.add(view_id)
+        workflow_view.destroyed.connect(partial(self._release_task_view_insert, view_id))
         set_line_animation_paused("workflow_tab_insert", True)
         workflow_view.setUpdatesEnabled(False)
         try:
@@ -875,23 +879,26 @@ class WorkflowTabWidget(QTabWidget):
             logger.error("加载工作流画布失败: %s", exc, exc_info=True)
             self._task_add_error = exc
             self._discard_failed_task_view(task_id, workflow_view)
-            set_line_animation_paused("workflow_tab_insert", False)
             return
         workflow_view.setUpdatesEnabled(True)
         QTimer.singleShot(0, workflow_view, lambda view=workflow_view: self._resume_task_view_insert(view))
 
-    def _resume_task_view_insert(self, workflow_view) -> None:
-        from shiboken6 import isValid
-
+    def _release_task_view_insert(self, view_id: int, _destroyed_object=None) -> None:
+        """插入完成、关闭和直接销毁都只释放该视图持有的一次暂停。"""
+        if view_id not in self._pending_task_view_inserts:
+            return
+        self._pending_task_view_inserts.remove(view_id)
         from .connection_line import set_line_animation_paused
 
         set_line_animation_paused("workflow_tab_insert", False)
+
+    def _resume_task_view_insert(self, workflow_view) -> None:
+        from shiboken6 import isValid
+
+        self._release_task_view_insert(id(workflow_view))
         if workflow_view is None or not isValid(workflow_view):
             return
-        try:
-            workflow_view._refresh_viewport_animations()
-        except Exception:
-            pass
+        workflow_view._refresh_viewport_animations()
 
     def _discard_failed_task_view(self, task_id: int, workflow_view) -> None:
         self.task_views.pop(task_id, None)
@@ -1142,6 +1149,7 @@ class WorkflowTabWidget(QTabWidget):
         if workflow_widget is None:
             return
         if isinstance(workflow_widget, WorkflowView):
+            self._release_task_view_insert(id(workflow_widget))
             workflow_widget.dispose_resources()
             workflow_widget.main_window = None
         workflow_widget.setParent(None)
