@@ -52,6 +52,7 @@ class ScriptCaptureBar(QWidget):
     capture_requested = Signal(str)
     find_requested = Signal()
     resources_toggled = Signal(bool)
+    environment_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -93,6 +94,16 @@ class ScriptCaptureBar(QWidget):
         row.addWidget(resource_btn)
         self._resource_btn = resource_btn
         self._buttons.append(resource_btn)
+        environment_btn = QPushButton("环境设置")
+        environment_btn.setObjectName("scriptCaptureButton")
+        environment_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        environment_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        environment_btn.setToolTip("选择运行环境，设置 Python 解释器、依赖和软件源。")
+        environment_btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        environment_btn.clicked.connect(self.environment_requested.emit)
+        row.addWidget(environment_btn)
+        self._environment_btn = environment_btn
+        self._buttons.append(environment_btn)
         row.addStretch(1)
         layout.addLayout(row)
         hint = QLabel("写到光标处。取色可连点再完成；截图每次新文件，找图行再截会追加多图。")
@@ -104,9 +115,7 @@ class ScriptCaptureBar(QWidget):
         self._idle_hint = hint.text()
 
     def set_resources_visible(self, visible: bool) -> None:
-        button = getattr(self, "_resource_btn", None)
-        if button is None:
-            return
+        button = self._resource_btn
         button.blockSignals(True)
         button.setChecked(bool(visible))
         button.blockSignals(False)

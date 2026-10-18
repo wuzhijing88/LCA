@@ -327,6 +327,71 @@ QComboBox::drop-down {
     width: 20px;
 }
 
+/* 脚本环境设置：输入框同高，箭头与输入区域共用背景。 */
+QDialog#scriptEnvironmentDialog QLineEdit,
+QDialog#scriptEnvironmentDialog QComboBox {
+    background-color: #252525;
+    color: #e0e0e0;
+    border: 1px solid #3e3e3e;
+    border-radius: 4px;
+    padding: 5px 10px;
+    min-height: 24px;
+}
+
+QDialog#scriptEnvironmentDialog QComboBox {
+    padding-right: 34px;
+}
+
+QDialog#scriptEnvironmentDialog QComboBox:hover {
+    border-color: #4e4e4e;
+}
+
+QDialog#scriptEnvironmentDialog QLineEdit:focus,
+QDialog#scriptEnvironmentDialog QComboBox:focus {
+    border-color: #0078d4;
+}
+
+QDialog#scriptEnvironmentDialog QLineEdit:disabled,
+QDialog#scriptEnvironmentDialog QComboBox:disabled {
+    background-color: #1e1e1e;
+    color: #666666;
+    border-color: #2e2e2e;
+}
+
+QDialog#scriptEnvironmentDialog QLabel#scriptEnvironmentHint {
+    color: #b0b0b0;
+    background: transparent;
+}
+
+/* 标准主题下拉的箭头由 ThemedComboBox 绘制，右侧不再留独立按钮。 */
+QComboBox[unifiedTheme="true"] {
+    padding-right: 34px;
+}
+
+QComboBox[unifiedTheme="true"]::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 28px;
+    background: transparent;
+    border: none;
+}
+
+/* 脚本标准下拉统一使用主题的禁用状态和列表样式。 */
+QComboBox[unifiedTheme="true"]:disabled,
+#scriptEditorDialog QComboBox[unifiedTheme="true"]:disabled {
+    background-color: #1e1e1e;
+    color: #666666;
+    border-color: #2e2e2e;
+}
+
+QListView#themedComboList::item {
+    padding: 6px 12px;
+    min-height: 20px;
+    margin: 0px;
+    border: none;
+    border-radius: 3px;
+}
+
 
 QComboBox QAbstractItemView {
     background-color: #2d2d2d;
@@ -1687,6 +1752,11 @@ QFrame#customDropdownPopup {
     margin: 0px;
 }
 
+QFrame#customDropdownPopup[roundedPopup="true"] {
+    background-color: transparent;
+    border: none;
+}
+
 /* 涓嬫媺妗嗗垪琛?*/
 QWidget#pluginPublicInner,
 QFrame#customDropdownPopup QWidget#pluginPublicInner,
@@ -1700,6 +1770,7 @@ QListWidget#customDropdownList {
     background-color: transparent;
     outline: none;
     show-decoration-selected: 1;
+    color: #e0e0e0;
 }
 
 QListWidget#customDropdownList::viewport {
@@ -1710,25 +1781,29 @@ QListWidget#customDropdownList::item {
     padding: 0px;
     min-height: 18px;
     color: #e0e0e0;
-    background-color: #2d2d2d;
+    background-color: transparent;
     text-align: left;
     border-radius: 4px;
     margin: 0px;
 }
 
 QListWidget#customDropdownList::item:hover {
-    background-color: transparent;
+    background-color: #3a3a3a;
     color: #e0e0e0;
 }
 
 QListWidget#customDropdownList::item:selected {
-    background-color: transparent;
-    color: #e0e0e0;
+    background-color: #0078d4;
+    color: #ffffff;
 }
 
 QListWidget#customDropdownList::item:selected:hover {
-    background-color: transparent;
-    color: #e0e0e0;
+    background-color: #0078d4;
+    color: #ffffff;
+}
+
+QListWidget#customDropdownList::item:disabled {
+    color: #b0b0b0;
 }
 
 /* ========== 鍙傛暟闈㈡澘鏍峰紡 ========== */

@@ -307,7 +307,7 @@
     {
       "name": "packaging",
       "version": "26.1",
-      "direct": false,
+      "direct": true,
       "bundled": true,
       "required_by": [
         "onnxruntime-directml"

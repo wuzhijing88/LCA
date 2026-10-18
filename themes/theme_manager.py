@@ -7,7 +7,7 @@
 from pathlib import Path
 from utils.app_paths import get_app_root
 from typing import Optional, Callable
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QWidget
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Signal
 import json
@@ -183,6 +183,14 @@ class ThemeManager:
     # 主题颜色映射
     THEME_COLORS = {
         'light': {
+            'script_syntax_keyword': '#0000ff',
+            'script_syntax_constant': '#0000ff',
+            'script_syntax_runtime': '#267f99',
+            'script_syntax_action': '#795e26',
+            'script_syntax_builtin': '#795e26',
+            'script_syntax_string': '#a31515',
+            'script_syntax_number': '#098658',
+            'script_syntax_comment': '#008000',
             'connection_sequential': '#3984c6',
             'connection_success': '#358b57',
             'connection_failure': '#cb6269',
@@ -221,6 +229,14 @@ class ThemeManager:
             'picker_text_bg': '#000000',        # 文本背景：黑色
         },
         'dark': {
+            'script_syntax_keyword': '#569cd6',
+            'script_syntax_constant': '#569cd6',
+            'script_syntax_runtime': '#4ec9b0',
+            'script_syntax_action': '#dcdcaa',
+            'script_syntax_builtin': '#dcdcaa',
+            'script_syntax_string': '#ce9178',
+            'script_syntax_number': '#b5cea8',
+            'script_syntax_comment': '#6a9955',
             'connection_sequential': '#76b4e8',
             'connection_success': '#79c992',
             'connection_failure': '#ec9199',
@@ -519,63 +535,40 @@ class ThemeManager:
                 background-color: {selected};
                 color: {self.get_color('accent_text')};
             }}
+            QListView#themedComboList {{
+                padding: 0px;
+            }}
+            QListView#themedComboList::item {{
+                margin: 0px;
+                border-radius: 4px;
+            }}
+            QListView#themedComboList::item:disabled {{
+                color: {self.get_color('text_disabled')};
+            }}
         """
 
-    def apply_combo_popup_theme(self, popup: Optional[QWidget], view: Optional[QWidget] = None) -> None:
-        if popup is None:
-            return
-        try:
-            from PySide6.QtWidgets import QComboBox, QDialog, QMainWindow
+    def apply_combo_popup_theme(self, popup: QWidget, view: QAbstractItemView) -> None:
+        """更新标准下拉容器的主题，展开与定位由控件负责。"""
+        from themes.rounded_popup import COMBO_RADIUS, apply_rounded_popup, apply_transparent_popup_palette
 
-            name = str(popup.objectName() or "")
-            if name in {"scriptCompleterPopup", "customDropdownPopup", "customDropdownList"}:
-                return
-            # 绝不能把主题套到 Combo/对话框/主窗本身（view.window() 误判时会整窗被涂坏）
-            if isinstance(popup, (QComboBox, QDialog, QMainWindow)):
-                return
-            class_name = ""
-            try:
-                class_name = popup.metaObject().className()
-            except Exception:
-                class_name = ""
-            if class_name and class_name not in {"QComboBoxPrivateContainer", "QFrame", "QWidget"}:
-                # 只接受下拉容器及其常见基类
-                if "ComboBox" not in class_name and "Popup" not in class_name:
-                    pass
-
-            from themes.rounded_popup import COMBO_RADIUS, apply_rounded_popup, apply_transparent_popup_palette
-
-            apply_rounded_popup(
-                popup,
-                radius=COMBO_RADIUS,
-                border_key="combo_popup_border",
-                frameless=True,
-                force_window=True,
-            )
-            popup.setStyleSheet(self.combo_popup_stylesheet())
-            targets = [view] if view is not None else []
-            if view is None:
-                from PySide6.QtWidgets import QAbstractItemView
-
-                targets.extend(popup.findChildren(QAbstractItemView))
-            for item in targets:
-                if item is None:
-                    continue
-                apply_transparent_popup_palette(item)
-                viewport = item.viewport() if hasattr(item, "viewport") else None
-                if viewport is not None:
-                    apply_transparent_popup_palette(viewport)
-            if not popup.isVisible():
-                popup.show()
-            popup.raise_()
-            popup.update()
-        except RuntimeError:
-            return
+        themed = view.objectName() == "themedComboList"
+        apply_rounded_popup(popup, radius=COMBO_RADIUS, border_key="border" if themed else "combo_popup_border")
+        popup.setStyleSheet(self.combo_popup_stylesheet())
+        if themed:
+            # 留白由容器布局持有，避免全局列表修饰器清理视图边距时被覆盖。
+            popup.layout().setContentsMargins(5, 5, 5, 5)
+            popup.setFixedWidth(popup.parentWidget().width())
+        apply_transparent_popup_palette(view)
+        apply_transparent_popup_palette(view.viewport())
+        popup.update()
+        view.viewport().update()
 
     def get_color(self, color_key: str) -> str:
         """获取当前主题的指定颜色"""
-        theme_colors = self.THEME_COLORS.get(self.current_theme, self.THEME_COLORS['light'])
-        return theme_colors.get(color_key, '#000000')
+        try:
+            return self.THEME_COLORS[self.current_theme][color_key]
+        except KeyError as exc:
+            raise KeyError(f"主题颜色未定义：{self.current_theme}/{color_key}") from exc
 
     def get_qcolor(self, color_key: str) -> QColor:
         """获取当前主题的指定颜色（QColor对象）"""

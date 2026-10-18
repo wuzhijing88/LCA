@@ -935,6 +935,8 @@ class MainWindowRunWorkflowMixin:
 
                                     'parameters': copy.deepcopy(card_obj.parameters),
 
+                                    'custom_name': card_obj.custom_name,
+
                                     'position': {'x': card_obj.x(), 'y': card_obj.y()}
 
                                 }

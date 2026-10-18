@@ -7,11 +7,14 @@ import re
 from typing import Dict, List, Tuple
 
 from PySide6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat
+from themes import get_theme_manager
 
-
-from task_workflow.script_sandbox import COMMAND_NAMES
+from task_workflow.script_sandbox import COMMAND_NAMES, _EXCEPTION_NAMES
+from task_workflow.script_image import IMAGE_METHODS
 
 _KEYWORDS = (
+    "导入", "从", "作为", "尝试", "捕获", "最终", "抛出", "匿名", "使用", "就是",
+    "import", "from", "as", "try", "except", "finally", "raise", "lambda", "with",
     "否则如果",
     "如果",
     "否则",
@@ -44,11 +47,11 @@ _KEYWORDS = (
     "is",
 )
 _CONSTANTS = ("真", "假", "空", "True", "False", "None")
-_RUNTIME = ("变量", "上次", "文字", "找图", "检测", "卡片", "结果", "色", "数据", "剪贴板", "窗口", "组件", "区域")
+_RUNTIME = ("变量", "上次", "文字", "找图", "检测", "卡片", "结果", "色", "数据", "剪贴板", "窗口", "组件", "区域", "图像")
 
 
 def script_action_names():
-    return (*COMMAND_NAMES, "组件.加载", "组件.调用", "组件.读取", "组件.写入", "组件.运行", "组件.关闭",
+    return (*COMMAND_NAMES, *(f"图像.{name}" for name in IMAGE_METHODS), "组件.加载", "组件.调用", "组件.读取", "组件.写入", "组件.运行", "组件.关闭",
             "变量.获取", "变量.设置", "变量.增加", "变量.存在", "变量.删除",
             "变量.全局获取", "变量.全局设置", "变量.全局增加", "变量.全局存在", "变量.全局删除",
             "数据.读取", "数据.写入", "数据.JSON读取", "数据.JSON写入", "数据.存在", "数据.删除",
@@ -76,6 +79,7 @@ _ACTION_METHODS = (
     "关闭",
 )
 _BUILTINS = (
+    "列表清空", "求和", "就近取整", "异常", "值错误", "类型错误", "运行错误",
     "随机",
     "开方",
     "平方根",
@@ -146,40 +150,17 @@ _STATE_NONE = 0
 _STATE_TRIPLE_DOUBLE = 1
 _STATE_TRIPLE_SINGLE = 2
 
-_DARK_COLORS = {
-    "keyword": "#569cd6",
-    "constant": "#569cd6",
-    "runtime": "#4ec9b0",
-    "action": "#dcdcaa",
-    "builtin": "#dcdcaa",
-    "string": "#ce9178",
-    "number": "#b5cea8",
-    "comment": "#6a9955",
-}
-
-_LIGHT_COLORS = {
-    "keyword": "#0000ff",
-    "constant": "#0000ff",
-    "runtime": "#267f99",
-    "action": "#795e26",
-    "builtin": "#795e26",
-    "string": "#a31515",
-    "number": "#098658",
-    "comment": "#008000",
-}
+_COLOR_ROLES = ("keyword", "constant", "runtime", "action", "builtin", "string", "number", "comment")
 
 
 def script_highlight_colors(dark: bool) -> Dict[str, str]:
-    return dict(_DARK_COLORS if dark else _LIGHT_COLORS)
+    theme = "dark" if dark else "light"
+    colors = get_theme_manager().THEME_COLORS[theme]
+    return {role: colors[f"script_syntax_{role}"] for role in _COLOR_ROLES}
 
 
 def is_dark_theme() -> bool:
-    try:
-        from themes import get_theme_manager
-
-        return bool(get_theme_manager().is_dark_mode())
-    except Exception:
-        return True
+    return get_theme_manager().is_dark_mode()
 
 
 def _word_pattern(words: Tuple[str, ...]) -> re.Pattern[str]:
@@ -213,6 +194,7 @@ class ScriptSyntaxHighlighter(QSyntaxHighlighter):
             % (runtime_names, field_names, runtime_names)
         )
         self._builtin_re = _call_pattern(_BUILTINS)
+        self._exception_re = _word_pattern(_EXCEPTION_NAMES)
         self._number_re = re.compile(r"(?<!\w)\d+(?:\.\d+)?(?!\w)")
 
     def set_dark(self, dark: bool) -> None:
@@ -328,6 +310,7 @@ class ScriptSyntaxHighlighter(QSyntaxHighlighter):
             (self._runtime_re, "runtime"),
             (self._action_re, "action"),
             (self._builtin_re, "builtin"),
+            (self._exception_re, "builtin"),
             (self._number_re, "number"),
         )
         for pattern, name in rules:

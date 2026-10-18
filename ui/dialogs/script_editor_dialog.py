@@ -131,6 +131,9 @@ class _ScriptDebugWorker(QObject):
         self.controller = controller
         self._params = dict(params or {})
         self._run_context = dict(run_context or {})
+        from task_workflow.resource_context import current_package_session
+
+        self._package_session = current_package_session()
         if "runtime_store" not in self._run_context:
             # 在调用方线程捕获上下文；调试 worker 运行在另一个线程，不能在那里
             # 再调用按线程绑定的 get_runtime_store()。
@@ -150,6 +153,7 @@ class _ScriptDebugWorker(QObject):
         try:
             context = build_script_run_context(
                 params=self._params,
+                project_path=ctx.get("project_path"),
                 source=self.source,
                 counters={},
                 execution_mode=ctx.get("execution_mode") or "foreground",
@@ -158,6 +162,10 @@ class _ScriptDebugWorker(QObject):
                 card_id=ctx.get("card_id"),
                 images_dir=ctx.get("images_dir"),
                 sounds_dir=ctx.get("sounds_dir"),
+                dicts_dir=ctx.get("dicts_dir"),
+                yolo_dir=ctx.get("yolo_dir"),
+                replays_dir=ctx.get("replays_dir"),
+                plugins_dir=ctx.get("plugins_dir"),
                 debugger=self.controller,
                 stop_checker=self.controller.stopped,
             )
@@ -185,7 +193,14 @@ class _ScriptDebugWorker(QObject):
             self.finished.emit(False, "已停止")
             return
         try:
-            ok, detail = run_script(self.source, debug_store, logger, context=context)
+            from task_workflow.resource_context import workflow_resource_scope
+
+            with workflow_resource_scope(
+                {key: context.get(key) or "" for key in
+                 ("images_dir", "sounds_dir", "dicts_dir", "yolo_dir", "replays_dir", "plugins_dir")},
+                package_session=self._package_session,
+            ):
+                ok, detail = run_script(self.source, debug_store, logger, context=context)
         except Exception as exc:
             # run_script 的 finally 已调用 controller.finish，这里只回传 Qt 信号，不重复 finish。
             self.finished.emit(False, str(exc))
@@ -245,6 +260,7 @@ class ScriptEditorDialog(QDialog):
         on_applied: Optional[Callable[[str], None]] = None,
         debug_context_provider: Optional[Callable[[], dict]] = None,
         parent=None,
+        environment=None,
     ):
         super().__init__(parent)
         self._card_id = card_id
@@ -253,6 +269,10 @@ class ScriptEditorDialog(QDialog):
         self._applied_source: Optional[str] = None
         self._on_applied = on_applied
         self._debug_context_provider = debug_context_provider
+        from app_core.script_environments import normalize_environment
+
+        self._environment = normalize_environment(environment)
+        self._saved_environment = dict(self._environment)
         self._find_message = ""
         self._custom_name = str(custom_name or "").strip() or None
         self._help_visible = _load_help_visible()
@@ -308,7 +328,22 @@ class ScriptEditorDialog(QDialog):
         return self.editor.toPlainText()
 
     def is_dirty(self) -> bool:
-        return self.editor.toPlainText() != self._saved_source
+        return (self.editor.toPlainText() != self._saved_source
+                or self.environment_settings() != self._saved_environment)
+
+    def environment_settings(self):
+        return dict(self._environment)
+
+    def _configure_environment(self):
+        from ui.dialogs.script_environment_dialog import ScriptEnvironmentDialog
+
+        dialog = ScriptEnvironmentDialog(self._environment, self)
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._environment = dialog.settings()
+                self._refresh_syntax_status()
+        finally:
+            dialog.deleteLater()
 
     def reload_source(self, source: str) -> None:
         text = str(source or "")
@@ -359,22 +394,19 @@ class ScriptEditorDialog(QDialog):
         center_window_on_widget_screen(self, self.parentWidget())
 
     def _register_theme_callback(self) -> None:
-        try:
-            from themes import get_theme_manager
+        import weakref
+        from themes import get_theme_manager
 
-            get_theme_manager().register_theme_change_callback(self._on_theme_changed)
-        except Exception:
-            return
+        manager = get_theme_manager()
+        owner = weakref.ref(self)
 
-        def _forget(_=None, callback=self._on_theme_changed) -> None:
-            try:
-                from themes import get_theme_manager
+        def changed(theme) -> None:
+            dialog = owner()
+            if dialog is not None:
+                dialog._on_theme_changed(theme)
 
-                get_theme_manager().unregister_theme_change_callback(callback)
-            except Exception:
-                pass
-
-        self.destroyed.connect(_forget)
+        manager.register_theme_change_callback(changed)
+        self.destroyed.connect(lambda _=None: manager.unregister_theme_change_callback(changed))
 
     def _on_theme_changed(self, _theme=None) -> None:
         widgets = [self, *self.findChildren(QWidget)]
@@ -383,7 +415,13 @@ class ScriptEditorDialog(QDialog):
             style.unpolish(widget)
             style.polish(widget)
             widget.update()
+        self._sync_minimum_size()
         self._set_status(self.status_label.text(), ok=self._syntax_ok)
+
+    def _sync_minimum_size(self) -> None:
+        self.layout().invalidate()
+        minimum = self.layout().minimumSize()
+        self.setMinimumSize(max(900, minimum.width()), max(560, minimum.height()))
 
     def _build_editor_column(self) -> QWidget:
         column = QWidget()
@@ -443,6 +481,7 @@ class ScriptEditorDialog(QDialog):
         self._capture = ScriptCaptureController(self, self.editor, capture)
         capture.find_requested.connect(self._show_find_bar)
         capture.resources_toggled.connect(self._set_resources_visible)
+        capture.environment_requested.connect(self._configure_environment)
         self._resource_timer = QTimer(self)
         self._resource_timer.setSingleShot(True)
         self._resource_timer.setInterval(200)
@@ -494,7 +533,7 @@ class ScriptEditorDialog(QDialog):
         # 导致暂停/继续/停止按钮看起来像没有反应。
         self._debug_panel.clear()
         self._debugger.start()
-        params = {"script_source": source}
+        params = {"script_source": source, "script_environment": self.environment_settings()}
         run_context: Dict[str, Any] = {}
         provider = self._debug_context_provider
         if callable(provider):
@@ -786,6 +825,7 @@ class ScriptEditorDialog(QDialog):
         self._help_panel.setVisible(self._help_visible)
         self._help_toggle.setText("隐藏命令" if self._help_visible else "显示命令")
         self._sync_insert_enabled()
+        self._sync_minimum_size()
         if persist:
             _save_help_visible(self._help_visible)
 
@@ -802,6 +842,9 @@ class ScriptEditorDialog(QDialog):
             return
         try:
             validate_script_source(source)
+            from app_core.script_environments import normalize_environment
+
+            self._environment = normalize_environment(self.environment_settings())
         except Exception as exc:
             self._syntax_ok = False
             self._syntax_text = str(exc)
@@ -891,6 +934,9 @@ class ScriptEditorDialog(QDialog):
             return False
         try:
             validate_script_source(source)
+            from app_core.script_environments import normalize_environment
+
+            self._environment = normalize_environment(self.environment_settings())
         except Exception as exc:
             self._syntax_ok = False
             self._syntax_text = str(exc)
@@ -900,6 +946,7 @@ class ScriptEditorDialog(QDialog):
             return False
         self._applied_source = source
         self._saved_source = source
+        self._saved_environment = dict(self._environment)
         logger.info("自定义脚本已应用: 卡片=%s, 长度=%s", self._card_id, len(source))
         if callable(self._on_applied):
             self._on_applied(source)

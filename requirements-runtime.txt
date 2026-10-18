@@ -6,6 +6,7 @@ mss==10.1.0
 numpy==2.2.6
 onnxruntime-directml==1.23.0
 opencv-python==4.13.0.90
+packaging==26.1
 pillow==12.1.0
 psutil==7.2.2
 PyAutoGUI==0.9.54

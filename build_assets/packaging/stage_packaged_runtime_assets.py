@@ -19,6 +19,21 @@ from services.ocr_runtime_contract import OCR_REQUIRED_RUNTIME_DLLS
 PLUGIN_REQUIRED_FILES = ("PluginHost.exe", "dm.dll")
 PLUGIN_OPTIONAL_FILES = ("xx.dat",)
 PLUGIN_PACK_FILES = PLUGIN_REQUIRED_FILES + PLUGIN_OPTIONAL_FILES
+SCRIPT_RUNTIME_FILES = (
+    ("script_process_worker.py", "worker.py"),
+    ("script_pure.py", "script_pure.py"),
+    ("script_parameters.py", "script_parameters.py"),
+    ("script_image.py", "script_image.py"),
+)
+
+
+def stage_script_runtime(project_root: Path, dist_root: Path) -> None:
+    for source, destination in SCRIPT_RUNTIME_FILES:
+        _copy_required_file(
+            project_root / "task_workflow" / source,
+            dist_root / "resources" / "script_runtime" / destination,
+            label="独立脚本运行时 " + source,
+        )
 
 
 def iter_plugin_pack_files(plugin_dir: Path):
@@ -179,6 +194,7 @@ def main() -> int:
     _stage_ocr_runtime(project_root, dist_root)
     _stage_interception_files(project_root, dist_root)
     _stage_plugin_runtime(project_root, dist_root)
+    stage_script_runtime(project_root, dist_root)
     _remove_unused_bundled_tools(dist_root)
     removed_duplicates = _remove_duplicate_runtime_files(dist_root)
     if removed_duplicates:

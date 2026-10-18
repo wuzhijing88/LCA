@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tasks.script_task import catalog_snippet, iter_script_insert_items, script_catalog_call_paths
 
-_KEYWORD_NAMES = frozenset({"如果", "否则如果", "否则", "循环", "当", "中断", "继续", "子程序", "函数", "返回", "略过"})
+_KEYWORD_NAMES = frozenset({"如果", "否则如果", "否则", "循环", "当", "中断", "继续", "子程序", "函数", "返回", "略过", "导入", "从", "作为", "尝试", "捕获", "最终", "抛出", "匿名", "使用", "就是"})
 KEYWORD_HINTS = {item["name"]: {"display": (item["signature"],)}
                  for item in iter_script_insert_items() if item["name"] in _KEYWORD_NAMES}
 

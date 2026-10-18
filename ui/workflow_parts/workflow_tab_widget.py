@@ -1771,13 +1771,59 @@ class WorkflowTabWidget(QTabWidget):
                 old_path = Path(task.filepath)
                 suffix = old_path.suffix.lower()
                 if suffix not in _WORKFLOW_FILE_SUFFIXES:
-                    suffix = ".json"
+                    task.name = old_name
+                    QMessageBox.warning(self, "重命名失败", "只能重命名现行 .lca 工程")
+                    return
                 new_filename = f"{requested_name}{suffix}"
                 new_filepath = str(old_path.with_name(new_filename))
 
+                workflow_data = getattr(task, "workflow_data", None)
+                metadata = workflow_data.get("metadata") if isinstance(workflow_data, dict) else None
+                is_unmaterialized_blank = (
+                    not os.path.exists(task.filepath)
+                    and isinstance(metadata, dict)
+                    and str(metadata.get("created") or "").strip() == "blank"
+                )
+                renamed_project_dir = None
+                if is_unmaterialized_blank:
+                    resource_path = str(metadata.get("custom_resource_path") or "").strip()
+                    project_dir = Path(
+                        os.path.abspath(resource_path)
+                        if resource_path
+                        else os.path.abspath(str(old_path.parent))
+                    )
+                    old_parent_key = os.path.normcase(os.path.abspath(str(old_path.parent)))
+                    project_dir_key = os.path.normcase(os.path.abspath(str(project_dir)))
+                    if (
+                        project_dir_key == old_parent_key
+                        and os.path.normcase(project_dir.name) == os.path.normcase(old_path.stem)
+                    ):
+                        renamed_project_dir = project_dir.parent / requested_name
+                        new_filepath = str(renamed_project_dir / new_filename)
+
                 # 重命名文件
                 try:
-                    if os.path.exists(task.filepath):
+                    if renamed_project_dir is not None:
+                        if renamed_project_dir.exists():
+                            raise OSError(f"项目目录已存在: {renamed_project_dir}")
+                        if project_dir.exists():
+                            os.rename(str(project_dir), str(renamed_project_dir))
+                        task.filepath = new_filepath
+                        task.name = new_filename
+                        metadata["custom_resource_path"] = os.path.abspath(str(renamed_project_dir))
+                        task.workflow_data["metadata"] = metadata
+                        view = self.task_views.get(task_id)
+                        if view is not None:
+                            view.workflow_metadata["custom_resource_path"] = metadata["custom_resource_path"]
+                        from task_workflow.workspace import apply_resource_dirs_to_task, project_resource_dirs
+
+                        apply_resource_dirs_to_task(
+                            task,
+                            project_resource_dirs(metadata["custom_resource_path"]),
+                            self.images_dir,
+                        )
+                        logger.info(f"更新空白工作流项目目录: {project_dir} -> {renamed_project_dir}")
+                    elif os.path.exists(task.filepath):
                         os.rename(task.filepath, new_filepath)
                         task.filepath = new_filepath
                         task.name = new_filename

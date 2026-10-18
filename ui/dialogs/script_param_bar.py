@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from tasks.script_task import apply_param_value, parse_param_fields
-from ui.widgets.custom_widgets import CustomDropdown as QComboBox
+from ui.widgets.custom_widgets import CustomDropdown
 
 
 class ScriptParamBar(QWidget):
@@ -98,7 +98,7 @@ class ScriptParamBar(QWidget):
         self._schedule_sync()
 
     def _editors(self) -> List[QWidget]:
-        return [widget for widget in self._widgets if isinstance(widget, (QLineEdit, QComboBox))]
+        return [widget for widget in self._widgets if isinstance(widget, (QLineEdit, CustomDropdown))]
 
     def _signature(self, parsed: Optional[Dict[str, Any]]) -> Tuple[str, List[Tuple[str, str]]]:
         fields = list((parsed or {}).get("fields") or [])
@@ -129,7 +129,7 @@ class ScriptParamBar(QWidget):
             return False
         if widget in self._widgets:
             return True
-        return any(isinstance(item, QComboBox) and item.lineEdit() is widget for item in self._widgets)
+        return any(isinstance(item, CustomDropdown) and item.lineEdit() is widget for item in self._widgets)
 
     def _render(self, parsed: Optional[Dict[str, Any]]) -> None:
         fields = list((parsed or {}).get("fields") or [])
@@ -149,6 +149,7 @@ class ScriptParamBar(QWidget):
     def _clear_fields(self) -> None:
         for widget in self._widgets:
             self._row.removeWidget(widget)
+            widget.hide()
             widget.deleteLater()
         self._widgets = []
 
@@ -161,7 +162,7 @@ class ScriptParamBar(QWidget):
             label.setObjectName("scriptParamLabel")
             choices = tuple(field.get("choices") or ())
             if choices:
-                box = QComboBox(self._inner)
+                box = CustomDropdown(self._inner)
                 box.setObjectName("scriptParamField")
                 box.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
                 box.setEditable(True)
@@ -196,10 +197,10 @@ class ScriptParamBar(QWidget):
         focused = self.focusWidget()
         editors = self._editors()
         for editor, field in zip(editors, fields):
-            if editor is focused or (isinstance(editor, QComboBox) and editor.lineEdit() is focused):
+            if editor is focused or (isinstance(editor, CustomDropdown) and editor.lineEdit() is focused):
                 continue
             value = str(field.get("value") or "")
-            if isinstance(editor, QComboBox):
+            if isinstance(editor, CustomDropdown):
                 if editor.currentText() != value:
                     editor.blockSignals(True)
                     editor.setCurrentText(value)
@@ -214,12 +215,9 @@ class ScriptParamBar(QWidget):
         for index, editor in enumerate(editors):
             is_active = index == active
             self._set_active_param(editor, is_active)
-            line_edit = editor.lineEdit() if hasattr(editor, "lineEdit") else None
-            if line_edit is not None:
-                self._set_active_param(line_edit, is_active)
-            arrow = getattr(editor, "display_button", None)
-            if arrow is not None:
-                self._set_active_param(arrow, is_active)
+            if isinstance(editor, CustomDropdown):
+                self._set_active_param(editor.lineEdit(), is_active)
+                self._set_active_param(editor.display_button, is_active)
 
     def _set_active_param(self, widget, active: bool) -> None:
         widget.setProperty("activeParam", active)
@@ -238,7 +236,7 @@ class ScriptParamBar(QWidget):
         if widget in editors:
             return editors.index(widget)
         for index, editor in enumerate(editors):
-            if isinstance(editor, QComboBox) and editor.lineEdit() is widget:
+            if isinstance(editor, CustomDropdown) and editor.lineEdit() is widget:
                 return index
         return None
 
@@ -264,7 +262,7 @@ class ScriptParamBar(QWidget):
             index = editors.index(sender)
         except ValueError:
             return
-        value = sender.currentText() if isinstance(sender, QComboBox) else sender.text()
+        value = sender.currentText() if isinstance(sender, CustomDropdown) else sender.text()
         cursor = self._editor.textCursor()
         line = cursor.block().text()
         column = cursor.positionInBlock()

@@ -1,6 +1,6 @@
 import logging
 from PySide6.QtWidgets import QFileDialog, QMessageBox
-from task_workflow.card_display import format_step_detail
+from task_workflow.card_display import format_step_detail, resolve_card_display_name
 from .main_window_support import create_media_control_icon
 
 logger = logging.getLogger(__name__)
@@ -114,11 +114,10 @@ class MainWindowExecutionStateMixin:
 
                     card_type = card.task_type if hasattr(card, 'task_type') else "未知"
 
-                    card_name = ""
-
-                    if hasattr(card, 'parameters') and card.parameters:
-
-                        card_name = card.parameters.get('name', '') or card.parameters.get('description', '')
+                    card_name = resolve_card_display_name(
+                        card,
+                        getattr(card, "parameters", None),
+                    )
 
                     self._execution_log_panel.on_step_started(card_type, card_name)
 

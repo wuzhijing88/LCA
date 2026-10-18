@@ -107,9 +107,6 @@ class ScriptDebugController:
             self._paused = False; self._step_once = False; self._condition.notify_all()
         self._emit("continued", {})
 
-    # Alias convenient for UI clients.
-    resume = continue_run
-
     def step(self) -> None:
         with self._condition:
             if self._finished:

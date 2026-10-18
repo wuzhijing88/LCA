@@ -4,6 +4,7 @@ Custom UI widgets.
 """
 
 import logging
+import weakref
 from PySide6.QtWidgets import (
     QWidget,
     QPushButton,
@@ -18,18 +19,16 @@ from PySide6.QtWidgets import (
     QStyle,
     QLineEdit,
 )
-from PySide6.QtCore import Qt, Signal, QSize, QMargins, QEvent, QRect, QPoint
+from PySide6.QtCore import Qt, Signal, QSize, QEvent, QRect, QPoint
 from PySide6.QtGui import QBrush, QColor, QFontMetrics, QIcon, QPainter, QPainterPath, QPen
+from shiboken6 import isValid
+from themes import apply_rounded_popup, get_theme_manager
+from themes.rounded_popup import apply_transparent_popup_palette
 from utils.window.window_activation_utils import show_and_raise_widget
 
 logger = logging.getLogger(__name__)
 
-def _get_theme_color(key: str, default: str) -> str:
-    try:
-        from themes import get_theme_manager
-        return get_theme_manager().get_color(key)
-    except Exception:
-        return default
+_SEPARATOR_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 class CenteredTextDelegate(QStyledItemDelegate):
@@ -43,9 +42,9 @@ class CenteredTextDelegate(QStyledItemDelegate):
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         widget = option.widget or self.parent()
-        if widget and hasattr(widget, 'viewport'):
+        if isinstance(widget, QAbstractItemView):
             view_rect = widget.viewport().rect()
-        elif widget and widget.parent() and hasattr(widget.parent(), 'viewport'):
+        elif widget and isinstance(widget.parent(), QAbstractItemView):
             view_rect = widget.parent().viewport().rect()
         else:
             view_rect = opt.rect
@@ -63,7 +62,7 @@ class CenteredTextDelegate(QStyledItemDelegate):
         is_selected = bool(opt.state & QStyle.State_Selected)
         is_hover = bool(opt.state & QStyle.State_MouseOver)
         if is_selected or is_hover:
-            bg_color = QColor(_get_theme_color('hover', '#e8e8e8'))
+            bg_color = QColor(get_theme_manager().get_color('selected' if is_selected else 'hover'))
             painter.save()
             from PySide6.QtCore import QRectF
             clip_path = QPainterPath()
@@ -89,7 +88,11 @@ class CenteredTextDelegate(QStyledItemDelegate):
             painter.drawRect(draw_rect)
             painter.restore()
 
-        text_color = QColor(_get_theme_color('text', '#333333'))
+        if not opt.state & QStyle.State_Enabled:
+            color_key = 'border' if index.data(_SEPARATOR_ROLE) else 'text_secondary'
+        else:
+            color_key = 'accent_text' if is_selected else 'text'
+        text_color = QColor(get_theme_manager().get_color(color_key))
         painter.save()
         painter.setPen(text_color)
         painter.setFont(opt.font)
@@ -123,9 +126,9 @@ class DropdownArrowButton(QPushButton):
         super().paintEvent(event)
         if not self._arrow_only:
             return
-        color = QColor(_get_theme_color("text_secondary", "#666666"))
+        color = QColor(get_theme_manager().get_color("text_secondary"))
         if not self.isEnabled():
-            color = QColor(_get_theme_color("text_disabled", "#999999"))
+            color = QColor(get_theme_manager().get_color("text_disabled"))
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         cx = self.width() / 2.0
@@ -144,8 +147,8 @@ class RoundedPopupFrame(QFrame):
     def __init__(self, parent=None, flags=Qt.WindowType.Widget):
         super().__init__(parent, flags)
         self._radius = 5
-        self._bg_color = QColor("#ffffff")
-        self._border_color = QColor("#d0d0d0")
+        self._bg_color = QColor(get_theme_manager().get_color("card"))
+        self._border_color = QColor(get_theme_manager().get_color("border"))
 
     def setRadius(self, radius):
         self._radius = radius
@@ -180,7 +183,7 @@ class FullBleedListWidget(QListWidget):
             if not viewport:
                 return
             margins = self.contentsMargins()
-            viewport_margins = self.viewportMargins() if hasattr(self, "viewportMargins") else QMargins(0, 0, 0, 0)
+            viewport_margins = self.viewportMargins()
             # Avoid fighting style-driven frame paddings; this can cause popup instability.
             if any((margins.left(), margins.top(), margins.right(), margins.bottom(),
                     viewport_margins.left(), viewport_margins.top(),
@@ -248,16 +251,10 @@ class CustomDropdown(QWidget):
         layout.addWidget(self.display_button)
 
         flags = Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
-        if hasattr(Qt.WindowType, "NoDropShadowWindowHint"):
-            flags |= Qt.WindowType.NoDropShadowWindowHint
-        popup_parent = None
-        try:
-            if parent:
-                popup_parent = parent.window()
-        except RuntimeError:
-            popup_parent = None
+        flags |= Qt.WindowType.NoDropShadowWindowHint
+        popup_parent = parent.window() if parent is not None else None
         # Use top-level parent for popup stability inside complex containers like ParameterPanel.
-        self.popup_frame = RoundedPopupFrame(popup_parent, flags)
+        self.popup_frame = QFrame(popup_parent, flags)
         self.popup_frame.setObjectName("customDropdownPopup")
         self.popup_frame.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.popup_frame.setContentsMargins(0, 0, 0, 0)
@@ -290,74 +287,43 @@ class CustomDropdown(QWidget):
         viewport.installEventFilter(self)
 
         self._model_wrapper = self._ModelWrapper(self.list_widget)
-        self._apply_styles()
-        self.destroyed.connect(self._cleanup_popup)
+        self._apply_popup_theme()
+        manager = get_theme_manager()
+        owner = weakref.ref(self)
+
+        def changed(_theme):
+            dropdown = owner()
+            if dropdown is not None:
+                dropdown._apply_popup_theme()
+
+        popup = self.popup_frame
+
+        def dispose(_=None):
+            manager.unregister_theme_change_callback(changed)
+            if isValid(popup):
+                popup.hide()
+                popup.deleteLater()
+
+        manager.register_theme_change_callback(changed)
+        self.destroyed.connect(dispose)
         logger.info(
             "CustomDropdown init: parent=%s list_widget=%s",
             type(parent).__name__ if parent else "None",
             type(self.list_widget).__name__,
         )
 
-    def _apply_styles(self):
-        self.display_button.setStyleSheet("")
-        self.popup_frame.setStyleSheet("")
-        self.list_widget.setStyleSheet("")
-
     def _apply_popup_theme(self) -> None:
-        card = _get_theme_color("card", "#ffffff")
-        text = _get_theme_color("text", "#333333")
-        border = _get_theme_color("border", "#d0d0d0")
-        hover = _get_theme_color("hover", "#e8e8e8")
-        selected = _get_theme_color("selected", "#0078d4")
-        accent_text = _get_theme_color("accent_text", "#ffffff")
-        self.popup_frame.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.popup_frame.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.popup_frame.setAutoFillBackground(False)
-        self.popup_frame.setBackgroundColor(card)
-        self.popup_frame.setBorderColor(border)
-        self.list_widget.setStyleSheet(
-            f"""
-            QListWidget#customDropdownList,
-            QListWidget#customDropdownList::viewport {{
-                background-color: transparent;
-                color: {text};
-                border: none;
-                outline: none;
-            }}
-            QListWidget#customDropdownList::item {{
-                background-color: transparent;
-                color: {text};
-                padding: 0px;
-                min-height: 18px;
-                margin: 0px;
-            }}
-            QListWidget#customDropdownList::item:hover {{
-                background-color: {hover};
-                color: {text};
-            }}
-            QListWidget#customDropdownList::item:selected,
-            QListWidget#customDropdownList::item:selected:hover {{
-                background-color: {selected};
-                color: {accent_text};
-            }}
-            """
-        )
-
-    def _cleanup_popup(self, *_):
-        popup = getattr(self, "popup_frame", None)
-        if not popup:
-            return
-        try:
-            popup.hide()
-            popup.deleteLater()
-        except RuntimeError:
-            return
+        apply_rounded_popup(self.popup_frame, radius=5)
+        apply_transparent_popup_palette(self.list_widget)
+        apply_transparent_popup_palette(self.list_widget.viewport())
+        self.popup_frame.update()
+        self.list_widget.viewport().update()
+        self.display_button.update()
 
     def _normalize_popup_layout(self):
         try:
             self.list_widget.setContentsMargins(0, 0, 0, 0)
-            if hasattr(self.list_widget, "setViewportMargins"):
-                self.list_widget.setViewportMargins(0, 0, 0, 0)
+            self.list_widget.setViewportMargins(0, 0, 0, 0)
             viewport = self.list_widget.viewport()
             if viewport:
                 viewport.setContentsMargins(0, 0, 0, 0)
@@ -381,7 +347,7 @@ class CustomDropdown(QWidget):
             if not self._items or not self.isVisible() or not self.isEnabled():
                 return
 
-            if getattr(self, "_line_edit", None) is not None:
+            if self._line_edit is not None:
                 global_pos = self.mapToGlobal(QPoint(0, self.height()))
                 popup_width = max(1, self.width())
             else:
@@ -394,17 +360,15 @@ class CustomDropdown(QWidget):
             self.list_widget.setFixedWidth(popup_width)
             self._sync_item_widths()
 
-            apply_popup_theme = getattr(self, "_apply_popup_theme", None)
-            if callable(apply_popup_theme):
-                apply_popup_theme()
+            self._apply_popup_theme()
 
             visible_items = min(len(self._items), self._max_visible_items)
             row_height = self.list_widget.sizeHintForRow(0) if self.list_widget.count() > 0 else self._item_height
             if row_height <= 0:
                 row_height = self._item_height
-            spacing = self.list_widget.spacing() if hasattr(self.list_widget, "spacing") else 0
+            spacing = self.list_widget.spacing()
             list_margins = self.list_widget.contentsMargins()
-            viewport_margins = self.list_widget.viewportMargins() if hasattr(self.list_widget, "viewportMargins") else QMargins(0, 0, 0, 0)
+            viewport_margins = self.list_widget.viewportMargins()
             list_height = (
                 (row_height * visible_items)
                 + max(0, visible_items - 1) * spacing
@@ -492,7 +456,7 @@ class CustomDropdown(QWidget):
             if list_width <= 0:
                 return
             list_margins = self.list_widget.contentsMargins()
-            viewport_margins = self.list_widget.viewportMargins() if hasattr(self.list_widget, "viewportMargins") else QMargins(0, 0, 0, 0)
+            viewport_margins = self.list_widget.viewportMargins()
             item_width = max(
                 0,
                 list_width
@@ -525,8 +489,6 @@ class CustomDropdown(QWidget):
         self._item_height = max(self._item_height, item_height)
         if not enabled:
             item.setFlags(Qt.ItemFlag.NoItemFlags)
-            muted = QColor(_get_theme_color("text_secondary", "#888888"))
-            item.setForeground(QBrush(muted))
         self.list_widget.addItem(item)
 
         index = len(self._items) - 1
@@ -541,14 +503,13 @@ class CustomDropdown(QWidget):
         self._sync_item_widths()
 
     def addSeparator(self):
-        """添加不可选分隔线，兼容分组下拉。"""
+        """添加不可选的分组分隔线。"""
         text = "────────"
         self._items.append(text)
         item = QListWidgetItem(text)
         item.setFlags(Qt.ItemFlag.NoItemFlags)
         item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
-        muted = QColor(_get_theme_color("border", "#cccccc"))
-        item.setForeground(QBrush(muted))
+        item.setData(_SEPARATOR_ROLE, True)
         font_metrics = QFontMetrics(self.list_widget.font())
         item.setSizeHint(QSize(font_metrics.horizontalAdvance(text) + 30, max(18, font_metrics.height())))
         self.list_widget.addItem(item)

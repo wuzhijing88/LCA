@@ -100,7 +100,7 @@ if errorlevel 1 (
     goto fail
 )
 
-REM 离线双身份：清单注入之后再盖编辑器印记（避免被其它资源更新冲掉）
+REM Stamp editor identity after manifest injection to preserve the stamp.
 set "STEP=STAMP_EDITOR_ENTRY"
 echo [2.15/6] Stamp editor entry identity into main.exe...
 venv\Scripts\python.exe -c "from pathlib import Path; from app_core.player.entry_stamp import ENTRY_EDITOR, apply_entry_stamp; p=Path(r'%DIST%\main.exe'); apply_entry_stamp(p, ENTRY_EDITOR); print('entry_stamp=editor path='+str(p))"
@@ -154,8 +154,8 @@ if not exist "%DIST%\Interception\library\x86\interception.dll" (
     set "ERRMSG=Missing Interception x86 DLL"
     goto fail
 )
-REM 以下四个文件由 run_nuitka_main_build.py 的 DATA_FILE_SPECS 打进 dist，
-REM 这里只校验产物，不再第二次拷贝，避免两份清单各改各的。
+REM DATA_FILE_SPECS in run_nuitka_main_build.py stages these four files.
+REM Only verify them here; keep the staging list in one place.
 for %%f in (
     "tools\ibinputsimulator\ib_worker_core.ahk"
     "tools\ibinputsimulator\Binding.AHK2\IbInputSimulator.ahk"
@@ -214,7 +214,7 @@ if errorlevel 1 (
 set "STEP=VERIFY_NO_SOURCE_FILES"
 venv\Scripts\python.exe build_assets\packaging\verify_no_source_files.py --dist "%DIST%"
 if errorlevel 1 (
-    set "ERRMSG=Packaged dist still contains Python source files"
+    set "ERRMSG=发行目录含有额外 Python 源码或独立脚本运行时内容不一致"
     goto fail
 )
 
@@ -245,12 +245,14 @@ echo   Output dir: %DIST%
 echo ========================================
 echo.
 
+set "STEP=MEASURE_DIST_SIZE"
+set "SIZE="
 for /f "tokens=1" %%a in ('powershell -command "(Get-ChildItem '%DIST%' -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB" 2^>nul') do set SIZE=%%a
-if defined SIZE (
-    echo Total size: ~ %SIZE% MB
-) else (
-    dir /s "%DIST%"
+if not defined SIZE (
+    set "ERRMSG=无法计算打包目录大小"
+    goto fail
 )
+echo Total size: ~ %SIZE% MB
 
 set "STEP=CHECK_INNO_SETUP"
 goto build_installers
@@ -287,11 +289,8 @@ for %%p in (
 ) do if exist %%p set "ISCC=%%~p"
 
 if "%ISCC%"=="" (
-    echo Inno Setup not found, skip installer build.
-    echo Please install Inno Setup locally and retry.
-    echo.
-    if not "%LCA_NONINTERACTIVE%"=="1" pause
-    exit /b 0
+    set "ERRMSG=未找到 Inno Setup，请安装后重试"
+    goto fail
 )
 
 set "STEP=VERIFY_STAGED_PLUGIN_RUNTIME"

@@ -1259,6 +1259,16 @@ SCRIPT_INSERT_GROUPS = (
     {
         "title": "语法",
         "items": (
+            {"name": "导入", "kind": "stmt", "signature": "导入 模块 作为 别名", "note": "导入 Python 模块，模块名称使用库的正式名称。", "snippet": "导入 math 作为 数学"},
+            {"name": "从", "kind": "stmt", "signature": "从 模块 导入 名称", "note": "从模块导入指定名称。", "snippet": "从 math 导入 pi 作为 圆周率"},
+            {"name": "作为", "kind": "stmt", "signature": "导入 模块 作为 别名", "note": "为导入的模块、异常或上下文对象命名。", "snippet": "导入 math 作为 数学"},
+            {"name": "尝试", "kind": "stmt", "signature": "尝试: / 捕获 异常 作为 错误: / 最终:", "note": "捕获普通异常；最终代码块在正常结束和异常时都会执行。", "snippet": "尝试:\n    略过\n捕获 异常 作为 错误:\n    记录(错误)\n最终:\n    略过"},
+            {"name": "捕获", "kind": "stmt", "signature": "捕获 值错误 作为 错误:", "note": "与尝试配合，可用异常、值错误、类型错误、运行错误或 Python 异常类型。", "snippet": "尝试:\n    略过\n捕获 值错误 作为 错误:\n    记录(错误)"},
+            {"name": "最终", "kind": "stmt", "signature": "最终:", "note": "与尝试配合，释放列表、图片等资源。", "snippet": "尝试:\n    略过\n最终:\n    略过"},
+            {"name": "抛出", "kind": "stmt", "signature": "抛出 错误", "note": "抛出异常；捕获块内可单独写抛出来继续传播当前异常。", "snippet": "抛出 值错误(\"参数不正确\")"},
+            {"name": "匿名", "signature": "匿名 项: 项[0]", "note": "单个表达式组成的函数，例如排序的依据。", "snippet": "排序([[2], [1]], 依据=匿名 项: 项[0])"},
+            {"name": "使用", "kind": "stmt", "signature": "使用 上下文 作为 对象:", "note": "退出代码块时关闭上下文管理的资源。", "snippet": "从 contextlib 导入 nullcontext\n使用 nullcontext() 作为 对象:\n    略过"},
+            {"name": "就是", "kind": "stmt", "signature": "对象 就是 另一对象", "note": "判断是否为同一个对象，对应 Python 的 is。比较数值使用 == 或 是。", "snippet": "甲 = []\n乙 = 甲\n断言(甲 就是 乙)"},
             {
                 "name": "如果",
                 "signature": "如果 条件:",
@@ -1549,14 +1559,32 @@ SCRIPT_INSERT_GROUPS = (
         ),
     },
     {
+        "title": "图像处理",
+        "items": (
+            {"name": "图像.截帧", "signature": "图像.截帧()", "note": "取得绑定窗口的客户区截图数组；未绑定或截图失败时报错。", "kind": "expr", "snippet": "画面 = 图像.截帧()"},
+            {"name": "图像.读取", "signature": "图像.读取(路径, 要求透明=假)", "params": (("路径", "要求透明=假"),), "note": "读取工程图片，保留原通道。要求透明时必须有有效的透明遮罩。", "kind": "expr", "snippet": "原图 = 图像.读取(\"images/模板.png\", 要求透明=真)"},
+            {"name": "图像.形状", "signature": "图像.形状(画面)", "params": (("画面",),), "note": "返回（高, 宽）或（高, 宽, 通道数），可用切片 [:2] 取高宽。", "kind": "expr", "snippet": "高, 宽 = 图像.形状(画面)[:2]"},
+            {"name": "图像.元素数", "signature": "图像.元素数(画面)", "params": (("画面",),), "note": "返回图像数组的元素总数，空图像报错。", "kind": "expr", "snippet": "数量 = 图像.元素数(画面)"},
+            {"name": "图像.通道", "signature": "图像.通道(画面, 序号)", "params": (("画面", "序号"),), "note": "序号从0开始，BGRA透明通道为3。返回共享原图数据的视图。", "kind": "expr", "snippet": "遮罩 = 图像.通道(原图, 3)"},
+            {"name": "图像.灰度", "signature": "图像.灰度(画面)", "params": (("画面",),), "note": "将BGR或BGRA图像转为灰度；灰度输入直接返回原图。", "kind": "expr", "snippet": "灰图 = 图像.灰度(画面)"},
+            {"name": "图像.缩放", "signature": "图像.缩放(画面, 倍率=空, 尺寸=空, 插值=\"面积\")", "params": (("画面", "倍率=空", "尺寸=空", "插值=\"面积\""),), "note": "倍率和尺寸必须二选一。尺寸为（宽, 高），插值可用面积、最近邻、线性、三次。", "kind": "expr", "snippet": "缩图 = 图像.缩放(画面, 倍率=0.5)"},
+            {"name": "图像.匹配", "signature": "图像.匹配(画面, 模板, 遮罩=空)", "params": (("画面", "模板", "遮罩=空"),), "note": "归一化相关系数匹配，返回热图；未定义的分数记为-1。输入非法时报错。", "kind": "expr", "snippet": "热图 = 图像.匹配(灰图, 模板, 遮罩=遮罩)"},
+            {"name": "图像.最高匹配", "signature": "图像.最高匹配(热图)", "params": (("热图",),), "note": "返回（分数, x, y），坐标为模板左上角，可修改热图切片后继续找下一处。", "kind": "expr", "snippet": "分数, x, y = 图像.最高匹配(热图)"},
+            {"name": "图像.去重", "signature": "图像.去重(框, 分数, 阈值=0.8, 重叠阈值=0.3)", "params": (("框", "分数", "阈值=0.8", "重叠阈值=0.3"),), "note": "按分数做重叠框抑制，框为（左, 顶, 宽, 高），返回保留的索引列表。", "kind": "expr", "snippet": "索引 = 图像.去重(框, 分数, 阈值=0.8, 重叠阈值=0.3)"},
+        ),
+    },
+    {
         "title": "编程工具",
         "items": (
             {"name": "JSON解析", "signature": "JSON解析(文本)", "params": (("文本",),), "note": "将 JSON 文本解析为列表或字典。", "kind": "expr", "snippet": "JSON解析(文本)"},
             {"name": "JSON生成", "signature": "JSON生成(对象)", "params": (("对象",),), "note": "将列表或字典生成 JSON 文本。", "kind": "expr", "snippet": "JSON生成(对象)"},
-            {"name": "字典获取", "signature": "字典获取(字典, 键, 默认值=None)", "params": (("字典", "键", "默认值=None"),), "note": "安全读取字典键。", "kind": "expr", "snippet": "字典获取(字典, 键, 默认值=None)"},
+            {"name": "字典获取", "signature": "字典获取(字典, 键, 默认值=空)", "params": (("字典", "键", "默认值=空"),), "note": "读取字典键；键不存在时返回默认值，目标不是字典时报错。", "kind": "expr", "snippet": "字典获取(字典, 键, 默认值=空)"},
             {"name": "字典设置", "signature": "字典设置(字典, 键, 值)", "params": (("字典", "键", "值"),), "note": "写入字典键并返回字典。", "kind": "expr", "snippet": "字典设置(字典, 键, 值)"},
             {"name": "列表追加", "signature": "列表追加(列表, 值)", "params": (("列表", "值"),), "note": "向列表末尾追加一项。", "kind": "expr", "snippet": "列表追加(列表, 值)"},
             {"name": "列表合并", "signature": "列表合并(列表, 数据)", "params": (("列表", "数据"),), "note": "批量追加列表数据。", "kind": "expr", "snippet": "列表合并(列表, 数据)"},
+            {"name": "列表清空", "signature": "列表清空(列表)", "params": (("列表",),), "note": "原地移除所有项目并释放列表持有的引用，返回空。", "snippet": "列表清空(列表)"},
+            {"name": "求和", "signature": "求和(数据, 起值=0)", "params": (("数据", "起值=0"),), "note": "累加序列或生成式；真假值按1和0计算。", "kind": "expr", "snippet": "求和([1, 2, 3])"},
+            {"name": "就近取整", "signature": "就近取整(数值)", "params": (("数值",),), "note": "取最近的整数，恰好一半时取偶数，与 Python round 不指定小数位时一致。", "kind": "expr", "snippet": "就近取整(数值)"},
             {"name": "列表弹出", "signature": "列表弹出(列表, 索引=-1)", "params": (("列表", "索引=-1"),), "note": "移除并返回列表项目。", "kind": "expr", "snippet": "列表弹出(列表, 索引=-1)"},
             {"name": "字典键", "signature": "字典键(字典)", "params": (("字典",),), "note": "返回字典的键列表。", "kind": "expr", "snippet": "字典键(字典)"},
             {"name": "字典值", "signature": "字典值(字典)", "params": (("字典",),), "note": "返回字典的值列表。", "kind": "expr", "snippet": "字典值(字典)"},
@@ -1566,7 +1594,7 @@ SCRIPT_INSERT_GROUPS = (
             {"name": "断言", "signature": "断言(条件, 错误信息=\"断言失败\")", "params": (("条件", "错误信息=\"断言失败\""),), "note": "条件不成立时立即报告脚本错误。", "kind": "expr", "snippet": "断言(条件, 错误信息=\"断言失败\")"},
             {"name": "枚举", "signature": "枚举(列表)", "params": (("列表",),), "note": "同时取得序号和项目。", "kind": "expr", "snippet": "枚举(列表)"},
             {"name": "配对", "signature": "配对(列表1, 列表2)", "params": (("列表1", "列表2"),), "note": "按位置配对多个序列。", "kind": "expr", "snippet": "配对(列表1, 列表2)"},
-            {"name": "排序", "signature": "排序(列表)", "params": (("列表",),), "note": "返回排序后的新列表。", "kind": "expr", "snippet": "排序(列表)"},
+            {"name": "排序", "signature": "排序(列表, 反向=假, 依据=空)", "params": (("列表", "反向=假", "依据=空"),), "note": "返回排序后的新列表。依据接受函数，例如 依据=匿名 项: 项[0]。", "kind": "expr", "snippet": "排序(列表)"},
             {"name": "四舍五入", "signature": "四舍五入(数值, 位数=0)", "params": (("数值", "位数=0"),), "note": "十进制中点远离零：2.5为3，-2.5为-3。位数为-308到308的整数。", "kind": "expr", "snippet": "四舍五入(数值)"},
             {"name": "全部", "signature": "全部(条件列表)", "params": (("条件列表",),), "note": "判断列表是否全部为真。", "kind": "expr", "snippet": "全部(条件列表)"},
             {"name": "任一", "signature": "任一(条件列表)", "params": (("条件列表",),), "note": "判断列表是否至少一项为真。", "kind": "expr", "snippet": "任一(条件列表)"},
@@ -1659,6 +1687,7 @@ def script_completion_names() -> List[str]:
             "真",
             "假",
             "空",
+            "异常", "值错误", "类型错误", "运行错误",
             "长度",
             "整数",
             "小数",
@@ -2869,6 +2898,29 @@ def align_block_keyword_line(line: str, source: str, line_index: int) -> Optiona
     if not stripped.endswith(":"):
         return None
     name = command_name_from_snippet(stripped)
+    if name in {"捕获", "最终", "except", "finally"}:
+        lines = source_lines(source)
+        current_indent = len(leading_whitespace(line))
+        open_tries = []
+        for previous in lines[:max(0, int(line_index))]:
+            if not previous.strip() or previous.lstrip().startswith("#"):
+                continue
+            indent = leading_whitespace(previous)
+            keyword = command_name_from_snippet(previous)
+            clause = _is_block_header(previous) and keyword in {"捕获", "最终", "否则", "except", "finally", "else"}
+            while open_tries and (len(indent) < len(open_tries[-1][0]) or
+                                  (len(indent) == len(open_tries[-1][0]) and not clause)):
+                open_tries.pop()
+            if clause and open_tries and len(indent) == len(open_tries[-1][0]):
+                if keyword in {"最终", "finally"}:
+                    open_tries[-1] = (indent, True)
+            elif _is_block_header(previous) and keyword in {"尝试", "try"}:
+                open_tries.append((indent, False))
+        for indent, finalized in reversed(open_tries):
+            if len(indent) <= current_indent and not finalized:
+                aligned = indent + stripped
+                return aligned if aligned != line else None
+        return None
     if not _is_outdent_keyword(name):
         return None
     lines = source_lines(source)
@@ -3651,6 +3703,11 @@ def command_help_text(item: Optional[Dict[str, Any]] = None) -> str:
 
 def get_params_definition() -> Dict[str, Dict[str, Any]]:
     return {
+        "script_environment": {
+            "type": "hidden",
+            "default": {"mode": "builtin"},
+            "description": "脚本运行环境、Python 解释器、依赖列表和软件源。",
+        },
     "script_source": {
             "label": "命令",
             "type": "text",
@@ -3695,6 +3752,7 @@ def build_script_run_context(
     """构造 run_script 的 context，供正式执行与编辑器调试运行共用。"""
     executor = kwargs.get("executor")
     context = {
+        "script_environment": params.get("script_environment"),
         "counters": counters if isinstance(counters, dict) else {},
         "execution_mode": execution_mode,
         "target_hwnd": target_hwnd,
@@ -3719,6 +3777,10 @@ def build_script_run_context(
     }
     for key in ("images_dir", "sounds_dir", "dicts_dir", "yolo_dir", "replays_dir", "plugins_dir"):
         context[key] = kwargs.get(key) if kwargs.get(key) is not None else getattr(executor, key, None)
+    if "project_path" in kwargs:
+        context["project_path"] = kwargs["project_path"]
+    elif executor is not None:
+        context["project_path"] = executor.workflow_filepath
     return context
 
 

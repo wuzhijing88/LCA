@@ -13,10 +13,12 @@ from .theme_manager import (
     theme_color,
     theme_rgba,
 )
+from .combo_box import ThemedComboBox
 
 __all__ = [
     'ThemeManager',
     'ThemeWatcher',
+    'ThemedComboBox',
     'apply_rounded_popup',
     'detect_system_theme',
     'get_theme_manager',

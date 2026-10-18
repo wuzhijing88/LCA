@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import weakref
 
 from PySide6.QtCore import QEvent, QObject, QTimer, Qt
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QComboBox, QFrame, QMenu, QWidget
+from PySide6.QtWidgets import QAbstractItemView, QComboBox, QFrame, QMenu, QWidget
+from shiboken6 import isValid
 
 _MAX_VISIBLE_ITEMS = 8
 _SCROLLER_OBJECT_NAMES = (
@@ -25,29 +27,20 @@ class ComboBoxPopupFixer(QObject):
         if event.type() not in (QEvent.Type.Show, QEvent.Type.ShowToParent):
             return False
 
-        try:
-            from ui.system_parts.menu_style import polish_standard_edit_menu
+        from ui.system_parts.menu_style import polish_standard_edit_menu
 
-            if isinstance(obj, QMenu):
-                polish_standard_edit_menu(obj, frameless=False)
-                return False
-        except Exception:
-            pass
+        if isinstance(obj, QMenu):
+            polish_standard_edit_menu(obj, frameless=False)
+            return False
 
         popup = None
         combo = None
-        try:
-            if isinstance(obj, QAbstractItemView):
-                popup = obj.window()
-                if popup:
-                    combo = popup.parentWidget()
-            else:
-                class_name = obj.metaObject().className() if hasattr(obj, "metaObject") else ""
-                if class_name == "QComboBoxPrivateContainer":
-                    popup = obj
-                    combo = obj.parentWidget()
-        except Exception:
-            return False
+        if isinstance(obj, QAbstractItemView):
+            popup = obj.window()
+            combo = popup.parentWidget()
+        elif obj.metaObject().className() == "QComboBoxPrivateContainer":
+            popup = obj
+            combo = obj.parentWidget()
 
         if not popup or not combo or not isinstance(combo, QComboBox):
             return False
@@ -55,7 +48,16 @@ class ComboBoxPopupFixer(QObject):
             return False
 
         popup.setProperty("_combo_popup_fixing", True)
-        QTimer.singleShot(0, lambda: self._fix_popup(combo, popup))
+        owner = weakref.ref(self)
+
+        def fix_popup():
+            fixer = owner()
+            if fixer is not None and isValid(fixer):
+                fixer._fix_popup(combo, popup)
+            else:
+                popup.setProperty("_combo_popup_fixing", False)
+
+        QTimer.singleShot(0, popup, fix_popup)
         return False
 
     def _fix_popup(self, combo, popup):
@@ -69,6 +71,8 @@ class ComboBoxPopupFixer(QObject):
                 popup.show()
 
             combo_bottom_left = combo.mapToGlobal(combo.rect().bottomLeft())
+            if combo.view().objectName() == "themedComboList":
+                combo_bottom_left.setY(combo_bottom_left.y() + 5)
             popup.move(combo_bottom_left)
 
             combo.setMaxVisibleItems(_MAX_VISIBLE_ITEMS)
@@ -78,7 +82,7 @@ class ComboBoxPopupFixer(QObject):
                 self._hide_builtin_scrollers(popup)
                 self._enforce_popup_height(combo, view, popup)
 
-            screen = combo.screen() or QApplication.primaryScreen()
+            screen = combo.screen()
             if screen:
                 screen_geometry = screen.availableGeometry()
                 if popup.geometry().bottom() > screen_geometry.bottom():
@@ -92,20 +96,9 @@ class ComboBoxPopupFixer(QObject):
 
     @staticmethod
     def _apply_popup_theme(combo, popup) -> None:
-        try:
-            from themes import get_theme_manager
+        from themes import get_theme_manager
 
-            get_theme_manager().apply_combo_popup_theme(popup, combo.view())
-        except Exception:
-            from themes.rounded_popup import COMBO_RADIUS, apply_rounded_popup
-
-            apply_rounded_popup(
-                popup,
-                radius=COMBO_RADIUS,
-                border_key="combo_popup_border",
-                frameless=True,
-                force_window=True,
-            )
+        get_theme_manager().apply_combo_popup_theme(popup, combo.view())
 
     @staticmethod
     def _style_view(view) -> None:
@@ -125,7 +118,7 @@ class ComboBoxPopupFixer(QObject):
     def _hide_builtin_scrollers(popup) -> None:
         for child in popup.findChildren(QWidget):
             name = child.objectName()
-            class_name = child.metaObject().className() if hasattr(child, "metaObject") else ""
+            class_name = child.metaObject().className()
             if name in _SCROLLER_OBJECT_NAMES or "Scroller" in class_name:
                 child.hide()
                 child.setEnabled(False)
@@ -133,27 +126,24 @@ class ComboBoxPopupFixer(QObject):
 
     @staticmethod
     def _enforce_popup_height(combo, view, popup) -> None:
-        try:
-            item_count = combo.count()
-            visible_count = min(item_count, _MAX_VISIBLE_ITEMS) if item_count > 0 else _MAX_VISIBLE_ITEMS
-            row_height = view.sizeHintForRow(0) if item_count > 0 else view.sizeHint().height()
-            if row_height <= 0:
-                row_height = view.fontMetrics().height() + 8
-            spacing = view.spacing() if hasattr(view, "spacing") else 0
-            margins = view.contentsMargins()
-            desired_view_height = (
-                row_height * visible_count
-                + max(0, visible_count - 1) * spacing
-                + margins.top()
-                + margins.bottom()
-                + view.frameWidth() * 2
-            )
-            extra = max(0, popup.height() - view.height())
-            view.setMinimumHeight(desired_view_height)
-            view.setMaximumHeight(desired_view_height)
-            popup.setFixedHeight(extra + desired_view_height)
-        except Exception:
-            pass
+        item_count = combo.count()
+        visible_count = min(item_count, _MAX_VISIBLE_ITEMS) if item_count > 0 else _MAX_VISIBLE_ITEMS
+        row_height = view.sizeHintForRow(0) if item_count > 0 else view.sizeHint().height()
+        if row_height <= 0:
+            row_height = view.fontMetrics().height() + 8
+        spacing = view.spacing()
+        margins = view.contentsMargins()
+        desired_view_height = (
+            row_height * visible_count
+            + max(0, visible_count - 1) * spacing
+            + margins.top()
+            + margins.bottom()
+            + view.frameWidth() * 2
+        )
+        extra = max(0, popup.height() - view.height())
+        view.setMinimumHeight(desired_view_height)
+        view.setMaximumHeight(desired_view_height)
+        popup.setFixedHeight(extra + desired_view_height)
 
 
 def install_combo_popup_fixer(app) -> bool:

@@ -193,6 +193,7 @@ class MainWindowParameterPanelMixin:
 
         bind_resource_dirs(dirs)
         return {
+            "project_path": self.workflow_tab_widget._get_current_workflow_filepath(),
             "target_hwnd": self._resolve_panel_target_hwnd(),
             "execution_mode": execution_mode,
             "images_dir": dirs.get("images_dir") or "",
@@ -238,8 +239,9 @@ class MainWindowParameterPanelMixin:
             card_id=card.card_id,
             source=str(card_params.get("script_source") or ""),
             custom_name=getattr(card, "custom_name", None),
-            on_applied=lambda source: self._persist_script_source(card, source),
+            on_applied=lambda source: self._persist_script_source(card, source, dialog.environment_settings()),
             debug_context_provider=lambda: self._script_debug_context(card),
+            environment=card_params.get("script_environment"),
             parent=self,
         )
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -254,7 +256,7 @@ class MainWindowParameterPanelMixin:
         self._script_editors[card.card_id] = dialog
         dialog.show()
 
-    def _persist_script_source(self, card, source: str) -> None:
+    def _persist_script_source(self, card, source: str, environment=None) -> None:
         """直接写回打开编辑器时的那张卡，不依赖 exec() 是否还活着。"""
         if card is None:
             logger.error("自定义脚本写入失败：卡片已失效")
@@ -262,6 +264,8 @@ class MainWindowParameterPanelMixin:
         if not isinstance(getattr(card, "parameters", None), dict):
             card.parameters = {}
         card.parameters["script_source"] = str(source or "")
+        if environment is not None:
+            card.parameters["script_environment"] = environment
         from tasks.script_task import script_source_hash
         card.parameters["script_source_sha256"] = script_source_hash(source)
         card.parameters.pop("allow_external_components", None)

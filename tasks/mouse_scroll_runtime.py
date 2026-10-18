@@ -352,8 +352,8 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
                     raise RuntimeError("无法确定滚轮窗口中心") from move_err
             else:
                 raise RuntimeError("无法确定滚轮窗口中心：未绑定目标窗口")
-        # else: location_mode == "当前位置" (or default if "当前位置" was an option)
-            # target_x, target_y remain None, scrolling happens at current mouse pos
+        else:
+            raise ValueError(f"不支持的滚轮起始位置模式：{location_mode!r}")
     
     except Exception as setup_err: # This is the except for the outer try block for location determination
          logger.error(f"确定滚动位置时发生错误: {setup_err}", exc_info=True)
@@ -373,10 +373,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
             scroll_hwnd = target_hwnd
             logger.info(f"执行后台鼠标滚轮: 滚动目标句柄={scroll_hwnd}, 坐标={(target_x, target_y) if target_x is not None else '默认'}, 方向='{direction}', 次数={scroll_count}")
             if target_x is None or target_y is None:
-                rect = win32gui.GetWindowRect(scroll_hwnd)
-                target_x = (rect[0] + rect[2]) // 2
-                target_y = (rect[1] + rect[3]) // 2
-                postmessage_coords_are_screen = True
+                raise RuntimeError("后台滚轮定位失败：未取得目标坐标")
 
             logger.debug(
                 f"后台滚轮参数: 方向={direction}, 单刻度值={scroll_value_per_unit}, "

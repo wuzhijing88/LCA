@@ -45,6 +45,16 @@ def _read_card_value(card: Any, attr_name: str, key_name: Optional[str] = None) 
     return None
 
 
+def resolve_card_display_name(card: Any = None, card_params: Any = None) -> str:
+    """返回日志使用的卡片名称，优先使用卡片备注名称。"""
+    custom_name = str(_read_card_value(card, "custom_name") or "").strip()
+    if custom_name:
+        return custom_name
+    if isinstance(card_params, dict):
+        return str(card_params.get("name") or card_params.get("description") or "").strip()
+    return ""
+
+
 def _normalize_card_id_text(card_id: Any) -> str:
     if card_id is None:
         return ""

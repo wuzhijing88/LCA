@@ -6,7 +6,6 @@ from __future__ import annotations
 import ast
 import logging
 import math
-import random
 import threading
 import time
 import json
@@ -20,8 +19,43 @@ from task_workflow.script_commands import RESULT_FIELD_ALIASES, CommandHost, Scr
 from task_workflow.script_parameters import (
     add_numeric_values,
     boolean_parameter as _as_bool,
-    number_parameter,
     text_parameter as _text,
+)
+from task_workflow.script_image import IMAGE_METHODS, ImageApi
+
+from task_workflow.script_pure import (
+    script_for_iterable,
+    script_random,
+    script_sqrt,
+    script_sin,
+    script_cos,
+    script_clamp,
+    script_contains,
+    script_slice,
+    script_replace,
+    script_strip,
+    script_find,
+    script_extract_number,
+    script_split,
+    script_now_ms,
+    script_json_parse,
+    script_json_dump,
+    script_dict_get,
+    script_dict_set,
+    script_list_append,
+    script_list_pop,
+    script_type,
+    script_assert,
+    script_dict_keys,
+    script_dict_values,
+    script_list_extend,
+    script_startswith,
+    script_endswith,
+    script_sort,
+    script_round,
+    script_list_clear,
+    script_sum,
+    script_nearest_int,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,6 +161,9 @@ _BUILTIN_CALLS = (
     "字典键",
     "字典值",
     "列表合并",
+    "列表清空",
+    "求和",
+    "就近取整",
     "开头是",
     "结尾是",
     "JSON解析",
@@ -148,6 +185,10 @@ _TRANSLATED_BUILTIN_CALLS = (
 )
 _RESULT_METHODS = frozenset({"点", "随机点"})
 _EXCEPTION_NAMES = (
+    "异常",
+    "值错误",
+    "类型错误",
+    "运行错误",
     "Exception",
     "BaseException",
     "ValueError",
@@ -164,6 +205,7 @@ _EXCEPTION_NAMES = (
 )
 
 ALLOWED_CALLS = {
+    *(f"图像.{name}" for name in IMAGE_METHODS),
     "大漠内存.模块基址", "大漠内存.模块大小",
     "大漠内存.读取整数", "大漠内存.读取单精度", "大漠内存.读取双精度",
     "大漠内存.读取文本", "大漠内存.读取数据",
@@ -267,6 +309,16 @@ ALLOWED_CALLS = {
 ALLOWED_CALL_ROOTS = frozenset({*COMMAND_NAMES, *_BUILTIN_CALLS, *_TRANSLATED_BUILTIN_CALLS, *_EXCEPTION_NAMES})
 
 _CN_IDENT_MAP = {
+    "导入": "import",
+    "从": "from",
+    "作为": "as",
+    "尝试": "try",
+    "捕获": "except",
+    "最终": "finally",
+    "抛出": "raise",
+    "匿名": "lambda",
+    "使用": "with",
+    "就是": "is",
     "否则如果": "elif",
     "如果": "if",
     "否则": "else",
@@ -298,6 +350,7 @@ _CN_IDENT_MAP = {
 _SYNTAX_CN = (
     ("'break' outside loop", "中断 只能写在循环里"),
     ("'continue' not properly in loop", "继续 只能写在循环里"),
+    ("expected 'except' or 'finally' block", "尝试 后需要 捕获 或 最终 代码块"),
     ("expected ':'", "这里少了冒号"),
     ("invalid syntax", "写法不对"),
     ("unexpected EOF while parsing", "代码没写完"),
@@ -613,7 +666,12 @@ def translate_cn_script(source: str) -> str:
                 cursor += 1
             ident = text[index:cursor]
             nxt = _peek_ident(text, cursor)
-            if ident in _BUILTIN_CALLS:
+            if ident in {"导入", "从", "作为", "尝试", "捕获", "最终", "抛出", "匿名", "使用", "就是"}:
+                following = text[cursor:].lstrip()
+                previous = text[:index].rstrip()
+                is_field = previous.endswith(".") or (following.startswith("=") and not following.startswith("=="))
+                out.append(ident if is_field else _CN_IDENT_MAP[ident])
+            elif ident in _BUILTIN_CALLS:
                 # 内置名也可能是命令的关键字参数或结果字段（例如 长度=64）。
                 # 只翻译独立的函数调用，不能改写这些参数名和属性名。
                 following = text[cursor:].lstrip()
@@ -1243,225 +1301,6 @@ def _raise_script_error(message: str, exc: Optional[BaseException] = None) -> No
     raise ScriptError(message, lineno=_script_lineno(exc) if exc is not None else None) from exc
 
 
-def _is_int_range_bound(value: Any) -> bool:
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, int):
-        return True
-    if isinstance(value, float):
-        return value.is_integer()
-    if isinstance(value, str):
-        text = value.strip()
-        if text.startswith(("+", "-")):
-            text = text[1:]
-        return bool(text) and text.isdigit()
-    return False
-
-
-def script_for_iterable(value: Any) -> Any:
-    """数字当循环次数；其它值保持原样交给 for。"""
-    if isinstance(value, bool):
-        raise ValueError("循环次数不能是真假")
-    if isinstance(value, range):
-        return value
-    if _is_int_range_bound(value):
-        count = int(value) if not isinstance(value, str) else int(str(value).strip())
-        if count < 0:
-            raise ValueError("循环次数不能是负数")
-        return range(count)
-    return value
-
-
-def script_random(*args: Any, 起点: Any = None, 终点: Any = None) -> Any:
-    if 起点 is not None or 终点 is not None:
-        if args:
-            raise ValueError("随机的位置范围与起点、终点不能同时传入")
-        if 起点 is None or 终点 is None:
-            raise ValueError("随机的起点和终点必须同时传入")
-        args = (起点, 终点)
-    if len(args) > 2:
-        raise ValueError("随机最多接受两个参数")
-    if not args:
-        return random.random()
-    if len(args) == 1:
-        return random.randrange(integer_parameter(args[0], "随机上限", minimum=1))
-    start, end = (number_parameter(item, label) for item, label in zip(args, ("随机起点", "随机终点")))
-    if end < start:
-        raise ValueError("随机终点不能小于起点")
-    if isinstance(start, int) and isinstance(end, int):
-        return random.randint(start, end)
-    if not math.isfinite(float(end) - float(start)):
-        raise ValueError("随机区间跨度必须是有限数字")
-    return random.uniform(float(start), float(end))
-
-
-def script_sqrt(值: Any) -> float:
-    number = float(值)
-    if number < 0:
-        raise ValueError("开方不能是负数")
-    return number ** 0.5
-
-
-def script_sin(角度: Any) -> float:
-    return math.sin(math.radians(float(角度)))
-
-
-def script_cos(角度: Any) -> float:
-    return math.cos(math.radians(float(角度)))
-
-
-def script_clamp(值: Any, 下限: Any, 上限: Any) -> float:
-    number = float(值)
-    low = float(下限)
-    high = float(上限)
-    if low > high:
-        low, high = high, low
-    return min(high, max(low, number))
-
-
-def script_contains(文本: Any, 片段: Any) -> bool:
-    return _text(片段) in _text(文本)
-
-
-def script_slice(文本: Any, 起点: Any, 字数: Any = None) -> str:
-    source = _text(文本)
-    begin = integer_parameter(起点, "截取起点", minimum=1) - 1
-    if 字数 is None:
-        return source[begin:]
-    return source[begin : begin + integer_parameter(字数, "截取字数", minimum=0)]
-
-
-def script_replace(文本: Any, 旧: Any, 新: Any, 次数: Any = None) -> str:
-    source = _text(文本)
-    if 次数 is None:
-        return source.replace(_text(旧), _text(新))
-    return source.replace(_text(旧), _text(新), integer_parameter(次数, "替换次数", minimum=0))
-
-
-def script_strip(文本: Any) -> str:
-    return _text(文本).strip()
-
-
-def script_find(文本: Any, 片段: Any) -> int:
-    index = _text(文本).find(_text(片段))
-    return 0 if index < 0 else index + 1
-
-
-def script_extract_number(文本: Any) -> Any:
-    import re
-
-    match = re.search(r"-?\d+(?:\.\d+)?", _text(文本))
-    if not match:
-        return 0
-    raw = match.group(0)
-    return float(raw) if "." in raw else int(raw)
-
-
-def script_split(文本: Any, 分隔符: Any = None) -> list:
-    source = _text(文本)
-    if 分隔符 is None or 分隔符 == "":
-        return source.split()
-    return source.split(str(分隔符))
-
-
-def script_now_ms() -> int:
-    return int(time.monotonic() * 1000)
-
-
-def script_json_parse(文本: Any) -> Any:
-    try:
-        return json.loads(_text(文本))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError(f"JSON解析失败: {exc}") from exc
-
-
-def script_json_dump(对象: Any) -> str:
-    try:
-        return json.dumps(对象, ensure_ascii=False, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"JSON生成失败: {exc}") from exc
-
-
-def script_dict_get(字典: Any, 键: Any, 默认值: Any = None) -> Any:
-    return 字典.get(键, 默认值) if isinstance(字典, dict) else 默认值
-
-
-def script_dict_set(字典: Any, 键: Any, 值: Any) -> Any:
-    if not isinstance(字典, dict):
-        raise TypeError("字典设置的目标必须是字典")
-    字典[键] = 值
-    return 字典
-
-
-def script_list_append(列表: Any, 值: Any) -> int:
-    if not isinstance(列表, list):
-        raise TypeError("列表追加的目标必须是列表")
-    列表.append(值)
-    return len(列表)
-
-
-def script_list_pop(列表: Any, 索引: Any = -1) -> Any:
-    if not isinstance(列表, list):
-        raise TypeError("列表弹出的目标必须是列表")
-    return 列表.pop(integer_parameter(索引, "列表索引"))
-
-
-def script_type(值: Any) -> str:
-    return type(值).__name__
-
-
-def script_assert(条件: Any, 错误信息: Any = "断言失败") -> bool:
-    if not 条件:
-        raise AssertionError(str(错误信息))
-    return True
-
-
-def script_dict_keys(字典: Any) -> list:
-    return list(字典.keys()) if isinstance(字典, dict) else []
-
-
-def script_dict_values(字典: Any) -> list:
-    return list(字典.values()) if isinstance(字典, dict) else []
-
-
-def script_list_extend(列表: Any, 数据: Any) -> int:
-    if not isinstance(列表, list):
-        raise TypeError("列表合并的目标必须是列表")
-    if not isinstance(数据, (list, tuple, set)):
-        raise TypeError("列表合并的数据必须是列表")
-    列表.extend(数据)
-    return len(列表)
-
-
-def script_startswith(文本: Any, 前缀: Any) -> bool:
-    return _text(文本).startswith(_text(前缀))
-
-
-def script_endswith(文本: Any, 后缀: Any) -> bool:
-    return _text(文本).endswith(_text(后缀))
-
-
-def script_sort(列表: Any, 反向: Any = False) -> list:
-    if not isinstance(列表, (list, tuple, set)):
-        raise TypeError("排序的目标必须是列表")
-    return sorted(列表, reverse=_as_bool(反向, "排序反向"))
-
-
-def script_round(数值: Any, 位数: Any = 0) -> Any:
-    from decimal import Decimal, ROUND_HALF_UP, localcontext
-
-    number = number_parameter(数值, "四舍五入数值")
-    places = integer_parameter(位数, "四舍五入位数", minimum=-308, maximum=308)
-    decimal = Decimal(str(number))
-    with localcontext() as context:
-        context.prec = max(32, len(decimal.as_tuple().digits) + abs(decimal.adjusted()) + abs(places) + 2)
-        result = decimal.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
-    if isinstance(number, int) and places <= 0:
-        return int(result)
-    rounded = float(result)
-    if not math.isfinite(rounded):
-        raise ValueError("四舍五入结果超出有限数值范围")
-    return rounded
 
 
 def clipboard_get() -> str:
@@ -3345,6 +3184,28 @@ def run_script(
     runtime_logger = logger_obj or logger
     runtime_context = dict(context or {})
     host = CommandHost(store, runtime_context, runtime_logger, modules=modules, invoke=invoke)
+    external_process = None
+
+    def _read_image_resource(path):
+        from task_workflow.script_resources import read_resource_bytes
+
+        data = read_resource_bytes(path, **host._resource_dirs())
+        if data is None:
+            raise ValueError("资源不存在：" + str(path))
+        return data
+
+    def _capture_image():
+        from utils.capture.screenshot_helper import capture_window_frame
+
+        hwnd = host.context.get("target_hwnd")
+        if not hwnd:
+            raise ValueError("截帧需要先绑定窗口")
+        frame = capture_window_frame(hwnd)
+        if frame is None:
+            raise ValueError("窗口截图失败")
+        return frame
+
+    image_api = ImageApi(_read_image_resource, _capture_image)
 
     def _script_stop() -> bool:
         return host.should_stop()
@@ -3374,6 +3235,8 @@ def run_script(
         raise ScriptOutcome(False, str(detail or "判断失败"))
 
     def _is_user_func(func: Any) -> bool:
+        if external_process is not None:
+            return external_process.is_user_callback(func, user_funcs)
         name = str(getattr(func, "__name__", "") or "")
         return name in user_funcs and namespace.get(name) is func
 
@@ -3382,7 +3245,7 @@ def run_script(
         if isinstance(target, str):
             if target not in user_funcs:
                 raise ScriptError(f"回调请传入子程序，例如 回调={target}")
-            callback = namespace.get(target)
+            callback = external_process.callback(target) if external_process is not None else namespace.get(target)
         if not callable(callback) or not _is_user_func(callback):
             raise ScriptError("回调请传入脚本中的子程序")
         return callback
@@ -3393,7 +3256,7 @@ def run_script(
         if isinstance(目标, str):
             if 目标 not in user_funcs:
                 raise ScriptError("多线程请传入子程序，例如 多线程(按W)")
-            func = namespace.get(目标)
+            func = external_process.callback(目标) if external_process is not None else namespace.get(目标)
             if not callable(func):
                 raise ScriptError(f"没有这个子程序：{目标}")
             label = 名字 or 目标
@@ -3407,6 +3270,7 @@ def run_script(
         "_lca_guard": guard,
         "__iter_count": script_for_iterable,
         "变量": _VarsApi(store),
+        "图像": image_api,
         "区域": _RegionApi(host),
         "上次": _StoreView(store),
         "文字": _StoreView(store, "ocr"),
@@ -3514,6 +3378,8 @@ def run_script(
         "配对": zip,
         "排序": script_sort,
         "四舍五入": script_round,
+        "就近取整": script_nearest_int,
+        "求和": script_sum,
         "全部": all,
         "任一": any,
         "随机": script_random,
@@ -3533,12 +3399,17 @@ def run_script(
         "字典键": script_dict_keys,
         "字典值": script_dict_values,
         "列表合并": script_list_extend,
+        "列表清空": script_list_clear,
         "开头是": script_startswith,
         "结尾是": script_endswith,
         "去空格": script_strip,
         "查找": script_find,
         "提取数字": script_extract_number,
         "Exception": Exception,
+        "异常": Exception,
+        "值错误": ValueError,
+        "类型错误": TypeError,
+        "运行错误": RuntimeError,
         "BaseException": BaseException,
         "ValueError": ValueError,
         "TypeError": TypeError,
@@ -3568,17 +3439,29 @@ def run_script(
             runtime_logger.debug("设置脚本调试变量白名单失败", exc_info=True)
     try:
         try:
+            from app_core.script_environments import normalize_environment
+
+            environment = normalize_environment(runtime_context.get("script_environment"))
+            if environment["mode"] == "isolated":
+                from task_workflow.script_process import ScriptProcess
+
+                host.context["script_environment"] = environment
+                external_process = ScriptProcess(namespace, host, guard, tree, debug_variable_names, _log)
             # 调试器仅在本次脚本执行期间安装逐行追踪，结束后恢复宿主线程原有设置。
             trace = getattr(debugger, "trace", None) if debugger is not None else None
             if callable(trace):
-                def _script_trace(frame, event, arg):
-                    if frame.f_code.co_filename != "<script>":
-                        return None
-                    return trace(frame, event, arg)
                 previous_trace = sys.gettrace()
-                sys.settrace(_script_trace)
-            exec(compile(tree, "<script>", "exec"), namespace, namespace)  # noqa: S102
-            result = (True, "")
+                if external_process is None:
+                    def _script_trace(frame, event, arg):
+                        if frame.f_code.co_filename != "<script>":
+                            return None
+                        return trace(frame, event, arg)
+                    sys.settrace(_script_trace)
+            if external_process is not None:
+                result = external_process.run()
+            else:
+                exec(compile(tree, "<script>", "exec"), namespace, namespace)  # noqa: S102
+                result = (True, "")
         except ScriptOutcome as outcome:
             result = (outcome.success, outcome.detail)
         except ScriptError:
@@ -3624,6 +3507,12 @@ def run_script(
             host.close()
         except Exception as exc:
             cleanup_error = ScriptError(f"{pending}；{exc}" if pending is not None else str(exc))
+        if external_process is not None:
+            try:
+                external_process.close()
+            except Exception as exc:
+                cleanup_error = ScriptError(f"{cleanup_error or pending}；{exc}" if cleanup_error or pending else str(exc))
+        image_api.close()
         failure = host.thread_failure()
         if failure and cleanup_error is None:
             cleanup_error = ScriptError(f"线程失败: {failure}")

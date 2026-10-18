@@ -863,7 +863,13 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             root_x, root_y = window_coords[self.hwnd]
             screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (int(root_x), int(root_y)))
 
-            wparam = (delta & 0xFFFF) << 16 | self._mouse_button_flags()
+            # 窗口可能按最近一次鼠标移动确定滚动区域；滚轮消息中的坐标不会更新悬停位置。
+            button_flags = self._mouse_button_flags()
+            if not self._send_mouse_message_to_chain(window_chain, window_coords, win32con.WM_MOUSEMOVE, button_flags):
+                return False
+            self._remember_cursor(client_x, client_y)
+
+            wparam = (delta & 0xFFFF) << 16 | button_flags
             lparam = self._make_mouse_lparam(int(screen_x), int(screen_y))
 
             targets = window_chain

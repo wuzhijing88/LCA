@@ -8,7 +8,11 @@ import time
 import threading
 from typing import Callable, Dict, List, Any, Optional, Set, Tuple
 from PySide6.QtCore import QObject, Signal, QThread
-from task_workflow.card_display import find_card_by_id, format_step_detail
+from task_workflow.card_display import (
+    find_card_by_id,
+    format_step_detail,
+    resolve_card_display_name,
+)
 from task_workflow.graph_engine import GraphEngine
 from task_workflow.run_context import RunContext
 from task_workflow.window_adapter import WindowBinding, get_window_adapter
@@ -502,13 +506,7 @@ class WorkflowExecutor(QObject):
         构建步骤日志详情，用于执行日志显示。
         """
         card = self._get_card_object(card_id)
-        card_name = ""
-        if isinstance(card, dict):
-            card_name = str(card.get("custom_name") or "").strip()
-        else:
-            card_name = str(getattr(card, "custom_name", "") or "").strip()
-        if not card_name and isinstance(card_params, dict):
-            card_name = str(card_params.get("name") or card_params.get("description") or "").strip()
+        card_name = resolve_card_display_name(card, card_params)
 
         details = [f"卡片ID：{card_id}"]
         if card_name:

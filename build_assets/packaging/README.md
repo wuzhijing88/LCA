@@ -12,6 +12,8 @@ build_assets\packaging\build_release.bat
 
 插件运行库放在 `tools/plugin/`。`PluginHost.exe`、`dm.dll` 是必需文件，缺少任一项立即终止打包；`xx.dat` 是可选附属文件。打包时只按文件白名单纳入：Nuitka 用 `--include-data-files`，`stage_packaged_runtime_assets.py` 再拷到发行目录并清掉其它残留。`RegDll.dll` 已移除，宿主不依赖 COM 注册表。
 
+独立 Python 环境需要 `resources/script_runtime/` 下的 `worker.py`、`script_pure.py`、`script_parameters.py` 和 `script_image.py`。源码校验与暂存共用 `SCRIPT_RUNTIME_FILES` 清单，只允许这四个精确路径，并逐字节核对本次构建的源码；其他 Python 源文件或内容不一致都会终止打包。
+
 
 离线双身份（行业常见、无授权）：
 
@@ -23,7 +25,7 @@ build_assets\packaging\build_release.bat
 
 播放器 exe 印记与 `package.lcap` 共享随机 `bind_id`：换包/混用不同导出批次会无法启动（防挪包；不防本地补丁）。
 
-本机已安装 Inno Setup 6 时，继续生成编辑器安装包。文件名按打包当天的日期写成 `LCA_<月>.<日>测试版_Setup.exe`，月日不补零。例如 9 月 16 日：
+生成编辑器安装包需要本机安装 Inno Setup 6，缺失时直接终止打包。文件名按打包当天的日期写成 `LCA_<月>.<日>测试版_Setup.exe`，月日不补零。例如 9 月 16 日：
 
 ```text
 build_assets\packaging\release_output\LCA_9.16测试版_Setup.exe

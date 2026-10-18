@@ -22,6 +22,7 @@ if str(PROJECT_ROOT_FOR_IMPORTS) not in sys.path:
 from build_assets.packaging.stage_packaged_runtime_assets import (
     PLUGIN_REQUIRED_FILES,
     iter_plugin_pack_files,
+    stage_script_runtime,
 )
 from services.ocr_runtime_contract import (
     OCR_MODEL_DIRECTORY,
@@ -897,6 +898,7 @@ def main() -> int:
         return 1
 
     removed_excluded_dlls = _remove_excluded_runtime_dlls(result_exe.parent)
+    stage_script_runtime(project_root, result_exe.parent)
     if removed_excluded_dlls:
         removed_size = sum(file_size for _relative_path, file_size in removed_excluded_dlls)
         print(

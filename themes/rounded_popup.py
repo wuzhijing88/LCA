@@ -19,13 +19,10 @@ _PAINTER_ATTR = "_theme_rounded_popup_painter"
 
 
 def popup_surface_colors(border_key: str = "border") -> tuple[QColor, QColor]:
-    try:
-        from themes.theme_manager import get_theme_manager
+    from themes.theme_manager import get_theme_manager
 
-        manager = get_theme_manager()
-        return QColor(manager.get_color("card")), QColor(manager.get_color(border_key))
-    except Exception:
-        return QColor("#ffffff"), QColor("#d0d0d0")
+    manager = get_theme_manager()
+    return QColor(manager.get_color("card")), QColor(manager.get_color(border_key))
 
 
 class RoundedPopupPainter(QObject):
@@ -112,8 +109,7 @@ def apply_native_window_corners(widget: QWidget, *, preference: int = 2) -> bool
 def prepare_rounded_popup_window(widget: QWidget, *, force: bool = False) -> None:
     """无边框 Popup + 透明背景，让圆角由绘制完成而不是裁剪。"""
     flags = widget.windowFlags() | Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
-    if hasattr(Qt.WindowType, "NoDropShadowWindowHint"):
-        flags |= Qt.WindowType.NoDropShadowWindowHint
+    flags |= Qt.WindowType.NoDropShadowWindowHint
     need_reapply = force or (widget.windowFlags() & flags) != flags
     if need_reapply:
         was_visible = widget.isVisible()
@@ -132,16 +128,10 @@ def apply_transparent_popup_palette(widget: QWidget) -> None:
     widget.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
     widget.setAutoFillBackground(False)
     widget.setProperty("roundedPopup", True)
-    try:
-        widget.clearMask()
-    except Exception:
-        pass
-    try:
-        from themes.theme_manager import get_theme_manager
+    widget.clearMask()
+    from themes.theme_manager import get_theme_manager
 
-        palette = get_theme_manager().build_palette()
-    except Exception:
-        palette = widget.palette()
+    palette = get_theme_manager().build_palette()
     transparent = QColor(0, 0, 0, 0)
     palette.setColor(QPalette.ColorRole.Window, transparent)
     palette.setColor(QPalette.ColorRole.Base, transparent)

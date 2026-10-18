@@ -274,6 +274,71 @@ QComboBox::drop-down {
     border-bottom-right-radius: 4px;
 }
 
+/* 脚本环境设置：输入框同高，箭头与输入区域共用背景。 */
+QDialog#scriptEnvironmentDialog QLineEdit,
+QDialog#scriptEnvironmentDialog QComboBox {
+    background-color: #ffffff;
+    color: #333333;
+    border: 1px solid #d0d0d0;
+    border-radius: 4px;
+    padding: 5px 10px;
+    min-height: 24px;
+}
+
+QDialog#scriptEnvironmentDialog QComboBox {
+    padding-right: 34px;
+}
+
+QDialog#scriptEnvironmentDialog QComboBox:hover {
+    border-color: #b0b0b0;
+}
+
+QDialog#scriptEnvironmentDialog QLineEdit:focus,
+QDialog#scriptEnvironmentDialog QComboBox:focus {
+    border-color: #0078d4;
+}
+
+QDialog#scriptEnvironmentDialog QLineEdit:disabled,
+QDialog#scriptEnvironmentDialog QComboBox:disabled {
+    background-color: #f5f5f5;
+    color: #999999;
+    border-color: #e0e0e0;
+}
+
+QDialog#scriptEnvironmentDialog QLabel#scriptEnvironmentHint {
+    color: #666666;
+    background: transparent;
+}
+
+/* 标准主题下拉的箭头由 ThemedComboBox 绘制，右侧不再留独立按钮。 */
+QComboBox[unifiedTheme="true"] {
+    padding-right: 34px;
+}
+
+QComboBox[unifiedTheme="true"]::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 28px;
+    background: transparent;
+    border: none;
+}
+
+/* 脚本标准下拉统一使用主题的禁用状态和列表样式。 */
+QComboBox[unifiedTheme="true"]:disabled,
+#scriptEditorDialog QComboBox[unifiedTheme="true"]:disabled {
+    background-color: #f5f5f5;
+    color: #999999;
+    border-color: #e0e0e0;
+}
+
+QListView#themedComboList::item {
+    padding: 6px 12px;
+    min-height: 20px;
+    margin: 0px;
+    border: none;
+    border-radius: 3px;
+}
+
 
 QComboBox QAbstractItemView {
     background-color: #ffffff;
@@ -1424,6 +1489,11 @@ QFrame#customDropdownPopup {
     margin: 0px;
 }
 
+QFrame#customDropdownPopup[roundedPopup="true"] {
+    background-color: transparent;
+    border: none;
+}
+
 /* 閫氱敤鍒楄〃鏍峰紡 */
 QListWidget {
     border: 1px solid #d0d0d0;
@@ -1459,6 +1529,7 @@ QListWidget#customDropdownList {
     background-color: transparent;
     outline: none;
     show-decoration-selected: 1;
+    color: #333333;
 }
 
 QListWidget#customDropdownList::viewport {
@@ -1469,25 +1540,29 @@ QListWidget#customDropdownList::item {
     padding: 0px;
     min-height: 18px;
     color: #333333;
-    background-color: #ffffff;
+    background-color: transparent;
     text-align: left;
     border-radius: 4px;
     margin: 0px;
 }
 
 QListWidget#customDropdownList::item:hover {
-    background-color: transparent;
+    background-color: #e8e8e8;
     color: #333333;
 }
 
 QListWidget#customDropdownList::item:selected {
-    background-color: transparent;
-    color: #333333;
+    background-color: #0078d4;
+    color: #ffffff;
 }
 
 QListWidget#customDropdownList::item:selected:hover {
-    background-color: transparent;
-    color: #333333;
+    background-color: #0078d4;
+    color: #ffffff;
+}
+
+QListWidget#customDropdownList::item:disabled {
+    color: #666666;
 }
 
 /* 鑷畾涔夋爣棰樻爮 */
