@@ -1,4 +1,7 @@
 from .workflow_view_common import *
+from weakref import ReferenceType, ref
+
+from task_workflow.thread_start import validate_thread_target
 
 operation_logger = logging.getLogger("workflow.operations")
 debug_print = lambda *args, **kwargs: None
@@ -116,9 +119,14 @@ class WorkflowViewClipboardUndoMixin:
         """复制单张卡片的数据。"""
         card = self.cards.get(card_id)
         if card:
-            safe_parameters = copy.deepcopy(parameters if isinstance(parameters, dict) else card.parameters)
+            if not isinstance(parameters, dict):
+                raise TypeError("复制卡片参数必须是字典")
+            safe_parameters = copy.deepcopy(parameters)
             type(self).copied_card_data = {
                 'single_card': True,  # 标记为单卡片复制
+                'source_images_dir': self.images_dir,
+                'source_view': ref(self),
+                'original_card_id': card.card_id,
                 'task_type': card.task_type,
                 'parameters': safe_parameters,
                 'custom_name': card.custom_name  # 包含卡片备注
@@ -182,6 +190,8 @@ class WorkflowViewClipboardUndoMixin:
 
         type(self).copied_card_data = {
             'single_card': False,  # 标记为批量复制
+            'source_images_dir': self.images_dir,
+            'source_view': ref(self),
             'cards': cards_data,
             'connections': connections_data  # 保存连接信息
         }
@@ -209,32 +219,68 @@ class WorkflowViewClipboardUndoMixin:
             debug_print("--- [DEBUG] WorkflowView: handle_paste_card END (No data) ---")
             return
 
-        # 注释已清理（原注释编码损坏）
-        is_single_card = type(self).copied_card_data.get('single_card', True)
+        from task_workflow.clipboard_resources import pasted_image_resources
 
+        clipboard = type(self).copied_card_data
+        old_ids = set(self.cards)
+        old_undo_stack = list(self.undo_stack)
         try:
-            if is_single_card:
-                # 单卡片粘贴（保持原有逻辑）
-                self._paste_single_card(scene_pos)
-            else:
-                # 批量卡片粘贴
-                self._paste_multiple_cards(scene_pos)
+            if not isinstance(clipboard, dict) or not {'single_card', 'source_images_dir'} <= clipboard.keys():
+                raise ValueError("剪贴板缺少卡片复制模式或来源图片目录，请重新复制卡片")
+            if 'source_view' not in clipboard or not isinstance(clipboard['source_view'], ReferenceType):
+                raise ValueError("剪贴板缺少来源画布身份，请重新复制卡片")
+            same_source = clipboard['source_view']() is self
+            is_single_card = clipboard['single_card']
+            if not isinstance(is_single_card, bool):
+                raise TypeError("剪贴板卡片复制模式必须是布尔值")
+            required = {'task_type', 'parameters', 'custom_name', 'original_card_id'} if is_single_card else {'cards', 'connections'}
+            if not required <= clipboard.keys():
+                raise ValueError("剪贴板卡片数据不完整，请重新复制卡片")
+            cards = [clipboard] if is_single_card else clipboard['cards']
+            if not isinstance(cards, list) or any(
+                not isinstance(item, dict) or not {'task_type', 'parameters', 'custom_name'} <= item.keys()
+                for item in cards
+            ):
+                raise ValueError("剪贴板卡片数据格式无效，请重新复制卡片")
+            with pasted_image_resources(
+                cards, source_images_dir=clipboard['source_images_dir'], images_dir=self.images_dir,
+            ) as prepared_cards:
+                if is_single_card:
+                    self._paste_single_card(scene_pos, prepared_cards[0], same_source, old_ids)
+                else:
+                    self._paste_multiple_cards(scene_pos, prepared_cards, clipboard['connections'], same_source, old_ids)
+            return True
+        except Exception as exc:
+            was_undoing = self._undoing_operation
+            self._undoing_operation = True
+            try:
+                for card_id in sorted(set(self.cards) - old_ids, reverse=True):
+                    if not self.delete_card(card_id, defer_view_refresh=True):
+                        raise RuntimeError(f"粘贴失败后无法释放卡片：{card_id}") from exc
+                self.undo_stack[:] = old_undo_stack
+                self.update_card_sequence_display()
+                self._refresh_thread_start_custom_names()
+                self._sync_scene_rect_to_content()
+            finally:
+                self._undoing_operation = was_undoing
+            operation_logger.error("[粘贴] 失败：%s", exc, exc_info=True)
+            QMessageBox.critical(self, "粘贴失败", str(exc) or f"具体原因未知（{type(exc).__name__}）")
+            return False
         finally:
-            # 任意校验/连线错误都不能把后续编辑永久锁在粘贴状态。
             self._pasting_card = False
 
-        debug_print("--- [DEBUG] WorkflowView: handle_paste_card END ---")
-
-    def _paste_single_card(self, scene_pos: QPointF):
+    def _paste_single_card(self, scene_pos: QPointF, card_data: dict, same_source: bool, existing_ids: set):
         """粘贴单个卡片"""
         # Extract data from clipboard
-        task_type = type(self).copied_card_data.get('task_type')
-        parameters_to_paste = type(self).copied_card_data.get('parameters', {})
+        task_type = card_data['task_type']
+        parameters_to_paste = card_data['parameters']
+        original_card_id = card_data['original_card_id']
+        if type(original_card_id) is not int or original_card_id < 0:
+            raise TypeError("剪贴板卡片原始 ID 必须是非负整数")
 
         if not task_type or not self.task_modules.get(task_type):
             debug_print(f"  [调试] 粘贴失败：剪贴板数据中的任务类型无效 '{task_type}'。")
-            QMessageBox.critical(self, "粘贴失败", f"剪贴板中的卡片类型 '{task_type}' 无效。")
-            return
+            raise ValueError(f"剪贴板中的卡片类型 '{task_type}' 无效。")
 
         debug_print(f"  [DEBUG] Pasting single card: Type='{task_type}', Params={parameters_to_paste}")
 
@@ -242,7 +288,7 @@ class WorkflowViewClipboardUndoMixin:
         self._pasting_card = True
         # Add the new card at the specified position
         try:
-            new_card = self.add_task_card(scene_pos.x(), scene_pos.y(), task_type, card_id=None)
+            new_card = self.add_task_card(scene_pos.x(), scene_pos.y(), task_type, card_id=None, parameters=copy.deepcopy(parameters_to_paste))
         finally:
             self._pasting_card = False
         # 重置粘贴标志
@@ -251,17 +297,13 @@ class WorkflowViewClipboardUndoMixin:
             debug_print(f"  [DEBUG] New card created with ID: {new_card.card_id}")
             # Apply the copied parameters to the new card
             new_card.parameters.update(copy.deepcopy(parameters_to_paste))
-            if new_card.task_type == '随机跳转':
-                from tasks.random_jump import prune_branch_weights
-
-                new_card.parameters['random_weights'] = prune_branch_weights(
-                    new_card.parameters.get('random_weights'),
-                    [],
-                )
+            self._remap_pasted_card_parameters(
+                new_card, {original_card_id: new_card}, same_source, existing_ids, set(),
+            )
             debug_print(f"  [DEBUG] Copied parameters applied to new card {new_card.card_id}: {new_card.parameters}")
 
             # Apply the copied custom name (备注)
-            custom_name = type(self).copied_card_data.get('custom_name')
+            custom_name = card_data['custom_name']
             if custom_name and (not self._is_start_task_type(new_card.task_type)):
                 new_card.set_custom_name(custom_name)
                 debug_print(f"  [DEBUG] Copied custom name applied to new card {new_card.card_id}: '{custom_name}'")
@@ -279,76 +321,95 @@ class WorkflowViewClipboardUndoMixin:
             debug_print("  Single card pasted successfully.")
         else:
             debug_print("  [调试] 粘贴失败：add_task_card 返回了 None。")
-            QMessageBox.critical(self, "粘贴失败", "创建新卡片时发生错误。")
+            raise RuntimeError("创建新卡片时发生错误。")
 
-    def _remap_pasted_card_selector_value(self, value: Any, old_to_new_card_map: Dict[int, TaskCard]):
-        """将粘贴参数中的旧卡片ID映射为新卡片ID，支持单值与列表。"""
-        if isinstance(value, bool):
-            return value, False
+    def _remap_pasted_card_parameters(self, card: TaskCard, mapping: Dict[int, TaskCard],
+                                      same_source: bool, existing_ids: set, random_targets: set):
+        """漏选分支跳转目标时初始化该分支；其他显式引用仍严格校验。"""
+        updated = copy.deepcopy(card.parameters)
 
-        if isinstance(value, int):
-            mapped_card = old_to_new_card_map.get(value)
-            if mapped_card:
-                return mapped_card.card_id, True
-            return value, False
+        def remap_target(target_id, parameter_name, active=True):
+            if type(target_id) is not int or target_id < 0:
+                raise TypeError(f"卡片 {card.card_id} 的引用参数 {parameter_name} 必须是非负整数或 None")
+            if target_id in mapping:
+                return mapping[target_id].card_id
+            if same_source and target_id in existing_ids:
+                return target_id
+            if not active:
+                return None
+            raise ValueError(
+                f"卡片 {card.card_id} 的引用参数 {parameter_name} 指向未复制的卡片 {target_id}。\n"
+                f"请将目标卡片 {target_id} 一起复制，或在来源卡片中明确修改该引用后重新复制。"
+            )
 
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return value, False
+        # 复制边界内没有对应目标的成功／失败跳转，按粘贴规则初始化。
+        # 这是显式编辑操作，不在保存或执行时为无效引用兜底。
+        for branch in ('success', 'failure'):
+            action_name = 'on_' + branch
+            target_name = branch + '_jump_target_id'
+            if updated.get(action_name) != '跳转到步骤':
+                continue
+            target_id = updated.get(target_name)
+            if target_id is not None and (type(target_id) is not int or target_id < 0):
+                raise TypeError(f"卡片 {card.card_id} 的引用参数 {target_name} 必须是非负整数或 None")
+            if target_id not in mapping:
+                updated[target_name] = None
+                updated[action_name] = '执行下一步'
 
-            parsed_id = None
-            match = re.search(r'\(ID:\s*(\d+)\)', stripped)
-            if match:
-                try:
-                    parsed_id = int(match.group(1))
-                except ValueError:
-                    parsed_id = None
-            else:
-                try:
-                    parsed_id = int(stripped)
-                except (TypeError, ValueError):
-                    parsed_id = None
+        for name in self._reference_parameter_names(card):
+            if name in updated and updated[name] is not None:
+                updated[name] = remap_target(updated[name], name, self._reference_is_active(card, name))
 
-            if parsed_id is not None:
-                mapped_card = old_to_new_card_map.get(parsed_id)
-                if mapped_card:
-                    return mapped_card.card_id, True
+        for name, definition in card.param_definitions.items():
+            if definition.get('widget_hint') != 'thread_target_selector' or name not in updated:
+                continue
+            value = updated[name]
+            validate_thread_target(value)
+            if isinstance(value, str) and value in {'当前线程', '全部线程'}:
+                continue
+            values = value if isinstance(value, list) else [value]
+            targets = []
+            for raw_target in values:
+                target_id = remap_target(int(raw_target), name)
+                target = self.cards[target_id]
+                if not self._is_start_task_type(target.task_type):
+                    raise ValueError(f"卡片 {card.card_id} 的目标线程 {raw_target} 不是线程起点")
+                targets.append(str(target_id))
+            updated[name] = targets if isinstance(value, list) else targets[0]
 
-            return value, False
+        weights = updated.get('random_weights')
+        if weights is not None:
+            if not isinstance(weights, dict):
+                raise TypeError("随机跳转权重必须是字典")
+            mapped_weights = {}
+            for key, weight in weights.items():
+                if not isinstance(key, str) or not key.isascii() or not key.isdecimal() or str(int(key)) != key:
+                    raise TypeError("随机跳转目标 ID 必须是非负整数的数字字符串")
+                if type(weight) is not int or weight <= 0:
+                    raise TypeError("随机跳转权重必须是正整数")
+                if int(key) in random_targets:
+                    mapped_weights[str(mapping[int(key)].card_id)] = weight
+            updated['random_weights'] = mapped_weights
+        connections = updated.get('_random_connections')
+        if connections is not None:
+            if not isinstance(connections, list):
+                raise TypeError("随机跳转目标清单必须是列表")
+            mapped_connections = []
+            for item in connections:
+                if not isinstance(item, dict) or type(item.get('card_id')) is not int or item['card_id'] < 0:
+                    raise TypeError("随机跳转目标项必须包含非负整数 card_id")
+                if item['card_id'] in random_targets:
+                    mapped_connections.append({**item, 'card_id': mapping[item['card_id']].card_id})
+            updated['_random_connections'] = mapped_connections
+        card.parameters = updated
+        card.update()
 
-        if isinstance(value, list):
-            updated_values = []
-            changed = False
-            for item in value:
-                updated_item, item_changed = self._remap_pasted_card_selector_value(item, old_to_new_card_map)
-                updated_values.append(updated_item)
-                changed = changed or item_changed
-            if changed:
-                return updated_values, True
-            return value, False
-
-        if isinstance(value, tuple):
-            updated_values = []
-            changed = False
-            for item in value:
-                updated_item, item_changed = self._remap_pasted_card_selector_value(item, old_to_new_card_map)
-                updated_values.append(updated_item)
-                changed = changed or item_changed
-            if changed:
-                return tuple(updated_values), True
-            return value, False
-
-        return value, False
-
-    def _paste_multiple_cards(self, scene_pos: QPointF):
+    def _paste_multiple_cards(self, scene_pos: QPointF, cards_data: list, connections_data: list,
+                              same_source: bool, existing_ids: set):
         """粘贴多个卡片"""
-        cards_data = type(self).copied_card_data.get('cards', [])
-        connections_data = type(self).copied_card_data.get('connections', [])
 
         if not cards_data:
-            QMessageBox.warning(self, "粘贴失败", "剪贴板中没有有效的卡片数据。")
-            return
+            raise ValueError("剪贴板中没有有效的卡片数据。")
 
         original_ids = set()
         for index, card_data in enumerate(cards_data):
@@ -359,8 +420,8 @@ class WorkflowViewClipboardUndoMixin:
             original_pos = card_data.get('original_pos')
             if not isinstance(task_type, str) or task_type not in self.task_modules:
                 raise ValueError(f"剪贴板包含无效任务类型: {task_type!r}")
-            if isinstance(original_card_id, bool) or not isinstance(original_card_id, int):
-                raise TypeError("剪贴板卡片原始 ID 必须是整数")
+            if type(original_card_id) is not int or original_card_id < 0:
+                raise TypeError("剪贴板卡片原始 ID 必须是非负整数")
             if original_card_id in original_ids:
                 raise ValueError(f"剪贴板卡片原始 ID 重复: {original_card_id}")
             if not isinstance(original_pos, (list, tuple)) or len(original_pos) != 2:
@@ -393,9 +454,9 @@ class WorkflowViewClipboardUndoMixin:
 
         for i, card_data in enumerate(cards_data):
             task_type = card_data.get('task_type')
-            parameters = card_data.get('parameters', {})
+            parameters = card_data['parameters']
             custom_name = card_data.get('custom_name')
-            original_pos = card_data.get('original_pos', (0, 0))
+            original_pos = card_data['original_pos']
             original_card_id = card_data.get('original_card_id')
 
             if not task_type or not self.task_modules.get(task_type):
@@ -410,7 +471,7 @@ class WorkflowViewClipboardUndoMixin:
             new_y = scene_pos.y() + offset_y
 
             # 创建新卡片
-            new_card = self.add_task_card(new_x, new_y, task_type, card_id=None)
+            new_card = self.add_task_card(new_x, new_y, task_type, card_id=None, parameters=copy.deepcopy(parameters))
 
             if new_card:
                 # 应用参数
@@ -430,10 +491,18 @@ class WorkflowViewClipboardUndoMixin:
             else:
                 self._pasting_card = False
                 raise RuntimeError(f"粘贴卡片创建失败: {task_type}")
-                debug_print(f"  [调试] 创建卡片失败 {i+1}/{len(cards_data)}：{task_type}")
 
         # 注意：不在这里重置 _pasting_card 标志，等连接重建完成后再重置
         # 这样可以防止重建连接时保存单独的撤销状态
+
+        # 参数先按来源 ID 映射一次；重建连线随后写入新端点 ID，禁止二次映射。
+        for card_data, new_card in zip(cards_data, new_cards):
+            random_targets = {item['end_card_id'] for item in connections_data
+                              if item['start_card_id'] == card_data['original_card_id']
+                              and item['line_type'] == 'random'}
+            self._remap_pasted_card_parameters(
+                new_card, old_to_new_card_map, same_source, existing_ids, random_targets,
+            )
 
         # 重建连接
         connection_count = 0
@@ -466,70 +535,6 @@ class WorkflowViewClipboardUndoMixin:
 
         # 重置粘贴标志（在连接重建完成后）
         self._pasting_card = False
-
-        # 更新参数中的卡片ID引用
-        # 注释已清理（原注释编码损坏）
-        if old_to_new_card_map:
-            for new_card in new_cards:
-                # 注释已清理（原注释编码损坏）
-                task_module = self.task_modules.get(new_card.task_type)
-                if not task_module:
-                    continue
-
-                # 获取参数定义字典
-                param_definitions = {}
-                try:
-                    param_definitions = task_module.get_params_definition()
-                except Exception as e:
-                    debug_print(f"  [调试] 获取参数定义失败 {new_card.task_type}：{e}")
-                    param_definitions = {}
-
-                if isinstance(param_definitions, list):
-                    converted_defs = {}
-                    for item in param_definitions:
-                        if isinstance(item, dict) and item.get('name'):
-                            converted_defs[item['name']] = item
-                    param_definitions = converted_defs
-
-                if not isinstance(param_definitions, dict):
-                    continue
-
-                # 只更新 widget_hint 为 'card_selector' 的参数
-                for param_name, param_value in new_card.parameters.items():
-                    param_def = param_definitions.get(param_name, {})
-                    widget_hint = param_def.get('widget_hint')
-
-                    # 只有明确标记为 card_selector 的参数才更新
-                    if widget_hint != 'card_selector':
-                        continue
-
-                    remapped_value, changed = self._remap_pasted_card_selector_value(param_value, old_to_new_card_map)
-                    if changed:
-                        new_card.parameters[param_name] = remapped_value
-                        debug_print(
-                            f"  [DEBUG] Updated card_selector parameter '{param_name}' in card {new_card.card_id}: "
-                            f"{param_value} -> {remapped_value}"
-                        )
-
-                if new_card.task_type == '随机跳转':
-                    from tasks.random_jump import normalize_branch_weights, prune_branch_weights
-
-                    normalized_weights = normalize_branch_weights(new_card.parameters.get('random_weights'))
-                    remapped_weights = {}
-                    for target_key, branch_weight in normalized_weights.items():
-                        mapped_card = old_to_new_card_map.get(int(target_key))
-                        if mapped_card:
-                            remapped_weights[str(mapped_card.card_id)] = branch_weight
-
-                    valid_random_targets = []
-                    for conn in getattr(new_card, 'connections', []):
-                        if not isinstance(conn, ConnectionLine):
-                            continue
-                        if conn.start_item != new_card or conn.line_type != 'random' or not conn.end_item:
-                            continue
-                        valid_random_targets.append(conn.end_item.card_id)
-
-                    new_card.parameters['random_weights'] = prune_branch_weights(remapped_weights, valid_random_targets)
 
         # 保存撤销状态（只有成功粘贴的卡片）
         if new_cards:
@@ -575,6 +580,8 @@ class WorkflowViewClipboardUndoMixin:
         'delete_connection': {'connection_data'},
         'add_connection': {'connection_data'},
         'modify_connection': {'old_connection_data', 'new_connection_data'},
+        'switch_output_connections': {'connection_data', 'connection_added',
+                                     'removed_connections', 'branch_parameters'},
         'add_card': {'card_data'},
         'change_card_ids': {'id_mapping'},
         'replace_workflow': {'workflow_data'},
@@ -772,6 +779,8 @@ class WorkflowViewClipboardUndoMixin:
                 self._undo_add_connection(operation_data)
             elif operation_type == 'modify_connection':
                 self._undo_modify_connection(operation_data)
+            elif operation_type == 'switch_output_connections':
+                self._connection_controller.restore_output_connections(operation_data)
             elif operation_type == 'add_card':
                 self._undo_add_card(operation_data)
             elif operation_type == 'change_card_ids':
@@ -798,24 +807,13 @@ class WorkflowViewClipboardUndoMixin:
             debug_print("  [UNDO] Cleared undoing operation flag")
 
     def _undo_paste_cards(self, operation_data: Dict[str, Any]):
-        """撤销粘贴卡片操作"""
-        pasted_card_ids = operation_data.get('pasted_card_ids', [])
-
-        debug_print(f"  [UNDO] Undoing paste operation, removing {len(pasted_card_ids)} cards")
-
-        for card_id in pasted_card_ids:
+        """撤销粘贴时走完整卡片、连线及主题资源卸载。图片属于工程资源，予以保留。"""
+        for card_id in reversed(operation_data['pasted_card_ids']):
             if card_id in self.cards:
-                card = self.cards[card_id]
-                # 移除卡片的所有连接
-                for conn in list(card.connections):
-                    self.remove_connection(conn)
-
-                # 注释已清理（原注释编码损坏）
-                if card.scene() == self.scene:
-                    self.scene.removeItem(card)
-                del self.cards[card_id]
-
-                debug_print(f"  [UNDO] Removed pasted card: {card_id}")
+                if not self.delete_card(card_id, defer_view_refresh=True):
+                    raise RuntimeError(f"撤销粘贴时无法释放卡片：{card_id}")
+        self._refresh_thread_start_custom_names()
+        self._sync_scene_rect_to_content()
 
     def _undo_delete_card(self, operation_data: Dict[str, Any]):
         """撤销删除卡片操作"""

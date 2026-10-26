@@ -32,7 +32,7 @@ class TaskModule(Protocol):
         execution_mode: str,
         **kwargs: Any,
     ) -> Any:
-        """返回 TaskResult，或旧式 (success, action, jump_id[, detail]) 元组；由执行器统一规范化。"""
+        """返回 (success, action, jump_id[, detail]) 元组，由执行器校验。"""
 
 
 @runtime_checkable

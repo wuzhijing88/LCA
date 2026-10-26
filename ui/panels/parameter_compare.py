@@ -4,22 +4,12 @@ from typing import Any, Dict, Iterable
 
 
 def parameter_values_equal(left: Any, right: Any) -> bool:
-    if left is right:
-        return True
-    if left in (None, "") and right in (None, ""):
-        return True
-    if isinstance(left, bool) or isinstance(right, bool):
-        return _as_bool(left) == _as_bool(right)
-    if _is_number(left) and _is_number(right):
-        return float(left) == float(right)
-    if _is_number(left) and isinstance(right, str):
-        parsed = _parse_number(right)
-        return parsed is not None and float(left) == parsed
-    if _is_number(right) and isinstance(left, str):
-        parsed = _parse_number(left)
-        return parsed is not None and parsed == float(right)
-    if isinstance(left, str) and isinstance(right, str):
-        return left == right
+    if type(left) is not type(right):
+        return _is_number(left) and _is_number(right) and left == right
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(parameter_values_equal(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(parameter_values_equal(a, b) for a, b in zip(left, right))
     return left == right
 
 
@@ -41,27 +31,3 @@ def collect_changed_parameters(
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _parse_number(value: str):
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return None
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in ("1", "true", "yes", "y", "on", "是", "真"):
-            return True
-        if text in ("0", "false", "no", "n", "off", "否", "假", ""):
-            return False
-    return bool(value)

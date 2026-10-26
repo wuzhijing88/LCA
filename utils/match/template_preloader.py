@@ -23,12 +23,14 @@ _memory_image_provider: Optional[Callable[[str], Optional[bytes]]] = None
 
 
 def _read_int_env(name: str, default: int, min_value: int, max_value: int) -> int:
-    """读取整型环境变量并限制范围。"""
+    """读取容量配置；显式错误不能改成默认值或钳制。"""
     try:
         value = int(os.getenv(name, str(default)))
-    except Exception:
-        value = default
-    return max(min_value, min(max_value, value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"配置 {name} 必须是整数") from exc
+    if not min_value <= value <= max_value:
+        raise ValueError(f"配置 {name} 必须在 {min_value}～{max_value} 之间")
+    return value
 
 
 def _ensure_cv2():
@@ -500,6 +502,8 @@ class TemplatePreloader:
 
                 cached_ok = cache_key in self.template_cache
 
+            from task_workflow.card_plugin_runtime import register_owned_resource
+            register_owned_resource(cache_key, "图片模板缓存", release_resource_root)
             logger.debug(f"预加载模板成功: {cache_key} ({template_size / 1024:.2f}KB)")
             return cached_ok
         except Exception as error:
@@ -605,3 +609,17 @@ def clear_global_cache():
     if _global_preloader is not None:
         _global_preloader.clear_cache()
         _global_preloader = None
+
+
+def release_resource_root(root):
+    """释放指定临时目录的模板，不创建预加载器或清理其他工程。"""
+    from pathlib import Path
+    root = Path(root).resolve()
+    preloader = _global_preloader
+    if preloader is None:
+        return 0
+    with preloader._cache_lock:
+        owned = [key for key in preloader.template_cache if Path(key).is_absolute() and Path(key).resolve().is_relative_to(root)]
+        for key in owned:
+            preloader._evict_template(key)
+    return len(owned)

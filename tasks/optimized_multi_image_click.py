@@ -26,7 +26,7 @@ def _is_stop_requested(stop_checker=None) -> bool:
 
 
 def _stop_result() -> Tuple[bool, str, Optional[int]]:
-    return False, '任务已停止', None
+    return False, '停止工作流', None
 
 
 def _sleep_with_stop(duration: float, stop_checker=None) -> bool:

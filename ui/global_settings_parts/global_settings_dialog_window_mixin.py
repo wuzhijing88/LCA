@@ -487,8 +487,8 @@ class GlobalSettingsDialogWindowMixin:
                 if added_count > 0 and self.get_custom_width() > 0 and self.get_custom_height() > 0:
                     try:
                         logger.info(f"开始批量调整 {added_count} 个窗口的分辨率...")
-                        # 使用QTimer异步执行，避免阻塞UI
-                        QTimer.singleShot(100, self._batch_resize_all_windows)
+                        # 后台任务只接收界面线程生成的数据快照
+                        self._batch_resize_all_windows()
                     except Exception as e:
                         logger.warning(f"批量调整窗口分辨率失败: {e}")
                 # 批量绑定完成后保存配置

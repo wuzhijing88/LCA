@@ -1,3 +1,5 @@
+from functools import partial
+
 from ..parameter_panel_support import *
 from .parameter_panel_recording_replay_thread import ParameterPanelReplayThread
 from utils.window.window_activation_utils import resolve_replay_window_offsets_from_config
@@ -19,44 +21,19 @@ from app_core.hotkey_spec import (
 
 class ParameterPanelRecordingMixin:
 
-    def _cleanup_recording_hotkey_binding(
-        self,
-        *,
-        handle_attr: str,
-        mouse_hook_attr: str,
-        registered_attr: str,
-        label: str,
-    ) -> None:
-        """安全清理录制面板快捷键绑定，允许重复调用。"""
+    def _cleanup_recording_hotkey_binding(self, *, handle_attr, mouse_hook_attr, registered_attr, label):
         handle = getattr(self, handle_attr, None)
         mouse_hook = getattr(self, mouse_hook_attr, None)
-        was_registered = bool(getattr(self, registered_attr, False))
-
-        try:
-            if handle is not None:
-                try:
-                    import keyboard
-
-                    keyboard.remove_hotkey(handle)
-                except (KeyError, ValueError) as exc:
-                    logger.debug(f"{label}快捷键句柄已失效，按已注销处理: {exc}")
-                except Exception as exc:
-                    logger.error(f"注销{label}快捷键失败: {exc}", exc_info=True)
-
-            if mouse_hook is not None:
-                try:
-                    import mouse
-
-                    mouse.unhook(mouse_hook)
-                except Exception as exc:
-                    logger.debug(f"{label}鼠标钩子已失效，按已注销处理: {exc}")
-        finally:
+        if handle is not None:
+            import keyboard
+            keyboard.remove_hotkey(handle)
             setattr(self, handle_attr, None)
+        if mouse_hook is not None:
+            import mouse
+            mouse.unhook(mouse_hook)
             setattr(self, mouse_hook_attr, None)
-            setattr(self, registered_attr, False)
-
-        if was_registered or handle is not None or mouse_hook is not None:
-            logger.info(f"{label}快捷键已注销")
+        self._resources.forget_cleanup(registered_attr)
+        setattr(self, registered_attr, False)
 
     def _reset_action_control_buttons(self):
         """
@@ -77,24 +54,19 @@ class ParameterPanelRecordingMixin:
             edit_widget.setEnabled(False)
 
     def _stop_combo_key_sequence_recording(self):
-        """停止组合键序列录制（如果正在录制）。"""
-        try:
-            if not bool(getattr(self, "_combo_seq_recording_active", False)):
-                return
-
-            hook = getattr(self, "_combo_seq_recording_hook", None)
-            if hook is not None:
-                try:
-                    import keyboard
-                    keyboard.unhook(hook)
-                except Exception:
-                    pass
-        finally:
-            setattr(self, "_combo_seq_recording_active", False)
-            setattr(self, "_combo_seq_recording_hook", None)
-            setattr(self, "_combo_seq_recording_events", [])
-            setattr(self, "_combo_seq_recording_pressed_keys", set())
-            setattr(self, "_combo_seq_block_global_record_hotkey", False)
+        hook = getattr(self, '_combo_seq_recording_hook', None)
+        mouse_hooks = getattr(self, '_combo_seq_recording_mouse_hooks', [])
+        if hook is not None or mouse_hooks:
+            import keyboard
+            import mouse
+            from tasks.keyboard_input import _cleanup_combo_sequence_recording
+            _cleanup_combo_sequence_recording(self, keyboard, mouse)
+        else:
+            self._combo_seq_recording_active = False
+            self._combo_seq_recording_events = []
+            self._combo_seq_recording_pressed_keys = set()
+            self._combo_seq_block_global_record_hotkey = False
+        self._resources.forget_cleanup('combo-recording')
 
     def _check_and_register_record_hotkey(self):
         """检查是否是录制回放卡片,并注册录制和回放快捷键"""
@@ -161,11 +133,14 @@ class ParameterPanelRecordingMixin:
                     )
                     logger.info(f"录制快捷键已注册: {display_hotkey(record_key)}")
 
+                cleanup = self._unregister_record_hotkey
+                self._resources.bind_cleanup('_record_hotkey_registered', cleanup)
                 self._record_hotkey_registered = True
             else:
                 logger.warning("无法获取录制快捷键配置")
 
         except Exception as e:
+            self._unregister_record_hotkey()
             logger.error(f"注册录制快捷键失败: {e}", exc_info=True)
 
     def _unregister_record_hotkey(self):
@@ -190,16 +165,12 @@ class ParameterPanelRecordingMixin:
             if QThread.currentThread() != self.thread():
                 QTimer.singleShot(0, self, self._on_record_hotkey)
                 return
-            try:
-                from utils.instance_runtime import should_handle_hotkey
-
-                parent = getattr(self, "parent_window", None)
-                if not should_handle_hotkey(getattr(parent, "bound_windows", None) if parent else None):
-                    if parent is not None and hasattr(parent, "_notify_hotkey_routed_away"):
-                        parent._notify_hotkey_routed_away()
-                    return
-            except Exception:
-                pass
+            from utils.instance_runtime import should_handle_hotkey
+            parent = getattr(self, "parent_window", None)
+            if not should_handle_hotkey(getattr(parent, "bound_windows", None) if parent else None):
+                if parent is not None and hasattr(parent, "_notify_hotkey_routed_away"):
+                    parent._notify_hotkey_routed_away()
+                return
             if not self._is_recording_panel_active:
                 return
             parent = getattr(self, "parent_window", None)
@@ -273,11 +244,14 @@ class ParameterPanelRecordingMixin:
                     )
                     logger.info(f"回放快捷键已注册: {display_hotkey(replay_key)}")
 
+                cleanup = self._unregister_replay_hotkey
+                self._resources.bind_cleanup('_replay_hotkey_registered', cleanup)
                 self._replay_hotkey_registered = True
             else:
                 logger.warning("无法获取回放快捷键配置")
 
         except Exception as e:
+            self._unregister_replay_hotkey()
             logger.error(f"注册回放快捷键失败: {e}", exc_info=True)
 
     def _unregister_replay_hotkey(self):
@@ -302,16 +276,12 @@ class ParameterPanelRecordingMixin:
             if QThread.currentThread() != self.thread():
                 QTimer.singleShot(0, self, self._on_replay_hotkey)
                 return
-            try:
-                from utils.instance_runtime import should_handle_hotkey
-
-                parent = getattr(self, "parent_window", None)
-                if not should_handle_hotkey(getattr(parent, "bound_windows", None) if parent else None):
-                    if parent is not None and hasattr(parent, "_notify_hotkey_routed_away"):
-                        parent._notify_hotkey_routed_away()
-                    return
-            except Exception:
-                pass
+            from utils.instance_runtime import should_handle_hotkey
+            parent = getattr(self, "parent_window", None)
+            if not should_handle_hotkey(getattr(parent, "bound_windows", None) if parent else None):
+                if parent is not None and hasattr(parent, "_notify_hotkey_routed_away"):
+                    parent._notify_hotkey_routed_away()
+                return
             parent = getattr(self, "parent_window", None)
             if parent is not None and hasattr(parent, "is_hotkey_listen_enabled") and not parent.is_hotkey_listen_enabled():
                 return
@@ -378,27 +348,13 @@ class ParameterPanelRecordingMixin:
 
     def _parse_recorded_actions_payload(self, recorded_data):
         data = json.loads(recorded_data) if isinstance(recorded_data, str) else recorded_data
-        recording_area = self._REPLAY_AREA_DEFAULT
-        recording_mode = self._REPLAY_MODE_DEFAULT
-
-        if isinstance(data, dict) and 'actions' in data:
-            recording_area = data.get('recording_area', self._REPLAY_AREA_DEFAULT)
-            recording_mode = data.get('recording_mode', self._REPLAY_MODE_DEFAULT)
-            actions = data['actions']
-        elif isinstance(data, list):
-            actions = data
-        else:
-            raise ValueError('录制数据格式错误')
-
-        if not isinstance(actions, list):
-            raise ValueError('录制数据格式错误')
-
-        return {
-            'actions': actions,
-            'recording_area': recording_area,
-            'recording_mode': recording_mode,
-            'raw': recorded_data,
-        }
+        if not isinstance(data, dict) or set(data) != {'actions', 'recording_area', 'recording_mode'}:
+            raise ValueError('录制数据必须是现行结构，旧数据请先转换工程格式')
+        if not isinstance(data['actions'], list):
+            raise ValueError('录制步骤必须是列表')
+        if data['recording_area'] not in {'全屏录制', '窗口录制'} or data['recording_mode'] not in {'绝对坐标', '相对位移'}:
+            raise ValueError('录制区域或模式无效')
+        return {**data, 'raw': recorded_data}
 
     def _get_recorded_action_count(self) -> int:
         recorded_data = self.current_parameters.get('recorded_actions', '')
@@ -482,6 +438,8 @@ class ParameterPanelRecordingMixin:
 
     @Slot()
     def _on_replay_finished(self):
+        if self.sender() is not self._replay_thread:
+            return
         try:
             self._replay_active = False
             self._restore_replay_button_default_state()
@@ -492,14 +450,8 @@ class ParameterPanelRecordingMixin:
 
     @Slot()
     def _on_replay_thread_finished(self):
-        thread = getattr(self, '_replay_thread', None)
-        if not thread:
-            return
-        self._replay_thread = None
-        try:
-            thread.deleteLater()
-        except RuntimeError:
-            pass
+        if self.sender() is self._replay_thread:
+            self._replay_thread = None
 
     def _start_replay(self):
         logger.info('开始回放操作')
@@ -547,14 +499,13 @@ class ParameterPanelRecordingMixin:
         return True
 
     def _resolve_replay_runtime_options(self):
-        speed = float(self.current_parameters.get('speed', 1.0))
-        loop_count_raw = self.current_parameters.get('loop_count', 1)
-        loop_count = int(loop_count_raw) if loop_count_raw is not None else 1
-        if loop_count <= 0:
-            loop_count = 1
-        logger.info(
-            f"[测试回放] 回放参数: speed={speed}, loop_count={loop_count}, raw={loop_count_raw}"
-        )
+        import math
+        speed = float(self.current_parameters['speed'])
+        loop_count = self.current_parameters['loop_count']
+        if not math.isfinite(speed) or not 0.1 <= speed <= 10:
+            raise ValueError('回放速度必须在 0.1 到 10 之间')
+        if isinstance(loop_count, bool) or not isinstance(loop_count, int) or not 1 <= loop_count <= 1000:
+            raise ValueError('回放循环次数必须是 1 到 1000 之间的整数')
         return speed, loop_count
 
     def _start_replay_thread(
@@ -576,6 +527,7 @@ class ParameterPanelRecordingMixin:
             window_offset_y,
             recording_mode,
         )
+        self._resources.own_thread(self._replay_thread)
         self._replay_thread.finished_signal.connect(self._on_replay_finished)
         self._replay_thread.finished.connect(self._on_replay_thread_finished)
         self._replay_active = True
@@ -607,7 +559,6 @@ class ParameterPanelRecordingMixin:
 
     def _begin_recording_start_transition(self):
         self._recording_state_changing = True
-        QTimer.singleShot(3000, lambda: setattr(self, '_recording_state_changing', False))
 
     _CAPTURE_PRECISION_MAP = {
         '低 (0.2秒)': 0.2,
@@ -642,54 +593,18 @@ class ParameterPanelRecordingMixin:
             return None, True
 
     def _resolve_capture_window_context(self, recording_area: str):
-        window_rect = None
         if recording_area != '窗口录制':
-            return recording_area, window_rect, False
-
+            return recording_area, None, False
         hwnd, abort_start = self._load_capture_target_hwnd_from_config()
         if abort_start:
             return recording_area, None, True
-
         if not hwnd:
-            logger.warning('窗口录制模式但config.json中没有窗口句柄，自动切换到全屏录制模式')
-            return '全屏录制', None, False
-
-        try:
-            import win32con
-            import win32gui
-
-            if not win32gui.IsWindow(hwnd):
-                logger.warning(f'窗口句柄无效: {hwnd}，自动切换到全屏录制模式')
-                return '全屏录制', None, False
-
-            try:
-                activation_hwnd = self._activate_bound_window(hwnd, log_prefix='录制')
-                window_title = win32gui.GetWindowText(activation_hwnd)
-                logger.info(
-                    '已激活录制目标窗口 '
-                    f'(句柄={activation_hwnd}, 标题={window_title})'
-                )
-            except Exception as error:
-                logger.warning(f'激活窗口失败: {error}')
-                try:
-                    from pynput.keyboard import Controller, Key
-
-                    keyboard_controller = Controller()
-                    win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-                    keyboard_controller.press(Key.alt)
-                    win32gui.SetForegroundWindow(hwnd)
-                    keyboard_controller.release(Key.alt)
-                    time.sleep(0.2)
-                    logger.info('使用备用方法激活窗口')
-                except Exception as backup_error:
-                    logger.error(f'备用激活方法也失败: {backup_error}')
-
-            window_rect = self._resolve_bound_window_client_rect(hwnd, log_prefix='录制')
-            logger.info(f'窗口录制模式: 句柄={hwnd}, 范围={window_rect}')
-            return recording_area, window_rect, False
-        except Exception as error:
-            logger.warning(f'获取窗口信息失败: {error}，自动切换到全屏录制模式')
-            return '全屏录制', None, False
+            raise ValueError("没有可用的绑定窗口，无法进行窗口录制")
+        import win32gui
+        if not win32gui.IsWindow(hwnd):
+            raise ValueError("绑定窗口已经失效，无法进行窗口录制")
+        self._activate_bound_window(hwnd, log_prefix='录制')
+        return recording_area, self._resolve_bound_window_client_rect(hwnd, log_prefix='录制'), False
 
     def _prepare_recording_widgets_for_active_state(self):
         control_widget = self.widgets.get('record_control')
@@ -709,6 +624,7 @@ class ParameterPanelRecordingMixin:
             logger.info('录制状态下已禁用步骤编辑按钮')
 
     def _hide_windows_for_recording_capture(self):
+        self._capture_hidden = True
         self._was_panel_visible = self.isVisible()
         if self._was_panel_visible:
             self.hide()
@@ -727,7 +643,7 @@ class ParameterPanelRecordingMixin:
             from ui.recording_parts.recording_control_panel import RecordingControlPanel
 
             logger.info('准备创建录制控制浮窗...')
-            self._recording_panel = RecordingControlPanel()
+            self._recording_panel = self._own_parameter_tool(RecordingControlPanel())
             self._recording_panel.stop_requested.connect(self._stop_recording)
             if hasattr(self._record_thread, 'step_count_updated'):
                 self._record_thread.step_count_updated.connect(self._recording_panel.update_step_count)
@@ -736,6 +652,7 @@ class ParameterPanelRecordingMixin:
             logger.info('录制控制浮窗已启动')
         except Exception as error:
             logger.error(f'创建录制控制浮窗失败: {error}', exc_info=True)
+            raise RuntimeError(f'无法创建录制控制浮窗：{error}') from error
 
     def _resolve_record_hotkey(self):
         record_hotkey = None
@@ -761,7 +678,11 @@ class ParameterPanelRecordingMixin:
             recording_mode=options['recording_mode'],
             filter_record_hotkey=self._resolve_record_hotkey(),
         )
+        self._resources.own_thread(self._record_thread)
+        self._record_thread._panel_card_id = self.current_card_id
+        self._record_thread.recording_failed.connect(self._on_recording_failed)
         self._record_thread.recording_finished.connect(self._on_recording_finished)
+        self._record_thread.finished.connect(self._on_record_thread_finished)
         self._record_thread.start()
         self._recording_active = True
         self._recording_start_time = time.time()
@@ -781,6 +702,9 @@ class ParameterPanelRecordingMixin:
     def _start_recording(self):
         """启动录制"""
         try:
+            if self._record_thread is not None and self._record_thread.isRunning():
+                raise RuntimeError("上一次录制尚未结束，请等待收尾")
+            self._capture_hidden = False
             self._begin_recording_start_transition()
             logger.info('快捷键触发:开始录制')
 
@@ -798,6 +722,10 @@ class ParameterPanelRecordingMixin:
             self._show_recording_control_panel()
         except Exception as error:
             logger.error(f'启动录制失败: {error}', exc_info=True)
+            thread, self._record_thread = self._record_thread, None
+            if thread is not None and thread.isRunning():
+                thread.stop()
+            self._restore_recording_capture_ui()
             QMessageBox.critical(self, '错误', f'启动录制失败: {error}')
         finally:
             self._recording_state_changing = False
@@ -832,11 +760,11 @@ class ParameterPanelRecordingMixin:
                 return
 
             try:
-                # 获取当前录制数据（统一走回放载荷解析器，兼容新旧格式）
+                # 获取当前录制数据（仅接受现行回放载荷）
                 recorded_data = self.current_parameters.get('recorded_actions', '')
                 actions = []
-                recording_area = self._REPLAY_AREA_DEFAULT
-                recording_mode = self._REPLAY_MODE_DEFAULT
+                recording_area = self.current_parameters['recording_area']
+                recording_mode = self.current_parameters['recording_mode']
 
                 if recorded_data:
                     try:
@@ -857,20 +785,13 @@ class ParameterPanelRecordingMixin:
                 editor = ActionEditorDialog(actions, recording_area, self, recording_mode)
 
                 # 连接信号
-                def on_actions_updated(updated_actions):
+                def on_actions_updated(updated_actions, area=recording_area, mode=recording_mode, card_id=self.current_card_id, workflow_identity=self._runtime_workflow_identity):
                     """步骤更新回调"""
                     try:
-                        # 保留原有的recording_area和recording_mode信息（如果存在）
+                        if self.current_card_id != card_id or self._runtime_workflow_identity != workflow_identity:
+                            return
                         import json
-                        recording_area = '全屏录制'  # 默认值
-                        recording_mode = '绝对坐标'  # 默认值
-                        if recorded_data:
-                            original_data = json.loads(recorded_data)
-                            if isinstance(original_data, dict):
-                                if 'recording_area' in original_data:
-                                    recording_area = original_data['recording_area']
-                                if 'recording_mode' in original_data:
-                                    recording_mode = original_data['recording_mode']
+                        recording_area, recording_mode = area, mode
 
                         # 创建包含元数据的新格式
                         recording_data = {
@@ -917,11 +838,12 @@ class ParameterPanelRecordingMixin:
 
                 self._action_editor = editor
                 try:
-                    result = editor.exec()
+                    from ui.dialogs.dialog_manager import exec_dialog
+                    result = exec_dialog(editor)
                 finally:
                     self._action_editor = None
 
-                if result == editor.DialogCode.Accepted:
+                if result == QDialog.DialogCode.Accepted:
                     logger.info("步骤编辑已保存")
                 else:
                     logger.info("步骤编辑已取消")
@@ -932,79 +854,46 @@ class ParameterPanelRecordingMixin:
                 QMessageBox.critical(self, "错误", f"打开步骤编辑器失败: {e}")
 
     def _on_recording_finished(self, actions):
-            """录制完成回调"""
-            try:
-                logger.info(f"录制完成回调触发，收到 {len(actions)} 个操作")
+        thread = self._record_thread
+        if thread is None or self.sender() is not thread or thread._panel_card_id != self.current_card_id:
+            return
+        self._restore_recording_capture_ui()
+        if actions:
+            payload = {'recording_area': thread.recording_area, 'recording_mode': thread.recording_mode, 'actions': actions}
+            self.current_parameters['recorded_actions'] = json.dumps(payload, ensure_ascii=False)
+            self.parameters_changed.emit(self.current_card_id, self.current_parameters.copy())
+        count = self._get_recorded_action_count()
+        for name, text in (('record_control', '开始录制'), ('replay_control', f'测试回放 ({count}个操作)' if count else '测试回放'), ('edit_actions', f'编辑步骤 ({count}个)' if count else '编辑步骤')):
+            widget = self.widgets.get(name)
+            if widget is not None:
+                widget.setText(text)
+                widget.setEnabled(True)
+                widget.setProperty('class', 'primary' if name != 'edit_actions' else 'secondary')
 
-                # 隐藏浮窗
-                if hasattr(self, '_recording_panel') and self._recording_panel:
-                    self._recording_panel.stop_recording()
-                    logger.info("已隐藏录制控制浮窗")
+    def _on_record_thread_finished(self):
+        if self.sender() is self._record_thread:
+            self._record_thread = None
+            self._recording_active = False
 
-                # 恢复参数面板和主窗口
-                if hasattr(self, '_was_panel_visible') and self._was_panel_visible:
-                    show_and_raise_widget(self, log_prefix='参数面板恢复')
-                    logger.info("已恢复参数面板可见性")
+    def _restore_recording_capture_ui(self):
+        self._recording_active = False
+        self._recording_state_changing = False
+        panel = getattr(self, "_recording_panel", None)
+        self._recording_panel = None
+        if panel is not None:
+            panel.stop_recording()
+            panel.close()
+            panel.deleteLater()
+        if not getattr(self, "_capture_hidden", False):
+            return
+        self._capture_hidden = False
+        if self._was_panel_visible:
+            show_and_raise_widget(self, log_prefix="录制结束")
+        if self._main_window is not None and self._was_main_window_visible:
+            show_and_raise_widget(self._main_window, log_prefix="录制结束")
 
-                if hasattr(self, '_main_window') and self._main_window and hasattr(self, '_was_main_window_visible') and self._was_main_window_visible:
-                    show_and_raise_widget(self._main_window, log_prefix='主窗口恢复')
-                    logger.info("已恢复主窗口可见性")
-
-                # 清除录制状态
-                self._recording_active = False
-                self._recording_state_changing = False
-
-                # 录制阶段已经根据精度参数控制了记录频率，这里不需要再优化
-                # 直接使用录制的数据
-                optimized_actions = actions
-
-                # 保存数据（包含录制区域信息）
-                import json
-
-                # 创建包含元数据的录制数据结构
-                recording_data = {
-                    'recording_area': self.current_parameters.get('recording_area', '全屏录制'),
-                    'recording_mode': self.current_parameters.get('recording_mode', '绝对坐标'),
-                    'actions': optimized_actions
-                }
-
-                json_data = json.dumps(recording_data, ensure_ascii=False)
-                self.current_parameters['recorded_actions'] = json_data
-
-                # 更新录制按钮 - 恢复原始样式
-                control_widget = self.widgets.get('record_control')
-                if control_widget:
-                    control_widget.setText(f"录制完成 ({len(optimized_actions)}个操作)")
-                    control_widget.setProperty("class", "primary")
-                    control_widget.setEnabled(True)  # 重新启用按钮
-
-                # 更新回放按钮 - 显示最新的操作数量
-                replay_widget = self.widgets.get('replay_control')
-                if replay_widget:
-                    replay_widget.setText(f"测试回放 ({len(optimized_actions)}个操作)")
-                    replay_widget.setEnabled(True)  # 录制完成后重新启用回放按钮
-                    logger.info("录制完成，已重新启用回放按钮")
-
-                # 更新编辑步骤按钮 - 显示最新的操作数量
-                edit_widget = self.widgets.get('edit_actions')
-                if edit_widget:
-                    edit_widget.setText(f"编辑步骤 ({len(optimized_actions)}个)")
-                    edit_widget.setEnabled(True)  # 录制完成后重新启用编辑步骤按钮
-                    logger.info("录制完成，已重新启用步骤编辑按钮")
-
-                # 发送参数更改信号
-                self.parameters_changed.emit(self.current_card_id, self.current_parameters.copy())
-
-                # 统计信息
-                mouse_moves = sum(1 for a in optimized_actions if a['type'] == 'mouse_move')
-                mouse_moves_relative = sum(1 for a in optimized_actions if a['type'] == 'mouse_move_relative')
-                mouse_clicks = sum(1 for a in optimized_actions if a['type'] == 'mouse_click')
-                key_presses = sum(1 for a in optimized_actions if a['type'] == 'key_press')
-                area_text = self.current_parameters.get('recording_area', '全屏录制')
-                mode_text = self.current_parameters.get('recording_mode', '绝对坐标')
-                logger.info(f"录制完成 ({area_text}, {mode_text}), 共{len(optimized_actions)}个操作 (绝对移动:{mouse_moves}, 相对移动:{mouse_moves_relative}, 点击:{mouse_clicks}, 按键:{key_presses})")
-
-                self._recording_active = False
-
-            except Exception as e:
-                logger.error(f"处理录制完成失败: {e}", exc_info=True)
+    def _on_recording_failed(self, message):
+        if self.sender() is not self._record_thread:
+            return
+        self._restore_recording_capture_ui()
+        QMessageBox.warning(self, "录制失败", message)

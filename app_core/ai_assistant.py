@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 
 DEFAULT_BASE_URL = "https://lcaa.xyz/v1"
-DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_MODEL = "gpt-6.1-sol"
 MAX_PROMPT_CHARS = 12000
 MAX_AI_IMAGES_PER_TURN = 4
 MAX_AI_WORKFLOW_FILES_PER_TURN = 2
@@ -62,8 +62,6 @@ _LINE_TYPE_LABELS = {
     "failure": "失败",
     "random": "随机",
 }
-AI_REQUEST_ATTEMPTS = 3
-_RETRY_BACKOFF_SECONDS = (0.4, 1.2)
 _RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _RETRYABLE_TEXT = (
     "remote end closed",
@@ -75,15 +73,13 @@ _RETRYABLE_TEXT = (
     "eof occurred",
 )
 _CACHE_LOCK = threading.RLock()
-_RESPONSE_CACHE: Dict[str, tuple[float, str]] = {}
+_RESPONSE_CACHE: Dict[str, tuple[float, str, str]] = {}
 AI_CACHE_TTL_SECONDS = 900
 AI_CACHE_MAX_ENTRIES = 64
-AI_CACHE_SCHEMA_VERSION = "4"
+AI_CACHE_SCHEMA_VERSION = "5-stream"
 _CACHE_HITS = 0
 _CACHE_MISSES = 0
 AI_TOOL_ROUNDS = 20
-STOP_SEARCH_PROMPT = "不要再调用工具。根据已经查阅的开源仓库源码给出审查结论。"
-SEARCH_LIMIT_REPLY = "已停止继续搜索开源仓库。下面是本次查阅过程，请据此继续提问。"
 AI_REPO_TOOLS = [
     {
         "type": "function",
@@ -120,8 +116,30 @@ AI_REPO_TOOLS = [
         },
     },
 ]
+AI_REPO_TOOLS.extend([
+    {"type": "function", "function": {
+        "name": "update_plan", "description": "复杂任务开始时列出计划，完成步骤后更新状态。只展示真实进度。",
+        "parameters": {"type": "object", "properties": {"steps": {
+            "type": "array", "minItems": 1, "maxItems": 7,
+            "items": {"type": "object", "properties": {
+                "step": {"type": "string"},
+                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+            }, "required": ["step", "status"], "additionalProperties": False},
+        }}, "required": ["steps"], "additionalProperties": False},
+    }},
+    {"type": "function", "function": {
+        "name": "validate_workflow", "description": "对本次提交的工作流快照校验修正方案，只校验不写入画布或磁盘。返回结构校验结果，不代表实际运行成功。",
+        "parameters": {"type": "object", "properties": {
+            "proposal": {"type": "string", "description": "工作流代码块中的完整 JSON 对象文本"},
+        }, "required": ["proposal"], "additionalProperties": False},
+    }},
+])
 _CHAT_SYSTEM_PROMPT = (
     "你是 LCA 的 AI 助手。"
+    "你按任务循环工作：复杂请求先用 update_plan 列计划，边查证边简短说明进展，完成步骤后更新计划。"
+    "工作流修正必须先用 validate_workflow 校验，失败则修正后重试；没有可用快照就明确说明未知。"
+    "结构校验通过不代表真实运行通过。工具没有的权限和能力不得假装拥有。"
+    "不要输出隐藏思维链，只给必要的执行说明、工具结果摘要和结论。"
     "卡片参数、端口、脚本命令和现行格式以开源仓库的现行源码为准，不要使用过时说明或记忆。"
     "卡片、参数和脚本命令以本机缓存的开源仓库源码为准。"
     "search_repo 和 read_repo_file 只读本机缓存，不会每次对话都重新下载仓库。"
@@ -139,6 +157,8 @@ _CHAT_SYSTEM_PROMPT = (
     "上传的工作流格式有误时，按「用户上传的工作流」给出修正；点应用后写入当前正在编辑的工作流。"
     "需要改画布时，必须输出一个语言标记为 工作流 的代码块，内容是只含 ops 数组的 JSON；"
     "未改动的卡片不要写进 ops。不要编造已删除的卡片名、参数名、命令或旧别名。"
+    "新增卡片按 200×60 场景单位规划位置，任何新增卡片都不能与已有卡片或其他新增卡片重叠；"
+    "新增两张及以上卡片时，pos_x 不能全部相同，pos_y 也不能全部相同，避免排成一条横线或竖线。"
     "禁止把卡片输出连到自己；循环必须经过另一张有输入口的卡片再连回来。"
     "用户点击「应用」后才会写入当前正在编辑的工作流；未点击前画布不变。"
     "用户点击「下载」会把修正后的工作流存成 .lca 文件，不改磁盘上的原文件，也不写入画布。"
@@ -160,13 +180,14 @@ _UPLOADED_KIND_LABELS = {
 _UNSUPPORTED_WORKFLOW_FILE = "只支持上传 .json 或 .lca 工作流文件"
 
 
-def _cache_key(config: AIProviderConfig, messages: Iterable[Mapping[str, Any]]) -> str:
+def _cache_key(config: AIProviderConfig, messages: Iterable[Mapping[str, Any]], tool_context=None) -> str:
     payload = {
         "schema": AI_CACHE_SCHEMA_VERSION,
         "endpoint": config.endpoint(),
-        "model": str(config.model or DEFAULT_MODEL),
+        "model": _required_ai_model(config.model),
         "tools": [str(item["function"]["name"]) for item in AI_REPO_TOOLS],
         "messages": [_api_chat_message(item) for item in messages],
+        "tool_context": tool_context,
     }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -183,8 +204,8 @@ def ai_response_cache_stats() -> Dict[str, int]:
     """Return cache size for diagnostics without exposing cached content."""
     now = time.time()
     with _CACHE_LOCK:
-        expired = [key for key, (stamp, _) in _RESPONSE_CACHE.items()
-                   if now - stamp >= AI_CACHE_TTL_SECONDS]
+        expired = [key for key, value in _RESPONSE_CACHE.items()
+                   if now - value[0] >= AI_CACHE_TTL_SECONDS]
         for key in expired:
             _RESPONSE_CACHE.pop(key, None)
         return {"entries": len(_RESPONSE_CACHE), "max_entries": AI_CACHE_MAX_ENTRIES,
@@ -203,22 +224,31 @@ def load_ai_provider_settings() -> Dict[str, Any]:
         from utils.instance_runtime import create_app_settings
 
         settings = create_app_settings()
-        saved_base_url = str(settings.value("ai/base_url", "") or "").strip()
-        values["base_url"] = normalize_ai_base_url(saved_base_url or DEFAULT_BASE_URL)
-        saved_model = str(settings.value("ai/model", "") or "").strip()
-        values["model"] = saved_model or DEFAULT_MODEL
-        values["api_key"] = str(settings.value("ai/api_key", ""))
+        saved_base_url = settings.value("ai/base_url", DEFAULT_BASE_URL)
+        if not isinstance(saved_base_url, str):
+            raise ValueError("服务地址设置必须是文本")
+        values["base_url"] = normalize_ai_base_url(saved_base_url) if saved_base_url.strip() else ""
+        saved_model = settings.value("ai/model", DEFAULT_MODEL)
+        if not isinstance(saved_model, str):
+            raise ValueError("模型设置必须是文本")
+        values["model"] = saved_model.strip()
+        saved_api_key = settings.value("ai/api_key", "")
+        if not isinstance(saved_api_key, str):
+            raise ValueError("API Key 设置必须是文本")
+        values["api_key"] = saved_api_key
         values["timeout"] = int(settings.value("ai/timeout", values["timeout"]))
-    except Exception:
-        pass
+        if values["timeout"] <= 0:
+            raise ValueError("AI 服务超时必须为正整数秒")
+    except Exception as exc:
+        raise ValueError(f"无法读取 AI 服务设置：{exc}") from exc
     return values
 
 
 def normalize_ai_base_url(base_url: str) -> str:
-    """Append /v1 when missing. Keep an existing /v1. Empty falls back to default."""
-    base = str(base_url or "").strip()
-    if not base:
-        return DEFAULT_BASE_URL
+    """补全 /v1；显式空地址必须失败，不能改用默认服务。"""
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError("请先填写有效的 AI 服务地址，不能自动使用默认服务")
+    base = base_url.strip()
     base = base.rstrip("/")
     completions = "/chat/completions"
     if base.endswith(completions):
@@ -237,11 +267,16 @@ def save_ai_provider_settings(
 ) -> None:
     from utils.instance_runtime import create_app_settings
 
+    if not all(isinstance(value, str) for value in (base_url, model, api_key)):
+        raise ValueError("AI 服务地址、模型和 API Key 必须是文本")
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError("AI 服务超时必须为正整数秒")
+    saved_base_url = normalize_ai_base_url(base_url) if base_url.strip() else ""
     settings = create_app_settings()
-    settings.setValue("ai/base_url", normalize_ai_base_url(base_url))
-    settings.setValue("ai/model", str(model or "").strip())
-    settings.setValue("ai/api_key", str(api_key or ""))
-    settings.setValue("ai/timeout", int(timeout or 90))
+    settings.setValue("ai/base_url", saved_base_url)
+    settings.setValue("ai/model", model.strip())
+    settings.setValue("ai/api_key", api_key)
+    settings.setValue("ai/timeout", timeout)
 
 
 @dataclass(frozen=True)
@@ -270,7 +305,7 @@ def _format_ai_http_error(status_code: int, detail: str) -> str:
 def model_supports_temperature(model: str) -> bool:
     """Newer chat/reasoning models often reject a custom temperature."""
     name = str(model or "").strip().lower()
-    return not name.startswith(("gpt-5", "o1", "o3", "o4"))
+    return name != "gpt-6.1-sol" and not name.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 def attachable_image_mime(path: str = "", *, mime: str = "") -> str:
@@ -508,7 +543,7 @@ def uploaded_workflow_for_apply(files: Optional[Sequence[Mapping[str, Any]]] = N
     snapshot = inspect_uploaded_workflow_file(path, display_name=name)
     if snapshot.get("status") == "ok" and isinstance(snapshot.get("workflow"), dict):
         return dict(snapshot["workflow"])
-    return {"cards": [], "connections": []}
+    raise ValueError("上传的工作流无法解析，不能用空工作流替代。请提供有效的工作流文件后重新审查。")
 
 
 def proposal_source_workflow(
@@ -648,6 +683,12 @@ def _api_chat_message(item: Mapping[str, Any]) -> Dict[str, Any]:
     return message
 
 
+def _required_ai_model(model: str) -> str:
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("请先选择或填写模型，不能自动使用默认模型")
+    return model.strip()
+
+
 def build_chat_payload(
     config: AIProviderConfig,
     messages: Iterable[Mapping[str, Any]],
@@ -655,10 +696,11 @@ def build_chat_payload(
     include_temperature: Optional[bool] = None,
     tools: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    model = str(config.model or DEFAULT_MODEL).strip()
+    model = _required_ai_model(config.model)
     payload: Dict[str, Any] = {
         "model": model,
         "messages": [_api_chat_message(item) for item in messages],
+        "stream": True,
     }
     if include_temperature if include_temperature is not None else model_supports_temperature(model):
         payload["temperature"] = 0.2
@@ -671,7 +713,7 @@ def _ai_request_headers(api_key: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {str(api_key).strip()}",
         "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json",
+        "Accept": "text/event-stream",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Accept-Encoding": "identity",
         "Connection": "close",
@@ -710,11 +752,6 @@ def is_retryable_ai_error(exc: BaseException) -> bool:
     return any(token in text for token in _RETRYABLE_TEXT)
 
 
-def _temperature_rejected(status_code: int, detail: str) -> bool:
-    if int(status_code) not in {400, 422}:
-        return False
-    text = str(detail or "").lower()
-    return "temperature" in text
 
 
 def format_ai_transport_error(exc: BaseException) -> str:
@@ -739,77 +776,6 @@ def _read_http_error_detail(exc: urllib.error.HTTPError) -> str:
         return ""
 
 
-def _post_chat_request(
-    request: urllib.request.Request,
-    timeout: int,
-    opener: Callable[..., Any],
-) -> str:
-    with opener(request, timeout=timeout) as response:
-        return response.read().decode("utf-8")
-
-
-def _parse_chat_completion(raw: str) -> str:
-    parsed = _parse_chat_message(raw)
-    if parsed["tool_calls"]:
-        raise RuntimeError("AI 服务响应包含未处理的工具调用")
-    return parsed["content"]
-
-
-def _text_from_parts(parts: Any, *, kinds: Sequence[str]) -> str:
-    chunks: List[str] = []
-    if not isinstance(parts, list):
-        return ""
-    allowed = {str(item) for item in kinds}
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
-        kind = str(part.get("type") or "text").strip() or "text"
-        if kind not in allowed:
-            continue
-        piece = str(part.get("text") or part.get("content") or part.get("thinking") or "")
-        if piece.strip():
-            chunks.append(piece)
-    return "\n".join(chunks).strip()
-
-
-def _message_reasoning(message: Mapping[str, Any]) -> str:
-    for key in ("reasoning_content", "reasoning"):
-        value = message.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        if isinstance(value, dict):
-            text = str(value.get("text") or value.get("content") or "").strip()
-            if text:
-                return text
-        if isinstance(value, list):
-            text = _text_from_parts(value, kinds=("text", "output_text", "reasoning", "thinking"))
-            if text:
-                return text
-    content = message.get("content")
-    return _text_from_parts(content, kinds=("reasoning", "thinking"))
-
-
-def _parse_chat_message(raw: str) -> Dict[str, Any]:
-    try:
-        data = json.loads(raw)
-        message = data["choices"][0]["message"]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("AI 服务响应不是有效的 chat-completions 格式") from exc
-    if not isinstance(message, dict):
-        raise RuntimeError("AI 服务响应不是有效的 chat-completions 格式")
-    content = message.get("content")
-    if isinstance(content, list):
-        text = _text_from_parts(content, kinds=("text", "output_text"))
-    else:
-        text = str(content or "").strip()
-    reasoning = _message_reasoning(message)
-    tool_calls = message.get("tool_calls")
-    if not isinstance(tool_calls, list):
-        tool_calls = []
-    tool_calls = [item for item in tool_calls if isinstance(item, dict)]
-    if not text and not tool_calls:
-        raise RuntimeError("AI 返回了空内容")
-    return {"content": text, "reasoning": reasoning, "tool_calls": tool_calls}
 
 
 def _tool_arguments(raw: Any) -> Dict[str, Any]:
@@ -841,8 +807,16 @@ def _tool_result_key(name: str, payload: Mapping[str, Any]) -> str:
     )
 
 
-def execute_ai_tool(name: str, arguments: Any) -> str:
+def execute_ai_tool(name: str, arguments: Any, *, opener=None, cancel=None) -> str:
+    from app_core.ai_repo import ensure_source_repository
+
     payload = _tool_arguments(arguments)
+    if name not in {"search_repo", "read_repo_file"}:
+        raise ValueError(f"未知工具：{name}")
+    required = {"query"} if name == "search_repo" else {"path"}
+    if set(payload) != required:
+        raise ValueError("仓库工具参数字段无效")
+    ensure_source_repository(opener=opener, cancel=cancel)
     cache_key = _tool_result_key(name, payload)
     with _TOOL_RESULT_LOCK:
         cached = _TOOL_RESULTS.get(cache_key)
@@ -854,14 +828,14 @@ def execute_ai_tool(name: str, arguments: Any) -> str:
             raise ValueError("缺少参数：query")
         from app_core.ai_repo import search_source_repository
 
-        result = search_source_repository(keyword)
+        result = search_source_repository(keyword, opener=opener, cancel=cancel)
     elif name == "read_repo_file":
         path = str(payload.get("path") or "").strip()
         if not path:
             raise ValueError("缺少参数：path")
         from app_core.ai_repo import read_source_repository_file
 
-        result = read_source_repository_file(path)
+        result = read_source_repository_file(path, opener=opener, cancel=cancel)
     else:
         raise ValueError(f"未知工具：{name}")
     with _TOOL_RESULT_LOCK:
@@ -871,18 +845,10 @@ def execute_ai_tool(name: str, arguments: Any) -> str:
     return result
 
 
-def _run_tool_call(call: Mapping[str, Any]) -> str:
-    function = call.get("function") if isinstance(call.get("function"), Mapping) else call
-    name = str((function or {}).get("name") or "").strip()
-    arguments = (function or {}).get("arguments")
-    try:
-        return execute_ai_tool(name, arguments)
-    except Exception as exc:
-        return str(exc)
 
 
 def describe_tool_call(call: Mapping[str, Any]) -> str:
-    function = call.get("function") if isinstance(call.get("function"), Mapping) else call
+    function = call["function"]
     name = str((function or {}).get("name") or "").strip()
     try:
         payload = _tool_arguments((function or {}).get("arguments"))
@@ -894,91 +860,40 @@ def describe_tool_call(call: Mapping[str, Any]) -> str:
     if name == "read_repo_file":
         path = str(payload.get("path") or "").strip()
         return f"读取仓库文件：{path}" if path else "读取仓库文件"
+    if name == "update_plan":
+        return "更新任务计划"
+    if name == "validate_workflow":
+        return "校验工作流修正方案"
     return f"调用工具：{name or '未知'}"
 
 
-def _post_chat_round(
-    config: AIProviderConfig,
-    messages: Sequence[Mapping[str, Any]],
-    *,
-    timeout: int,
-    post: Callable[..., Any],
-    include_temperature: bool,
-    tools: Optional[Sequence[Mapping[str, Any]]] = AI_REPO_TOOLS,
-) -> Tuple[Dict[str, Any], bool]:
-    last_error: Optional[BaseException] = None
-    temperature = include_temperature
-    for attempt in range(AI_REQUEST_ATTEMPTS):
-        payload = build_chat_payload(
-            config,
-            messages,
-            include_temperature=temperature,
-            tools=tools,
-        )
-        request = urllib.request.Request(
-            config.endpoint(),
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=_ai_request_headers(str(config.api_key)),
-            method="POST",
-        )
-        try:
-            parsed = _parse_chat_message(_post_chat_request(request, timeout, post))
-            return parsed, temperature
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            detail = _read_http_error_detail(exc)
-            if temperature and _temperature_rejected(exc.code, detail):
-                temperature = False
-                continue
-            if is_retryable_ai_error(exc) and attempt + 1 < AI_REQUEST_ATTEMPTS:
-                time.sleep(_RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)])
-                continue
-            raise RuntimeError(_format_ai_http_error(exc.code, detail)) from exc
-        except Exception as exc:
-            last_error = exc
-            if is_retryable_ai_error(exc) and attempt + 1 < AI_REQUEST_ATTEMPTS:
-                time.sleep(_RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)])
-                continue
-            raise RuntimeError(format_ai_transport_error(exc)) from exc
-    raise RuntimeError(format_ai_transport_error(last_error or RuntimeError("未知网络错误")))
+def validate_ai_workflow_proposal(proposal: str, context: Mapping[str, Any]) -> str:
+    from app_core.ai_workflow import build_workflow_from_proposal
+
+    if not isinstance(context.get("workflow"), Mapping):
+        raise ValueError("本次任务没有可校验的工作流快照，不能确认方案有效")
+    task_types = context.get("task_types")
+    if not isinstance(task_types, list) or not task_types:
+        raise ValueError("本次任务没有现行卡片目录，不能校验方案")
+    workflow = build_workflow_from_proposal(proposal, context["workflow"], known_task_types=task_types)
+    return f"结构校验通过：{len(workflow['cards'])} 张卡片、{len(workflow['connections'])} 条连线；未执行、未写入画布或磁盘"
 
 
-def _apply_tool_calls(
-    working: List[Mapping[str, Any]],
-    parsed: Mapping[str, Any],
-    *,
-    progress: Optional[Callable[[str], None]],
-    thinking: List[str],
-) -> None:
-    reasoning = str(parsed.get("reasoning") or "").strip()
-    if reasoning:
-        thinking.append(reasoning)
-        if progress:
-            progress(reasoning.splitlines()[0][:80])
-    content = str(parsed.get("content") or "").strip()
-    if content:
-        thinking.append(content)
-    assistant: Dict[str, Any] = {
-        "role": "assistant",
-        "content": parsed.get("content") or None,
-        "tool_calls": list(parsed.get("tool_calls") or []),
-    }
-    working.append(assistant)
-    for call in list(parsed.get("tool_calls") or []):
-        call_id = str(call.get("id") or "").strip()
-        if not call_id:
-            raise RuntimeError("AI 工具调用缺少 id")
-        line = describe_tool_call(call)
-        thinking.append(line)
-        if progress:
-            progress(line)
-        working.append(
-            {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": _run_tool_call(call),
-            }
-        )
+def _plan_steps(payload: Mapping[str, Any]) -> List[Dict[str, str]]:
+    if set(payload) != {"steps"} or not isinstance(payload["steps"], list) or not 1 <= len(payload["steps"]) <= 7:
+        raise ValueError("计划必须包含 1 到 7 个步骤")
+    steps = []
+    for item in payload["steps"]:
+        if not isinstance(item, dict) or set(item) != {"step", "status"}:
+            raise ValueError("计划步骤字段无效")
+        if not isinstance(item["step"], str) or not item["step"].strip() or len(item["step"]) > 120:
+            raise ValueError("计划步骤必须是 1 到 120 字的文本")
+        if item["status"] not in {"pending", "in_progress", "completed"}:
+            raise ValueError("计划步骤状态无效")
+        steps.append(dict(item))
+    if sum(item["status"] == "in_progress" for item in steps) > 1:
+        raise ValueError("计划只能有一个进行中的步骤")
+    return steps
 
 
 def complete_ai_chat(
@@ -988,83 +903,130 @@ def complete_ai_chat(
     opener: Optional[Callable[..., Any]] = None,
     use_cache: bool = True,
     progress: Optional[Callable[[str], None]] = None,
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    cancel=None,
+    tool_context: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[str, str]:
-    """Call chat-completions, run repo tools, and return (answer, thinking)."""
+    """Run one cancellable, streaming task; never downgrade its transport or tools."""
+    from app_core.ai_stream import (
+        AICancellation, AIRequestCancelled, ChatStreamDecoder, MAX_STREAM_BYTES,
+        repository_opener, request_http,
+    )
+
     if not str(config.api_key or "").strip():
         raise ValueError("请先填写 API Key")
-    message_list = list(messages)
-    key = _cache_key(config, message_list) if (use_cache and opener is None) else ""
+    cancel = cancel if cancel is not None else AICancellation()
+    cancel.check()
+    working = list(messages)
+    key = _cache_key(config, working, tool_context) if use_cache else ""
     if key:
         global _CACHE_HITS, _CACHE_MISSES
         with _CACHE_LOCK:
             cached = _RESPONSE_CACHE.get(key)
             if cached and time.time() - cached[0] < AI_CACHE_TTL_SECONDS:
                 _CACHE_HITS += 1
-                text = cached[1]
-                thinking = cached[2] if len(cached) > 2 else ""
-                return text, str(thinking or "")
+                if on_event:
+                    on_event({"type": "content", "text": cached[1]})
+                return cached[1], cached[2]
             _CACHE_MISSES += 1
             _RESPONSE_CACHE.pop(key, None)
-    timeout = max(5, int(config.timeout))
-    post = opener or urllib.request.urlopen
-    include_temperature = model_supports_temperature(str(config.model or DEFAULT_MODEL))
-    if opener is None:
-        from app_core.ai_repo import ensure_source_repository, repo_snapshot_ready
+    transcript = []
+    total_chars = 0
 
-        if not repo_snapshot_ready() and progress:
-            progress("正在下载开源仓库缓存…")
-        ensure_source_repository()
-    working: List[Mapping[str, Any]] = list(message_list)
-    thinking: List[str] = []
-    tool_rounds = 0
-    while True:
-        parsed, include_temperature = _post_chat_round(
-            config,
-            working,
-            timeout=timeout,
-            post=post,
-            include_temperature=include_temperature,
-            tools=AI_REPO_TOOLS,
+    def emit(event):
+        nonlocal total_chars
+        cancel.check()
+        if event["type"] == "content":
+            total_chars += len(event["text"])
+            if total_chars > MAX_STREAM_BYTES:
+                raise RuntimeError("本次任务累计回复超过大小上限")
+        if on_event:
+            on_event(event)
+        if progress and event.get("text") and event["type"] != "content":
+            progress(event["text"])
+
+    repo_post = repository_opener(cancel)
+    for round_number in range(1, AI_TOOL_ROUNDS + 1):
+        cancel.check()
+        emit({"type": "round", "round": round_number, "text": f"正在处理第 {round_number} 轮…"})
+        decoder = ChatStreamDecoder(emit)
+        request = urllib.request.Request(
+            config.endpoint(),
+            data=json.dumps(build_chat_payload(config, working, tools=AI_REPO_TOOLS), ensure_ascii=False).encode("utf-8"),
+            headers=_ai_request_headers(config.api_key), method="POST",
         )
-        tool_calls = parsed["tool_calls"]
-        if not tool_calls:
-            reasoning = str(parsed.get("reasoning") or "").strip()
-            if reasoning:
-                thinking.append(reasoning)
-            result = parsed["content"]
-            packed = "\n".join(item for item in thinking if item).strip()
+        try:
+            if opener is None:
+                request_http(request, timeout=config.timeout, cancel=cancel,
+                             consume=decoder.feed, max_bytes=MAX_STREAM_BYTES)
+            else:
+                with opener(request, timeout=config.timeout) as response:
+                    if response.headers.get_content_type() != "text/event-stream":
+                        raise RuntimeError("AI 服务没有返回要求的流式响应")
+                    while True:
+                        cancel.check()
+                        chunk = response.read(4096)
+                        if not chunk:
+                            break
+                        decoder.feed(chunk)
+            parsed = decoder.finish()
+        except AIRequestCancelled:
+            raise
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = _read_http_error_detail(exc)
+            finally:
+                exc.close()
+            raise RuntimeError(_format_ai_http_error(exc.code, detail)) from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise RuntimeError(format_ai_transport_error(exc)) from exc
+        cancel.check()
+        if parsed["content"]:
+            transcript.append(parsed["content"])
+        calls = parsed["tool_calls"]
+        if not calls:
+            from app_core.ai_chat_format import iter_message_segments, WORKFLOW_FENCE_LANGUAGE
+
+            result = "\n\n".join(transcript)
+            for kind, language, body in iter_message_segments(result):
+                if kind == "fence" and language == WORKFLOW_FENCE_LANGUAGE:
+                    emit({"type": "status", "text": "正在校验最终工作流方案…"})
+                    validation = validate_ai_workflow_proposal(body, tool_context or {})
+                    emit({"type": "status", "text": validation})
             if key:
                 with _CACHE_LOCK:
-                    _RESPONSE_CACHE[key] = (time.time(), result, packed)
+                    _RESPONSE_CACHE[key] = (time.time(), result, "")
                     while len(_RESPONSE_CACHE) > AI_CACHE_MAX_ENTRIES:
                         _RESPONSE_CACHE.pop(next(iter(_RESPONSE_CACHE)))
-            return result, packed
-        _apply_tool_calls(working, parsed, progress=progress, thinking=thinking)
-        tool_rounds += 1
-        if tool_rounds < AI_TOOL_ROUNDS:
-            continue
-        if progress:
-            progress("正在根据已查阅的源码给出结论…")
-        working.append({"role": "user", "content": STOP_SEARCH_PROMPT})
-        parsed, include_temperature = _post_chat_round(
-            config,
-            working,
-            timeout=timeout,
-            post=post,
-            include_temperature=include_temperature,
-            tools=None,
-        )
-        reasoning = str(parsed.get("reasoning") or "").strip()
-        if reasoning:
-            thinking.append(reasoning)
-        result = str(parsed.get("content") or "").strip() or SEARCH_LIMIT_REPLY
-        packed = "\n".join(item for item in thinking if item).strip()
-        if key:
-            with _CACHE_LOCK:
-                _RESPONSE_CACHE[key] = (time.time(), result, packed)
-                while len(_RESPONSE_CACHE) > AI_CACHE_MAX_ENTRIES:
-                    _RESPONSE_CACHE.pop(next(iter(_RESPONSE_CACHE)))
-        return result, packed
+            return result, ""
+        working.append({"role": "assistant", "content": parsed["content"] or None, "tool_calls": calls})
+        for call in calls:
+            cancel.check()
+            label = describe_tool_call(call)
+            emit({"type": "tool_start", "id": call["id"], "text": label})
+            try:
+                name = call["function"]["name"]
+                payload = _tool_arguments(call["function"]["arguments"])
+                if name == "update_plan":
+                    steps = _plan_steps(payload)
+                    emit({"type": "plan", "steps": steps})
+                    result = "计划已更新"
+                elif name == "validate_workflow":
+                    if set(payload) != {"proposal"} or not isinstance(payload["proposal"], str):
+                        raise ValueError("校验工具必须提供 proposal 文本")
+                    result = validate_ai_workflow_proposal(payload["proposal"], tool_context or {})
+                else:
+                    result = execute_ai_tool(name, payload, opener=repo_post, cancel=cancel)
+                cancel.check()
+                emit({"type": "tool_end", "id": call["id"], "text": label + "（已完成）"})
+            except AIRequestCancelled:
+                raise
+            except Exception as exc:
+                cancel.check()
+                result = f"工具执行失败：{exc}"
+                emit({"type": "tool_error", "id": call["id"], "text": label + "：" + result})
+            working.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+    raise RuntimeError(f"已达到 {AI_TOOL_ROUNDS} 轮任务上限，任务未完成；请缩小范围后继续，不会关闭工具强行生成结论")
 
 
 def chat_completion(
@@ -1801,7 +1763,7 @@ def _read_resource_text(path: str, kind: str) -> str:
     if kind not in {"dict", "replay"} and not (kind == "component" and ext == ".py"):
         return ""
     with open(path, "r", encoding="utf-8") as handle:
-        return _truncate_context_text(handle.read(), MAX_RESOURCE_TEXT_CHARS)
+        return _truncate_context_text(handle.read(MAX_RESOURCE_TEXT_CHARS + 1), MAX_RESOURCE_TEXT_CHARS)
 
 
 def _inspect_workflow_file(path: str, kind: str) -> Dict[str, Any]:
@@ -1840,6 +1802,8 @@ def _inspect_workflow_file(path: str, kind: str) -> Dict[str, Any]:
 def collect_workflow_resources(
     workflow: Optional[Mapping[str, Any]],
     dirs: Optional[Mapping[str, str]] = None,
+    *,
+    cancel=None,
 ) -> List[Dict[str, Any]]:
     from task_workflow.script_resources import list_script_resources, resolve_resource_path
 
@@ -1860,6 +1824,8 @@ def collect_workflow_resources(
     found: Dict[str, Dict[str, Any]] = {}
 
     def add(raw_path: str, card_id: Any, abs_path: str = "") -> None:
+        if cancel is not None:
+            cancel.check()
         text = str(raw_path or "").replace("\\", "/").strip()
         if not text:
             return
@@ -1894,6 +1860,8 @@ def collect_workflow_resources(
             item["card_ids"].append(card_id)
 
     for card in cards:
+        if cancel is not None:
+            cancel.check()
         if not isinstance(card, Mapping):
             continue
         card_id = card.get("id")

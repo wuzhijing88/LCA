@@ -1,9 +1,0 @@
-from .parameter_panel_media_multi_image_paths_convert_mixin import ParameterPanelMediaMultiImagePathsConvertMixin
-from .parameter_panel_media_multi_image_paths_parse_core_mixin import ParameterPanelMediaMultiImagePathsParseCoreMixin
-
-
-class ParameterPanelMediaMultiImagePathsParseMixin(
-    ParameterPanelMediaMultiImagePathsParseCoreMixin,
-    ParameterPanelMediaMultiImagePathsConvertMixin,
-):
-    pass

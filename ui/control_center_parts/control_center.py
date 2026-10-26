@@ -1,10 +1,11 @@
 import os
 from collections import deque
 from typing import Dict, Any, List
+from PySide6.QtCore import Slot
 from PySide6.QtWidgets import QMainWindow
 
 from app_core.control_plane import JobScheduler
-from utils.app_paths import get_user_data_dir
+from utils.app_paths import get_runtime_state_dir
 from ..control_center_parts.control_center_runner_mixin import ControlCenterRunnerMixin
 from ..control_center_parts.control_center_timer_mixin import ControlCenterTimerMixin
 from ..control_center_parts.control_center_pause_timer_mixin import ControlCenterPauseTimerMixin
@@ -63,12 +64,7 @@ class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, Con
         self._hwnd_watchdog_timer = None
 
         # 临时工作流配置文件路径
-        try:
-            from utils.app_paths import get_runtime_state_dir
-
-            runtime_dir = get_runtime_state_dir("LCA")
-        except Exception:
-            runtime_dir = os.path.join(get_user_data_dir("LCA"), "runtime")
+        runtime_dir = get_runtime_state_dir("LCA")
         os.makedirs(runtime_dir, exist_ok=True)
         self.temp_workflow_config_file = os.path.join(runtime_dir, ".control_center_workflows.json")
 
@@ -93,6 +89,27 @@ class ControlCenterWindow(ControlCenterRunnerMixin, ControlCenterTimerMixin, Con
         self.setup_timer()
         self._setup_hwnd_watchdog()
         self._setup_shortcuts()
+
+    # Qt 槽在窗口类中声明，确保跨线程信号以窗口为接收者。
+    @Slot(str, str)
+    def on_window_status_updated(self, window_id, status):
+        super().on_window_status_updated(window_id, status)
+
+    @Slot(str, str)
+    def on_window_step_updated(self, window_id, step_info):
+        super().on_window_step_updated(window_id, step_info)
+
+    @Slot(str, str)
+    def _on_runner_runtime_alert(self, window_id, message):
+        super()._on_runner_runtime_alert(window_id, message)
+
+    @Slot(str, bool)
+    def _on_window_runner_completed(self, window_id: str, success: bool):
+        super()._on_window_runner_completed(window_id, success)
+
+    @Slot()
+    def _on_window_runner_finished(self):
+        super()._on_window_runner_finished()
 
     def sort_windows_by_title(self, windows):
         """按窗口标题排序"""

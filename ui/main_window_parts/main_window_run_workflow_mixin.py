@@ -74,38 +74,17 @@ class MainWindowRunWorkflowMixin:
 
         test_card_id = kwargs.get('test_card_id', None)
 
-        # 防御：标准化测试参数，避免非测试启动误携带测试状态
-
         if test_mode not in (None, 'single_card', 'flow'):
+            QMessageBox.warning(self, "测试参数错误", "不支持的测试模式，已取消执行。")
+            return
 
-            logger.warning(f"run_workflow: 非法 test_mode='{test_mode}'，已重置为None")
-
-            test_mode = None
-
-        if not test_mode and test_card_id is not None:
-
-            logger.warning(f"run_workflow: 非测试模式下忽略 test_card_id={test_card_id}")
-
-            test_card_id = None
+        if test_mode is None and test_card_id is not None:
+            QMessageBox.warning(self, "测试参数错误", "普通执行不能指定测试卡片，已取消执行。")
+            return
 
         if test_mode:
-
-            if not isinstance(test_card_id, int):
-
-                try:
-
-                    test_card_id = int(test_card_id)
-
-                except Exception:
-
-                    QMessageBox.warning(self, "测试参数错误", "测试模式缺少有效的卡片ID，已取消执行。")
-
-                    return
-
-            if test_card_id < 0:
-
-                QMessageBox.warning(self, "测试参数错误", "测试模式卡片ID无效，已取消执行。")
-
+            if isinstance(test_card_id, bool) or not isinstance(test_card_id, int) or test_card_id < 0:
+                QMessageBox.warning(self, "测试参数错误", "测试模式卡片ID必须是非负整数，已取消执行。")
                 return
 
         if test_mode:
@@ -461,12 +440,8 @@ class MainWindowRunWorkflowMixin:
 
                  logging.info("旧线程仍在运行，尝试停止...")
 
-                 if self.executor and hasattr(self.executor, 'request_stop'):
-
-                     try:
-                         self.executor.request_stop(force=True)
-                     except TypeError:
-                         self.executor.request_stop()
+                 if self.executor:
+                     self.executor.request_stop(force=True)
 
                  # 等待最多2秒让线程退出
 
@@ -542,13 +517,13 @@ class MainWindowRunWorkflowMixin:
 
                 # 【优化】使用已序列化的连接数据，而不是遍历场景对象
 
-                connections_list = workflow_data.get("connections", [])
+                connections_list = workflow_data["connections"]
 
             else:
 
                 # 测试模式下也需要加载原有连接，特别是流程测试需要完整的连接关系
 
-                connections_list = workflow_data.get("connections", [])
+                connections_list = workflow_data["connections"]
 
                 logger.info(f"[测试模式] 加载原有连接 {len(connections_list)} 条，后续会添加虚拟连接")
 
@@ -664,91 +639,9 @@ class MainWindowRunWorkflowMixin:
 
                 # --- END MODIFICATION ---
 
-                # 工具 关键修复：优先使用强制指定的窗口句柄（单个启用窗口模式）
-
-                target_hwnd = None
-
-                target_window_title = self.current_target_window_title or None
-
-                # 第一优先级：强制指定的窗口句柄（来自启用窗口检查）
-
-                if hasattr(self, '_forced_target_hwnd') and self._forced_target_hwnd:
-
-                    target_hwnd = self._forced_target_hwnd
-
-                    target_window_title = getattr(self, '_forced_target_title', None) or target_window_title
-
-                    logger.info(f"使用强制指定的启用窗口句柄: {target_hwnd} ('{self._forced_target_title}')")
-
-                # 第二优先级：从绑定窗口中查找保存的句柄
-
-                elif self.current_target_window_title:
-
-                    target_window_title = self.current_target_window_title
-
-                    # 首先尝试从绑定窗口列表中获取保存的句柄
-
-                    for window_info in self.bound_windows:
-
-                        if window_info['title'] == self.current_target_window_title:
-
-                            saved_hwnd = window_info.get('hwnd')
-
-                            if saved_hwnd:
-
-                                # 验证保存的句柄是否仍然有效
-
-                                try:
-
-                                    import win32gui
-
-                                    if win32gui.IsWindow(saved_hwnd):
-
-                                        target_hwnd = saved_hwnd
-
-                                        logger.info(f"单窗口模式: 使用保存的窗口句柄 '{self.current_target_window_title}' (HWND: {target_hwnd})")
-
-                                        # 工具 应用保存的DPI信息
-
-                                        self._apply_saved_dpi_info(window_info, target_hwnd)
-
-                                        break
-
-                                    else:
-
-                                        logger.warning(f"保存的窗口句柄已失效: {saved_hwnd}")
-
-                                except Exception as e:
-
-                                    logger.warning(f"验证保存的窗口句柄时出错: {e}")
-
-                    # 如果没有找到有效的保存句柄，才重新查找（但这可能导致窗口混乱）
-
-                    if not target_hwnd:
-
-                        logger.warning(f"未找到保存的窗口句柄，重新查找可能导致窗口混乱: '{self.current_target_window_title}'")
-
-                        target_hwnd = self._find_window_by_title(self.current_target_window_title)
-
-                        if target_hwnd:
-
-                            logger.warning(f"重新查找到窗口，但可能不是用户绑定的特定窗口: {target_hwnd}")
-
-                        else:
-
-                            logger.error(f"完全找不到目标窗口: '{self.current_target_window_title}'")
-
-                # 工具 关键修复：在创建WorkflowExecutor之前应用强制窗口句柄
-
-                if hasattr(self, '_forced_target_hwnd') and self._forced_target_hwnd:
-
-                    logger.info(f"应用强制窗口句柄: {target_hwnd} -> {self._forced_target_hwnd}")
-
-                    target_hwnd = self._forced_target_hwnd
-
-                    target_window_title = getattr(self, '_forced_target_title', None) or target_window_title
-
-                logger.info(f"单窗口模式: 最终目标窗口句柄 = {target_hwnd}")
+                # 当前单窗口分支只使用本轮启用的绑定，不按旧标题重新找其他窗口。
+                target_hwnd = self._forced_target_hwnd
+                target_window_title = self._forced_target_title
 
                 from utils.window.virtual_desktop import should_block_execution_start
 
@@ -769,9 +662,14 @@ class MainWindowRunWorkflowMixin:
 
                     logger.info("[测试模式] 进入测试模式分支")
 
-                    # 创建一个虚拟的测试线程起点卡片（ID使用负数，避免与真实卡片冲突）
+                    if test_card_id not in cards_dict:
+                        QMessageBox.critical(self, "错误", f"无法找到测试卡片 {test_card_id}")
+                        self._reset_run_button()
+                        return
 
-                    virtual_start_id = -9999
+                    # 在本轮执行快照中分配不与真实卡片冲突的非负线程起点 ID
+
+                    virtual_start_id = max(cards_dict) + 1
 
                     virtual_start_card = {
 
@@ -781,7 +679,8 @@ class MainWindowRunWorkflowMixin:
 
                         'parameters': {},
 
-                        'position': {'x': 0, 'y': 0}
+                        'pos_x': 0,
+                        'pos_y': 0
 
                     }
 
@@ -795,55 +694,11 @@ class MainWindowRunWorkflowMixin:
 
                         logger.info(f"[单卡测试] 创建虚拟起点 -> 卡片 {test_card_id}")
 
-                        single_card_obj = workflow_view.cards.get(test_card_id)
-
-                        if not single_card_obj:
-
-                            logging.error(f"[单卡测试] 无法找到卡片 {test_card_id}")
-
-                            QMessageBox.critical(self, "错误", f"无法找到测试卡片 {test_card_id}")
-
-                            self._reset_run_button()
-
-                            self.executor = None
-
-                            self.executor_thread = None
-
-                            return
-
-                        # 创建单卡工作流数据（序列化卡片对象）
-
-                        # 检查是TaskCard对象还是字典（字典类型检查更可靠）
-
-                        if isinstance(single_card_obj, dict):
-
-                            # 已经是字典，需要深拷贝以避免修改原始数据
-
-                            single_card_data = copy.deepcopy(single_card_obj)
-
-                            logger.info(f"[单卡测试] 卡片 {test_card_id} 已经是字典格式")
-
-                        else:
-
-                            # TaskCard对象，需要序列化
-
-                            single_card_data = {
-
-                                'id': test_card_id,
-
-                                'task_type': single_card_obj.task_type,
-
-                                'parameters': copy.deepcopy(single_card_obj.parameters),
-
-                                'position': {'x': single_card_obj.x(), 'y': single_card_obj.y()}
-
-                            }
-
-                            logger.info(f"[单卡测试] 卡片 {test_card_id} 从TaskCard对象序列化为字典")
+                        single_card_data = copy.deepcopy(cards_dict[test_card_id])
 
                         # 清除跳转相关参数，避免跳转到不存在的卡片
 
-                        params = single_card_data.get('parameters', {})
+                        params = single_card_data['parameters']
 
                         # 列出所有可能包含卡片ID引用的参数键
 
@@ -911,39 +766,7 @@ class MainWindowRunWorkflowMixin:
 
                         logger.info(f"[流程测试] 创建虚拟起点 -> 卡片 {test_card_id} -> 完整流程")
 
-                        # 序列化所有卡片为字典格式
-
-                        serialized_cards = {}
-
-                        for cid, card_obj in cards_dict.items():
-
-                            if isinstance(card_obj, dict):
-
-                                # 已经是字典
-
-                                serialized_cards[cid] = card_obj
-
-                            else:
-
-                                # TaskCard对象，序列化
-
-                                serialized_cards[cid] = {
-
-                                    'id': cid,
-
-                                    'task_type': card_obj.task_type,
-
-                                    'parameters': copy.deepcopy(card_obj.parameters),
-
-                                    'custom_name': card_obj.custom_name,
-
-                                    'position': {'x': card_obj.x(), 'y': card_obj.y()}
-
-                                }
-
-                        # 添加虚拟起点
-
-                        serialized_cards[virtual_start_id] = virtual_start_card
+                        cards_dict[virtual_start_id] = virtual_start_card
 
                         # 添加虚拟起点到测试卡片的连接
 
@@ -959,10 +782,6 @@ class MainWindowRunWorkflowMixin:
 
                         connections_list = [virtual_connection] + connections_list
 
-                        # 使用序列化的卡片字典
-
-                        cards_dict = serialized_cards
-
                         # 设置虚拟起点作为起始卡片
 
                         start_card_id = virtual_start_id
@@ -975,7 +794,7 @@ class MainWindowRunWorkflowMixin:
 
                 from task_workflow.workflow_vars import workflow_context_key
 
-                workflow_id = workflow_context_key(getattr(actual_task, "task_id", None)) or "default"
+                workflow_id = workflow_context_key(actual_task.task_id)
                 runtime_start_card_ids = [start_card_id] if test_mode else start_card_ids
                 self.executor, self.executor_thread = create_coordinated_workflow_runtime(
                     source=(
@@ -1058,15 +877,7 @@ class MainWindowRunWorkflowMixin:
 
                 if start_card:
 
-                    # 处理字典和对象两种情况
-
-                    if isinstance(start_card, dict):
-
-                        params = start_card.get('parameters', {})
-
-                    else:
-
-                        params = start_card.parameters
+                    params = start_card['parameters']
 
                     logging.debug(f"run_workflow: Parameters for starting card ({start_card_id_for_debug}) before execution: {params}") 
 

@@ -8,7 +8,7 @@ from app_core.player.package import (
     PLAYER_PACKAGE_SCHEMA_VERSION,
     PlayerPackage,
     normalize_player_manifest,
-    normalize_player_ui,
+    ensure_designer_ui,
     resolve_player_theme,
 )
 from task_workflow.workspace import resolve_runtime_resource_dirs
@@ -70,7 +70,7 @@ def build_dev_player_package(
     entry_script_id: str = "",
 ) -> PlayerPackage:
     name = str(app_name or "").strip() or "独立程序"
-    local_ui = normalize_player_ui(rewrite_ui_assets_to_local(ui, asset_map), app_name=name)
+    local_ui = ensure_designer_ui(rewrite_ui_assets_to_local(ui, asset_map), app_name=name)
     payload_scripts = []
     for item in scripts_meta or []:
         if not isinstance(item, Mapping):

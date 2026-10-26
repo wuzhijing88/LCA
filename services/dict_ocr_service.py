@@ -18,7 +18,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DM_DEFAULT_HEIGHT = 11
 DICT_INFO_STRUCT = struct.Struct("<hhi")
 WORD1_INFO_STRUCT = struct.Struct("<BBH16s")
 WORD0_STRUCT = struct.Struct("<8shhI32I")
@@ -222,29 +221,6 @@ def parse_dm_text_entry(line: str) -> Optional[Glyph]:
     return _make_glyph(name, bitmap)
 
 
-def parse_simple_text_entry(line: str) -> Optional[Glyph]:
-    parts = [part.strip() for part in str(line or "").split("$")]
-    if len(parts) != 2:
-        return None
-    left, right = parts
-    if _is_hex(left) and not _is_hex(right):
-        hex_data, name = left, right
-    elif _is_hex(right) and not _is_hex(left):
-        name, hex_data = left, right
-    else:
-        return None
-    if not name:
-        return None
-    total_bits = len(hex_data) * 4
-    height = _choose_dm_height(total_bits, DM_DEFAULT_HEIGHT)
-    width = _dm_width_for_height(total_bits, height)
-    if width <= 0 or width > 255:
-        return None
-    bits = _bits_from_hex_msb(hex_data)
-    bitmap = _bitmap_from_column_bits(bits, width, height)
-    return _make_glyph(name, bitmap)
-
-
 def parse_text_dict_entry(line: str) -> Optional[Glyph]:
     text = str(line or "").strip()
     if not text or text.startswith("#") or text.startswith("//"):
@@ -254,8 +230,6 @@ def parse_text_dict_entry(line: str) -> Optional[Glyph]:
         return parse_dm_text_entry(text)
     if dollar_count == 2:
         return parse_op_text_entry(text)
-    if dollar_count == 1:
-        return parse_simple_text_entry(text)
     return None
 
 
@@ -534,6 +508,42 @@ def extract_single_glyph(
     return [glyph] if glyph is not None else []
 
 
+def find_glyph_split_bounds(
+    binary: np.ndarray,
+    x: int,
+    y: int,
+    *,
+    orientation: str,
+    row_gap: int,
+    col_gap: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """定位待切分字形，返回左、上、右、下边界（右下不含）。"""
+    if orientation not in {"vertical", "horizontal"}:
+        raise ValueError("切分方向必须为 vertical 或 horizontal")
+    if binary is None or binary.size == 0:
+        return None
+    mask = binary > 0
+    for top, bottom in _ink_ranges(mask.sum(axis=1), max_gap=row_gap, min_run=1):
+        if not top <= y <= bottom:
+            continue
+        band = mask[top : bottom + 1]
+        for left, right in _ink_ranges(band.sum(axis=0), max_gap=col_gap, min_run=1):
+            if not left <= x <= right:
+                continue
+            trimmed = _trim_binary_box(band[:, left : right + 1])
+            if trimmed is None:
+                return None
+            crop, dx, dy = trimmed
+            x1, y1 = left + dx, top + dy
+            x2, y2 = x1 + crop.shape[1], y1 + crop.shape[0]
+            if orientation == "vertical":
+                valid = x1 < x < x2 and y1 <= y < y2
+            else:
+                valid = x1 <= x < x2 and y1 < y < y2
+            return (x1, y1, x2, y2) if valid else None
+    return None
+
+
 def extract_glyphs_from_binary(
     binary: np.ndarray,
     *,
@@ -543,11 +553,15 @@ def extract_glyphs_from_binary(
     min_width: int = 1,
     min_height: int = 1,
     min_area: int = 2,
+    split_lines: Sequence[Tuple[int, int, int]] = (),
+    horizontal_split_lines: Sequence[Tuple[int, int, int]] = (),
 ) -> List[ExtractedGlyph]:
-    """按大漠方式切字：整框单个，或多个时用行列投影，框内笔画整块收取。"""
+    """按行列投影提取；竖线为 (列边界, 上, 下)，横线为 (行边界, 左, 右)，终点不含。"""
+    if mode not in {"single", "multiple"}:
+        raise ValueError("提取模式必须为 single 或 multiple")
     if binary is None or binary.size == 0:
         return []
-    if str(mode or "").strip() in {"single", "单个", "单个提取"}:
+    if mode == "single":
         return extract_single_glyph(
             binary,
             min_width=min_width,
@@ -556,54 +570,43 @@ def extract_glyphs_from_binary(
         )
 
     mask = (binary > 0).astype(np.uint8)
-    height, width = mask.shape[:2]
     row_ranges = _ink_ranges(mask.sum(axis=1), max_gap=int(row_gap), min_run=max(1, min_height))
-    if not row_ranges:
-        return extract_single_glyph(
-            mask,
-            min_width=min_width,
-            min_height=min_height,
-            min_area=min_area,
-        )
 
     items: List[ExtractedGlyph] = []
     for top, bottom in row_ranges:
         band = mask[top : bottom + 1]
         col_ranges = _ink_ranges(band.sum(axis=0), max_gap=int(col_gap), min_run=max(1, min_width))
-        if not col_ranges:
-            glyph = _glyph_from_mask_box(
-                mask,
-                0,
-                top,
-                width - 1,
-                bottom,
-                min_width=min_width,
-                min_height=min_height,
-                min_area=min_area,
-            )
-            if glyph is not None:
-                items.append(glyph)
-            continue
         for left, right in col_ranges:
-            glyph = _glyph_from_mask_box(
-                mask,
-                left,
-                top,
-                right,
-                bottom,
-                min_width=min_width,
-                min_height=min_height,
-                min_area=min_area,
-            )
-            if glyph is not None:
-                items.append(glyph)
-    if not items:
-        return extract_single_glyph(
-            mask,
-            min_width=min_width,
-            min_height=min_height,
-            min_area=min_area,
-        )
+            vertical_cuts = sorted({
+                position
+                for position, start, end in split_lines
+                if left < position <= right
+                and start <= bottom
+                and end > top
+            })
+            horizontal_cuts = sorted({
+                position
+                for position, start, end in horizontal_split_lines
+                if top < position <= bottom
+                and start <= right
+                and end > left
+            })
+            x_edges = [left, *vertical_cuts, right + 1]
+            y_edges = [top, *horizontal_cuts, bottom + 1]
+            for y_start, y_end in zip(y_edges, y_edges[1:]):
+                for x_start, x_end in zip(x_edges, x_edges[1:]):
+                    glyph = _glyph_from_mask_box(
+                        mask,
+                        x_start,
+                        y_start,
+                        x_end - 1,
+                        y_end - 1,
+                        min_width=min_width,
+                        min_height=min_height,
+                        min_area=min_area,
+                    )
+                    if glyph is not None:
+                        items.append(glyph)
     return sort_glyphs_reading_order(items)
 
 
@@ -785,8 +788,36 @@ def binarize_image(image: np.ndarray, color_format: str = "") -> np.ndarray:
     else:
         gray = image
     _, binary = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    if int(binary.sum()) > binary.size // 2:
+    # 用边界估计背景；框选收紧时，文字可以占据大多数像素，不能按整图占比反色。
+    border = np.concatenate((binary[0], binary[-1], binary[1:-1, 0], binary[1:-1, -1]))
+    invert = int(border.sum()) > border.size // 2
+    # Windows 图形捕获的整窗帧有时会在四周附带一像素黑边。此时最外圈
+    # 不是内容背景，直接使用它会把浅色窗口背景判成前景。仅对足够大的
+    # 图像检查内侧一圈，避免改变紧框小字形的前景极性。
+    height, width = binary.shape[:2]
+    if not invert and min(height, width) >= 32 and height >= 3 and width >= 3:
+        inner_border = np.concatenate(
+            (
+                binary[1, 1:-1],
+                binary[-2, 1:-1],
+                binary[2:-2, 1],
+                binary[2:-2, -2],
+            )
+        )
+        if (
+            border.size > 0
+            and int(border.sum()) <= border.size * 0.1
+            and inner_border.size > 0
+            and int(inner_border.sum()) >= inner_border.size * 0.75
+        ):
+            invert = True
+    if invert:
         binary = 1 - binary
+        if min(height, width) >= 32:
+            binary[0, :] = 0
+            binary[-1, :] = 0
+            binary[:, 0] = 0
+            binary[:, -1] = 0
     return binary.astype(np.uint8)
 
 
@@ -870,28 +901,18 @@ def find_glyph_hits(
         wanted = {str(item) for item in texts if str(item)}
     hits: List[GlyphHit] = []
     threshold = min(1.0, max(0.1, float(similarity)))
-    # WGC/桌面合成可能按 DPI 对字形做非整数缩放；字库和截图不再要求像素级同高。
-    # 先尝试原尺寸，只有原尺寸没有命中时才尝试缩放模板，避免正常场景增加开销和误报。
-    scale_candidates = (0.75, 0.8, 0.9, 1.1, 1.2, 1.25, 1.333333, 1.5, 1.75, 2.0)
+    # 同一画面可能同时出现原尺寸和 DPI 缩放的文字，所有尺寸统一参与匹配。
+    scale_candidates = (1.0, 0.75, 0.8, 0.9, 1.1, 1.2, 1.25, 1.333333, 1.5, 1.75, 2.0)
     for glyph in library.glyphs:
         if wanted is not None and glyph.text not in wanted:
             continue
-        match_variants = [(1.0, _match_scores(binary, glyph, 1.0))]
-        native_match = match_variants[0][1]
-        native_has_hit = False
-        if native_match is not None:
-            native_scores, native_w, native_h, native_template, _native_coverage = native_match
-            native_glyph = Glyph(
-                glyph.text,
-                native_w,
-                native_h,
-                int(np.count_nonzero(native_template)),
-                native_template,
-            )
-            native_has_hit = bool(_peak_positions(native_scores, native_glyph, threshold))
-        if not native_has_hit:
-            match_variants.extend((scale, _match_scores(binary, glyph, scale)) for scale in scale_candidates)
-        for scale, matched in match_variants:
+        seen_sizes = set()
+        for scale in scale_candidates:
+            size = (max(1, round(glyph.width * scale)), max(1, round(glyph.height * scale)))
+            if size in seen_sizes:
+                continue
+            seen_sizes.add(size)
+            matched = _match_scores(binary, glyph, scale)
             if matched is None:
                 continue
             scores, matched_w, matched_h, matched_template, coverage = matched
@@ -926,12 +947,12 @@ def find_glyph_hits(
 def _nms_hits(hits: Sequence[GlyphHit], overlap: float = 0.35) -> List[GlyphHit]:
     if not hits:
         return []
-    # 不同 DPI 模板在同一个字形内可能都得到接近 1 的分数；按定位分数排序，
-    # 再保留覆盖范围更大的模板，避免把实际字形缩小框中的局部当成识别结果。
+    # 同分时优先原尺寸，其余模板按覆盖面积排序，避免缩放空白边缘改变坐标。
     ordered = sorted(
         hits,
         key=lambda item: (
             -round(float(item.match_score if item.match_score >= 0 else item.score), 2),
+            item.scale != 1.0,
             -(item.w * item.h),
             item.y,
             item.x,
@@ -1024,13 +1045,20 @@ def _link_string_hits(hits: Sequence[GlyphHit], target: str) -> Optional[Tuple[L
     starts = by_char.get(first) or []
     best: Optional[Tuple[List[GlyphHit], float]] = None
     for start in starts:
+        # 同一段文字的字形应来自同一个缩放比例。否则相邻字符可能分别
+        # 选中 1.0 和 1.1 候选，最低覆盖率会被放大模板的抗锯齿边缘拉低。
+        scale = float(start.scale)
         chain = [start]
         cursor = start
         failed = False
         for char in target[1:]:
             gap = max(2, cursor.w)
+            candidates = [
+                item for item in (by_char.get(char) or [])
+                if abs(float(item.scale) - scale) <= 1e-6
+            ]
             matched = None
-            for candidate in by_char.get(char) or []:
+            for candidate in candidates:
                 if candidate.x < cursor.x + max(1, cursor.w - 2):
                     continue
                 if candidate.x > cursor.x + cursor.w + gap:
@@ -1072,7 +1100,12 @@ def find_strings(
     for target in targets:
         exact_hits = [item for item in hits if item.text == target]
         if exact_hits:
-            best = max(exact_hits, key=lambda item: (item.score, item.w * item.h))
+            best = max(
+                exact_hits,
+                key=lambda item: (
+                    round(item.match_score, 2), item.score, item.scale == 1.0, item.w * item.h
+                ),
+            )
             results.append(
                 {
                     "text": target,

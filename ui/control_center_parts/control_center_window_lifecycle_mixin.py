@@ -8,13 +8,9 @@ logger = logging.getLogger(__name__)
 class ControlCenterWindowLifecycleMixin:
     def _iter_all_window_runners(self):
         for runners in list(self.window_runners.values()):
-            if isinstance(runners, list):
-                for runner in runners:
-                    if self._is_qt_runner_valid(runner):
-                        yield runner
-                continue
-            if self._is_qt_runner_valid(runners):
-                yield runners
+            for runner in runners:
+                if self._is_qt_runner_valid(runner):
+                    yield runner
 
     def is_any_task_running(self) -> bool:
         """检查中控是否有任何任务正在运行
@@ -25,8 +21,6 @@ class ControlCenterWindowLifecycleMixin:
         if self._runner_start_queue:
             return True
         for window_id, runners in self.window_runners.items():
-            if not isinstance(runners, list):
-                runners = [runners]
             for runner in runners:
                 try:
                     if runner.has_pending_work:
@@ -46,7 +40,9 @@ class ControlCenterWindowLifecycleMixin:
 
     def closeEvent(self, event):
         """窗口关闭事件"""
-        # 工具 关键修复：使用异步方式停止任务，避免阻塞主线程导致UI冻结
+        if self._is_closing:
+            event.accept()
+            return
         logger.info("中控窗口关闭，开始异步停止所有任务")
         self._is_closing = True
         try:
@@ -68,8 +64,13 @@ class ControlCenterWindowLifecycleMixin:
         self._cancel_start_sequence = True
         self._runner_dispatch_suspended = True
 
+        for runner in self._iter_all_window_runners():
+            self._disconnect_window_task_runner(runner)
         self._request_close_runners_stop()
         self._handoff_control_center_shutdown()
+        self.window_runners.clear()
+        self._window_workflow_results.clear()
+        self._runner_start_queue.clear()
 
         if self.parent_window and hasattr(self.parent_window, "_on_control_center_closed"):
             self.parent_window._on_control_center_closed()
@@ -86,21 +87,20 @@ class ControlCenterWindowLifecycleMixin:
                 if runner.can_stop or runner_thread_running or runner.current_state == TaskState.IDLE:
                     runner.stop()
                     logger.debug("已请求停止runner: %s", self._safe_runner_window_id(runner))
+                if not runner_thread_running:
+                    runner.deleteLater()
             except Exception as stop_err:
                 logger.warning("关闭中控时停止runner失败: %s", stop_err)
 
     def _handoff_control_center_shutdown(self):
         from .control_center_shutdown import (
             ControlCenterShutdownSession,
-            cleanup_control_center_shared_runtime,
             collect_close_runners,
         )
 
         session = ControlCenterShutdownSession(collect_close_runners(self.window_runners))
-        parent = getattr(self, "parent_window", None)
-        if parent is not None and hasattr(parent, "_begin_control_center_shutdown"):
-            parent._begin_control_center_shutdown(session)
-            logger.info("已将中控关闭收尾交给主窗口，orphans=%s", len(session.orphans))
-            return
-        logger.warning("中控关闭时没有主窗口接管，立即清理共享运行时")
-        cleanup_control_center_shared_runtime()
+        parent = self.parent_window
+        if parent is None:
+            raise RuntimeError("中控关闭收尾需要所属主窗口接管")
+        parent._begin_control_center_shutdown(session)
+        logger.info("已将中控关闭收尾交给主窗口，orphans=%s", len(session.orphans))

@@ -30,7 +30,7 @@ def script_action_button_size(widget) -> tuple:
     metrics = widget.fontMetrics()
     text_width = max(
         metrics.horizontalAdvance(label)
-        for label in ("显示命令", "隐藏命令", "应用", "重置", "插入")
+        for label in ("显示命令", "隐藏命令", "导出插件", "应用", "重置", "插入")
     )
     width = max(96, text_width + 28)
     height = max(32, metrics.height() + 14)

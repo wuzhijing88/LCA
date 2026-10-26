@@ -145,7 +145,6 @@ def adjust_window_to_required_client_size(
             handle,
             required[0],
             required[1],
-            async_mode=False,
         )
     except Exception as exc:
         return (

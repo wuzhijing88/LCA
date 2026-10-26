@@ -85,7 +85,6 @@ class WindowTaskRunnerExecutionMixin:
                 self._emit_task_completed_once(False)
                 return
 
-            # 转换数据格式并识别起点（兼容字符串/整数ID）
             cards_dict = {}
             start_card_id = None
             start_card_ids = []
@@ -93,36 +92,29 @@ class WindowTaskRunnerExecutionMixin:
             thread_labels = {}
             for card in cards:
                 card_id = card['id']
+                if isinstance(card_id, bool) or not isinstance(card_id, int) or card_id < 0:
+                    raise ValueError(f"卡片ID必须是非负整数: {card_id!r}")
+                if card_id in cards_dict:
+                    raise ValueError(f"卡片ID重复: {card_id}")
                 cards_dict[card_id] = card
-                cards_dict[str(card_id)] = card
-                normalized_card_id = self._parse_card_id_as_int(card_id)
-                if normalized_card_id is not None:
-                    cards_dict[normalized_card_id] = card
 
                 if not self._is_start_task_type(card.get('task_type')):
                     continue
 
                 start_card_ids.append(card_id)
-                if normalized_card_id is not None and normalized_card_id not in session_start_card_ids:
-                    session_start_card_ids.append(normalized_card_id)
-                    custom_name = str(card.get("custom_name") or "").strip()
-                    if custom_name:
-                        thread_labels[normalized_card_id] = custom_name
+                session_start_card_ids.append(card_id)
+                custom_name = str(card.get("custom_name") or "").strip()
+                if custom_name:
+                    thread_labels[card_id] = custom_name
 
             self._rebuild_card_step_labels(cards)
 
             connections_list = self.workflow_data.get('connections', [])
             if not isinstance(connections_list, list):
-                logger.warning(f"Window {self.window_id} workflow connections must be a list, got {type(connections_list)}")
-                connections_list = []
-            else:
-                safe_connections = []
-                for conn in connections_list:
-                    if isinstance(conn, dict):
-                        safe_connections.append(copy.deepcopy(conn))
-                    else:
-                        logger.warning(f"Window {self.window_id} skipping invalid connection entry: {type(conn)}")
-                connections_list = safe_connections
+                raise TypeError("工作流连接数据必须是列表")
+            if any(not isinstance(connection, dict) for connection in connections_list):
+                raise TypeError("工作流连接条目必须是字典")
+            connections_list = copy.deepcopy(connections_list)
 
             if session_start_card_ids:
                 start_card_id = session_start_card_ids[0]
@@ -232,13 +224,6 @@ class WindowTaskRunnerExecutionMixin:
                 )
             self._set_state(TaskState.RUNNING, "工作流启动中")
             logger.info(f"窗口工作流已启动: {window_title} (HWND: {window_hwnd})")
-            bind_id = str(self.window_info.get("bind_id") or self.job_id or "").strip()
-            if bind_id:
-                try:
-                    self.executor.target_bind_id = bind_id
-                except Exception:
-                    pass
-
             if self._abort_if_stop_requested("执行前收到停止请求"):
                 try:
                     self.executor.request_stop(force=True)
@@ -246,7 +231,7 @@ class WindowTaskRunnerExecutionMixin:
                     pass
                 return
 
-            self.executor.execution_finished.connect(self.quit, Qt.ConnectionType.DirectConnection)
+            self.executor_thread.finished.connect(self.quit, Qt.ConnectionType.DirectConnection)
             logger.info("进入QThread事件循环，等待执行完成")
             self.executor.run()
             self.exec()
@@ -258,7 +243,25 @@ class WindowTaskRunnerExecutionMixin:
             self._set_state(TaskState.FAILED, f"错误: {str(e)}", force=True)
             self._emit_task_completed_once(False)
         finally:
-            self._release_execution_slot()
+            cleanup_errors = []
+            for runtime_object in (self.executor, self.executor_thread):
+                if runtime_object is not None:
+                    try:
+                        runtime_object.deleteLater()
+                    except Exception as exc:
+                        cleanup_errors.append(f"销毁工作流运行对象失败: {exc}")
+            self.executor = None
+            self.executor_thread = None
+            try:
+                self._release_execution_slot()
+            except Exception as exc:
+                cleanup_errors.append(f"释放中控执行槽位失败: {exc}")
+            if cleanup_errors:
+                message = "; ".join(cleanup_errors)
+                self._last_execution_success = False
+                self._last_execution_message = message
+                self._set_state(TaskState.FAILED, message, force=True)
+                logger.error(message)
             self._is_running = False
             logger.info(f"QThread运行完成: {self.window_id}")
 
@@ -279,10 +282,7 @@ class WindowTaskRunnerExecutionMixin:
             self._emit_step(step_info)
         else:
             self._emit_step(f"执行卡片{card_id}")
-        try:
-            self.card_executing.emit(int(card_id))
-        except (TypeError, ValueError):
-            pass
+        self.card_executing.emit(card_id)
 
     def _on_card_finished(self, card_id, success):
         """卡片执行完成回调"""
@@ -290,10 +290,7 @@ class WindowTaskRunnerExecutionMixin:
             self._emit_step("步骤执行成功")
         else:
             self._emit_step("步骤执行失败")
-        try:
-            self.card_finished.emit(int(card_id), bool(success))
-        except (TypeError, ValueError):
-            self.card_finished.emit(0, bool(success))
+        self.card_finished.emit(card_id, success)
 
     def _emit_runtime_alert(self, message: str):
         text = str(message or "").strip()
@@ -306,10 +303,7 @@ class WindowTaskRunnerExecutionMixin:
         from .control_center_dispatch import format_runner_runtime_alert
 
         self._emit_runtime_alert(format_runner_runtime_alert("error", card_id, error_message))
-        try:
-            parsed_card_id = int(card_id)
-        except (TypeError, ValueError):
-            parsed_card_id = 0
+        parsed_card_id = card_id
         title = str((self.window_info or {}).get("title") or "")
         try:
             hwnd = int(self.hwnd or 0)
@@ -329,24 +323,23 @@ class WindowTaskRunnerExecutionMixin:
             self._last_execution_message = str(message or "").strip()
             self._last_execution_success = bool(success)
             # 区分不同的完成状态
-            if "被用户停止" in message or "用户停止" in message:
+            if self._should_stop or message == "多线程执行已停止" or "被用户停止" in message or "用户停止" in message:
                 self._set_state(TaskState.STOPPED, "工作流被中断", force=True)
                 success = False
             elif success:
                 self._set_state(TaskState.COMPLETED, "工作流已完成", force=True)
             else:
                 self._set_state(TaskState.FAILED, "工作流执行失败", force=True)
+            self._last_execution_success = success
 
             logger.info(f"窗口{self.window_id}工作流执行完成: {self._current_state.value} - success={success}, {message}")
-
-            # 发送任务完成信号
-            self._emit_task_completed_once(success)
 
             # 只在线程真正退出后清理，避免停止竞态下提前释放运行中资源。
             if self.isRunning():
                 self._defer_cleanup_until_thread_finished()
             else:
                 self._cleanup_thread()
+                self._emit_task_completed_once(self._last_execution_success)
 
         except Exception as e:
             logger.error(f"执行完成回调处理失败: {e}")

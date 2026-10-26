@@ -331,9 +331,6 @@ class MainWindowUiSetupMixin:
             QTimer.singleShot(50, self, self._auto_load_recent_workflows_when_ready)
             return
         self._auto_load_recent_workflows()
-    def _apply_force_down_popup_to_widget(self, widget):
-        """No-op: legacy popup adjustment removed."""
-        return
     def _apply_native_rounded_corners(self) -> bool:
         if os.name != "nt" or os.environ.get("FORCE_CUSTOM_ROUNDED", "0") == "1":
             return False
@@ -368,6 +365,3 @@ class MainWindowUiSetupMixin:
     def paintEvent(self, event):
         """Use default painting to avoid custom side effects."""
         super().paintEvent(event)
-    def _apply_rounded_combobox_style(self, widget):
-        """No-op: legacy combobox popup styling removed."""
-        return

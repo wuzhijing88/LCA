@@ -24,31 +24,24 @@ _FILE_LOG_FORMAT = (
 
 
 def install_root_log_translator() -> None:
-    try:
-        from utils.log_message_translator import install_log_message_translator
-
-        install_log_message_translator(logging.getLogger())
-    except Exception:
-        pass
+    from utils.log_message_translator import install_log_message_translator
+    install_log_message_translator(logging.getLogger())
 
 
 def ensure_standalone_subprocess_file_logging(log_level: int = logging.INFO) -> None:
     root_logger = logging.getLogger()
     if root_logger.handlers:
         return
-    try:
-        import datetime as _datetime
-        from utils.app_paths import get_logs_dir
+    import datetime as _datetime
+    from utils.app_paths import get_logs_dir
 
-        log_dir = get_logs_dir("LCA")
-        log_path = os.path.join(log_dir, f"app_{_datetime.date.today():%Y-%m-%d}.log")
-        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-        file_handler.setLevel(int(log_level))
-        file_handler.setFormatter(logging.Formatter(_FILE_LOG_FORMAT))
-        root_logger.setLevel(int(log_level))
-        root_logger.addHandler(file_handler)
-    except Exception:
-        logging.basicConfig(level=int(log_level), format=_FILE_LOG_FORMAT)
+    log_dir = get_logs_dir("LCA")
+    log_path = os.path.join(log_dir, f"app_{_datetime.date.today():%Y-%m-%d}.log")
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setLevel(int(log_level))
+    file_handler.setFormatter(logging.Formatter(_FILE_LOG_FORMAT))
+    root_logger.setLevel(int(log_level))
+    root_logger.addHandler(file_handler)
 
 
 def _build_ocr_subprocess_args(argv) -> tuple[str, int]:
@@ -78,6 +71,14 @@ def _build_external_component_subprocess_args(argv) -> tuple[int, str]:
     return port, token
 
 
+def _build_parameter_capture_args(argv) -> tuple[str, str]:
+    path = get_cli_argument_value(argv, "--request", "").strip()
+    digest = get_cli_argument_value(argv, "--digest", "").strip()
+    if not path or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("参数采集入口缺少有效请求路径或摘要")
+    return path, digest
+
+
 def _log_ocr_subprocess_start(logger, _argv, args) -> None:
     install_root_log_translator()
     process_id, port = args
@@ -99,6 +100,22 @@ def _log_workflow_subprocess_start(logger, _argv, args) -> None:
 
 
 STANDALONE_SUBPROCESS_SPECS = (
+    StandaloneSubprocessSpec(
+        flag="--element-pick-worker",
+        module_name="services.element_pick_worker",
+        callable_name="run_element_pick_worker",
+        logger_name="ELEMENT_PICK_WORKER",
+        error_label="元素拾取进程",
+        args_factory=_build_parameter_capture_args,
+    ),
+    StandaloneSubprocessSpec(
+        flag="--parameter-capture-worker",
+        module_name="services.parameter_capture_worker",
+        callable_name="run_parameter_capture_worker",
+        logger_name="PARAMETER_CAPTURE_WORKER",
+        error_label="参数采集进程",
+        args_factory=_build_parameter_capture_args,
+    ),
     StandaloneSubprocessSpec(
         flag="--ocr-worker",
         module_name="services.multiprocess_ocr_worker",

@@ -134,7 +134,7 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             use_foreground: 是否使用前台模式（驱动级）
             enable_activation_sequence: 是否启用完整激活消息序列（仅后台模式）
             enable_message_guard: 是否探测接收线程响应（后台消息 + 前台点击收敛）
-            background_hierarchy_broadcast: 是否向命中窗口的所有父子层级发送消息
+            background_hierarchy_broadcast: 鼠标向命中层级广播，键盘只发送最终接收控件
         """
         self.use_foreground = use_foreground
         self.foreground_driver = foreground_driver
@@ -495,13 +495,12 @@ class StandardWindowInputSimulator(BaseInputSimulator):
         self._virtual_cursor = (int(x), int(y))
 
     def _remember_target_control(self, window_chain) -> None:
-        for hwnd in reversed(list(window_chain or ())):
-            try:
-                if hwnd and win32gui.IsWindow(int(hwnd)):
-                    self._last_input_control_hwnd = int(hwnd)
-                    return
-            except Exception:
-                continue
+        if not window_chain:
+            raise RuntimeError("后台输入接收窗口未知")
+        receiver = int(window_chain[-1])
+        if not receiver or not win32gui.IsWindow(receiver):
+            raise RuntimeError("后台输入接收窗口已失效")
+        self._last_input_control_hwnd = receiver
 
     def _background_key_targets(self):
         if not self.background_hierarchy_broadcast:
@@ -510,10 +509,12 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             hwnd for receivers in self._pending_key_releases.values() for hwnd in receivers
         ))
         if held_targets:
+            if len(held_targets) != 1:
+                raise RuntimeError("后台按键接收控件状态不一致")
             return held_targets
         if self._virtual_cursor is not None:
             chain, _ = self._resolve_mouse_message_targets(*self._virtual_cursor)
-            return chain
+            return [chain[-1]]
         return resolve_background_key_targets(self.hwnd, True, self._last_input_control_hwnd)
 
     def _mouse_button_flags(self, exclude=None) -> int:
@@ -912,8 +913,8 @@ class StandardWindowInputSimulator(BaseInputSimulator):
             return False
 
     def _press_background_key(self, targets, vk_code, scan_code, extended) -> bool:
-        if not targets:
-            return False
+        if len(targets) != 1:
+            raise RuntimeError("后台按键必须使用唯一的接收控件")
         if scan_code == 0:
             scan_code = win32api.MapVirtualKey(vk_code, 0)
         self._activate_background_control(targets[-1])

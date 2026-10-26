@@ -2,7 +2,7 @@ import hashlib
 import logging
 import os
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from task_workflow.card_display import format_step_detail
 from task_workflow.thread_start import is_thread_start_task_type
@@ -16,44 +16,36 @@ class WindowTaskRunnerSlotsMixin:
         return is_thread_start_task_type(task_type)
 
     @staticmethod
-    def _parse_card_id_as_int(card_id: Any) -> Optional[int]:
-        try:
-            if card_id is None:
-                return None
-            return int(str(card_id).strip())
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
     def _get_cpu_logical_thread_limit() -> int:
-        try:
-            return max(1, int(os.cpu_count() or 1))
-        except Exception:
-            return 1
+        cpu_limit = os.cpu_count()
+        if isinstance(cpu_limit, bool) or not isinstance(cpu_limit, int) or cpu_limit < 1:
+            raise RuntimeError("无法确定 CPU 逻辑线程数")
+        return cpu_limit
 
     @classmethod
     def _get_execution_slot_limit(cls) -> int:
         cpu_limit = cls._get_cpu_logical_thread_limit()
         default_limit = max(1, cpu_limit // 2)
-        raw_value = str(os.getenv("LCA_CC_MAX_CONCURRENT_RUNNERS") or "").strip()
-        if not raw_value:
+        raw_value = os.getenv("LCA_CC_MAX_CONCURRENT_RUNNERS")
+        if raw_value is None:
             return default_limit
         try:
             configured_limit = int(raw_value)
-        except Exception:
-            return default_limit
-        return max(1, min(cpu_limit, configured_limit))
+        except ValueError as exc:
+            raise ValueError("中控并发数必须是整数") from exc
+        if not 1 <= configured_limit <= cpu_limit:
+            raise ValueError(f"中控并发数必须在 1 到 {cpu_limit} 之间")
+        return configured_limit
 
     @classmethod
     def _get_execution_slot_semaphore(cls):
         with cls._execution_slot_lock:
             limit = cls._get_execution_slot_limit()
-            if (
-                cls._execution_slot_semaphore is None
-                or cls._execution_slot_limit != limit
-            ):
+            if cls._execution_slot_semaphore is None:
                 cls._execution_slot_limit = limit
                 cls._execution_slot_semaphore = threading.BoundedSemaphore(limit)
+            elif cls._execution_slot_limit != limit:
+                raise RuntimeError("中控并发数已改变，请重启应用后使用新配置")
             return cls._execution_slot_semaphore, limit
 
     def _acquire_execution_slot(self) -> bool:
@@ -78,43 +70,34 @@ class WindowTaskRunnerSlotsMixin:
         semaphore = self._execution_slot_ref
         self._execution_slot_ref = None
         if semaphore is None:
-            return
-        try:
-            semaphore.release()
-            logger.info("窗口%s已释放执行槽位", self.window_id)
-        except ValueError:
-            logger.warning("窗口%s释放执行槽位时检测到计数异常", self.window_id)
+            raise RuntimeError("执行槽位已获取，但缺少可释放的槽位对象")
+        semaphore.release()
+        logger.info("窗口%s已释放执行槽位", self.window_id)
 
     def _rebuild_card_step_labels(self, cards: Any) -> None:
         labels: Dict[str, str] = {}
         if not isinstance(cards, list):
-            self._card_step_labels = labels
-            return
+            raise TypeError("工作流卡片必须是列表")
 
         for card in cards:
             if not isinstance(card, dict):
-                continue
+                raise TypeError("工作流卡片数据必须是字典")
             card_id = card.get("id")
-            if card_id is None:
-                continue
+            if isinstance(card_id, bool) or not isinstance(card_id, int) or card_id < 0:
+                raise ValueError("卡片ID必须是非负整数")
             step_info = format_step_detail("正在执行", card=card, card_id=card_id)
             labels[str(card_id)] = step_info
 
         self._card_step_labels = labels
 
     def _build_workflow_id(self) -> str:
-        window_part = str(getattr(self, "job_id", None) or self.window_id or "").strip() or "unknown"
+        window_part = self.job_id
         slot_part = str(self.workflow_slot)
         workflow_path = str(self.workflow_file_path or "").strip()
         if workflow_path:
             normalized = os.path.normcase(os.path.abspath(workflow_path)).replace("\\", "/")
         else:
-            card_count = 0
-            try:
-                cards = self.workflow_data.get("cards", []) if isinstance(self.workflow_data, dict) else []
-                card_count = len(cards) if isinstance(cards, list) else 0
-            except Exception:
-                card_count = 0
+            card_count = len(self.workflow_data["cards"])
             normalized = f"memory:{window_part}:{slot_part}:{card_count}"
         digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
         return f"cc_{window_part}_{slot_part}_{digest}"

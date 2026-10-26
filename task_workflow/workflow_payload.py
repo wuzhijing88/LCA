@@ -11,6 +11,7 @@ from app_core.lca_format.project_io import (
     workflow_from_session,
 )
 from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from app_core.lca_format.session import LcaPackageSession
 from task_workflow.workflow_sanitize import sanitize_card_parameters
 
 
@@ -176,8 +177,10 @@ def load_workflow_file(
     return payload
 
 
-def save_workflow_file(path: str | Path, data: dict) -> Path:
+def save_workflow_file(
+    path: str | Path, data: dict, *, source_session: Optional[LcaPackageSession] = None,
+) -> Path:
     source = Path(path)
     if not is_lca_path(source):
         raise ValueError("只能保存现行 .lca 工程，旧格式须先经工程转换")
-    return save_lca_project(source, data, display_name=source.stem)
+    return save_lca_project(source, data, display_name=source.stem, source_session=source_session)

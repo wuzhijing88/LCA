@@ -191,7 +191,11 @@ def _card_references(
         value = parameters[name]
         if isinstance(value, str) and value in _THREAD_SPECIAL_VALUES:
             continue
-        references.add(_numeric_reference(value, f"卡片 {card_id} 的引用参数 {name}"))
+        from task_workflow.thread_start import validate_thread_target
+
+        validate_thread_target(value)
+        targets = value if isinstance(value, list) else [value]
+        references.update(_numeric_reference(target, f"卡片 {card_id} 的引用参数 {name}") for target in targets)
     if "random_weights" in parameters:
         weights = parameters["random_weights"]
         if not isinstance(weights, dict):
@@ -226,8 +230,13 @@ def _remap_parameters(
         if name in parameters and parameters[name] is not None:
             parameters[name] = id_mapping[parameters[name]]
     for name in thread_names:
-        if name in parameters and parameters[name] not in _THREAD_SPECIAL_VALUES:
-            parameters[name] = str(id_mapping[int(parameters[name])])
+        if name not in parameters:
+            continue
+        value = parameters[name]
+        if isinstance(value, list):
+            parameters[name] = [str(id_mapping[int(target)]) for target in value]
+        elif value not in _THREAD_SPECIAL_VALUES:
+            parameters[name] = str(id_mapping[int(value)])
     if "random_weights" in parameters:
         weights = {}
         for target, weight in parameters["random_weights"].items():

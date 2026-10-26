@@ -1,16 +1,7 @@
 # -*- coding: utf-8 -*-
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from utils.window.hwnd_utils import as_hwnd
-
-
-@dataclass(frozen=True)
-class DetachedWgcResources:
-    session: Any
-    frame_pool: Any
-    item: Any
-    latest_frame: Any
 
 
 def should_force_static_window_rebuild(
@@ -41,23 +32,8 @@ def resolve_wgc_capture_hwnd(
     if not target:
         return 0
     if get_root_hwnd is None:
-        return target
-    try:
-        root = as_hwnd(get_root_hwnd(target))
-    except Exception:
-        return target
-    return root or target
-
-
-def detach_wgc_owned_resources(owner: Any) -> DetachedWgcResources:
-    taken = DetachedWgcResources(
-        session=getattr(owner, "session", None),
-        frame_pool=getattr(owner, "frame_pool", None),
-        item=getattr(owner, "item", None),
-        latest_frame=getattr(owner, "latest_frame", None),
-    )
-    owner.session = None
-    owner.frame_pool = None
-    owner.item = None
-    owner.latest_frame = None
-    return taken
+        raise RuntimeError("缺少WGC顶层窗口解析器")
+    root = as_hwnd(get_root_hwnd(target))
+    if not root:
+        raise RuntimeError("无法确定WGC捕获窗口")
+    return root

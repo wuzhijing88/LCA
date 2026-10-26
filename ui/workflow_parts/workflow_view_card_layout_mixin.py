@@ -88,6 +88,8 @@ class WorkflowViewCardLayoutMixin:
         task_info = self.task_modules.get(task_type)
         if task_info is None:
             raise ValueError(f"未知任务类型: {task_type}")
+        from tasks import bind_task_module_for_card
+        task_info = bind_task_module_for_card(task_info, parameters, task_type)
         current_id = self._resolve_card_id(card_id)
 
         # 新建卡片时应用网格吸附（加载工作流时不吸附，保持原位置）
@@ -100,6 +102,8 @@ class WorkflowViewCardLayoutMixin:
         card = TaskCard(self, x, y, task_type=task_type, card_id=current_id, task_module=task_info) 
         try:
             card.set_display_id(None) # Set the display ID
+            if task_type == "脚本卡片":
+                card.set_custom_name(task_info.TASK_NAME)
         except Exception:
             self._discard_uncommitted_card(card)
             raise

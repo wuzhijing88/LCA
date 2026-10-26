@@ -364,7 +364,7 @@ def _format_prose(text: str, colors: Dict[str, str]) -> str:
     return html_text.replace("@@INLINE_BG@@", colors["surface"])
 
 
-def _block_html(index: int, language: str, body: str, colors: Dict[str, str]) -> str:
+def _block_html(index: int, language: str, body: str, colors: Dict[str, str], *, allow_actions: bool = True) -> str:
     label = html.escape(block_label(language, body))
     payload = html.escape(body)
     surface = colors["surface"]
@@ -374,7 +374,7 @@ def _block_html(index: int, language: str, body: str, colors: Dict[str, str]) ->
     accent = colors["accent"]
     text = colors["text"]
     actions = []
-    if str(language or "").strip() == WORKFLOW_FENCE_LANGUAGE:
+    if allow_actions and str(language or "").strip() == WORKFLOW_FENCE_LANGUAGE:
         actions.append(
             f"<a href='apply:{index}' style='color:{accent}; text-decoration:none;'>应用</a>"
         )
@@ -408,6 +408,7 @@ def format_ai_message_html(
     colors: Dict[str, str],
     *,
     start_index: int = 0,
+    allow_actions: bool = True,
 ) -> Tuple[str, List[str]]:
     """Return Qt rich-text HTML and copy payloads for fenced blocks."""
     payloads: List[str] = []
@@ -416,7 +417,7 @@ def format_ai_message_html(
         if kind == "fence":
             index = start_index + len(payloads)
             payloads.append(body)
-            parts.append(_block_html(index, language, body, colors))
+            parts.append(_block_html(index, language, body, colors, allow_actions=allow_actions))
             continue
         formatted = _format_prose(body, colors)
         if formatted:
@@ -521,6 +522,8 @@ def format_ai_thinking_html(text: str, colors: Dict[str, str], *, live: bool = F
 def format_ai_transcript_html(
     messages: Sequence[Mapping[str, Any]],
     colors: Dict[str, str],
+    *,
+    expanded_activity=frozenset(),
 ) -> Tuple[str, List[str], List[str]]:
     if not messages:
         muted = colors["muted"]
@@ -532,7 +535,7 @@ def format_ai_transcript_html(
     payloads: List[str] = []
     image_paths: List[str] = []
     blocks = [f"<div style='color:{colors['text']};'>"]
-    for item in messages:
+    for message_index, item in enumerate(messages):
         role = str(item.get("role") or "")
         label = "你" if role == "user" else "AI"
         color = colors["user"] if role == "user" else colors["assistant"]
@@ -542,12 +545,33 @@ def format_ai_transcript_html(
             str(item.get("content") or ""),
             colors,
             start_index=len(payloads),
+            allow_actions=role == "assistant" and item.get("run_status") == "completed",
         )
         payloads.extend(copied)
+        state = item.get("run_status")
+        status_labels = {"running": "执行中", "stopping": "正在停止", "completed": "已完成",
+                         "failed": "失败", "cancelled": "已停止", "interrupted": "已中断"}
+        status_html = ""
+        if state in status_labels:
+            status_html = f" &nbsp;<span style='color:{colors['muted']};'>{status_labels[state]}</span>"
+        process = []
+        for step in item.get("plan", []):
+            step_labels = {"pending": "待处理", "in_progress": "进行中", "completed": "已完成"}
+            label_text = step_labels[step["status"]]
+            process.append(f"<p style='color:{colors['muted']};'>{label_text} · {html.escape(step['step'])}</p>")
+        activity = item.get("activity", [])
+        if activity:
+            expanded = message_index in expanded_activity
+            label_text = "收起执行过程" if expanded else f"查看执行过程（{len(activity)} 条）"
+            process.append(f"<p><a href='activity:{message_index}' style='color:{colors['accent']};'>{label_text}</a></p>")
+            if expanded:
+                process.append(f"<p style='color:{colors['muted']};'>" + "<br>".join(html.escape(line) for line in activity) + "</p>")
+        if item.get("error"):
+            process.append(f"<p style='color:{colors['muted']};'>{html.escape(item['error'])}</p>")
         blocks.append(
             f"<div style='margin:0 0 18px 0;'>"
-            f"<p style='margin:0 0 8px 0;'><b style='color:{color};'>{html.escape(label)}</b></p>"
-            f"{images_html}{files_html}{body_html}</div>"
+            f"<p style='margin:0 0 8px 0;'><b style='color:{color};'>{html.escape(label)}</b>{status_html}</p>"
+            f"{''.join(process)}{images_html}{files_html}{body_html}</div>"
         )
     blocks.append("</div>")
     return "".join(blocks), payloads, image_paths

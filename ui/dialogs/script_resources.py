@@ -344,11 +344,12 @@ def plan_insert_resource(
 ) -> Dict[str, Any]:
     kind = str((item or {}).get("kind") or "")
     path = str((item or {}).get("path") or "")
-    abs_path = str((item or {}).get("abs_path") or "")
     lines = source_lines(source)
     safe_index = max(0, min(int(line_index), len(lines) - 1))
     current = lines[safe_index]
-    insert_path = path or abs_path
+    if not path:
+        raise ValueError("资源条目缺少现行路径字段")
+    insert_path = path
     literal = script_string_literal(path)
     span = _literal_span_to_replace(current, column, select_start, select_end)
     if span is not None:
@@ -360,8 +361,6 @@ def plan_insert_resource(
         updated = _rewrite_string_kind_arg(current, literal, _IMAGE_REWRITE_HOSTS, ("图片",), "image")
         if updated is not None:
             return {"mode": "replace", "line": safe_index, "text": updated}
-        # 脚本中优先写入资源相对路径，避免把机器绝对路径写进卡片；
-        # 绝对路径仅作为旧资源对象缺少 path 时的兼容回退。
         return apply_script_capture(source, line_index, "image", insert_path)
     if kind == "audio":
         updated = _rewrite_audio_arg(current, literal)

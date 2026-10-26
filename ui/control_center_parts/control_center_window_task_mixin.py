@@ -1,7 +1,6 @@
 import logging
-from typing import List
-from functools import partial
 from typing import Dict, List, Optional
+from PySide6.QtCore import QObject, Qt
 from PySide6.QtWidgets import QMessageBox
 from app_core.control_plane import JobState
 from ..control_center_parts.control_center_runtime import WindowTaskRunner
@@ -14,8 +13,6 @@ class ControlCenterWindowTaskMixin:
 
     def _get_window_runner_list(self, window_id) -> List:
         runners = self.window_runners.get(str(window_id), [])
-        if not isinstance(runners, list):
-            runners = [runners]
         return [runner for runner in runners if self._is_qt_runner_valid(runner)]
 
     def stop_window_task(self, row):
@@ -73,6 +70,8 @@ class ControlCenterWindowTaskMixin:
         return stop_requested
 
     def on_window_status_updated(self, window_id, status):
+        if self._is_closing:
+            return
         snapshot = self._sync_job_from_runners(window_id)
         if snapshot is not None:
             return
@@ -82,6 +81,8 @@ class ControlCenterWindowTaskMixin:
             self._refresh_overview_metrics()
 
     def on_window_step_updated(self, window_id, step_info):
+        if self._is_closing:
+            return
         from app_core.control_plane import JobState
 
         scheduler = getattr(self, "scheduler", None)
@@ -149,6 +150,8 @@ class ControlCenterWindowTaskMixin:
         return True
 
     def _on_runner_runtime_alert(self, window_id, message):
+        if self._is_closing:
+            return
         text = str(message or "").strip()
         if not text:
             return
@@ -298,9 +301,6 @@ class ControlCenterWindowTaskMixin:
         workflows = self.window_workflows.get(window_id)
         if workflows is None:
             return []
-        if isinstance(workflows, dict):
-            workflows = [workflows]
-            self.window_workflows[window_id] = workflows
         if not isinstance(workflows, list):
             logger.warning("\u7a97\u53e3%s\u5de5\u4f5c\u6d41\u914d\u7f6e\u683c\u5f0f\u65e0\u6548: %s", window_id, type(workflows).__name__)
             return []
@@ -331,16 +331,22 @@ class ControlCenterWindowTaskMixin:
     ) -> List[WindowTaskRunner]:
         runners = []
         workflow_total = len(workflows)
-        for workflow_index, workflow_info in enumerate(workflows):
-            runner = self._create_window_task_runner(
-                window_info,
-                window_id,
-                workflow_info,
-                workflow_index,
-                workflow_total,
-                configured_execution_mode,
-            )
-            runners.append(runner)
+        try:
+            for workflow_index, workflow_info in enumerate(workflows):
+                runner = self._create_window_task_runner(
+                    window_info,
+                    window_id,
+                    workflow_info,
+                    workflow_index,
+                    workflow_total,
+                    configured_execution_mode,
+                )
+                runners.append(runner)
+        except Exception:
+            for runner in runners:
+                self._disconnect_window_task_runner(runner)
+                runner.deleteLater()
+            raise
         return runners
 
     def _create_window_task_runner(
@@ -378,16 +384,25 @@ class ControlCenterWindowTaskMixin:
         )
         runner.setProperty("workflow_index", workflow_index)
         runner.setProperty("workflow_name", workflow_name)
-        runner.status_updated.connect(self.on_window_status_updated)
-        runner.step_updated.connect(self.on_window_step_updated)
-        runner.runtime_alert.connect(self._on_runner_runtime_alert)
-        runner.finished.connect(runner.deleteLater)
-        runner.task_completed.connect(
-            partial(self.on_workflow_completed, workflow_index=workflow_index)
-        )
-        runner.finished.connect(
-            partial(self.on_workflow_thread_finished, window_id, workflow_index)
-        )
+        runner._control_center_connections = []
+        try:
+            for signal, callback in (
+                (runner.status_updated, self.on_window_status_updated),
+                (runner.step_updated, self.on_window_step_updated),
+                (runner.runtime_alert, self._on_runner_runtime_alert),
+                (runner.task_completed, self._on_window_runner_completed),
+            ):
+                runner._control_center_connections.append(signal.connect(callback))
+            runner._control_center_connections.append(
+                runner.finished.connect(
+                    self._on_window_runner_finished, Qt.ConnectionType.QueuedConnection
+                )
+            )
+            runner.finished.connect(runner.deleteLater)
+        except Exception:
+            self._disconnect_window_task_runner(runner)
+            runner.deleteLater()
+            raise
         logger.info(
             "\u521b\u5efa\u5de5\u4f5c\u6d41\u8fd0\u884c\u5668 %s/%s: %s",
             workflow_index + 1,
@@ -421,7 +436,32 @@ class ControlCenterWindowTaskMixin:
             queued_count,
         )
 
+    def _on_window_runner_completed(self, window_id: str, success: bool):
+        if self._is_closing:
+            return
+        runner = self.sender()
+        # 解绑后已入队的信号仍可能送达，Qt 此时不再提供发送者。
+        if runner is None:
+            return
+        self.on_workflow_completed(window_id, success, runner.workflow_slot)
+
+    def _on_window_runner_finished(self):
+        if self._is_closing:
+            return
+        runner = self.sender()
+        # 解绑后已入队的信号仍可能送达，Qt 此时不再提供发送者。
+        if runner is None:
+            return
+        self.on_workflow_thread_finished(runner.job_id, runner.workflow_slot)
+
+    def _disconnect_window_task_runner(self, runner):
+        for connection in runner._control_center_connections:
+            QObject.disconnect(connection)
+        runner._control_center_connections.clear()
+
     def on_workflow_completed(self, window_id: str, success: bool, workflow_index: int):
+        if self._is_closing:
+            return
         logger.info(f"窗口{window_id}的工作流{workflow_index + 1}已完成，成功={success}")
         result_map = self._window_workflow_results.setdefault(window_id, {})
         result_map[workflow_index] = bool(success)
@@ -429,14 +469,18 @@ class ControlCenterWindowTaskMixin:
         self._dispatch_pending_runner_starts()
 
     def on_workflow_thread_finished(self, window_id: str, workflow_index: int):
+        if self._is_closing:
+            return
         logger.info(f"窗口{window_id}的工作流线程{workflow_index + 1}已退出")
         self._try_finalize_window_workflows(window_id)
         self._dispatch_pending_runner_starts()
 
     def _try_finalize_window_workflows(self, window_id: str):
+        if self._is_closing:
+            return
         runners = self._get_window_runner_list(window_id)
         if not runners:
-            stored = self.window_runners.get(str(window_id), self.window_runners.get(window_id))
+            stored = self.window_runners.get(window_id)
             if stored is None and window_id not in self._window_workflow_results:
                 return
             scheduler = getattr(self, "scheduler", None)
@@ -468,6 +512,8 @@ class ControlCenterWindowTaskMixin:
         self.on_window_task_completed(window_id, final_success)
 
     def on_window_task_completed(self, window_id, success):
+        if self._is_closing:
+            return
         row = self.find_window_row(window_id)
         self._update_window_completion_status(row, success, window_id=window_id)
         self._cleanup_window_task_runners(window_id)
@@ -505,25 +551,17 @@ class ControlCenterWindowTaskMixin:
         self._set_step_cell(row, step_text)
 
     def _cleanup_window_task_runners(self, window_id: str):
-        if window_id not in self.window_runners:
-            return
-        try:
-            for runner in self._get_window_runner_list(window_id):
-                try:
-                    self._remove_runner_from_start_queue(runner)
-                    runner.status_updated.disconnect()
-                    runner.step_updated.disconnect()
-                    runner.task_completed.disconnect()
-                except Exception as disconnect_error:
-                    logger.debug(f"Disconnect runner signal ignored: {disconnect_error}")
-            del self.window_runners[window_id]
-            logger.info(f"Window runners cleaned: {window_id}")
-        except Exception as e:
-            logger.error(f"运行器清理失败：window_id={window_id}, error={e}")
+        for runner in self._get_window_runner_list(window_id):
+            self._remove_runner_from_start_queue(runner)
+            self._disconnect_window_task_runner(runner)
+            if not runner.isRunning():
+                runner.deleteLater()
+        self.window_runners.pop(window_id, None)
+        logger.info("窗口运行器已清理：%s", window_id)
 
     def _build_window_completion_log_context(self, row: int, success: bool) -> Tuple[str, str, str]:
-        window_title = "Unknown"
-        workflow_name = "Workflow"
+        window_title = "未知窗口"
+        workflow_name = "未知工作流"
         if row >= 0:
             title_item = self.window_table.item(row, 0)
             workflow_item = self.window_table.item(row, 1)
@@ -535,13 +573,13 @@ class ControlCenterWindowTaskMixin:
         if row >= 0:
             final_status = self._get_window_status_text(row)
             if final_status == "已中断":
-                result = "interrupted"
-            elif final_status in {TaskState.COMPLETED.value, "完成"}:
-                result = "success"
+                result = "已中断"
+            elif final_status == TaskState.COMPLETED.value:
+                result = "成功"
             else:
-                result = "failed"
+                result = "失败"
         else:
-            result = "success" if success else "failed"
+            result = "成功" if success else "失败"
         return window_title, workflow_name, result
 
     def _check_cleanup_ocr_after_window_completion(self):

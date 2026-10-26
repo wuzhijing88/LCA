@@ -137,6 +137,9 @@ class ScriptProcess:
         if operation == "resource":
             from task_workflow.script_resources import read_resource_bytes
 
+            invocation = self.host.context.get("plugin_invocation")
+            if invocation is not None:
+                invocation.require_resource("image", args[0])
             data = read_resource_bytes(
                 args[0],
                 **{

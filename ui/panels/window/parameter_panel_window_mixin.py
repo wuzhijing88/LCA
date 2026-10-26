@@ -1,50 +1,10 @@
 from ..parameter_panel_support import *
 from utils.window.window_coordinate_common import (
-    build_window_info,
     get_available_geometry_for_widget,
     get_qt_virtual_desktop_rect,
-    get_window_client_qt_global_rect,
     resolve_qt_screen,
 )
 from utils.window.window_activation_utils import show_and_raise_widget
-
-def _is_native_client_geometry_usable(candidate_geometry, fallback_geometry) -> bool:
-    if candidate_geometry is None or candidate_geometry.isEmpty():
-        return False
-
-    if fallback_geometry is None or fallback_geometry.isEmpty():
-        return True
-
-    try:
-        candidate_width = max(1, int(candidate_geometry.width()))
-        candidate_height = max(1, int(candidate_geometry.height()))
-        fallback_width = max(1, int(fallback_geometry.width()))
-        fallback_height = max(1, int(fallback_geometry.height()))
-
-        # Docking uses Qt logical coordinates. If the native-derived rect is
-        # noticeably larger than the Qt geometry, it is almost certainly a
-        # physical-pixel rect from a packaged high-DPI runtime and must be
-        # rejected.
-        size_tolerance = 24
-        if candidate_width > fallback_width + size_tolerance:
-            return False
-        if candidate_height > fallback_height + size_tolerance:
-            return False
-
-        min_width = max(120, int(round(fallback_width * 0.6)))
-        min_height = max(160, int(round(fallback_height * 0.6)))
-        if candidate_width < min_width or candidate_height < min_height:
-            return False
-
-        offset_tolerance = 48
-        if abs(int(candidate_geometry.x()) - int(fallback_geometry.x())) > offset_tolerance:
-            return False
-        if abs(int(candidate_geometry.y()) - int(fallback_geometry.y())) > offset_tolerance:
-            return False
-    except Exception:
-        return False
-
-    return True
 
 class ParameterPanelWindowMixin:
 
@@ -70,20 +30,12 @@ class ParameterPanelWindowMixin:
         self.manually_closed = True  # 标记为用户手动关闭
         self._stop_combo_key_sequence_recording()
 
-        # 停止回放线程
-        if hasattr(self, '_replay_thread') and self._replay_thread and self._replay_thread.isRunning():
-            try:
-                self._replay_thread.stop()
-            except Exception:
-                pass
-
-        # 注销录制和回放快捷键
-        self._unregister_record_hotkey()
-        self._unregister_replay_hotkey()
-        self._is_recording_panel_active = False
+        self._release_panel_runtime()
         self._clear_favorites_runtime_refs()
 
         self.panel_closed.emit()
+        from ..card_plugin_state import release_card_plugin_panel
+        release_card_plugin_panel(self)
         # 注意：不要在这里重置 current_card_id
         event.accept()
 
@@ -172,20 +124,30 @@ class ParameterPanelWindowMixin:
         super().mouseReleaseEvent(event)
 
     def _auto_save_before_hide(self):
-        if self.current_card_id is None or not hasattr(self, 'widgets') or not self.widgets:
-            return
+        if self.current_card_id is None or not self.widgets:
+            return True
         try:
-            self._apply_parameters(auto_close=False)
-            logger.info(f"Auto-save parameter panel before hide: card_id={self.current_card_id}")
-        except Exception as exc:
-            logger.warning(f"隐藏前自动保存失败：{exc}")
+            if self.current_task_type == "脚本卡片":
+                self._plugin_parameter_controller.save_draft()
+            else:
+                self._apply_parameters(auto_close=False)
+            return True
+        except Exception as error:
+            logger.error("隐藏前保存参数失败：%s", error)
+            QMessageBox.warning(self, "参数未保存", str(error))
+            return False
 
     def hide_panel(self):
-        logger.debug(f"Hide parameter panel - card_id: {self.current_card_id}")
-        self._auto_save_before_hide()
+        if not self._auto_save_before_hide():
+            return
+        self._finish_hiding_panel()
+
+    def _finish_hiding_panel(self):
         self.manually_closed = True
         self.hide()
         self.panel_closed.emit()
+        from ..card_plugin_state import release_card_plugin_panel
+        release_card_plugin_panel(self)
 
     def is_panel_open(self) -> bool:
         return self.isVisible() and self.current_card_id is not None
@@ -244,8 +206,8 @@ class ParameterPanelWindowMixin:
             self.main_window_minimized = False
             if not self.manually_closed and self._should_restore_panel_content():
                 logger.debug('[Parameter Panel] Delay show and reposition panel')
-                QTimer.singleShot(100, self.show)
-                QTimer.singleShot(250, self._position_panel)
+                QTimer.singleShot(100, self, lambda: self.show() if not self.manually_closed else None)
+                QTimer.singleShot(250, self, self._position_panel)
 
     def _should_restore_panel_content(self) -> bool:
         return (
@@ -293,12 +255,9 @@ class ParameterPanelWindowMixin:
         title_layout.setContentsMargins(8, 3, 4, 3)
 
         self.title_input = QLineEdit('\u53c2\u6570\u8bbe\u7f6e')
-        self.title_input.setFont(QFont('Microsoft YaHei', 10, QFont.Weight.Bold))
+        self.title_input.setObjectName('parameterPanelTitleInput')
         self.title_input.setFrame(False)
         self.title_input.setReadOnly(False)
-        self.title_input.setStyleSheet(
-            'QLineEdit { background: transparent; border: none; padding: 0px; }'
-        )
         self.title_input.editingFinished.connect(self._on_title_edited)
         title_layout.addWidget(self.title_input)
         title_layout.addStretch()
@@ -337,11 +296,11 @@ class ParameterPanelWindowMixin:
         button_layout.addStretch()
 
         self.apply_button = QPushButton('\u5e94\u7528')
-        self.apply_button.clicked.connect(lambda: self._apply_parameters(auto_close=True))
+        self.apply_button.clicked.connect(self._apply_parameters_from_ui)
         button_layout.addWidget(self.apply_button)
 
         self.reset_button = QPushButton('\u91cd\u7f6e')
-        self.reset_button.clicked.connect(self._reset_parameters)
+        self.reset_button.clicked.connect(self._reset_parameters_from_ui)
         button_layout.addWidget(self.reset_button)
 
         content_layout.addLayout(button_layout)
@@ -355,11 +314,8 @@ class ParameterPanelWindowMixin:
     def _install_wheel_filter(self, widget, name):
         if not isinstance(widget, (QComboBox, QSpinBox, QDoubleSpinBox, QSlider)):
             return
-        wheel_filter = WheelEventFilter(f"{type(widget).__name__}_{name}")
+        wheel_filter = WheelEventFilter(f"{type(widget).__name__}_{name}", widget)
         widget.installEventFilter(wheel_filter)
-        if not hasattr(self, '_wheel_filters'):
-            self._wheel_filters = []
-        self._wheel_filters.append(wheel_filter)
         logger.debug(f"Install wheel filter for widget {name} ({type(widget).__name__})")
 
     def _apply_styles(self):
@@ -368,19 +324,7 @@ class ParameterPanelWindowMixin:
     _PANEL_SNAP_GAP = 2
 
     def _get_parent_client_geometry(self):
-        fallback_geometry = self.parent_window.geometry()
-
-        try:
-            parent_hwnd = int(self.parent_window.winId())
-            if parent_hwnd:
-                window_info = build_window_info(parent_hwnd)
-                client_qt_rect = get_window_client_qt_global_rect(window_info)
-                if _is_native_client_geometry_usable(client_qt_rect, fallback_geometry):
-                    return client_qt_rect
-        except Exception:
-            pass
-
-        return fallback_geometry
+        return self.parent_window.geometry()
 
     def _sync_panel_target_screen(self, reference_geometry) -> None:
         try:
@@ -559,12 +503,12 @@ class ParameterPanelWindowMixin:
             # 如果之前有焦点控件且仍然可用，尝试恢复焦点
             if saved_focus and saved_focus.isVisible() and saved_focus.isEnabled():
                 # 使用定时器延迟恢复焦点，避免立即被覆盖
-                QTimer.singleShot(50, lambda: self._restore_widget_focus(saved_focus))
+                QTimer.singleShot(50, saved_focus, lambda: self._restore_widget_focus(saved_focus))
 
             logger.debug("参数面板激活，智能同步主窗口（保护焦点）")
         finally:
             # 使用定时器重置标志
-            QTimer.singleShot(200, lambda: setattr(self, '_activation_in_progress', False))
+            QTimer.singleShot(200, self, lambda: setattr(self, '_activation_in_progress', False))
 
     def _restore_widget_focus(self, widget):
 
@@ -616,12 +560,12 @@ class ParameterPanelWindowMixin:
             # 如果之前有焦点控件且仍然可用，尝试恢复焦点
             if saved_focus and saved_focus.isVisible() and saved_focus.isEnabled():
                 # 使用定时器延迟恢复焦点，避免立即被覆盖
-                QTimer.singleShot(50, lambda: self._restore_widget_focus(saved_focus))
+                QTimer.singleShot(50, saved_focus, lambda: self._restore_widget_focus(saved_focus))
 
             logger.debug("主窗口激活，智能同步参数面板（保护焦点）")
         finally:
             # 使用定时器重置标志
-            QTimer.singleShot(200, lambda: setattr(self, '_activation_in_progress', False))
+            QTimer.singleShot(200, self, lambda: setattr(self, '_activation_in_progress', False))
 
     def paintEvent(self, event):
         """绘制圆角背景（10px圆角，与主窗口保持一致）"""
@@ -636,28 +580,11 @@ class ParameterPanelWindowMixin:
         content_rect = rect.adjusted(shadow_margin, shadow_margin, -shadow_margin, -shadow_margin)
         path.addRoundedRect(content_rect, radius, radius)
 
-        # 从主题管理器获取背景颜色
-        try:
-            from themes import get_theme_manager
-            theme_manager = get_theme_manager()
-            bg_color = theme_manager.get_qcolor('background')
-            bg_color.setAlpha(250)  # 略透明
-            border_color = theme_manager.get_qcolor('border')
-        except Exception:
-            from themes import theme_color
-
-            bg_color = QColor(theme_color("background", "#ffffff"))
-            bg_color.setAlpha(250)
-            border_color = QColor(theme_color("border", "#e0e0e0"))
-
-        # 绘制阴影（内置阴影边框）
-        if shadow_margin > 0 and not getattr(self, "_use_native_shadow", False):
-            for i in range(shadow_margin, 0, -1):
-                alpha = int(20 * (i / shadow_margin))
-                shadow_rect = content_rect.adjusted(-i, -i, i, i)
-                shadow_path = QPainterPath()
-                shadow_path.addRoundedRect(shadow_rect, radius + i, radius + i)
-                painter.fillPath(shadow_path, QBrush(QColor(0, 0, 0, alpha)))
+        from themes import get_theme_manager
+        theme_manager = get_theme_manager()
+        bg_color = theme_manager.get_qcolor('background')
+        bg_color.setAlpha(250)
+        border_color = theme_manager.get_qcolor('border')
 
         # 绘制背景
         painter.fillPath(path, QBrush(bg_color))

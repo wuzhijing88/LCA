@@ -11,7 +11,9 @@ import os
 from datetime import datetime
 from typing import Optional, Tuple
 from PySide6.QtWidgets import QApplication, QWidget, QMessageBox, QPushButton
-from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal, QEvent, QObject
+from shiboken6 import isValid
+from themes import get_theme_manager, theme_color
 from PySide6.QtGui import QPainter, QPen, QColor, QPixmap, QFontMetrics
 from PIL import Image
 import numpy as np
@@ -41,6 +43,8 @@ from utils.window.window_overlay_utils import (
 from utils.window.window_activation_utils import (
     activate_window,
     schedule_overlay_activation_boost,
+    schedule_overlay_callback,
+    release_overlay_input,
     show_and_activate_overlay,
 )
 from ui.selectors.selection_adjust import (
@@ -51,41 +55,12 @@ from ui.selectors.selection_adjust import (
 )
 
 
-def _get_default_images_dir() -> str:
-    """Get default images directory."""
-    from utils.app_paths import get_images_dir
+def _normalize_screenshot_save_dir(save_dir):
+    if not isinstance(save_dir, str) or not save_dir.strip():
+        raise ValueError("未设置截图保存目录")
+    return os.path.abspath(save_dir)
 
-    return get_images_dir("LCA")
-
-
-def _get_context_images_dir(context) -> str:
-    """优先使用上层上下文传入的图片目录，保证截图与工作流目录一致。"""
-    try:
-        candidate = str(getattr(context, "images_dir", "") or "").strip()
-    except Exception:
-        candidate = ""
-    return _normalize_screenshot_save_dir(candidate)
-
-
-def _normalize_screenshot_save_dir(save_dir: str) -> str:
-    raw_save_dir = str(save_dir or "").strip()
-    default_images_dir = _get_default_images_dir()
-    if (not raw_save_dir) or raw_save_dir.replace("/", "\\").lower() in {"images", ".\images"}:
-        return default_images_dir
-
-    if os.path.isabs(raw_save_dir):
-        return raw_save_dir
-
-    from utils.app_paths import get_app_root
-
-    return os.path.abspath(os.path.join(get_app_root(), raw_save_dir))
-
-try:
-    import win32gui
-    PYWIN32_AVAILABLE = True
-except ImportError:
-    PYWIN32_AVAILABLE = False
-    logger.warning("pywin32 not available, screenshot tool may have limited functionality")
+import win32gui
 
 class ScreenshotOverlay(QWidget):
     """截图覆盖层 - 使用当前截图引擎捕获窗口客户区"""
@@ -110,18 +85,27 @@ class ScreenshotOverlay(QWidget):
         workflow_id: Optional[object] = None,
         unique_filename: bool = False,
     ):
+        if screenshot_format not in self.SUPPORTED_FORMATS:
+            raise ValueError(f"不支持的截图格式：{screenshot_format}")
+        resolved_save_dir = _normalize_screenshot_save_dir(save_dir)
         super().__init__(None)  # 独立窗口
 
         self.target_hwnd = target_hwnd
-        self.save_dir = _normalize_screenshot_save_dir(save_dir)
+        self.save_dir = resolved_save_dir
         self.parent_widget = parent
         self.card_id = card_id
         self._workflow_token = self._normalize_workflow_token(workflow_id)
         self.unique_filename = bool(unique_filename)
         self._completion_emitted = False
+        self._resources_released = False
+        self._theme_registered = False
+        self._composed_backdrop = None
+        self._composed_backdrop_key = None
+        if parent is not None:
+            parent.destroyed.connect(self._on_owner_destroyed)
 
         # 截图格式设置
-        self.screenshot_format = screenshot_format if screenshot_format in self.SUPPORTED_FORMATS else 'bmp'
+        self.screenshot_format = screenshot_format
 
         # 窗口信息
         self.window_info = None
@@ -153,9 +137,9 @@ class ScreenshotOverlay(QWidget):
         # 性能优化：缓存字体和颜色
         self.hint_font = overlay_hint_font()
         self.size_font = overlay_hint_font()
-        self.selection_color = QColor(0, 255, 0)
+        self.selection_color = QColor(theme_color("selection_target"))
         self.hint_color = OVERLAY_TEXT_COLOR
-        self.mask_color = QColor(0, 0, 0, 100)
+        self.mask_color = QColor(theme_color("selection_backdrop"))
 
         # 抓图前保持轻量 Tool 窗，和仓库旧实现一致。
         # 这里如果先建成不透明原生顶层窗，会和 DXGI Desktop Duplication 抢 D3D，dxcam 直接失败。
@@ -172,35 +156,42 @@ class ScreenshotOverlay(QWidget):
         # 提示文字
         self.hint_text = "拖动鼠标选择截图区域 | 右键或ESC取消"
 
-        self.confirm_button = QPushButton("确定", self)
-        self.confirm_button.setObjectName("screenshotConfirmButton")
-        self.confirm_button.setFixedSize(84, 34)
-        self.confirm_button.setProperty("primary", True)
-        self.confirm_button.setAutoDefault(False)
-        self.confirm_button.setDefault(False)
-        self.confirm_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.confirm_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.confirm_button.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.confirm_button.clicked.connect(self._confirm_selection)
-        self.confirm_button.hide()
+        try:
+            self.confirm_button = QPushButton("确定", self)
+            self.confirm_button.setObjectName("screenshotConfirmButton")
+            self.confirm_button.setFixedSize(84, 34)
+            self.confirm_button.setProperty("primary", True)
+            self.confirm_button.setAutoDefault(False)
+            self.confirm_button.setDefault(False)
+            self.confirm_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.confirm_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.confirm_button.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            self.confirm_button.clicked.connect(self._confirm_selection)
+            self.confirm_button.hide()
 
-        self.reselect_button = QPushButton("重选", self)
-        self.reselect_button.setObjectName("screenshotReselectButton")
-        self.reselect_button.setFixedSize(84, 34)
-        self.reselect_button.setAutoDefault(False)
-        self.reselect_button.setDefault(False)
-        self.reselect_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.reselect_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.reselect_button.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.reselect_button.clicked.connect(self._reset_selection)
-        self.reselect_button.hide()
-        self._apply_action_buttons_theme()
+            self.reselect_button = QPushButton("重选", self)
+            self.reselect_button.setObjectName("screenshotReselectButton")
+            self.reselect_button.setFixedSize(84, 34)
+            self.reselect_button.setAutoDefault(False)
+            self.reselect_button.setDefault(False)
+            self.reselect_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.reselect_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.reselect_button.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            self.reselect_button.clicked.connect(self._reset_selection)
+            self.reselect_button.hide()
+            self._apply_action_buttons_theme()
+            self._theme_registered = True
+            get_theme_manager().register_theme_change_callback(self._on_theme_changed)
 
-        logger.info(f"创建截图工具覆盖层，目标窗口: {target_hwnd}")
+            logger.info(f"创建截图工具覆盖层，目标窗口: {target_hwnd}")
 
-        # 如果有目标窗口，获取窗口信息
-        if self.target_hwnd and PYWIN32_AVAILABLE:
-            self.window_info = self._get_window_info(self.target_hwnd)
+            # 如果有目标窗口，获取窗口信息
+            if self.target_hwnd:
+                self.window_info = self._get_window_info(self.target_hwnd)
+        except Exception:
+            self._release_capture()
+            self.deleteLater()
+            raise
 
     @staticmethod
     def _normalize_workflow_token(workflow_id: Optional[object]) -> str:
@@ -245,11 +236,13 @@ class ScreenshotOverlay(QWidget):
             return f"{self._workflow_token}_{self.card_id}"
         return f"card_{self.card_id}"
 
-    def _emit_screenshot_taken_once(self, filepath: str) -> None:
+    def _emit_screenshot_taken_once(self, path: str):
         if self._completion_emitted:
             return
         self._completion_emitted = True
-        self.screenshot_taken.emit(filepath)
+        self.close()
+        if isValid(self):
+            self.screenshot_taken.emit(path)
 
     def _emit_screenshot_cancelled_once(self) -> None:
         if self._completion_emitted:
@@ -263,24 +256,16 @@ class ScreenshotOverlay(QWidget):
             self._completion_emitted = False
 
             # 仅在使用 WGC 引擎时清理 WGC 缓存，避免与其他引擎日志混淆
-            try:
-                from utils.capture.screenshot_helper import get_screenshot_engine
-                engine = get_screenshot_engine()
-            except Exception:
-                engine = "unknown"
+            from utils.capture.screenshot_helper import get_screenshot_engine, clear_screenshot_cache
+            engine = get_screenshot_engine()
 
             if engine == "wgc":
-                try:
-                    from utils.capture.screenshot_helper import clear_screenshot_cache
-                    clear_screenshot_cache()
-                    logger.debug("WGC缓存已清理")
-                except Exception as e:
-                    logger.debug(f"清理WGC缓存失败: {e}")
+                clear_screenshot_cache()
 
             logger.info(f"开始捕获截图，窗口句柄: {self.target_hwnd}")
 
             # 激活目标窗口（桌面不能置顶，跳过）
-            if self.target_hwnd and PYWIN32_AVAILABLE:
+            if self.target_hwnd:
                 from utils.window.window_identity import is_desktop_window
 
                 if is_desktop_window(self.target_hwnd):
@@ -307,6 +292,7 @@ class ScreenshotOverlay(QWidget):
             if not self.target_hwnd:
                 logger.error("未提供目标窗口句柄，无法截图")
                 show_critical_box(self.parent_widget, "截图失败", "未绑定目标窗口\n\n请先绑定一个窗口再使用截图工具")
+                self.close()
                 return False
 
             # 【关键修复】锁定窗口坐标，截图前后保持一致
@@ -316,13 +302,10 @@ class ScreenshotOverlay(QWidget):
             except Exception as e:
                 logger.error(f"锁定窗口坐标失败: {e}")
                 show_critical_box(self.parent_widget, "截图失败", f"无法获取窗口位置\n\n{str(e)}")
+                self.close()
                 return False
 
-            try:
-                from utils.capture.screenshot_helper import get_screenshot_engine
-                current_engine = get_screenshot_engine()
-            except Exception:
-                current_engine = "unknown"
+            current_engine = engine
             logger.info(f"使用 {str(current_engine).upper()} 窗口客户区截图")
             screenshot = self._capture_window_wgc()
 
@@ -339,6 +322,7 @@ class ScreenshotOverlay(QWidget):
                 if detail:
                     tip = f"{tip}\n\n详情：{detail}"
                 QMessageBox.critical(None, "截图失败", tip)
+                self.close()
                 return False
 
             # 保存截图数据（现在统一为numpy.ndarray BGR格式）
@@ -355,6 +339,7 @@ class ScreenshotOverlay(QWidget):
 
             if self.screenshot_pixmap is None:
                 logger.error("无法转换截图为QPixmap")
+                self.close()
                 return False
 
             logger.info(f"截图QPixmap创建: 尺寸={self.screenshot_pixmap.width()}x{self.screenshot_pixmap.height()}")
@@ -382,7 +367,9 @@ class ScreenshotOverlay(QWidget):
 
             if show_and_activate_overlay(self, log_prefix='截图覆盖层', focus=True):
                 logger.info("已使用统一覆盖层激活链启动截图覆盖层")
-            QApplication.processEvents()
+            if self._closing:
+                self.close()
+                return False
             sync_overlay_geometry(self)
             mapped_rect = self._native_rect_to_overlay_rect(native_client_rect)
             if self._should_use_full_overlay_selection():
@@ -425,7 +412,7 @@ class ScreenshotOverlay(QWidget):
                 focus=True,
             )
             for delay in (0, 50, 160, 320):
-                QTimer.singleShot(delay, self._grab_overlay_input)
+                schedule_overlay_callback(self, delay, self._grab_overlay_input)
 
             logger.info("截图覆盖层已显示，等待用户选择区域")
 
@@ -446,9 +433,6 @@ class ScreenshotOverlay(QWidget):
 
         【关键修复】在截图前锁定窗口坐标，保存时使用快照值避免时序竞争
         """
-        if not PYWIN32_AVAILABLE:
-            raise Exception("pywin32不可用")
-
         client_screen_pos = None
         client_width = 0
         client_height = 0
@@ -477,13 +461,9 @@ class ScreenshotOverlay(QWidget):
         """Convert a Win32 native rect to an overlay-local Qt rect."""
         return map_native_rect_to_local(self, native_rect)
 
-    def _should_use_full_overlay_selection(self) -> bool:
-        try:
-            from utils.window.window_identity import is_desktop_window
-
-            return is_desktop_window(self.target_hwnd)
-        except Exception:
-            return False
+    def _should_use_full_overlay_selection(self):
+        from utils.window.window_identity import is_desktop_window
+        return is_desktop_window(self.target_hwnd)
 
     def _client_rect_is_usable(self) -> bool:
         rect = self.client_qt_rect
@@ -507,15 +487,8 @@ class ScreenshotOverlay(QWidget):
         except Exception as exc:
             logger.warning("截图覆盖层抓取输入失败: %s", exc)
 
-    def _release_overlay_input(self) -> None:
-        try:
-            self.releaseMouse()
-        except Exception:
-            pass
-        try:
-            self.releaseKeyboard()
-        except Exception:
-            pass
+    def _release_overlay_input(self):
+        release_overlay_input(self)
 
     def _get_window_info(self, hwnd: int):
         """获取窗口信息（包括DPI处理）"""
@@ -551,53 +524,15 @@ class ScreenshotOverlay(QWidget):
             logger.error(f"获取窗口信息失败: {e}")
             return None
 
-    def _activate_target_window(self, hwnd: int):
-        """激活并置顶目标窗口"""
-        if not hwnd or hwnd == 0:
-            logger.warning("窗口句柄无效，跳过激活")
-            return
-
-        try:
-            # 检查窗口是否存在
-            if PYWIN32_AVAILABLE and not win32gui.IsWindow(hwnd):
-                logger.error(f"窗口句柄 {hwnd} 无效（窗口不存在），跳过激活")
-                return
-            activation_hwnd = activate_window(hwnd, log_prefix='截图')
-            if activation_hwnd:
-                logger.info(f"截图目标窗口激活完成: {activation_hwnd}")
-            else:
-                logger.warning("截图目标窗口激活失败")
-
-        except Exception as e:
-            logger.warning(f"激活目标窗口失败: {e}", exc_info=True)
+    def _activate_target_window(self, hwnd):
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            raise ValueError("截图目标窗口无效")
+        if not activate_window(hwnd, log_prefix='截图'):
+            raise RuntimeError("无法激活截图目标窗口")
 
     def _capture_window_wgc(self):
-        """捕获窗口客户区截图（与识图任务保持同一链路）。"""
-        try:
-            if not PYWIN32_AVAILABLE:
-                logger.warning("pywin32不可用，无法捕获窗口")
-                return None
-
-            # 与 image_match_click 执行路径统一：始终走 capture_window_smart。
-            from tasks.task_utils import capture_window_smart
-            try:
-                from utils.capture.engine_ids import screenshot_engine_log_label
-                from utils.capture.screenshot_helper import get_screenshot_engine
-                engine = screenshot_engine_log_label(get_screenshot_engine())
-            except Exception:
-                engine = "未知引擎"
-            screenshot = capture_window_smart(self.target_hwnd, client_area_only=True)
-
-            if screenshot is not None:
-                logger.info(f"{engine} 窗口截图成功（客户区），尺寸: {screenshot.shape}")
-                return screenshot
-
-            logger.warning(f"{engine} 窗口截图失败")
-            return None
-
-        except Exception as e:
-            logger.error(f"窗口截图异常: {e}", exc_info=True)
-            return None
+        from tasks.task_utils import capture_window_smart
+        return capture_window_smart(self.target_hwnd, client_area_only=True)
 
     def _pil_to_qpixmap(self, pil_image):
         """PIL图像转QPixmap (优化版 - 减少内存拷贝)"""
@@ -986,6 +921,8 @@ class ScreenshotOverlay(QWidget):
         event.accept()
 
     def paintEvent(self, event):
+        if self._resources_released:
+            return
         """Paint overlay."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
@@ -1001,7 +938,7 @@ class ScreenshotOverlay(QWidget):
         )
 
         if self.client_qt_rect:
-            draw_overlay_frame(painter, self.client_qt_rect, border_color=QColor(0, 255, 0), border_width=3)
+            draw_overlay_frame(painter, self.client_qt_rect, border_color=QColor(theme_color("selection_target")), border_width=3)
 
         if self.selecting or not self.selection_rect.isEmpty():
             painter.fillRect(dirty, self.mask_color)
@@ -1024,7 +961,7 @@ class ScreenshotOverlay(QWidget):
                 draw_dynamic_center_crosshair(
                     painter,
                     self.selection_rect,
-                    color=QColor(255, 0, 0),
+                    color=QColor(theme_color("selection_marker")),
                     inset=1,
                 )
 
@@ -1063,7 +1000,7 @@ class ScreenshotOverlay(QWidget):
 
         label_rect = QRect(int(x), int(y), int(box_w), int(box_h))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 160))
+        painter.setBrush(QColor(theme_color("selection_backdrop")))
         painter.drawRoundedRect(label_rect, 6, 6)
 
         painter.setPen(OVERLAY_TEXT_COLOR)
@@ -1071,279 +1008,106 @@ class ScreenshotOverlay(QWidget):
         painter.restore()
 
     def _apply_action_buttons_theme(self) -> None:
-        """应用截图操作按钮主题样式（与全局主题保持一致）。"""
-        palette = {
-            "text": "#333333",
-            "text_disabled": "#999999",
-            "surface": "#f5f5f5",
-            "border": "#e0e0e0",
-            "border_light": "#eeeeee",
-            "hover": "#e8e8e8",
-            "pressed": "#d8d8d8",
-            "accent": "#0078d4",
-            "accent_hover": "#1084d8",
-            "accent_pressed": "#006cbe",
-        }
-
-        try:
-            from themes import get_theme_manager
-
-            theme_manager = get_theme_manager()
-            for key in list(palette.keys()):
-                value = str(theme_manager.get_color(key) or "").strip()
-                if value:
-                    palette[key] = value
-        except Exception:
-            pass
-
-        surface_qc = QColor(palette["surface"])
-        hover_qc = QColor(palette["hover"])
-        pressed_qc = QColor(palette["pressed"])
-        border_qc = QColor(palette["border"])
-
-        if not surface_qc.isValid():
-            surface_qc = QColor("#f5f5f5")
-        if not hover_qc.isValid():
-            hover_qc = QColor("#e8e8e8")
-        if not pressed_qc.isValid():
-            pressed_qc = QColor("#d8d8d8")
-        if not border_qc.isValid():
-            border_qc = QColor("#d0d0d0")
-
-        surface_rgba = f"rgba({surface_qc.red()}, {surface_qc.green()}, {surface_qc.blue()}, 228)"
-        hover_rgba = f"rgba({hover_qc.red()}, {hover_qc.green()}, {hover_qc.blue()}, 240)"
-        pressed_rgba = f"rgba({pressed_qc.red()}, {pressed_qc.green()}, {pressed_qc.blue()}, 246)"
-        border_rgba = f"rgba({border_qc.red()}, {border_qc.green()}, {border_qc.blue()}, 235)"
-
-        common_style = (
-            "outline: none;"
-            "border-radius: 10px;"
-            "padding: 0 14px;"
-            "font-family: \"Microsoft YaHei\";"
-            "font-size: 12px;"
-            "font-weight: 600;"
-            "min-height: 30px;"
-            "letter-spacing: 0.5px;"
-        )
-
-        action_style = (
-            f"""
-            QPushButton#screenshotConfirmButton {{
-                {common_style}
-                background-color: {palette['accent']};
-                color: #ffffff;
-                border: 1px solid {palette['accent']};
-            }}
-            QPushButton#screenshotConfirmButton:hover {{
-                background-color: {palette['accent_hover']};
-                border-color: {palette['accent_hover']};
-            }}
-            QPushButton#screenshotConfirmButton:pressed {{
-                background-color: {palette['accent_pressed']};
-                border-color: {palette['accent_pressed']};
-            }}
-            QPushButton#screenshotConfirmButton:focus {{
-                outline: none;
-                border: 1px solid {palette['accent_hover']};
-            }}
-            QPushButton#screenshotConfirmButton:disabled {{
-                background-color: {palette['surface']};
-                color: {palette['text_disabled']};
-                border: 1px solid {palette['border_light']};
-            }}
-
-            QPushButton#screenshotReselectButton {{
-                {common_style}
-                background-color: {surface_rgba};
-                color: {palette['text']};
-                border: 1px solid {border_rgba};
-            }}
-            QPushButton#screenshotReselectButton:hover {{
-                background-color: {hover_rgba};
-                border-color: {border_rgba};
-            }}
-            QPushButton#screenshotReselectButton:pressed {{
-                background-color: {pressed_rgba};
-                border-color: {border_rgba};
-            }}
-            QPushButton#screenshotReselectButton:focus {{
-                outline: none;
-                border: 1px solid {border_rgba};
-            }}
-            QPushButton#screenshotReselectButton:disabled {{
-                background-color: {palette['surface']};
-                color: {palette['text_disabled']};
-                border: 1px solid {palette['border_light']};
-            }}
-            """
-        )
-
-        self.confirm_button.setStyleSheet(action_style)
-        self.reselect_button.setStyleSheet(action_style)
+        from themes.capture_tools import apply_capture_action_buttons
+        apply_capture_action_buttons(self.confirm_button, self.reselect_button)
 
     def _save_screenshot(self):
-        """保存截图（全屏覆盖+DPI转换模式）"""
+        if self._closing:
+            return
         try:
-            # 确保保存目录存在
-            if not os.path.exists(self.save_dir):
-                os.makedirs(self.save_dir)
-
-            # 获取格式配置
-            format_info = self.SUPPORTED_FORMATS.get(self.screenshot_format, self.SUPPORTED_FORMATS['bmp'])
-            ext = format_info['ext']
-
-            # 脚本采集每次单独存一张；卡片截图仍按卡片名覆盖。
-            if self.unique_filename or not (isinstance(self.card_id, int) and self.card_id >= 0):
-                filepath = self._allocate_unique_filepath(ext)
+            if self.client_qt_rect is None or self.client_qt_rect.isEmpty():
+                raise ValueError("缺少有效的窗口客户区信息")
+            image = self.screenshot_image
+            if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3 or not image.size:
+                raise ValueError("缺少有效的窗口截图数据")
+            selection = self.selection_rect.intersected(self.client_qt_rect)
+            if selection.isEmpty():
+                raise ValueError("截图选区为空")
+            img_h, img_w = image.shape[:2]
+            scale_x = img_w / self.client_qt_rect.width()
+            scale_y = img_h / self.client_qt_rect.height()
+            x = max(0, min(int(round((selection.x() - self.client_qt_rect.x()) * scale_x)), img_w - 1))
+            y = max(0, min(int(round((selection.y() - self.client_qt_rect.y()) * scale_y)), img_h - 1))
+            width = min(max(1, int(round(selection.width() * scale_x))), img_w - x)
+            height = min(max(1, int(round(selection.height() * scale_y))), img_h - y)
+            format_info = self.SUPPORTED_FORMATS[self.screenshot_format]
+            os.makedirs(self.save_dir, exist_ok=True)
+            if self.unique_filename or not (type(self.card_id) is int and self.card_id >= 0):
+                filepath = self._allocate_unique_filepath(format_info['ext'])
             else:
-                base_name = self._build_card_filename_base()
-                filepath = os.path.join(self.save_dir, f"{base_name}{ext}")
-
-            # 卡片命名模式：先清理同名不同后缀，避免残留旧格式文件
-            if (not self.unique_filename) and isinstance(self.card_id, int) and self.card_id >= 0:
-                base_name = self._build_card_filename_base()
-                for fmt_name, fmt_info in self.SUPPORTED_FORMATS.items():
-                    stale_path = os.path.join(self.save_dir, f"{base_name}{fmt_info['ext']}")
-                    if stale_path != filepath and os.path.exists(stale_path):
-                        try:
-                            os.remove(stale_path)
-                            logger.debug(f"已清理旧截图文件: {stale_path}")
-                        except Exception as cleanup_err:
-                            logger.warning(f"清理旧截图文件失败: {stale_path}, {cleanup_err}")
-
-            # 【关键】坐标转换：基于截图时锁定的客户区映射，避免打包环境 DPI 偏移
-            if not self.client_qt_rect:
-                logger.error("缺少窗口客户区信息")
-                QMessageBox.critical(self, "错误", "缺少窗口客户区信息，无法保存截图")
-                self._emit_screenshot_cancelled_once()
-                self.close()
-                return
-
-            # 用户框选的Qt逻辑坐标
-            sel_x = self.selection_rect.x()
-            sel_y = self.selection_rect.y()
-            sel_width = self.selection_rect.width()
-            sel_height = self.selection_rect.height()
-
-            # 仅使用“客户区矩形 + 截图分辨率”做比例换算，避免全局坐标二次换算误差
-            client_left = int(self.client_qt_rect.x())
-            client_top = int(self.client_qt_rect.y())
-            client_w_qt = max(1, int(self.client_qt_rect.width()))
-            client_h_qt = max(1, int(self.client_qt_rect.height()))
-
-            rel_qt_x = sel_x - client_left
-            rel_qt_y = sel_y - client_top
-            rel_qt_w = sel_width
-            rel_qt_h = sel_height
-
-            capture_w = max(1, int(getattr(self, "_snapshot_client_w", 1)))
-            capture_h = max(1, int(getattr(self, "_snapshot_client_h", 1)))
-            if self.screenshot_image is not None and isinstance(self.screenshot_image, np.ndarray):
-                try:
-                    capture_h, capture_w = [max(1, int(v)) for v in self.screenshot_image.shape[:2]]
-                except Exception:
-                    capture_w = max(1, int(getattr(self, "_snapshot_client_w", 1)))
-                    capture_h = max(1, int(getattr(self, "_snapshot_client_h", 1)))
-            elif self.screenshot_pixmap:
-                try:
-                    capture_w = max(1, int(self.screenshot_pixmap.width()))
-                    capture_h = max(1, int(self.screenshot_pixmap.height()))
-                except Exception:
-                    capture_w = max(1, int(getattr(self, "_snapshot_client_w", 1)))
-                    capture_h = max(1, int(getattr(self, "_snapshot_client_h", 1)))
-
-            scale_x = capture_w / float(client_w_qt)
-            scale_y = capture_h / float(client_h_qt)
-
-            relative_physical_x = int(round(rel_qt_x * scale_x))
-            relative_physical_y = int(round(rel_qt_y * scale_y))
-            physical_width = max(1, int(round(rel_qt_w * scale_x)))
-            physical_height = max(1, int(round(rel_qt_h * scale_y)))
-
-            # 仅用于日志对齐（坐标系原点）
-            client_screen_pos = self._snapshot_client_pos
-            sel_physical_x = int(client_screen_pos[0]) + int(relative_physical_x)
-            sel_physical_y = int(client_screen_pos[1]) + int(relative_physical_y)
-            logger.info("==== 坐标转换详细诊断 ====")
-            logger.info(f"框选区域Qt逻辑: ({sel_x}, {sel_y}) {sel_width}x{sel_height}")
-            logger.info(f"客户区Qt逻辑: ({self.client_qt_rect.x()}, {self.client_qt_rect.y()}) {self.client_qt_rect.width()}x{self.client_qt_rect.height()}")
-            logger.info(f"客户区物理坐标(快照): {client_screen_pos}")
-            logger.info(f"框选区域物理屏幕坐标: ({sel_physical_x}, {sel_physical_y})")
-            logger.info(f"相对客户区物理坐标: ({relative_physical_x}, {relative_physical_y})")
-            logger.info(f"物理尺寸: {physical_width}x{physical_height}")
-
-            if self.screenshot_image is not None and isinstance(self.screenshot_image, np.ndarray):
-                pass
-
-                # 边界检查
-                img_h, img_w = self.screenshot_image.shape[:2]
-                try:
-                    from utils.capture.engine_ids import screenshot_engine_log_label
-                    from utils.capture.screenshot_helper import get_screenshot_engine
-                    engine = screenshot_engine_log_label(get_screenshot_engine())
-                except Exception:
-                    engine = "未知引擎"
-                logger.info(f"{engine} 截图尺寸(物理像素): {img_w}x{img_h}")
-
-                # 直接使用相对坐标裁剪，不再判断WGC返回内容
-                x = max(0, min(relative_physical_x, img_w - 1))
-                y = max(0, min(relative_physical_y, img_h - 1))
-                w = min(physical_width, img_w - x)
-                h = min(physical_height, img_h - y)
-
-                logger.info(f"实际裁剪区域(物理像素): ({x}, {y}) {w}x{h}")
-
-                # 检查边界修正
-                if x != relative_physical_x or y != relative_physical_y or w != physical_width or h != physical_height:
-                    logger.warning(f"边界修正发生: 原始({relative_physical_x}, {relative_physical_y}) {physical_width}x{physical_height}")
-                    logger.warning(f"             修正为({x}, {y}) {w}x{h}")
-
-                # 裁剪并保存
-                cropped_img = self.screenshot_image[y:y+h, x:x+w]
-                self._save_cv_image_to_path(cropped_img, filepath, format_info)
-
-                self._invalidate_saved_template_cache(filepath)
-
-                logger.info(f"窗口截图已保存: {filepath} (格式: {self.screenshot_format}, 物理像素尺寸: {w}x{h})")
-                self._emit_screenshot_taken_once(filepath)
-                self.close()
-
-            elif self.screenshot_pixmap:
-                # 备用方案：使用QPixmap
-                relative_rect = QRect(relative_physical_x, relative_physical_y, physical_width, physical_height)
-                cropped = self.screenshot_pixmap.copy(relative_rect)
-                cropped.save(filepath)
-
-                self._invalidate_saved_template_cache(filepath)
-
-                logger.info(f"窗口截图已保存: {filepath}")
-                self._emit_screenshot_taken_once(filepath)
-                self.close()
-
-            else:
-                logger.error("无截图数据")
-                self._emit_screenshot_cancelled_once()
-                self.close()
-
-        except Exception as e:
-            logger.error(f"保存截图失败: {e}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"保存截图失败: {str(e)}")
-            self._emit_screenshot_cancelled_once()
+                filepath = os.path.join(self.save_dir, self._build_card_filename_base() + format_info['ext'])
+            self._save_cv_image_to_path(image[y:y+height, x:x+width], filepath, format_info)
+            if not self.unique_filename and type(self.card_id) is int and self.card_id >= 0:
+                for info in self.SUPPORTED_FORMATS.values():
+                    stale = os.path.join(self.save_dir, self._build_card_filename_base() + info['ext'])
+                    if stale != filepath and os.path.exists(stale):
+                        os.remove(stale)
+            self._invalidate_saved_template_cache(filepath)
+        except Exception as error:
+            logger.exception("保存截图失败")
             self.close()
+            QMessageBox.critical(None, "截图失败", f"保存截图失败：{error}")
+            return
+        self._emit_screenshot_taken_once(filepath)
+
+    def _on_theme_changed(self, *_args):
+        if not self._resources_released:
+            self.selection_color = QColor(theme_color("selection_target"))
+            self.mask_color = QColor(theme_color("selection_backdrop"))
+            self._composed_backdrop = self._composed_backdrop_key = None
+            self.update()
+
+    def _release_capture(self):
+        if self._resources_released:
+            return
+        self._resources_released = True
+        if self._theme_registered:
+            get_theme_manager().unregister_theme_change_callback(self._on_theme_changed)
+            self._theme_registered = False
+        self._closing = True
+        release_overlay_input(self)
+        self.screenshot_image = None
+        self.screenshot_pixmap = None
+        self.desktop_pixmap = None
+        self._composed_backdrop = None
+        self._composed_backdrop_key = None
+        self.selecting = self.selection_ready = False
+        self.dragging_selection = self.resizing_selection = False
+        self.selection_rect = QRect()
+
+    def _on_owner_destroyed(self):
+        self._release_capture()
+        self.deleteLater()
+
+    def close(self):
+        self._release_capture()
+        result = super().close()
+        if isValid(self):
+            self._emit_screenshot_cancelled_once()
+        return result
 
     def closeEvent(self, event):
-        self._closing = True
-        self._release_overlay_input()
-        self._emit_screenshot_cancelled_once()
+        self._release_capture()
         super().closeEvent(event)
+        self._emit_screenshot_cancelled_once()
+
+    def hideEvent(self, event):
+        self._release_capture()
+        super().hideEvent(event)
+        self._emit_screenshot_cancelled_once()
+
+    def event(self, event):
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._release_capture()
+        return super().event(event)
 
     @staticmethod
     def _save_cv_image_to_path(image: np.ndarray, filepath: str, format_info: dict) -> None:
         """
         使用编码后写字节的方式保存图片，避免 Windows 下中文路径被错误编码。
         """
-        ext = str(format_info.get("ext", ".png") or ".png")
-        cv2_params = list(format_info.get("cv2_params") or [])
+        ext = format_info["ext"]
+        cv2_params = format_info["cv2_params"]
 
         if cv2_params:
             ok, buffer = cv2.imencode(ext, image, cv2_params)
@@ -1356,136 +1120,12 @@ class ScreenshotOverlay(QWidget):
         with open(filepath, "wb") as f:
             f.write(buffer.tobytes())
 
-    def _invalidate_saved_template_cache(self, filepath: str) -> None:
-        """截图保存后主动失效模板缓存，避免立即识别命中旧图。"""
-        try:
-            from pathlib import Path
-            from utils.match.template_preloader import get_global_preloader
-
-            preloader = get_global_preloader()
-            if preloader is None:
-                return
-
-            normalized = str(Path(filepath).resolve())
-            preloader.invalidate_template(normalized)
-            preloader.invalidate_template(filepath)
-            preloader.invalidate_template(filepath.replace("\\", "/"))
-        except Exception:
-            pass
-        try:
-            from utils.image_paths import get_image_path_resolver
-
-            get_image_path_resolver().invalidate(filepath)
-        except Exception:
-            pass
-
-class QuickScreenshotButton:
-    """快速截图按钮助手类 - 用于集成到参数面板"""
-
-    def __init__(self, parent_panel, target_hwnd: Optional[int] = None):
-        """
-        初始化快速截图按钮
-
-        Args:
-            parent_panel: 父面板（参数面板）
-            target_hwnd: 目标窗口句柄
-        """
-        self.parent_panel = parent_panel
-        self.target_hwnd = target_hwnd
-        self.save_dir = _get_context_images_dir(parent_panel)
-        self.screenshot_overlay = None
-
-    def _get_screenshot_format(self) -> str:
-        """从全局配置获取截图格式"""
-        try:
-            from app_core.config_store import load_config
-            config = load_config()
-            return config.get('screenshot_format', 'bmp')
-        except Exception as e:
-            logger.warning(f"获取截图格式配置失败: {e}, 使用默认BMP格式")
-            return 'bmp'
-
-    def create_button(self, text="快速截图"):
-        """创建截图按钮"""
-        from PySide6.QtWidgets import QPushButton
-
-        button = QPushButton(text)
-        button.setToolTip("点击后拖动鼠标选择区域截图\n截图将自动保存到 images 目录")
-        button.clicked.connect(self.start_screenshot)
-
-        from themes import theme_color
-
-        button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {theme_color("accent", "#0078d4")};
-                color: white;
-                border: none;
-                padding: 5px 10px;
-                border-radius: 3px;
-                font-size: 12px;
-            }}
-            QPushButton:hover {{
-                background-color: {theme_color("accent_hover", "#1084d8")};
-            }}
-            QPushButton:pressed {{
-                background-color: {theme_color("accent_pressed", "#006cbe")};
-            }}
-        """)
-
-        return button
-
-    def start_screenshot(self):
-        """开始截图"""
-        try:
-            logger.info("启动快速截图工具")
-
-            # 获取截图格式配置
-            screenshot_format = self._get_screenshot_format()
-            logger.info(f"使用截图格式: {screenshot_format}")
-
-            workflow_id = None
-            try:
-                if self.parent_panel and hasattr(self.parent_panel, "_get_active_workflow_file_token"):
-                    workflow_id = self.parent_panel._get_active_workflow_file_token()
-            except Exception:
-                workflow_id = None
-
-            # 创建截图覆盖层
-            self.screenshot_overlay = ScreenshotOverlay(
-                target_hwnd=self.target_hwnd,
-                save_dir=self.save_dir,
-                parent=self.parent_panel,
-                screenshot_format=screenshot_format,
-                workflow_id=workflow_id,
-            )
-
-            # 连接信号
-            self.screenshot_overlay.screenshot_taken.connect(self._on_screenshot_taken)
-            self.screenshot_overlay.screenshot_cancelled.connect(self._on_screenshot_cancelled)
-
-            # 捕获并显示
-            if not self.screenshot_overlay.capture_and_show():
-                logger.error("启动截图工具失败")
-                self.screenshot_overlay = None
-
-        except Exception as e:
-            logger.error(f"启动截图工具失败: {e}", exc_info=True)
-            show_critical_box(self.parent_widget, "错误", f"启动截图工具失败: {str(e)}")
-
-    def _on_screenshot_taken(self, filepath):
-        """截图完成回调"""
-        logger.info(f"截图已保存: {filepath}")
-        self.screenshot_overlay = None
-
-    def _on_screenshot_cancelled(self):
-        """截图取消回调"""
-        logger.info("截图已取消")
-        self.screenshot_overlay = None
-
-    def set_target_hwnd(self, hwnd: int):
-        """设置目标窗口句柄"""
-        self.target_hwnd = hwnd
-
-    def set_save_dir(self, save_dir: str):
-        """设置保存目录"""
-        self.save_dir = save_dir
+    def _invalidate_saved_template_cache(self, filepath):
+        from pathlib import Path
+        from utils.match.template_preloader import get_global_preloader
+        from utils.image_paths import get_image_path_resolver
+        preloader = get_global_preloader()
+        if preloader is not None:
+            for name in {str(Path(filepath).resolve()), filepath, filepath.replace("\\", "/")}:
+                preloader.invalidate_template(name)
+        get_image_path_resolver().invalidate(filepath)

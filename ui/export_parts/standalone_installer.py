@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,10 @@ from typing import Callable, Optional, Sequence
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Optional[Callable[[int, str], None]]
+
+
+class ExportCancelled(RuntimeError):
+    """用户取消制作独立程序。"""
 
 # 官方下载（不随 LCA 打包，避免增大体积）
 INNO_SETUP_DOWNLOAD_PAGE = "https://jrsoftware.org/isdl.php"
@@ -335,7 +340,7 @@ def _expand_iscc_path(path: Path | str | None) -> Optional[Path]:
 
 
 def _configured_iscc_path() -> Optional[Path]:
-    raw = str(os.environ.get("INNO_SETUP_ISCC") or os.environ.get("ISCC") or "").strip()
+    raw = str(os.environ.get("INNO_SETUP_ISCC") or "").strip()
     return _expand_iscc_path(raw)
 
 
@@ -574,12 +579,12 @@ def stage_setup_icon(icon_path: str, dest_dir: Path) -> str:
     """
     source = Path(str(icon_path or "").strip())
     if not source.is_file():
-        return ""
+        raise FileNotFoundError(f"安装包图标不存在: {icon_path}")
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     target = dest_dir / "setup.ico"
     shutil.copy2(source, target)
-    return "setup.ico" if target.is_file() else ""
+    return "setup.ico"
 
 
 def build_setup_iss_text(
@@ -593,9 +598,7 @@ def build_setup_iss_text(
     payload_dir: str,
     setup_icon_relative: str = "",
 ) -> str:
-    app_id = "A1B2C3D4-E5F6-7890-ABCD-" + "".join(
-        f"{ord(c):02X}" for c in output_base[:6]
-    ).ljust(12, "0")[:12]
+    app_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "lca-standalone:" + display_name)).upper()
     # 应用与功能 / 快捷方式统一用安装目录内落地的 icon.ico，不依赖从 exe 抽图标
     uninstall_icon = "{app}\\icon.ico"
     icon_line = f"SetupIconFile={setup_icon_relative}" if setup_icon_relative else ""
@@ -667,10 +670,7 @@ class IsccResult:
 def _report_iscc_progress(progress: ProgressCallback, value: int, message: str) -> None:
     if progress is None:
         return
-    try:
-        progress(int(value), str(message or ""))
-    except Exception:
-        logger.debug("ISCC 进度回调失败", exc_info=True)
+    progress(int(value), str(message or ""))
 
 
 def run_iscc(
@@ -681,6 +681,7 @@ def run_iscc(
     poll_seconds: float = 2.0,
     extra_args: Sequence[str] | None = None,
     progress_value: int = 82,
+    cancel_check: Callable[[], None] | None = None,
 ) -> IsccResult:
     """运行 ISCC，输出写入日志文件，避免 capture_output 管道堵满假死。"""
     iss_path = Path(iss_path)
@@ -698,38 +699,50 @@ def run_iscc(
         "正在压缩安装包（Inno Setup，首次可能需数分钟）…",
     )
 
-    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            cwd=str(iss_path.parent),
-        )
-        while True:
-            try:
-                returncode = proc.wait(timeout=max(0.01, float(poll_seconds)))
-                break
-            except subprocess.TimeoutExpired:
-                elapsed = int(time.monotonic() - started)
-                _report_iscc_progress(
-                    progress,
-                    progress_value,
-                    f"正在压缩安装包（Inno Setup，已用时 {elapsed} 秒，请耐心等待）…",
-                )
+    from app_core.script_process_job import ProcessJob
 
-    detail = ""
     try:
+        if cancel_check:
+            cancel_check()
+        with open(log_path, "w", encoding="utf-8", errors="replace") as log_file, ProcessJob() as job:
+            with subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd=str(iss_path.parent),
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            ) as proc:
+                try:
+                    job.assign(proc)
+                    next_report = started + max(0.1, float(poll_seconds))
+                    while True:
+                        if cancel_check:
+                            cancel_check()
+                        try:
+                            returncode = proc.wait(timeout=0.1)
+                            break
+                        except subprocess.TimeoutExpired:
+                            now = time.monotonic()
+                            if now >= next_report:
+                                elapsed = int(now - started)
+                                _report_iscc_progress(
+                                    progress,
+                                    progress_value,
+                                    f"正在压缩安装包（Inno Setup，已用时 {elapsed} 秒，请耐心等待）…",
+                                )
+                                next_report = now + max(0.1, float(poll_seconds))
+                finally:
+                    try:
+                        job.terminate_and_wait()
+                    finally:
+                        job.close()
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.wait()
         detail = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        detail = ""
-    try:
+        return IsccResult(returncode=int(returncode), stdout=detail, stderr="")
+    finally:
         log_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    if returncode is None:
-        returncode = int(proc.returncode or 0)
-    return IsccResult(returncode=int(returncode), stdout=detail, stderr="")
 
 
 def build_standalone_installer(
@@ -742,6 +755,7 @@ def build_standalone_installer(
     version: str = "1.0.0",
     publisher: str = "LCA",
     progress: ProgressCallback = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> Path:
     """
     编译安装包，返回 Setup.exe 路径。
@@ -763,30 +777,26 @@ def build_standalone_installer(
     if not exe_path.is_file():
         raise FileNotFoundError(f"安装包源目录缺少主程序: {exe_path}")
 
-    ico = Path(icon_path) if icon_path else None
-    if ico is None or not ico.is_file():
-        # 回退：工程默认图标
+    if icon_path:
+        ico = Path(icon_path)
+    else:
         from utils.app_paths import get_resource_path
 
-        fallback = Path(get_resource_path("icon.ico"))
-        ico = fallback if fallback.is_file() else None
-        if icon_path and str(icon_path).strip():
-            logger.warning("安装包图标不存在，回退默认图标: %s", icon_path)
+        ico = Path(get_resource_path("icon.ico"))
+    if not ico.is_file():
+        raise FileNotFoundError(f"安装包图标不存在: {ico}")
 
-    output_base = "".join(ch for ch in display_name if ch not in '<>:"/\\|?*').strip() or "独立程序"
-    output_base = f"{output_base}_Setup"
+    output_base = f"{Path(safe_exe).stem}_Setup"
 
-    with tempfile.TemporaryDirectory(prefix="lca_standalone_iss_") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix=".lca_standalone_iss_", dir=output_dir) as temp_dir:
         temp_root = Path(temp_dir)
         setup_icon_relative = stage_setup_icon(str(ico) if ico else "", temp_root)
-        if ico and ico.is_file() and not setup_icon_relative:
-            logger.warning("无法暂存安装包图标，Setup.exe 可能显示默认图标: %s", ico)
         iss_text = build_setup_iss_text(
             display_name=display_name,
             safe_exe=safe_exe,
             publisher=publisher or "LCA",
             version=version or "1.0.0",
-            output_dir=str(output_dir),
+            output_dir=str(temp_root),
             output_base=output_base,
             payload_dir=str(payload_dir),
             setup_icon_relative=setup_icon_relative,
@@ -796,7 +806,7 @@ def build_standalone_installer(
         iss_path.write_bytes(b"\xef\xbb\xbf" + iss_text.encode("utf-8"))
         if setup_icon_relative:
             logger.info("安装包图标: %s -> %s", ico, temp_root / setup_icon_relative)
-        completed = run_iscc(iscc, iss_path, progress=progress)
+        completed = run_iscc(iscc, iss_path, progress=progress, cancel_check=cancel_check)
         if completed.returncode != 0:
             detail = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
             if _is_missing_chinese_language_error(detail):
@@ -807,13 +817,12 @@ def build_standalone_installer(
                 f"{_summarize_iscc_error(detail)}"
             )
 
-    setup_path = output_dir / f"{output_base}.exe"
-    if not setup_path.is_file():
-        # 偶发 OutputBaseFilename 规范化差异，回退扫描
-        candidates = sorted(output_dir.glob("*_Setup.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if candidates:
-            setup_path = candidates[0]
-        else:
-            raise FileNotFoundError(f"未生成安装包: {output_dir / (output_base + '.exe')}")
+        staged_setup = temp_root / f"{output_base}.exe"
+        if not staged_setup.is_file() or staged_setup.stat().st_size == 0:
+            raise FileNotFoundError(f"未生成安装包: {output_base}.exe")
+        if cancel_check:
+            cancel_check()
+        setup_path = output_dir / staged_setup.name
+        staged_setup.replace(setup_path)
     logger.info("独立程序安装包已生成: %s", setup_path)
     return setup_path

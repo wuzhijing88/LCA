@@ -190,10 +190,10 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
             interruptible_sleep(safe_duration, stop_checker)
         except InterruptedError:
             logger.info(stop_message)
-            return False, (False, '任务已停止', None)
+            return False, (False, '停止工作流', None)
         if _control_requested():
             logger.info(stop_message)
-            return False, (False, '任务已停止', None)
+            return False, (False, '停止工作流', None)
         return True, None
 
     direction = params.get('direction', '向下')
@@ -394,9 +394,9 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
             try:
                 for i in range(scroll_count):
                     if _control_requested():
-                        return False, '任务已停止', None
+                        return False, '停止工作流', None
                     if not simulator.scroll(client_x, client_y, scroll_value_per_unit):
-                        return False, '后台滚轮发送失败', None
+                        return False, '执行下一步', None, '后台滚轮发送失败'
                     sleep_ok, stop_result = _sleep_with_control(0.02, "后台滚轮收尾等待期间已停止")
                     if not sleep_ok:
                         return stop_result
@@ -432,7 +432,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
             
             # 移动到目标位置（如果指定）
             if target_x is not None and target_y is not None:
-                if _control_requested(): return False, '任务已停止', None
+                if _control_requested(): return False, '停止工作流', None
                 try:
                     logger.debug(f"前台移动鼠标到目标位置: ({target_x}, {target_y})")
 
@@ -449,7 +449,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
                         return stop_result
                 except Exception as move_err:
                      logger.error(f"前台移动鼠标失败: {move_err}")
-                     return False, f'前台移动鼠标失败: {move_err}', None
+                     return False, '执行下一步', None, f'前台移动鼠标失败: {move_err}'
 
             logger.debug(
                 f"前台滚轮参数: 方向={direction}, 单刻度值={scroll_value_per_unit}, "
@@ -457,7 +457,7 @@ def execute_mouse_scroll(params: Dict[str, Any], counters: Dict[str, int], execu
             )
             
             for i in range(scroll_count):
-                if _control_requested(): return False, f'任务已停止 (滚动 {i+1})', None
+                if _control_requested(): return False, '停止工作流', None, f'任务已停止 (滚动 {i+1})'
                 logger.debug(f"执行前台滚轮 {i+1}/{scroll_count}: 单步delta={scroll_value_per_unit}")
                 try:
                     pyautogui.scroll(scroll_value_per_unit)

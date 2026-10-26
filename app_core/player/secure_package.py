@@ -505,10 +505,6 @@ def load_sealed_package_memory(export_root: Path) -> Tuple[dict, dict, dict, str
     return manifest, ui_payload, workflow_data, memory_uri(entry_rel)
 
 
-def unseal_package_to_dir(export_root: Path, *, extract_root: Optional[Path] = None) -> Path:
-    """兼容旧接口：默认不再落盘，改为加载内存包并返回占位目录路径（export_root）。"""
-    load_sealed_package_memory(export_root)
-    return Path(export_root)
 
 
 def cleanup_extracted_package(export_root: Path) -> None:

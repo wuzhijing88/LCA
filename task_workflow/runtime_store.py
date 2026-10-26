@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import copy
 from typing import Any, Dict, Iterable, Optional
 
 from task_workflow.script_parameters import add_numeric_values
@@ -292,6 +293,10 @@ class RuntimeStore:
         merged = dict(perception or {})
         merged.update(fields)
         payload = normalize_perception(**merged)
+        if "outputs" in merged:
+            if not isinstance(merged["outputs"], dict):
+                raise TypeError("卡片输出必须是字典")
+            payload["outputs"] = normalize_var_value(merged["outputs"])
         thread_id = threading.get_ident()
         with self._lock:
             self._last_by_thread[thread_id] = payload
@@ -318,10 +323,10 @@ class RuntimeStore:
                 if alias:
                     payload = self._last_by_kind.get(thread_id, {}).get(alias)
                     if payload is not None:
-                        return dict(payload)
+                        return {**payload, "outputs": copy.deepcopy(payload["outputs"])} if "outputs" in payload else dict(payload)
             payload = self._last_by_thread.get(thread_id)
             if payload is not None:
-                return dict(payload)
+                return {**payload, "outputs": copy.deepcopy(payload["outputs"])} if "outputs" in payload else dict(payload)
         return empty_perception(kind)
 
     def card_result(self, card_id: Any) -> Dict[str, Any]:
@@ -332,7 +337,7 @@ class RuntimeStore:
         with self._lock:
             payload = self._card_results.get(numeric_card_id)
             if payload is not None:
-                return dict(payload)
+                return {**payload, "outputs": copy.deepcopy(payload["outputs"])} if "outputs" in payload else dict(payload)
         return empty_perception()
 
     def current_count(self) -> int:
@@ -377,7 +382,7 @@ class RuntimeStore:
 
 def _read_perception(payload: Dict[str, Any], parts: list[str]) -> Any:
     if not parts:
-        return dict(payload)
+        return {**payload, "outputs": copy.deepcopy(payload["outputs"])} if "outputs" in payload else dict(payload)
     current: Any = payload
     for part in parts:
         if isinstance(current, dict):

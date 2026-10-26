@@ -310,8 +310,8 @@ class GlobalSettingsDialogTabsMixin:
             self.current_config.get("background_hierarchy_broadcast", False)
         )
         self.background_hierarchy_broadcast_check.setToolTip(
-            "勾选后沿主窗口到接收子窗口逐级发送键鼠消息；关闭时只发送绑定主窗口，不查询子窗口。"
-            "部分控件会自行向父窗口传递消息，开启广播可能重复响应。"
+            "勾选后，鼠标消息沿命中的窗口层级广播；键盘和文字只发送给最终接收控件一次，避免父子窗口重复输入。"
+            "关闭时只发送绑定主窗口，不查询子窗口。"
         )
         self.background_fake_active_check = QCheckBox("后台假激活", self.background_options_widget)
         self.background_fake_active_check.setObjectName("background_fake_active_check")

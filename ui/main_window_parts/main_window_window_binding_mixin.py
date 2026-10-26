@@ -485,22 +485,3 @@ class MainWindowWindowBindingMixin:
         logger.info("全局设置更新完成，跳过自动窗口激活以避免干扰用户")
         return
         # 以下代码已禁用，只在实际执行任务时才激活窗口
-        try:
-            if self.window_binding_mode == 'single':
-                # 单窗口模式：检查目标窗口
-                if self.current_target_window_title:
-                    hwnd = self._find_window_by_title(self.current_target_window_title)
-                    if hwnd:
-                        logger.info(f"全局设置更新后检查窗口激活: {self.current_target_window_title}")
-                        self._activate_window_if_needed(hwnd, self.current_target_window_title)
-            elif self.window_binding_mode == 'multiple':
-                # 多窗口模式：检查所有绑定的窗口
-                for window_info in self.bound_windows:
-                    if window_info.get('enabled', True):
-                        hwnd = window_info.get('hwnd')
-                        window_title = window_info.get('title', '')
-                        if hwnd and window_title:
-                            logger.info(f"全局设置更新后检查窗口激活: {window_title}")
-                            self._activate_window_if_needed(hwnd, window_title)
-        except Exception as e:
-            logger.error(f"检查窗口激活时出错: {e}")

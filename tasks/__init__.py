@@ -72,6 +72,7 @@ _PRIMARY_TASK_MODULE_PATHS = {
     "附加条件": "tasks.watchdog_monitor",
     "子工作流": "tasks.sub_workflow_task",
     "自定义脚本": "tasks.script_task",
+    "脚本卡片": "tasks.card_plugin_task",
 }
 
 # 监控类节点不参与顺序执行，只在工作流启动时登记（见 tasks.contract.MonitorModule）。
@@ -131,7 +132,7 @@ def __dir__():
 
 def get_available_tasks():
     """Return task names for UI display."""
-    return list(PRIMARY_TASK_MODULES.keys())
+    return [name for name in PRIMARY_TASK_MODULES if name != "脚本卡片"]
 
 
 def get_all_tasks():
@@ -163,3 +164,10 @@ __all__ = [
     "get_task_modules",
 ] + sorted(_EXPORT_MODULES.keys())
 
+
+
+def bind_task_module_for_card(module, parameters, task_type):
+    """为带插件快照的卡片取得实例级参数定义；普通卡片沿用原模块。"""
+    if task_type == "脚本卡片":
+        return module.bind_card(parameters)
+    return module

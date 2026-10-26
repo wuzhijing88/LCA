@@ -12,6 +12,7 @@ from .global_settings_dialog_visibility_mixin import GlobalSettingsDialogVisibil
 from .global_settings_dialog_save_mixin import GlobalSettingsDialogSaveMixin
 from .global_settings_dialog_runtime_mixin import GlobalSettingsDialogRuntimeMixin
 from .global_settings_dialog_window_crud_mixin import GlobalSettingsDialogWindowCrudMixin
+from .window_resize_jobs import WindowResizeJobs
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,8 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
     IB_DRIVER_REVERSE_MAP = {v: k for k, v in IB_DRIVER_MAP.items()}
     def __init__(self, current_config: dict, parent=None):
         super().__init__(parent)
+        self._window_resize_jobs = WindowResizeJobs()
+        self.destroyed.connect(self._window_resize_jobs.cancel)
         self._window_handle_subscription = None
         self.destroyed.connect(lambda: self._release_window_handle_callbacks())
         self.setWindowTitle("全局设置")
@@ -153,17 +156,24 @@ class GlobalSettingsDialog(GlobalSettingsDialogTabsMixin, GlobalSettingsDialogVi
         from ui.dialogs.dialog_manager import retire_dialog
 
         self._stop_plugin_bind_sweep()
+        self._window_resize_jobs.cancel()
         bridge = getattr(self, "_plugin_auth_probe_bridge", None)
         if bridge is not None:
             bridge.finished.disconnect()
         workers = (
+            self._window_resize_jobs.thread,
             getattr(self, "_plugin_bind_sweep_thread", None),
             getattr(self, "_plugin_auth_probe_thread", None),
             getattr(self, "_plugin_probe_discard_thread", None),
         )
         retire_dialog(self, workers)
 
+    def hideEvent(self, event):
+        self._window_resize_jobs.cancel()
+        super().hideEvent(event)
+
     def showEvent(self, event: QShowEvent) -> None:
+        self._window_resize_jobs.resume()
         super().showEvent(event)
         # 以插件配置打开时，首帧后再按内容拉高，避免执行页被卷进滚动区
         if not getattr(self, "_plugin_height_adjusted_on_show", False):

@@ -34,7 +34,7 @@ from app_core.player.loader import prepare_player_search_paths
 from app_core.player.package import (
     PlayerPackage,
     expand_script_run_queue,
-    has_custom_widgets,
+    normalize_player_ui,
     player_close_hides_to_tray,
     player_should_start_hidden,
     player_should_stay_on_top,
@@ -83,7 +83,7 @@ logger = logging.getLogger(__name__)
 
 
 class PlayerWindow(QMainWindow):
-    """独立程序运行窗：支持画布 widgets 绝对布局；无 widgets 时回退固定模板。"""
+    """独立程序运行窗：按现行画布 widgets 布局创建界面。"""
 
     def __init__(
         self,
@@ -95,13 +95,14 @@ class PlayerWindow(QMainWindow):
         persist_binding: bool = True,
         initial_page: str = "",
     ):
+        ui_payload = normalize_player_ui(package.ui)
         super().__init__(parent)
         self.setObjectName("PlayerWindow")
         self._package = package
         self._config = dict(config or {})
         self.config = self._config
         self._ui_state = load_player_ui_state(getattr(package, "userdata_dir", "") or "")
-        ui_seed = merge_settings_into_ui(package.ui, self._ui_state.get("settings"))
+        ui_seed = merge_settings_into_ui(ui_payload, self._ui_state.get("settings"))
         self._ui = apply_player_ui_hotkeys(
             ui_seed,
             getattr(package, "runtime_config", None),
@@ -124,7 +125,6 @@ class PlayerWindow(QMainWindow):
         self._notify_on_finish = bool(self._ui.get("notify_on_finish", True))
         self._is_running = False
         self._is_paused = False
-        self._custom_mode = has_custom_widgets(self._ui)
         self._queue_total = 0
         self._queue_index = 0
         self._run_started_at = 0.0
@@ -162,10 +162,7 @@ class PlayerWindow(QMainWindow):
 
         prepare_player_search_paths(package)
         self._setup_window_chrome()
-        if self._custom_mode:
-            self._build_custom_body()
-        else:
-            self._build_legacy_body()
+        self._build_custom_body()
         self._install_bind_button()
         self._install_hotkeys()
         self._apply_layout()
@@ -200,10 +197,7 @@ class PlayerWindow(QMainWindow):
             return True
         if mode == "light":
             return False
-        try:
-            return bool(get_theme_manager().is_dark_mode())
-        except Exception:
-            return False
+        return bool(get_theme_manager().is_dark_mode())
 
     def _setup_window_chrome(self):
         title = str(self._ui.get("title") or self._package.manifest.get("app_name") or "独立程序")
@@ -225,15 +219,10 @@ class PlayerWindow(QMainWindow):
         apply_player_rounded_window(self)
 
         available = get_available_geometry_for_widget(self)
-        if self._custom_mode:
-            window = self._ui.get("window") if isinstance(self._ui.get("window"), dict) else {}
-            body_w = int(window.get("width") or 460)
-            body_h = int(window.get("height") or 360)
-            pref_w, pref_h = window_outer_size(body_w, body_h)
-        else:
-            show_log = bool(self._ui.get("show_log"))
-            pref_w, pref_h = 460, 520 if show_log else 240
-            body_w, body_h = pref_w, pref_h
+        window = self._ui.get("window") if isinstance(self._ui.get("window"), dict) else {}
+        body_w = int(window.get("width") or 460)
+        body_h = int(window.get("height") or 360)
+        pref_w, pref_h = window_outer_size(body_w, body_h)
         width, height = clamp_preferred_window_size(pref_w, pref_h, available)
 
         container = QWidget(self)
@@ -248,13 +237,9 @@ class PlayerWindow(QMainWindow):
         self._body.setObjectName("PlayerBody")
         self._win_controls = None
         self._drag_offset = None
-        if self._custom_mode:
-            self._body.setFixedSize(body_w, body_h)
-            layout.addWidget(self._body, 0)
-            self.setFixedSize(width, height)
-        else:
-            layout.addWidget(self._body, 1)
-            self.resize(width, height)
+        self._body.setFixedSize(body_w, body_h)
+        layout.addWidget(self._body, 0)
+        self.setFixedSize(width, height)
         self.setCentralWidget(container)
         apply_player_rounded_window(self)
         # 最小化/关闭叠在设计区右上角，不另占一层标题栏
@@ -744,90 +729,6 @@ class PlayerWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl(text))
 
-    def _build_legacy_body(self):
-        self._body.setObjectName("PlayerBodyLegacy")
-        layout = QVBoxLayout(self._body)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(14)
-
-        about = str(self._ui.get("about") or self._package.manifest.get("description") or "").strip()
-        if about:
-            about_label = QLabel(about)
-            about_label.setObjectName("PlayerAbout")
-            about_label.setWordWrap(True)
-            layout.addWidget(about_label)
-
-        status_row = QHBoxLayout()
-        status_row.setSpacing(10)
-        self._status_dot = QLabel("●")
-        self._status_dot.setObjectName("PlayerStatusDot")
-        self._status_label = QLabel("就绪")
-        self._status_label.setObjectName("PlayerStatusLabel")
-        status_row.addWidget(self._status_dot)
-        status_row.addWidget(self._status_label, 1)
-        layout.addLayout(status_row)
-
-        button_row = QHBoxLayout()
-        button_row.setSpacing(10)
-        self._start_button = QPushButton("开始")
-        self._start_button.setObjectName("PlayerStartButton")
-        self._start_button.setProperty("primary", True)
-        self._start_button.setMinimumHeight(36)
-        self._start_button.clicked.connect(self.safe_start_tasks)
-        self._start_default_text = "开始"
-
-        self._pause_button = QPushButton("暂停")
-        self._pause_button.setObjectName("PlayerPauseButton")
-        self._pause_button.setMinimumHeight(36)
-        self._pause_button.clicked.connect(self._on_pause_clicked)
-
-        self._stop_button = QPushButton("停止")
-        self._stop_button.setObjectName("PlayerStopButton")
-        self._stop_button.setMinimumHeight(36)
-        self._stop_button.clicked.connect(self.safe_stop_tasks)
-
-        self._bind_button = QPushButton("绑定窗口")
-        self._bind_button.setObjectName("PlayerBindButton")
-        self._bind_button.setMinimumHeight(36)
-        self._bind_button.clicked.connect(self.open_window_binding_dialog)
-
-        button_row.addWidget(self._start_button, 1)
-        button_row.addWidget(self._pause_button, 1)
-        button_row.addWidget(self._stop_button, 1)
-        button_row.addWidget(self._bind_button, 1)
-        layout.addLayout(button_row)
-
-        self._log_frame = QFrame(self._body)
-        self._log_frame.setObjectName("PlayerLogFrame")
-        log_layout = QVBoxLayout(self._log_frame)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.setSpacing(6)
-        log_title = QLabel("运行日志")
-        log_title.setObjectName("PlayerLogTitle")
-        self._log_view = QTextEdit()
-        self._log_view.setObjectName("PlayerLogView")
-        self._log_view.setReadOnly(True)
-        log_layout.addWidget(log_title)
-        log_layout.addWidget(self._log_view, 1)
-        layout.addWidget(self._log_frame, 1)
-
-        if not bool(self._ui.get("show_log")):
-            self._log_frame.hide()
-
-        hotkey_text = "  ·  ".join(
-            part
-            for part in (
-                f"开始 {display_hotkey(self._ui.get('start_hotkey'))}",
-                f"停止 {display_hotkey(self._ui.get('stop_hotkey'))}",
-                f"暂停 {display_hotkey(self._ui.get('pause_hotkey'))}",
-            )
-            if part
-        )
-        hotkey_label = QLabel(hotkey_text)
-        hotkey_label.setObjectName("PlayerHotkeyHint")
-        hotkey_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(hotkey_label)
-
     def _clear_player_shortcuts(self) -> None:
         for shortcut in list(getattr(self, "_player_shortcuts", []) or []):
             try:
@@ -1131,38 +1032,10 @@ class PlayerWindow(QMainWindow):
         from app_core.player.package import normalize_script_loop_count
 
         refs = self._custom_refs or {}
-        mapping = refs.get("script_lists")
-        spins_by_id = refs.get("group_loop_spins_by_id")
-        if isinstance(spins_by_id, dict) and spins_by_id:
-            result: dict[str, int] = {}
-            for list_id, spin in spins_by_id.items():
-                try:
-                    result[str(list_id)] = normalize_script_loop_count(spin.value(), 1)
-                except RuntimeError:
-                    continue
-            if result:
-                return result
-        spins = refs.get("group_loop_spins") or []
-        if not isinstance(mapping, dict) or not mapping:
-            spin = refs.get("group_loop_spin")
-            if spin is not None:
-                try:
-                    return {"__main__": normalize_script_loop_count(spin.value(), 1)}
-                except RuntimeError:
-                    pass
-            return {}
-
-        order = [str(key) for key in (refs.get("script_list_order") or mapping.keys())]
-        result: dict[str, int] = {}
-        for index, list_id in enumerate(order):
-            if list_id not in mapping or index >= len(spins):
-                continue
-            spin = spins[index]
-            try:
-                result[list_id] = normalize_script_loop_count(spin.value(), 1)
-            except RuntimeError:
-                continue
-        return result
+        return {
+            list_id: normalize_script_loop_count(spin.value(), 1)
+            for list_id, spin in refs["group_loop_spins_by_id"].items()
+        }
 
     def _waiting_script_ids(self) -> list[str]:
         ids: list[str] = []
@@ -1450,16 +1323,15 @@ class PlayerWindow(QMainWindow):
 
     def maybe_auto_start(self):
         if bool(self._ui.get("auto_start")):
-            QTimer.singleShot(400, self.safe_start_tasks)
+            QTimer.singleShot(400, self, self.safe_start_tasks)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._custom_mode:
-            from ui.player.player_chrome import apply_player_background_geometry
+        from ui.player.player_chrome import apply_player_background_geometry
 
-            apply_player_background_geometry(
-                self._body, self._bg_label, self._ui.get("background") or {}
-            )
+        apply_player_background_geometry(
+            self._body, self._bg_label, self._ui.get("background") or {}
+        )
         if self._win_controls is not None:
             self._win_controls.reposition(self._body)
             self._win_controls.raise_()

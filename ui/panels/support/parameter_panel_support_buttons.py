@@ -10,54 +10,28 @@ logger = logging.getLogger(__name__)
 class CloseButton(QPushButton):
     def __init__(self, parent=None):
         super().__init__("✕", parent)
-        self.setObjectName("windowButton")
+        self.setObjectName("parameterPanelCloseButton")
         self.setToolTip("关闭")
         self.setFixedSize(36, 28)
-        self.setStyleSheet(self._style("normal"))
-
-    def _style(self, kind: str) -> str:
-        from themes import theme_color
-
-        if kind == "hover":
-            background = theme_color("error", "#e81123")
-            color = "#ffffff"
-        elif kind == "pressed":
-            background = theme_color("error", "#e81123")
-            color = "#ffffff"
-        else:
-            background = "transparent"
-            color = theme_color("text_secondary", "#666666")
-        return f"""
-        QPushButton {{
-            background-color: {background};
-            border: none;
-            border-radius: 4px;
-            color: {color};
-            font-family: "Segoe UI Symbol", "Segoe UI Emoji", "Arial";
-            font-size: 12px;
-        }}
-        """
-
-    def enterEvent(self, event):
-        self.setStyleSheet(self._style("hover"))
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self.setStyleSheet(self._style("normal"))
-        super().leaveEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.setStyleSheet(self._style("pressed"))
+            self.setDown(True)
             self.clicked.emit()
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self.setStyleSheet(self._style("normal"))
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setDown(False)
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def resetStyle(self):
-        self.setStyleSheet(self._style("normal"))
+        self.setDown(False)
+        self.update()
 
 
 class ResponsiveButton(QPushButton):

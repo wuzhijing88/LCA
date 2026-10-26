@@ -239,11 +239,7 @@ class GlobalDialogScreenFixer(_ApplicationEventFilter):
         if not isinstance(window, QDialog):
             self._last_non_dialog_window = weakref.ref(window)
 
-    def _schedule_fix(self, obj):
-        if self._disposed or not isinstance(obj, QWidget) or not isValid(obj):
-            return
-        dialog = obj.window()
-
+    def _schedule_fix(self, dialog):
         if not self._should_fix(dialog):
             return
 

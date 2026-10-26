@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+import weakref
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -67,6 +68,14 @@ class ScriptParamBar(QWidget):
         self._empty = empty
         self._widgets: List[QWidget] = []
 
+    @property
+    def _editor(self):
+        return self._editor_ref() if self._editor_ref is not None else None
+
+    @_editor.setter
+    def _editor(self, editor):
+        self._editor_ref = weakref.ref(editor) if editor is not None else None
+
     def bind_editor(self, editor) -> None:
         if self._editor is not None:
             self._editor.cursorPositionChanged.disconnect(self._schedule_sync)
@@ -84,10 +93,11 @@ class ScriptParamBar(QWidget):
         if self.isVisible() and self._editor is not None:
             self._timer.start()
 
-    def _on_editor_destroyed(self, *_args) -> None:
+    @Slot(QObject)
+    def _on_editor_destroyed(self, _object=None) -> None:
         self._timer.stop()
         self._editor = None
-        self._render(None)
+        self._fields = []
 
     def hideEvent(self, event) -> None:
         self._timer.stop()
@@ -148,6 +158,10 @@ class ScriptParamBar(QWidget):
 
     def _clear_fields(self) -> None:
         for widget in self._widgets:
+            widget.blockSignals(True)
+            widget.removeEventFilter(self)
+            if isinstance(widget, CustomDropdown) and widget.lineEdit() is not None:
+                widget.lineEdit().removeEventFilter(self)
             self._row.removeWidget(widget)
             widget.hide()
             widget.deleteLater()

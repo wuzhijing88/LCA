@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
 from collections import OrderedDict
+from task_workflow.task_result import validate_step_action, validate_card_target
 from utils.window.hwnd_utils import as_hwnd
 from utils.image_paths import get_image_path_resolver
 from utils.precise_sleep import precise_sleep as _shared_precise_sleep
@@ -31,115 +32,39 @@ REGION_BINDING_CLIENT_SIZE_TOLERANCE = 2
 
 
 def coerce_bool(value: Any) -> bool:
-    """Convert possibly string/int values to a strict bool."""
-    if isinstance(value, bool):
+    """校验现行布尔参数，不推测文本或数字的含义。"""
+    if type(value) is bool:
         return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in ("1", "true", "yes", "y", "on", "是", "真"):
-            return True
-        if text in ("0", "false", "no", "n", "off", "否", "假", ""):
-            return False
-    return False
+    raise ValueError(f"布尔参数必须是布尔值: {value!r}")
 
 
-def coerce_int(value: Any, default: int = 0) -> int:
-    """Convert possibly string/float values to int with a default fallback."""
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
+def coerce_int(value: Any) -> int:
+    """校验现行整数参数。"""
+    if type(value) is int:
         return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return default
-        try:
-            return int(float(text))
-        except ValueError:
-            return default
-    return default
+    raise ValueError(f"整数参数必须是整数: {value!r}")
 
 
-def coerce_float(value: Any, default: float = 0.0) -> float:
-    """Convert possibly string/int values to float with a default fallback."""
-    if isinstance(value, bool):
+def coerce_float(value: Any) -> float:
+    """校验现行有限数值参数。"""
+    if type(value) in (int, float) and math.isfinite(value):
         return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return default
-        try:
-            return float(text)
-        except ValueError:
-            return default
-    return default
+    raise ValueError(f"数值参数必须是有限数值: {value!r}")
 
 
 def resolve_region_selection_params(
     params: Dict[str, Any],
     default_mode: str = "指定区域",
 ) -> Tuple[str, int, int, int, int]:
-    """
-    统一解析区域选择参数，兼容新旧两套存储格式：
-    1. region_x / region_y / region_width / region_height
-    2. region_x1 / region_y1 / region_x2 / region_y2
-    3. region_coordinates 文本格式
-    """
-    region_mode = str(params.get("region_mode", default_mode) or default_mode)
+    """只读取现行的区域坐标字段；展示文本不参与执行。"""
+    if any(key in params for key in ("region_x1", "region_y1", "region_x2", "region_y2")):
+        raise ValueError("区域参数含旧字段，请先转换为现行工程格式")
+    region_mode = params.get("region_mode", default_mode)
+    values = tuple(params.get(key, 0) for key in ("region_x", "region_y", "region_width", "region_height"))
+    if any(type(value) is not int for value in values):
+        raise ValueError("区域坐标和尺寸必须是整数")
+    return region_mode, *values
 
-    region_x = coerce_int(params.get("region_x", 0), 0)
-    region_y = coerce_int(params.get("region_y", 0), 0)
-    region_width = coerce_int(params.get("region_width", 0), 0)
-    region_height = coerce_int(params.get("region_height", 0), 0)
-
-    if region_width <= 0 or region_height <= 0:
-        region_x1 = coerce_int(params.get("region_x1", 0), 0)
-        region_y1 = coerce_int(params.get("region_y1", 0), 0)
-        region_x2 = coerce_int(params.get("region_x2", 0), 0)
-        region_y2 = coerce_int(params.get("region_y2", 0), 0)
-
-        if region_x2 > region_x1 and region_y2 > region_y1:
-            region_x = region_x1
-            region_y = region_y1
-            region_width = region_x2 - region_x1
-            region_height = region_y2 - region_y1
-
-    if region_width <= 0 or region_height <= 0:
-        import re
-
-        region_coordinates = str(params.get("region_coordinates", "") or "")
-        if region_coordinates and region_coordinates != "未指定识别区域":
-            x_match = re.search(r"X=(-?\d+)", region_coordinates)
-            y_match = re.search(r"Y=(-?\d+)", region_coordinates)
-            width_match = re.search(r"宽度?=(-?\d+)", region_coordinates)
-            height_match = re.search(r"高度?=(-?\d+)", region_coordinates)
-
-            if x_match and y_match and width_match and height_match:
-                region_x = coerce_int(x_match.group(1), 0)
-                region_y = coerce_int(y_match.group(1), 0)
-                region_width = coerce_int(width_match.group(1), 0)
-                region_height = coerce_int(height_match.group(1), 0)
-            else:
-                x1_match = re.search(r"X1=(-?\d+)", region_coordinates)
-                y1_match = re.search(r"Y1=(-?\d+)", region_coordinates)
-                x2_match = re.search(r"X2=(-?\d+)", region_coordinates)
-                y2_match = re.search(r"Y2=(-?\d+)", region_coordinates)
-                if x1_match and y1_match and x2_match and y2_match:
-                    region_x = coerce_int(x1_match.group(1), 0)
-                    region_y = coerce_int(y1_match.group(1), 0)
-                    region_x2 = coerce_int(x2_match.group(1), 0)
-                    region_y2 = coerce_int(y2_match.group(1), 0)
-                    if region_x2 > region_x and region_y2 > region_y:
-                        region_width = region_x2 - region_x
-                        region_height = region_y2 - region_y
-
-    return region_mode, region_x, region_y, region_width, region_height
 
 
 def get_recorded_region_binding_mismatch_detail(
@@ -154,8 +79,8 @@ def get_recorded_region_binding_mismatch_detail(
     recorded_hwnd = as_hwnd(params.get("region_hwnd", 0))
     recorded_title = str(params.get("region_window_title", "") or "").strip()
     recorded_class = str(params.get("region_window_class", "") or "").strip()
-    recorded_client_width = coerce_int(params.get("region_client_width", 0), 0)
-    recorded_client_height = coerce_int(params.get("region_client_height", 0), 0)
+    recorded_client_width = coerce_int(params.get("region_client_width", 0))
+    recorded_client_height = coerce_int(params.get("region_client_height", 0))
 
     has_recording_binding = any((
         recorded_hwnd > 0,
@@ -323,16 +248,12 @@ def safe_imread(image_path: str, flags=cv2.IMREAD_COLOR) -> Optional[np.ndarray]
         图像的numpy数组，失败返回None
     """
     try:
-        # 【性能优化】优先从模板缓存加载
-        try:
-            from utils.match.template_preloader import get_global_preloader
-            preloader = get_global_preloader()
-            template = preloader.get_template(image_path)
-            if template is not None:
-                logger.debug(f"[性能优化] 使用缓存的模板: {image_path}")
-                return template
-        except Exception as e:
-            logger.debug(f"[性能优化] 模板缓存读取失败: {e}")
+        from utils.match.template_preloader import get_global_preloader
+        preloader = get_global_preloader()
+        template = preloader.get_template(image_path)
+        if template is not None:
+            logger.debug(f"[性能优化] 使用缓存的模板: {image_path}")
+            return template
 
         # 缓存未命中，正常加载
         if image_path.startswith('memory://'):
@@ -372,14 +293,6 @@ def safe_imread(image_path: str, flags=cv2.IMREAD_COLOR) -> Optional[np.ndarray]
             if img is not None:
                 return img
 
-        # 备选方法：直接读取
-        if image_path.startswith('memory://'):
-            return None
-
-        img = cv2.imread(image_path, flags)
-        if img is not None:
-            return img
-
         return None
     except Exception as e:
         logger.error(f"安全图像读取失败 {image_path}: {e}")
@@ -409,17 +322,11 @@ def capture_window_smart(
     """
     try:
         if allow_shared:
-            try:
-                from task_workflow.workflow_context import get_current_workflow_context
-                context = get_current_workflow_context()
-                shared_img = context.get_shared_capture(hwnd, client_area_only)
-                if shared_img is not None:
-                    try:
-                        return shared_img.copy()
-                    except Exception:
-                        return shared_img
-            except Exception:
-                pass
+            from task_workflow.workflow_context import get_current_workflow_context
+            context = get_current_workflow_context()
+            shared_img = context.get_shared_capture(hwnd, client_area_only)
+            if shared_img is not None:
+                return shared_img.copy()
 
         from utils.capture.screenshot_helper import get_screenshot_engine, _capture_with_engine
 
@@ -474,9 +381,11 @@ def capture_and_match_template_smart(
             return max(min_value, min(max_value, float(default)))
         try:
             value = float(raw)
-        except Exception:
-            value = float(default)
-        return max(min_value, min(max_value, value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"截图配置 {name} 必须是有限数值") from exc
+        if not math.isfinite(value) or not min_value <= value <= max_value:
+            raise ValueError(f"截图配置 {name} 必须在 {min_value} 到 {max_value} 之间")
+        return value
 
     def _read_int_env(name: str, default: int, min_value: int, max_value: int) -> int:
         raw = os.getenv(name)
@@ -484,9 +393,11 @@ def capture_and_match_template_smart(
             return max(min_value, min(max_value, int(default)))
         try:
             value = int(raw)
-        except Exception:
-            value = int(default)
-        return max(min_value, min(max_value, value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"截图配置 {name} 必须是整数") from exc
+        if not min_value <= value <= max_value:
+            raise ValueError(f"截图配置 {name} 必须在 {min_value} 到 {max_value} 之间")
+        return value
 
     def _is_transient_capture_error(error_text: Any) -> bool:
         text = str(error_text or "").strip().lower()
@@ -507,14 +418,10 @@ def capture_and_match_template_smart(
         if not isinstance(template, np.ndarray) or template.size == 0:
             failed_response["error"] = "invalid_template"
             return failed_response
-        try:
-            scale = float(template_scale)
-        except (TypeError, ValueError):
-            scale = 1.0
-        if not math.isfinite(scale) or scale <= 0:
+        scale = coerce_float(template_scale)
+        if not 0.25 <= scale <= 4.0:
             failed_response["error"] = "invalid_template_scale"
             return failed_response
-        scale = max(0.25, min(4.0, scale))
         if abs(scale - 1.0) > 1e-6:
             height, width = template.shape[:2]
             resized_width = max(1, int(round(width * scale)))
@@ -529,27 +436,28 @@ def capture_and_match_template_smart(
             return failed_response
 
         roi_param = None
-        if isinstance(roi, (list, tuple)) and len(roi) == 4:
-            try:
-                rx, ry, rw, rh = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
-                if rw > 0 and rh > 0:
-                    roi_param = (rx, ry, rw, rh)
-            except Exception:
-                roi_param = None
+        if roi is not None:
+            if (not isinstance(roi, (list, tuple)) or len(roi) != 4
+                    or any(type(value) is not int for value in roi)
+                    or roi[2] <= 0 or roi[3] <= 0):
+                failed_response["error"] = "invalid_roi"
+                return failed_response
+            roi_param = tuple(roi)
 
-        match_engine = str(engine or "").strip().lower()
-        if not match_engine:
-            try:
-                from utils.capture.screenshot_helper import get_screenshot_engine
-                match_engine = str(get_screenshot_engine() or "wgc").strip().lower()
-            except Exception:
-                match_engine = "wgc"
+        if engine is None:
+            from utils.capture.screenshot_helper import get_screenshot_engine
+            engine = get_screenshot_engine()
+        match_engine = str(engine).strip().lower()
         from utils.capture.engine_ids import is_supported_screenshot_engine
 
         if not is_supported_screenshot_engine(match_engine):
-            match_engine = "wgc"
+            failed_response["error"] = f"无效的截图引擎: {engine!r}"
+            return failed_response
 
-        timeout = max(0.3, float(capture_timeout))
+        timeout = coerce_float(capture_timeout)
+        if timeout <= 0:
+            raise ValueError("截图超时必须大于零")
+        timeout = max(0.3, timeout)
 
         from services.screenshot_pool import capture_and_match_template
         from utils.capture.screenshot_helper import clear_screenshot_cache
@@ -659,38 +567,32 @@ def is_smart_capture_available() -> bool:
 
 
 def handle_next_step_delay(params: Dict[str, Any], stop_checker=None):
-    """处理下一步延迟执行"""
-    try:
-        if not isinstance(params, dict):
-            return
-
-        # 兼容开发环境/打包环境的参数类型差异（bool/float 可能被序列化为字符串）
-        if not coerce_bool(params.get('enable_next_step_delay', False)):
-            return
-
-        delay_mode_raw = str(params.get('delay_mode', '固定延迟') or '').strip().lower()
-        if delay_mode_raw in ('fixed', '固定延迟'):
-            delay_time = coerce_float(params.get('fixed_delay', 1.0), 1.0)
-            delay_time = max(0.0, delay_time)
-            logger.info(f"执行固定延迟: {delay_time:.2f} 秒")
-            interruptible_sleep(delay_time, stop_checker)
-        elif delay_mode_raw in ('random', '随机延迟'):
-            min_delay = max(0.0, coerce_float(params.get('min_delay', 0.5), 0.5))
-            max_delay = max(0.0, coerce_float(params.get('max_delay', 2.0), 2.0))
-            if min_delay > max_delay:
-                min_delay, max_delay = max_delay, min_delay
-            delay_time = random.uniform(min_delay, max_delay)
-            logger.info(f"执行随机延迟: {delay_time:.2f} 秒 (范围: {min_delay}-{max_delay})")
-            interruptible_sleep(delay_time, stop_checker)
-        else:
-            logger.warning(f"未知的延迟模式: {params.get('delay_mode')}")
-    except Exception as e:
-        logger.error(f"执行下一步延迟时发生错误: {e}")
+    """按现行参数执行延迟；无效配置交给执行器报告并停止。"""
+    if not isinstance(params, dict):
+        raise ValueError("延迟参数必须是字典")
+    if not coerce_bool(params.get('enable_next_step_delay', False)):
+        return
+    delay_mode = params.get('delay_mode', '固定延迟')
+    if delay_mode == '固定延迟':
+        delay_time = coerce_float(params.get('fixed_delay', 1.0))
+        if delay_time < 0:
+            raise ValueError("固定延迟不能为负数")
+        logger.info("执行固定延迟: %.2f 秒", delay_time)
+    elif delay_mode == '随机延迟':
+        min_delay = coerce_float(params.get('min_delay', 0.5))
+        max_delay = coerce_float(params.get('max_delay', 2.0))
+        if not 0 <= min_delay <= max_delay:
+            raise ValueError("随机延迟必须满足 0 ≤ 最小值 ≤ 最大值")
+        delay_time = random.uniform(min_delay, max_delay)
+        logger.info("执行随机延迟: %.2f 秒 (范围: %s-%s)", delay_time, min_delay, max_delay)
+    else:
+        raise ValueError(f"未知的延迟模式: {delay_mode!r}")
+    interruptible_sleep(delay_time, stop_checker)
 
 
 def interruptible_sleep(duration: float, stop_checker=None):
     """可中断的睡眠函数 - 使用高精度计时器"""
-    duration = coerce_float(duration, 0.0)
+    duration = coerce_float(duration)
     if duration <= 0:
         return
 
@@ -893,81 +795,27 @@ def resolve_step_action_result(
     action: Any,
     jump_id: Any,
     card_id: Optional[int],
-    require_jump_target: bool = False,
     detail: Any = "",
 ) -> Tuple[Any, ...]:
-    """统一解析步骤跳转动作，返回 (success, action_text, next_id)。"""
-    action_text = normalize_step_action(action)
-    normalized_jump_id = _normalize_jump_target_id(jump_id)
-    clean_detail = str(detail or "").strip()
-
+    """按现行动作生成卡片结果，非法动作或缺失跳转目标直接失败。"""
+    action_text = validate_step_action(action)
     if action_text == "跳转到步骤":
-        if require_jump_target and normalized_jump_id is None:
-            result = (success, "执行下一步", None)
-        else:
-            result = (success, "跳转到步骤", normalized_jump_id)
-    elif action_text == "停止工作流":
-        result = (success, "停止工作流", None)
+        target = validate_card_target(jump_id)
+        if target is None:
+            raise ValueError("跳转到步骤必须指定目标卡片")
     elif action_text == "继续执行本步骤":
-        result = (success, "继续执行本步骤", card_id)
+        target = validate_card_target(card_id)
     else:
-        result = (success, "执行下一步", None)
-
-    if clean_detail:
-        return (*result, clean_detail)
-    return result
-
-
-_STEP_ACTION_ALIASES = {
-    "执行下一步": {
-        "执行下一步",
-        "下一步",
-        "继续下一步",
-    },
-    "继续执行本步骤": {
-        "继续执行本步骤",
-        "继续本步骤",
-    },
-    "跳转到步骤": {
-        "跳转到步骤",
-        "跳转到指定步骤",
-    },
-    "停止工作流": {
-        "停止工作流",
-        "结束工作流",
-        "结束流程",
-        "终止流程",
-    },
-}
+        target = None
+    if type(success) is not bool or not isinstance(detail, str):
+        raise TypeError("任务状态必须是布尔值，结果说明必须是文本")
+    result = (success, action_text, target)
+    return (*result, detail.strip()) if detail.strip() else result
 
 
 def normalize_step_action(action: Any) -> str:
-    """规范化动作文案，兼容历史任务中不同动作名称。"""
-    action_text = str(action or "").strip()
-    if not action_text:
-        return "执行下一步"
-    for normalized, aliases in _STEP_ACTION_ALIASES.items():
-        if action_text in aliases:
-            return normalized
-    return "执行下一步"
-
-
-def _normalize_jump_target_id(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return int(float(text))
-    except (TypeError, ValueError):
-        return None
+    """校验现行动作，不转换别名。"""
+    return validate_step_action(action)
 
 
 def correct_image_paths(

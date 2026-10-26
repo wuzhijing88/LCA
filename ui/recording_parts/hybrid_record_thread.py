@@ -3,8 +3,7 @@
 
 支持三种录制模式:
 1. Raw Input相对移动 (FPS游戏推荐)
-2. 传统轮询相对移动 (兼容模式)
-3. 绝对坐标录制 (普通操作)
+2. 绝对坐标录制 (普通操作)
 """
 
 import time
@@ -20,7 +19,7 @@ try:
     RAW_INPUT_AVAILABLE = True
 except ImportError:
     RAW_INPUT_AVAILABLE = False
-    logger.warning("Raw Input不可用，将使用传统方式")
+    logger.warning("Raw Input不可用，无法录制相对位移")
 
 
 class HybridRecordThread(QThread):
@@ -29,11 +28,12 @@ class HybridRecordThread(QThread):
 
     录制模式选择逻辑:
     - 相对位移 + Raw Input可用 → Raw Input (最佳精度)
-    - 相对位移 + Raw Input不可用 → 传统轮询 (兼容)
+    - 相对位移需要 Raw Input，不可用时明确失败
     - 绝对坐标 → 传统轮询 (必需)
     """
 
     recording_finished = Signal(list)
+    recording_failed = Signal(str)
     recording_progress = Signal(str)
     step_count_updated = Signal(int)
 
@@ -63,11 +63,19 @@ class HybridRecordThread(QThread):
 
         self.recording_data = []
         self.recording_active = False
+        self._stop_requested = threading.Event()
+        self._capture_threads = []
+        self._raw_recorder = None
         self.start_time = 0
         self.step_count = 0
 
         self._pynput_listener_lock = threading.Lock()
         self._pynput_listeners = []
+
+        if recording_mode not in {"绝对坐标", "相对位移"}:
+            raise ValueError("录制模式无效")
+        if recording_mode == "相对位移" and self.record_mouse and not RAW_INPUT_AVAILABLE:
+            raise RuntimeError("Raw Input不可用，无法录制相对位移")
 
         # 选择录制方式
         self.use_raw_input = (
@@ -92,18 +100,38 @@ class HybridRecordThread(QThread):
             logger.info(f"✓ 使用传统轮询录制 ({reason_str}) - 录制区域: {recording_area}")
 
     def run(self):
-        """执行录制"""
+        error = None
         try:
+            if self._stop_requested.is_set():
+                self.recording_finished.emit([])
+                return
             if self.use_raw_input:
                 self._run_raw_input_mode()
             else:
                 self._run_traditional_mode()
-        except Exception as e:
-            logger.error(f"录制失败: {e}", exc_info=True)
-            self.recording_progress.emit(f"录制失败: {e}")
-            self.recording_finished.emit([])
+        except Exception as exc:
+            error = exc
+            logger.error("录制失败：%s", exc, exc_info=True)
         finally:
-            self._stop_tracked_pynput_listeners()
+            self.recording_active = False
+            try:
+                self._stop_tracked_pynput_listeners()
+            except Exception as exc:
+                error = exc
+                logger.error("停止录制监听器失败：%s", exc)
+            try:
+                if self._raw_recorder is not None:
+                    self._raw_recorder.stop_recording()
+                    self._raw_recorder = None
+            except Exception as exc:
+                error = exc
+                logger.error("停止相对位移录制器失败：%s", exc)
+            for thread in self._capture_threads:
+                thread.join()
+            self._capture_threads.clear()
+        if error is not None:
+            self.recording_failed.emit(f"录制失败：{error}")
+            self.recording_finished.emit([])
 
     def _track_pynput_listener(self, listener):
         if not listener:
@@ -244,14 +272,9 @@ class HybridRecordThread(QThread):
             raw_recorder = RawInputRecorder()
 
             # 启动录制
+            self._raw_recorder = raw_recorder
             if not raw_recorder.start_recording():
-                logger.error("Raw Input录制启动失败，自动回退到传统轮询模式")
-                self.recording_progress.emit("Raw Input启动失败，自动切换到传统模式")
-                # 重置标志，回退到传统模式
-                self.use_raw_input = False  # 标记为不使用Raw Input
-                # 注意：不要设置 recording_active = False，让传统模式继续
-                self._run_traditional_mode()
-                return
+                raise RuntimeError("Raw Input录制启动失败")
 
             self.recording_progress.emit("Raw Input录制中... (高精度)")
             self.recording_active = True
@@ -270,6 +293,7 @@ class HybridRecordThread(QThread):
                     daemon=True
                 )
                 mouse_click_thread.start()
+                self._capture_threads.append(mouse_click_thread)
 
                 # 滚轮录制线程（使用pynput，因为win32api无法轮询检测滚轮）
                 scroll_thread = threading.Thread(
@@ -278,6 +302,7 @@ class HybridRecordThread(QThread):
                     daemon=True
                 )
                 scroll_thread.start()
+                self._capture_threads.append(scroll_thread)
 
             # 键盘录制（如果需要）
             keyboard_thread = None
@@ -289,10 +314,11 @@ class HybridRecordThread(QThread):
                     daemon=True
                 )
                 keyboard_thread.start()
+                self._capture_threads.append(keyboard_thread)
 
             # 等待录制时长
             elapsed = 0
-            while elapsed < self.duration and self.recording_active:
+            while elapsed < self.duration and self.recording_active and not self._stop_requested.is_set():
                 time.sleep(0.1)
                 elapsed = time.time() - self.start_time
 
@@ -304,6 +330,7 @@ class HybridRecordThread(QThread):
 
             # 停止录制
             raw_mouse_data = raw_recorder.stop_recording()
+            self._raw_recorder = None
             self.recording_active = False
 
             # 合并数据：Raw Input移动 + 点击 + 滚轮 + 键盘
@@ -311,17 +338,17 @@ class HybridRecordThread(QThread):
 
             # 添加鼠标点击数据
             if self.record_mouse and mouse_click_thread:
-                mouse_click_thread.join(timeout=1.0)
+                mouse_click_thread.join()
                 all_data.extend(mouse_click_data_list)
 
             # 添加滚轮数据
             if self.record_mouse and scroll_thread:
-                scroll_thread.join(timeout=1.0)
+                scroll_thread.join()
                 all_data.extend(scroll_data_list)
 
             # 添加键盘数据
             if self.record_keyboard and keyboard_thread:
-                keyboard_thread.join(timeout=1.0)
+                keyboard_thread.join()
                 all_data.extend(keyboard_data_list)
 
             # 按时间排序
@@ -335,8 +362,7 @@ class HybridRecordThread(QThread):
 
         except Exception as e:
             logger.error(f"Raw Input录制异常: {e}", exc_info=True)
-            self.recording_progress.emit(f"Raw Input录制失败: {e}")
-            self.recording_finished.emit([])
+            raise
 
     def _run_traditional_mode(self):
         """传统录制模式 - 使用pynput钩子（鼠标+键盘）"""
@@ -365,6 +391,7 @@ class HybridRecordThread(QThread):
                 daemon=True
             )
             mouse_thread.start()
+            self._capture_threads.append(mouse_thread)
             logger.info("鼠标监听线程已启动（pynput钩子模式）")
 
         # 启动键盘监听线程
@@ -376,10 +403,11 @@ class HybridRecordThread(QThread):
                 daemon=True
             )
             keyboard_thread.start()
+            self._capture_threads.append(keyboard_thread)
             logger.info("键盘监听线程已启动（pynput钩子模式）")
 
         # 等待录制完成或超时
-        while (time.time() - self.start_time) < self.duration and self.recording_active:
+        while (time.time() - self.start_time) < self.duration and self.recording_active and not self._stop_requested.is_set():
             time.sleep(0.05)
 
         # 停止录制
@@ -387,9 +415,9 @@ class HybridRecordThread(QThread):
 
         # 等待线程结束
         if mouse_thread and mouse_thread.is_alive():
-            mouse_thread.join(timeout=1.0)
+            mouse_thread.join()
         if keyboard_thread and keyboard_thread.is_alive():
-            keyboard_thread.join(timeout=1.0)
+            keyboard_thread.join()
 
         # 合并数据并按时间排序
         all_data = mouse_data + keyboard_data
@@ -524,7 +552,7 @@ class HybridRecordThread(QThread):
             self._track_pynput_listener(listener)
             try:
                 listener.start()
-                while self.recording_active:
+                while self.recording_active and not self._stop_requested.is_set():
                     time.sleep(0.05)
             finally:
                 try:
@@ -532,7 +560,7 @@ class HybridRecordThread(QThread):
                 except Exception:
                     pass
                 try:
-                    listener.join(timeout=1.0)
+                    listener.join()
                 except Exception:
                     pass
                 self._untrack_pynput_listener(listener)
@@ -596,7 +624,7 @@ class HybridRecordThread(QThread):
             self._track_pynput_listener(listener)
             try:
                 listener.start()
-                while self.recording_active:
+                while self.recording_active and not self._stop_requested.is_set():
                     time.sleep(0.05)
             finally:
                 try:
@@ -604,7 +632,7 @@ class HybridRecordThread(QThread):
                 except Exception:
                     pass
                 try:
-                    listener.join(timeout=1.0)
+                    listener.join()
                 except Exception:
                     pass
                 self._untrack_pynput_listener(listener)
@@ -630,7 +658,7 @@ class HybridRecordThread(QThread):
                 'middle': win32con.VK_MBUTTON
             }
 
-            while self.recording_active:
+            while self.recording_active and not self._stop_requested.is_set():
                 timestamp = time.time() - self.start_time
 
                 for button_name, vk_code in button_vk.items():
@@ -698,7 +726,7 @@ class HybridRecordThread(QThread):
             self._track_pynput_listener(listener)
             try:
                 listener.start()
-                while self.recording_active:
+                while self.recording_active and not self._stop_requested.is_set():
                     time.sleep(0.05)
             finally:
                 try:
@@ -706,7 +734,7 @@ class HybridRecordThread(QThread):
                 except Exception:
                     pass
                 try:
-                    listener.join(timeout=1.0)
+                    listener.join()
                 except Exception:
                     pass
                 self._untrack_pynput_listener(listener)
@@ -759,7 +787,7 @@ class HybridRecordThread(QThread):
             self._track_pynput_listener(listener)
             try:
                 listener.start()
-                while self.recording_active:
+                while self.recording_active and not self._stop_requested.is_set():
                     time.sleep(0.05)  # 只用于检查停止标志
             finally:
                 try:
@@ -767,7 +795,7 @@ class HybridRecordThread(QThread):
                 except Exception:
                     pass
                 try:
-                    listener.join(timeout=1.0)
+                    listener.join()
                 except Exception:
                     pass
                 self._untrack_pynput_listener(listener)
@@ -851,6 +879,7 @@ class HybridRecordThread(QThread):
 
     def stop(self):
         """停止录制"""
+        self._stop_requested.set()
         self.recording_active = False
         self._stop_tracked_pynput_listeners()
 

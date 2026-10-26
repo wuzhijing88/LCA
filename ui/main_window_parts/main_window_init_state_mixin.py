@@ -135,6 +135,7 @@ class MainWindowInitStateMixin:
         self._window_monitor_interval = 30000  # 每30秒检查一次
         self._window_invalid_count = {}  # 记录每个窗口连续失效次数
         self._window_monitor_enabled = True  # 默认启用
+        self._start_window_monitor()
         # ------------------------------------------
         # --- ADDED: Parameter panel state ---
         self._parameter_panel_visible = False

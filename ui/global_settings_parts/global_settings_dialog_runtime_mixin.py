@@ -7,110 +7,19 @@ logger = logging.getLogger(__name__)
 class GlobalSettingsDialogRuntimeMixin:
 
     def _check_and_adjust_window_resolution(self, hwnd: int, title: str):
-        """绑定窗口成功后检查并调整分辨率"""
-        try:
-            # 获取自定义分辨率配置
-            target_width = self.get_custom_width()
-            target_height = self.get_custom_height()
-            # 检查是否配置了自定义分辨率
-            if target_width <= 0 or target_height <= 0:
-                logger.debug(f"未配置自定义分辨率，跳过窗口 {title} 的分辨率调整")
-                return
-            # 检查窗口是否有效
-            import win32gui
-            if not win32gui.IsWindow(hwnd):
-                logger.warning(f"窗口句柄无效，跳过分辨率调整: {title} (HWND: {hwnd})")
-                return
-            # 获取当前窗口客户区大小
-            try:
-                left, top, right, bottom = win32gui.GetClientRect(hwnd)
-                current_width = right - left
-                current_height = bottom - top
-            except Exception as e:
-                logger.warning(f"获取窗口客户区大小失败: {e}")
-                return
-            # 检查分辨率是否已经符合
-            if current_width == target_width and current_height == target_height:
-                logger.info(f"窗口 {title} 分辨率已符合 ({current_width}x{current_height})，跳过调整")
-                return
-            # 分辨率不符合，进行调整
-            logger.info(f"窗口 {title} 分辨率不符合 ({current_width}x{current_height} -> {target_width}x{target_height})，开始调整")
-            from utils.window.universal_window_manager import get_universal_window_manager
-            window_manager = get_universal_window_manager()
-            result = window_manager.adjust_single_window(hwnd, target_width, target_height, async_mode=True)
-            if result.success:
-                logger.info(
-                    f"窗口分辨率调整成功: {title} "
-                    f"({result.before_size[0]}x{result.before_size[1]} -> {result.after_size[0]}x{result.after_size[1]})"
-                )
-            else:
-                logger.warning(f"窗口分辨率调整失败: {title} - {result.message}")
-        except Exception as e:
-            logger.error(f"检查并调整窗口分辨率失败: {e}")
+        """在界面线程读取配置，只将数据快照交给后台。"""
+        width, height = self.get_custom_width(), self.get_custom_height()
+        if width > 0 and height > 0 and hwnd:
+            self._window_resize_jobs.submit(((hwnd, title),), width, height)
 
     def _batch_resize_all_windows(self):
-        """批量调整所有窗口的分辨率（异步执行，避免阻塞UI）"""
-        try:
-            logger.info("[批量调整] 开始批量调整所有窗口分辨率...")
-            target_width = self.get_custom_width()
-            target_height = self.get_custom_height()
-            if target_width <= 0 or target_height <= 0:
-                logger.info("[批量调整] 未配置自定义分辨率，跳过调整")
-                return
-            # 获取需要调整的窗口
-            windows_to_resize = []
-            for window_info in self.bound_windows:
-                hwnd = window_info.get('hwnd', 0)
-                if hwnd and hwnd != 0:
-                    windows_to_resize.append(window_info)
-            if not windows_to_resize:
-                logger.info("[批量调整] 没有需要调整的窗口")
-                return
-            logger.info(f"[批量调整] 共需调整 {len(windows_to_resize)} 个窗口")
-            # 使用通用窗口管理器批量调整
-            try:
-                from utils.window.universal_window_manager import get_universal_window_manager
-                window_manager = get_universal_window_manager()
-                success_count = 0
-                fail_count = 0
-                for window_info in windows_to_resize:
-                    hwnd = window_info.get('hwnd')
-                    title = window_info.get('title', 'Unknown')
-                    try:
-                        # 检查当前分辨率是否已符合
-                        import win32gui
-                        if win32gui.IsWindow(hwnd):
-                            left, top, right, bottom = win32gui.GetClientRect(hwnd)
-                            current_width = right - left
-                            current_height = bottom - top
-                            if current_width == target_width and current_height == target_height:
-                                logger.info(f"[批量调整] - {title}: 分辨率已符合，跳过")
-                                success_count += 1
-                                continue
-                        # 使用异步模式避免阻塞
-                        result = window_manager.adjust_single_window(
-                            hwnd, target_width, target_height, async_mode=True
-                        )
-                        if result.success:
-                            logger.info(f"[批量调整] ✓ {title}: {result.before_size} -> {result.after_size}")
-                            success_count += 1
-                        else:
-                            logger.warning(f"[批量调整] ✗ {title}: {result.message}")
-                            fail_count += 1
-                    except Exception as e:
-                        logger.error(f"[批量调整] ✗ {title}: {e}")
-                        fail_count += 1
-                logger.info(f"[批量调整] 完成: 成功 {success_count} 个, 失败 {fail_count} 个")
-            except ImportError as e:
-                logger.error(f"[批量调整] 导入窗口管理器失败: {e}")
-            except Exception as e:
-                logger.error(f"[批量调整] 批量调整失败: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-        except Exception as e:
-            logger.error(f"[批量调整] 批量调整分辨率过程异常: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+        """整批调整在后台串行执行，重复请求按句柄合并。"""
+        width, height = self.get_custom_width(), self.get_custom_height()
+        if width <= 0 or height <= 0:
+            return
+        windows = tuple((item['hwnd'], str(item.get('title') or '未知窗口'))
+                        for item in self.bound_windows if item.get('hwnd'))
+        self._window_resize_jobs.submit(windows, width, height)
 
     def _register_windows_to_handle_manager(self):
         """按当前绑定列表同步句柄管理器，已移除的窗口立即注销。"""
@@ -172,6 +81,9 @@ class GlobalSettingsDialogRuntimeMixin:
         manager.remove_user_notification_callback(notify)
         for key, callback in updates.items():
             manager.remove_update_callback(key, callback=callback)
+            manager.unregister_window(key)
+        if not manager.get_all_registered_windows():
+            manager.stop_monitoring()
 
     def _handle_window_hwnd_update(self, window_index: int, old_hwnd: int, new_hwnd: int):
         """处理窗口句柄更新 - 使用Qt信号确保线程安全"""

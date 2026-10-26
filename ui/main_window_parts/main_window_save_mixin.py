@@ -25,21 +25,27 @@ class MainWindowSaveMixin:
         logger.info(f"开始保存并备份所有工作流，共 {len(all_tasks)} 个")
         # 收集所有需要保存的任务信息，并获取最新工作流数据
         tasks_to_save = []
+        failed_tasks = []
         for task in all_tasks:
             task_id = task.task_id
-            # 更新任务的工作流数据
-            workflow_data = None
-            if task_id in self.workflow_tab_widget.task_views:
+            task.last_save_error = ""
+            task.last_save_file_written = False
+            try:
+                if task_id not in self.workflow_tab_widget.task_views:
+                    raise RuntimeError("工作流画布未初始化，无法读取当前编辑内容")
                 workflow_view = self.workflow_tab_widget.task_views[task_id]
                 workflow_data = workflow_view.serialize_workflow()
                 task.update_workflow_data(workflow_data)
-            tasks_to_save.append((task, workflow_data))
+                tasks_to_save.append((task, workflow_data))
+            except Exception as exc:
+                task.record_save_failure("读取画布数据", exc)
+                failed_tasks.append(f"工作流：{task.name}\n{task.last_save_error}")
 
         # 子工作流先写回父工程，父工程随后从最新会话封装子包。
         # 否则父工程会先封装旧的子包，子工作流新增资源会在随后写回时丢失。
         tasks_to_save.sort(
             key=lambda item: 0
-            if str(getattr(item[0], "filepath", "") or "").startswith("memory://")
+            if str(item[0].filepath).startswith("memory://")
             else 1
         )
         # 处理没有保存路径的任务
@@ -56,21 +62,26 @@ class MainWindowSaveMixin:
                 QMessageBox.warning(self, "保存取消", "未选择保存目录，保存已取消")
                 return
             from task_workflow.workspace import prepare_exclusive_workflow_save
-            for index, (task, workflow_data) in enumerate(tasks_to_save):
+            prepared_tasks = []
+            for task, workflow_data in tasks_to_save:
                 if task.filepath:
+                    prepared_tasks.append((task, workflow_data))
                     continue
                 base_name = task.name if task.name else "工作流"
                 base_name = os.path.splitext(base_name)[0]
-                data = workflow_data if isinstance(workflow_data, dict) else {}
-                filepath = prepare_exclusive_workflow_save(
-                    data,
-                    os.path.join(save_dir, f"{base_name}.lca"),
-                    source_filepath=str(task.filepath or ""),
-                )
-                task.update_workflow_data(data)
-                task.filepath = filepath
-                task.name = os.path.splitext(os.path.basename(filepath))[0]
-                tasks_to_save[index] = (task, data)
+                filepath = os.path.join(save_dir, f"{base_name}.lca")
+                try:
+                    filepath = prepare_exclusive_workflow_save(
+                        workflow_data, filepath, source_filepath=str(task.filepath or ""),
+                    )
+                    task.update_workflow_data(workflow_data)
+                    task.filepath = filepath
+                    task.name = os.path.splitext(os.path.basename(filepath))[0]
+                    prepared_tasks.append((task, workflow_data))
+                except Exception as exc:
+                    task.record_save_failure("准备保存路径", exc, filepath=filepath)
+                    failed_tasks.append(f"工作流：{task.name}\n{task.last_save_error}")
+            tasks_to_save = prepared_tasks
         # 检测同名冲突并处理
         filepath_count = {}
         for task, workflow_data in tasks_to_save:
@@ -87,11 +98,16 @@ class MainWindowSaveMixin:
             else:
                 filepath_count[identity] = [(task, workflow_data)]
         # 处理冲突
+        conflicting_tasks = set()
         for task_list in filepath_count.values():
             if len(task_list) > 1:
                 filepath = task_list[0][0].filepath
                 if str(filepath).startswith("memory://"):
-                    raise ValueError("同一父工程中的子工作流被重复打开，无法保存")
+                    for task, _ in task_list:
+                        task.record_save_failure("校验保存目标", "同一父工程中的子工作流被重复打开，无法保存")
+                        failed_tasks.append(f"工作流：{task.name}\n{task.last_save_error}")
+                        conflicting_tasks.add(task.task_id)
+                    continue
                 # 有冲突，重命名
                 base_path = os.path.splitext(filepath)[0]
                 for i, (task, _) in enumerate(task_list):
@@ -106,25 +122,31 @@ class MainWindowSaveMixin:
                         logger.info(f"同名冲突，重命名任务: {filepath} -> {new_filepath}")
         # 执行保存和备份
         saved_count = 0
-        failed_tasks = []
         for task, workflow_data in tasks_to_save:
+            if task.task_id in conflicting_tasks:
+                continue
             old_filepath = task.filepath
-            # 使用 save_and_backup 同时保存和备份
-            if task.save_and_backup(workflow_data=workflow_data):
-                saved_count += 1
+            stage = "保存并备份工程"
+            try:
+                if not task.save_and_backup(workflow_data=workflow_data):
+                    failed_tasks.append(f"工作流：{task.name}\n{task.last_save_error}")
+                    continue
+                stage = "同步保存后的界面与资源"
                 self._sync_favorite_path_after_save(old_filepath, task)
                 self._sync_saved_task_resources(task, workflow_data)
                 self.workflow_tab_widget._update_tab_status(task.task_id)
+                saved_count += 1
                 logger.info(f"已保存并备份: {task.filepath}")
-            else:
-                failed_tasks.append(task.name)
-                logger.error(f"保存或备份失败: {task.filepath}")
+            except Exception as exc:
+                task.record_save_failure(stage, exc)
+                failed_tasks.append(f"工作流：{task.name}\n{task.last_save_error}")
         # 显示结果
         if failed_tasks:
             QMessageBox.warning(
                 self,
                 "保存完成",
-                f"已保存并备份 {saved_count} 个工作流\n失败: {', '.join(failed_tasks)}"
+                f"已保存并备份 {saved_count} 个工作流，{len(failed_tasks)} 个未完成\n\n"
+                + "\n\n".join(failed_tasks)
             )
         else:
             QMessageBox.information(

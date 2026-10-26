@@ -29,6 +29,7 @@ MAX_THREAD_ERRORS = 256
 
 RESULT_FIELD_ALIASES = {
     "通过": "ok",
+    "输出": "outputs",
     "成功": "ok",
     "类型": "kind",
     "内容": "text",

@@ -97,60 +97,24 @@ class DXGICapture:
         self._last_frame_key = None
         self._last_frame_ts = 0.0
         self._last_none_log_ts = 0.0
-        self._reuse_frame_timeout = 0.25
-        self._none_frame_retry_count = 2
-        self._none_frame_retry_interval_sec = 0.01
-        self._last_reinit_attempt_ts = 0.0
-        self._reinit_cooldown_sec = 0.1
+        self._closed = False
 
         self._init_capture()
 
     def _init_capture(self):
-        """初始化截图引擎"""
-        try:
-            with self._camera_lock:
-                if self._camera is not None:
-                    try:
-                        if hasattr(self._camera, "release"):
-                            self._camera.release()
-                    except Exception:
-                        pass
-                self._camera = None
-                self._camera_output_idx = None
-                self._monitors = []
-                self._initialized = False
-
-                if DXCAM_AVAILABLE:
-                    self._camera = dxcam.create(output_idx=0, output_color="BGR")
-                    self._camera_output_idx = 0
-                    self._monitors = self._get_monitors_dxcam()
-                    self._initialized = True
-                    _set_last_failure_reason("")
-                    logger.info("[OK] DXGI Desktop Duplication 已初始化")
-                else:
-                    _set_last_failure_reason("dxcam_unavailable")
-                    raise ImportError("dxcam 不可用")
-
-        except Exception as e:
-            logger.error(f"DXGI 初始化失败: {e}")
-            _set_last_failure_reason(f"init_failed:{type(e).__name__}".lower())
-            self._initialized = False
-
-    def _try_reinitialize(self, force: bool = False) -> bool:
-        try:
-            now = time.perf_counter()
-        except Exception:
-            now = time.time()
+        """先完成显示器校验，再取得相机所有权。"""
         with self._camera_lock:
-            if self._initialized and self._camera is not None:
-                return True
-            if (not force) and ((now - float(self._last_reinit_attempt_ts)) < float(self._reinit_cooldown_sec)):
-                return False
-            self._last_reinit_attempt_ts = now
-
-        self._init_capture()
-        with self._camera_lock:
-            return bool(self._initialized and self._camera is not None)
+            if not DXCAM_AVAILABLE:
+                raise RuntimeError("dxcam 不可用")
+            monitors = self._get_monitors_dxcam()
+            camera = dxcam.create(output_idx=0, output_color="BGR")
+            if camera is None:
+                raise RuntimeError("DXGI未返回相机对象")
+            self._camera = camera
+            self._camera_output_idx = 0
+            self._monitors = monitors
+            self._initialized = True
+            _set_last_failure_reason("")
 
     def _get_win32_error(self) -> Optional[Tuple[int, str]]:
         try:
@@ -202,138 +166,45 @@ class DXGICapture:
         logger.error("DXGI failure context: " + ", ".join(parts))
 
     def _ensure_camera(self, monitor_index: int):
-        """确保 camera 与 monitor_index 对应（dxcam 的 output_idx）"""
-        if not DXCAM_AVAILABLE:
-            raise RuntimeError("dxcam 不可用")
-
-        if monitor_index is None:
-            monitor_index = 0
-
         with self._camera_lock:
+            if self._closed or not self._initialized:
+                raise RuntimeError("DXGI相机已关闭或尚未初始化")
             if self._camera is not None and self._camera_output_idx == monitor_index:
                 return
-
-            try:
-                # 释放旧 camera
-                if self._camera is not None:
-                    try:
-                        if hasattr(self._camera, "release"):
-                            self._camera.release()
-                    except Exception:
-                        pass
-                    self._camera = None
-
-                self._camera = dxcam.create(output_idx=int(monitor_index), output_color="BGR")
-                self._camera_output_idx = int(monitor_index)
-                logger.info(f"[DXGI] dxcam camera 已切换到输出: {self._camera_output_idx} ({self._camera.width}x{self._camera.height})")
-            except Exception as e:
-                raise RuntimeError(f"创建 dxcam camera 失败: output_idx={monitor_index}, err={e}") from e
-
-    def _recreate_camera_for_output_locked(self, monitor_index: int) -> bool:
-        """在已持有 _camera_lock 时强制重建当前输出对应的 camera。"""
-        if not DXCAM_AVAILABLE:
-            return False
-        try:
             if self._camera is not None:
-                try:
-                    if hasattr(self._camera, "release"):
-                        self._camera.release()
-                except Exception:
-                    pass
-            self._camera = None
-            self._camera_output_idx = None
-            self._ensure_camera(monitor_index)
-            return bool(self._camera is not None and self._camera_output_idx == int(monitor_index))
-        except Exception as exc:
-            logger.warning("[DXGI] 重建 dxcam camera 失败: output=%s, error=%s", monitor_index, exc)
-            return False
+                self._camera.release()
+                self._camera = None
+                self._camera_output_idx = None
+            camera = dxcam.create(output_idx=int(monitor_index), output_color="BGR")
+            if camera is None:
+                raise RuntimeError("DXGI未返回相机对象")
+            self._camera = camera
+            self._camera_output_idx = int(monitor_index)
 
     def _get_monitors_dxcam(self) -> List[MonitorInfo]:
-        """使用 dxcam 获取显示器列表"""
-        monitors: List[MonitorInfo] = []
-        try:
-            # 优先使用 pywin32 获取显示器信息（可靠、无需手动解析结构体）
-            try:
-                for i, (hmon, _hdc, _rect) in enumerate(win32api.EnumDisplayMonitors()):
-                    info = win32api.GetMonitorInfo(hmon) or {}
-                    mon_rect = info.get("Monitor")
-                    if not mon_rect or len(mon_rect) != 4:
-                        continue
-                    left, top, right, bottom = mon_rect
-                    width = int(right - left)
-                    height = int(bottom - top)
-                    flags = int(info.get("Flags", 0) or 0)
-                    monitors.append(MonitorInfo(
-                        index=i,
-                        left=int(left),
-                        top=int(top),
-                        width=width,
-                        height=height,
-                        is_primary=bool(flags & 1),
-                    ))
-            except Exception as e:
-                logger.error(f"使用 win32api 获取显示器列表失败: {e}")
-
-            # 兜底：如果枚举失败，至少用 camera 的输出尺寸构造一个主显示器
-            if not monitors and self._camera is not None:
-                cam_w = int(getattr(self._camera, "width", 0) or 0)
-                cam_h = int(getattr(self._camera, "height", 0) or 0)
-                if cam_w > 0 and cam_h > 0:
-                    monitors = [MonitorInfo(index=0, left=0, top=0, width=cam_w, height=cam_h, is_primary=True)]
-
-            if monitors:
-                logger.info("DXGI 显示器列表: " + ", ".join(
-                    [f"{m.index}:{m.width}x{m.height}@({m.left},{m.top}){'*' if m.is_primary else ''}" for m in monitors]
-                ))
-        except Exception as e:
-            logger.error(f"获取显示器列表失败: {e}")
-
+        monitors = []
+        for i, (hmon, _hdc, _rect) in enumerate(win32api.EnumDisplayMonitors()):
+            info = win32api.GetMonitorInfo(hmon)
+            left, top, right, bottom = info["Monitor"]
+            if right <= left or bottom <= top:
+                raise RuntimeError("DXGI显示器尺寸无效")
+            monitors.append(MonitorInfo(i, int(left), int(top), int(right-left), int(bottom-top), bool(info["Flags"] & 1)))
+        if not monitors:
+            raise RuntimeError("DXGI无法枚举显示器")
         return monitors
-
-    def _refresh_monitors(self) -> None:
-        try:
-            refreshed = self._get_monitors_dxcam()
-            if refreshed:
-                self._monitors = refreshed
-        except Exception:
-            pass
 
     def get_monitors(self) -> List[MonitorInfo]:
         """获取显示器列表"""
         return self._monitors.copy()
 
     def _get_monitor_for_window(self, hwnd: int) -> Optional[MonitorInfo]:
-        """获取窗口所在的显示器"""
-        if not self._monitors:
-            self._refresh_monitors()
-
-        try:
-            rect = win32gui.GetWindowRect(hwnd)
-            window_center_x = (rect[0] + rect[2]) // 2
-            window_center_y = (rect[1] + rect[3]) // 2
-
-            for monitor in self._monitors:
-                if (monitor.left <= window_center_x < monitor.left + monitor.width and
-                    monitor.top <= window_center_y < monitor.top + monitor.height):
-                    return monitor
-
-            # 显示器拓扑可能动态变化，刷新后再尝试一次
-            self._refresh_monitors()
-            for monitor in self._monitors:
-                if (monitor.left <= window_center_x < monitor.left + monitor.width and
-                    monitor.top <= window_center_y < monitor.top + monitor.height):
-                    return monitor
-
-            # 默认返回主显示器
-            for monitor in self._monitors:
-                if monitor.is_primary:
-                    return monitor
-
-            return self._monitors[0] if self._monitors else None
-
-        except Exception as e:
-            logger.error(f"获取窗口所在显示器失败: {e}")
-            return self._monitors[0] if self._monitors else None
+        self._monitors = self._get_monitors_dxcam()
+        rect = win32gui.GetWindowRect(hwnd)
+        x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+        for monitor in self._monitors:
+            if monitor.left <= x < monitor.left + monitor.width and monitor.top <= y < monitor.top + monitor.height:
+                return monitor
+        return None
 
     def capture_screen(
         self,
@@ -354,13 +225,7 @@ class DXGICapture:
         start_time = time.time()
 
         try:
-            if (not self._initialized) or (self._camera is None):
-                if not self._try_reinitialize(force=True):
-                    logger.error("DXGI 未初始化")
-                    _set_last_failure_reason("not_initialized")
-                    return None
-            if not self._initialized:
-                logger.error("DXGI 未初始化")
+            if not self._initialized or self._closed:
                 _set_last_failure_reason("not_initialized")
                 return None
 
@@ -377,7 +242,7 @@ class DXGICapture:
                     left, top, width, height = region
                     if width <= 0 or height <= 0:
                         _set_last_failure_reason("invalid_region_size")
-                        raise ValueError(f"Invalid Region: width/height must be > 0, got {region}")
+                        raise ValueError(f"截图区域的宽高必须大于0：{region}")
 
                     cam_w = int(getattr(self._camera, "width", 0) or 0)
                     cam_h = int(getattr(self._camera, "height", 0) or 0)
@@ -390,7 +255,7 @@ class DXGICapture:
                     if left < 0 or top < 0 or right > cam_w or bottom > cam_h:
                         _set_last_failure_reason("region_out_of_bounds")
                         raise ValueError(
-                            f"Invalid Region: {region} out of bounds for output {monitor_index} ({cam_w}x{cam_h})"
+                            f"截图区域{region}超出显示器{monitor_index}的范围（{cam_w}x{cam_h}）"
                         )
 
                 if DXCAM_AVAILABLE and self._camera:
@@ -426,48 +291,13 @@ class DXGICapture:
         """使用 dxcam 截图"""
         try:
             if self._camera_output_idx != monitor_index:
-                # 理论上 capture_screen 会确保一致，这里再兜底提示
-                logger.warning(f"[DXGI] camera 输出不一致: camera={self._camera_output_idx}, requested={monitor_index}")
-
-            def _grab_once() -> Optional[np.ndarray]:
-                if region:
-                    left, top, width, height = region
-                    return self._camera.grab(region=(left, top, left + width, top + height))
-                return self._camera.grab()
-
-            frame = _grab_once()
-
+                raise RuntimeError("DXGI相机输出与请求不一致")
+            if region is None:
+                frame = self._camera.grab()
+            else:
+                left, top, width, height = region
+                frame = self._camera.grab(region=(left, top, left + width, top + height))
             if frame is None:
-                now = time.time()
-                if (
-                    self._last_frame is not None
-                    and self._last_frame_key == frame_key
-                    and now - self._last_frame_ts <= self._reuse_frame_timeout
-                ):
-                    elapsed_ms = (time.time() - start_time) * 1000
-                    with self.lock:
-                        self.stats.total_captures += 1
-                        self.stats.success_captures += 1
-                        self.stats.total_time_ms += elapsed_ms
-                    _set_last_failure_reason("")
-                    return self._last_frame
-
-                for _ in range(max(0, int(self._none_frame_retry_count))):
-                    retry_interval = max(0.0, float(self._none_frame_retry_interval_sec))
-                    if retry_interval > 0:
-                        time.sleep(retry_interval)
-                    frame = _grab_once()
-                    if frame is not None:
-                        break
-
-                if frame is None and self._recreate_camera_for_output_locked(monitor_index):
-                    frame = _grab_once()
-
-            if frame is None:
-                if now - self._last_none_log_ts > 1.0:
-                    logger.error("dxcam 截图返回 None")
-                    self._log_failure_context("dxcam returned None", monitor_index, region)
-                    self._last_none_log_ts = now
                 _set_last_failure_reason("dxcam_returned_none")
                 with self.lock:
                     self.stats.total_captures += 1
@@ -530,6 +360,7 @@ class DXGICapture:
             if not win32gui.IsWindowVisible(hwnd):
                 logger.warning(f"窗口不可见: {hwnd}")
                 _set_last_failure_reason("window_not_visible")
+                return None
 
             # 获取窗口位置
             if client_area_only:
@@ -554,38 +385,12 @@ class DXGICapture:
             # 获取窗口所在显示器
             monitor = self._get_monitor_for_window(hwnd)
             if monitor is None:
-                try:
-                    hmon = win32api.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
-                    info = win32api.GetMonitorInfo(hmon) or {}
-                    mon_rect = info.get("Monitor")
-                    if mon_rect and len(mon_rect) == 4:
-                        m_left, m_top, m_right, m_bottom = [int(v) for v in mon_rect]
-                        m_width = int(m_right - m_left)
-                        m_height = int(m_bottom - m_top)
-                        if m_width > 0 and m_height > 0:
-                            fallback_index = (
-                                int(self._camera_output_idx)
-                                if self._camera_output_idx is not None
-                                else 0
-                            )
-                            monitor = MonitorInfo(
-                                index=fallback_index,
-                                left=m_left,
-                                top=m_top,
-                                width=m_width,
-                                height=m_height,
-                                is_primary=bool(int(info.get("Flags", 0) or 0) & 1),
-                            )
-                except Exception:
-                    monitor = None
-            monitor_index = monitor.index if monitor else 0
+                _set_last_failure_reason("monitor_not_found")
+                raise RuntimeError("无法确定窗口所在显示器")
+            monitor_index = monitor.index
             self._last_hwnd = hwnd
 
             # DXGI/dxcam 的 region 坐标相对于显示器左上角
-            if monitor is None:
-                _set_last_failure_reason("monitor_not_found")
-                raise RuntimeError("无法确定窗口所在显示器")
-
             rel_left = int(left - monitor.left)
             rel_top = int(top - monitor.top)
 
@@ -658,39 +463,22 @@ class DXGICapture:
             return None
 
     def cleanup(self, hwnd: int = None):
-        """清理资源"""
-        try:
-            with self._camera_lock:
-                if hwnd is not None:
-                    with self.lock:
-                        if self._last_hwnd == hwnd:
-                            self._last_hwnd = None
-                            self._last_frame = None
-                            self._last_frame_key = None
-                            self._last_frame_ts = 0.0
-                else:
-                    with self.lock:
-                        self._last_hwnd = None
-                        self._last_frame = None
-                        self._last_frame_key = None
-                        self._last_frame_ts = 0.0
-                        self._last_none_log_ts = 0.0
-                        self._monitors.clear()
-                        self._initialized = False
-
-                    if self._camera:
-                        try:
-                            if hasattr(self._camera, 'release'):
-                                self._camera.release()
-                        except Exception:
-                            pass
-                        self._camera = None
-                    self._camera_output_idx = None
-
-            logger.debug(f"DXGI 资源已清理: hwnd={hwnd}")
-
-        except Exception as e:
-            logger.error(f"DXGI 清理失败: {e}")
+        with self._camera_lock:
+            if hwnd is None and self._camera is not None:
+                # 释放失败时保留对象，不发布一个仍占用原生资源的新相机。
+                self._camera.release()
+                self._camera = None
+                self._camera_output_idx = None
+            with self.lock:
+                if hwnd is None or self._last_hwnd == hwnd:
+                    self._last_hwnd = None
+                    self._last_frame = None
+                    self._last_frame_key = None
+                    self._last_frame_ts = 0.0
+                if hwnd is None:
+                    self._monitors.clear()
+                    self._initialized = False
+                    self._closed = True
 
     def clear_runtime_cache(self, hwnd: int = None):
         """软清理运行时缓存（不释放camera，避免下次重建）。"""
@@ -733,11 +521,16 @@ _global_lock = threading.Lock()
 def get_global_capture() -> DXGICapture:
     """获取全局截图器实例"""
     global _global_capture
-    if _global_capture is None:
-        with _global_lock:
-            if _global_capture is None:
-                _global_capture = DXGICapture()
-    return _global_capture
+    with _global_lock:
+        if _global_capture is None:
+            _global_capture = DXGICapture()
+        return _global_capture
+
+
+def get_existing_global_capture() -> Optional[DXGICapture]:
+    """读取已存在的截图器，不为统计查询创建相机。"""
+    with _global_lock:
+        return _global_capture
 
 
 def capture_window_dxgi(
@@ -794,11 +587,10 @@ def cleanup_dxgi(hwnd: int = None):
     global _global_capture
     with _global_lock:
         capture = _global_capture
-        if hwnd is None:
-            _global_capture = None
-
-    if capture:
-        capture.cleanup(hwnd)
+        if capture is not None:
+            capture.cleanup(hwnd)
+            if hwnd is None:
+                _global_capture = None
 
 
 def clear_dxgi_runtime_cache(hwnd: int = None):

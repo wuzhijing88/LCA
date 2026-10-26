@@ -19,7 +19,6 @@ from app_core.lca_format.container import LcaFormatError, seal_lca_bytes, unseal
 from app_core.lca_format.session import (
     LcaPackageSession,
     clear_path,
-    get_active,
     get_active_path,
     get_for_path,
     materialize_package_assets,
@@ -251,6 +250,14 @@ class _ProjectCollector:
             if not isinstance(parameters, dict):
                 continue
             task_type = str(card.get("task_type") or "").strip()
+            plugin_file_keys = set()
+            if task_type == "脚本卡片":
+                plugin_file_keys = self._collect_card_plugin_inputs(
+                    parameters, source_session=source_session,
+                    images_dir=local_images_dir, sounds_dir=local_sounds_dir,
+                    dicts_dir=local_dicts_dir, yolo_dir=local_yolo_dir,
+                    replays_dir=local_replays_dir, plugins_dir=local_plugins_dir,
+                )
             if task_type == "自定义脚本":
                 self._collect_script_resources(
                     parameters,
@@ -264,6 +271,8 @@ class _ProjectCollector:
                     dicts_dir=local_dicts_dir,
                 )
             for key, value in list(parameters.items()):
+                if key in plugin_file_keys:
+                    continue
                 if key in SUB_WORKFLOW_KEYS and (
                     task_type == "子工作流"
                     or any(str(item).lower().endswith(LCA_EXTENSION) for item in _path_values(value))
@@ -309,6 +318,38 @@ class _ProjectCollector:
                     parameters[key] = "\n".join(rewritten)
                 else:
                     parameters[key] = rewritten[0]
+
+    def _collect_card_plugin_inputs(self, parameters, *, source_session, **resource_dirs):
+        from app_core.card_plugins import bundle_from_parameters, MAX_CONTENT_BYTES, input_parameter_key
+        from app_core.card_plugin_conditions import prepare_parameter_storage
+        from task_workflow.card_plugin_runtime import read_bound_resource
+        from task_workflow.expr import contains_interpolation
+        import hashlib
+
+        bundle = bundle_from_parameters(parameters)
+        definitions = bundle.manifest["parameters"]
+        states = prepare_parameter_storage(definitions, parameters)
+        file_keys = set()
+        total = 0
+        for name, definition in bundle.manifest["parameters"].items():
+            if definition["type"] != "file":
+                continue
+            storage_key = input_parameter_key(name)
+            file_keys.add(storage_key)
+            if states[name].active is False:
+                continue
+            value = parameters[storage_key]
+            if not isinstance(value, str):
+                raise LcaFormatError(f"脚本卡片文件参数必须是文本：{name}")
+            if contains_interpolation(value) or not value:
+                continue
+            kind = definition["resource_kind"]
+            data = read_bound_resource(value, kind, {key: str(directory) for key, directory in resource_dirs.items()}, package_session=source_session, limit=MAX_CONTENT_BYTES - total)
+            total += len(data)
+            package_kind = "audio" if kind == "sound" else kind
+            source_key = ("plugin_input", package_kind, hashlib.sha256(data).hexdigest())
+            parameters[storage_key] = self._store_packaged_asset(value, package_kind, data, source_key)
+        return file_keys
 
     def _collect_script_resources(
         self,
@@ -716,19 +757,6 @@ class _ProjectCollector:
         return candidate
 
 
-def _source_session_for_save(destination: Path) -> Optional[LcaPackageSession]:
-    session = get_for_path(destination)
-    if session is not None:
-        return session
-    active_path = get_active_path()
-    if not active_path:
-        return None
-    destination_key = os.path.normcase(os.path.abspath(str(destination)))
-    if os.path.normcase(os.path.abspath(active_path)) != destination_key:
-        return None
-    return get_active()
-
-
 def ensure_registered_lca_session(path: str | Path) -> Optional[LcaPackageSession]:
     text = str(path or "").strip()
     if not is_lca_path(text):
@@ -751,12 +779,13 @@ def save_lca_project(
     workflow_data: dict,
     *,
     display_name: str = "",
+    source_session: Optional[LcaPackageSession] = None,
 ) -> Path:
     destination = Path(path)
     collector = _ProjectCollector(destination.parent)
     cleaned = collector.collect(
         workflow_data,
-        source_session=_source_session_for_save(destination),
+        source_session=source_session if source_session is not None else get_for_path(destination),
         workflow_filepath=str(destination),
     )
     collector.files[ENTRY_WORKFLOW] = _json_bytes(cleaned)

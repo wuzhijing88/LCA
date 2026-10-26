@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from typing import Tuple
+import weakref
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, QStringListModel, QTimer, Signal
 from PySide6.QtGui import (
@@ -21,7 +22,7 @@ from PySide6.QtGui import (
     QTextDocument,
     QTextFormat,
 )
-from PySide6.QtWidgets import QCompleter, QFrame, QLabel, QPlainTextEdit, QTextEdit, QWidget
+from PySide6.QtWidgets import QApplication, QCompleter, QFrame, QLabel, QPlainTextEdit, QTextEdit, QWidget
 
 from ui.system_parts.menu_style import create_themed_edit_menu
 from themes import get_theme_manager, theme_color
@@ -68,13 +69,20 @@ class _BreakpointData(QTextBlockUserData):
 class _LineNumberArea(QWidget):
     def __init__(self, editor: "ScriptCodeEdit") -> None:
         super().__init__(editor)
-        self._editor = editor
+        self._editor_ref = weakref.ref(editor)
+
+    @property
+    def _editor(self):
+        return self._editor_ref()
 
     def sizeHint(self) -> QSize:
-        return QSize(self._editor.line_number_width(), 0)
+        editor = self._editor
+        return QSize(editor.line_number_width(), 0) if editor is not None else QSize()
 
     def paintEvent(self, event) -> None:
-        self._editor.paint_line_numbers(event)
+        editor = self._editor
+        if editor is not None:
+            editor.paint_line_numbers(event)
 
     def mousePressEvent(self, event) -> None:
         # 左键点在行号旁即切换该行断点，和「断点」按钮走同一处理。
@@ -95,34 +103,42 @@ class ScriptCodeEdit(QPlainTextEdit):
     breakpoint_toggle_requested = Signal(int)
 
     def __init__(self, parent=None) -> None:
+        from ui.panels.managed_resources import dispose_partial_widget
+        if QApplication.instance() is None:
+            raise RuntimeError("创建参数界面前必须创建应用程序")
         super().__init__(parent)
-        self.setObjectName("scriptEditor")
-        self._dark = is_dark_theme()
-        self._line_area = _LineNumberArea(self)
-        self._highlighter = ScriptSyntaxHighlighter(self.document(), dark=self._dark)
-        self._completer = None
-        self._signature_hint = None
-        self._execution_line = None
-        self._breakpoint_snapshot: set = set()
-        self._hide_hint_timer = QTimer(self)
-        self._hide_hint_timer.setSingleShot(True)
-        self._hide_hint_timer.timeout.connect(self._hide_signature_hint_if_away)
-        self._execution_repaint_timer = QTimer(self)
-        self._execution_repaint_timer.setSingleShot(True)
-        self._execution_repaint_timer.timeout.connect(self._apply_extra_selections)
-        self._completer = self._build_completer()
-        self._completer_mode = "command"
-        self._signature_hint = ScriptSignatureHint(self)
-        self._signature_hint.installEventFilter(self)
-        self.blockCountChanged.connect(self._update_line_number_width)
-        self.updateRequest.connect(self._update_line_number_area)
-        self.document().contentsChange.connect(self._on_contents_change)
-        self.setMouseTracking(True)
-        self.viewport().setMouseTracking(True)
-        self.viewport().installEventFilter(self)
-        self.cursorPositionChanged.connect(self._on_cursor_moved)
-        self._update_line_number_width(0)
-        self._highlight_current_line()
+        try:
+            self.setObjectName("scriptEditor")
+            self._dark = is_dark_theme()
+            self._line_area = _LineNumberArea(self)
+            self._highlighter = ScriptSyntaxHighlighter(self.document(), dark=self._dark)
+            self._completer = None
+            self._signature_hint = None
+            self._execution_line = None
+            self._breakpoint_snapshot: set = set()
+            self._hide_hint_timer = QTimer(self)
+            self._hide_hint_timer.setSingleShot(True)
+            self._hide_hint_timer.timeout.connect(self._hide_signature_hint_if_away)
+            self._execution_repaint_timer = QTimer(self)
+            self._execution_repaint_timer.setSingleShot(True)
+            self._execution_repaint_timer.timeout.connect(self._apply_extra_selections)
+            self._completer = self._build_completer()
+            self._completer_mode = "command"
+            self._signature_hint = ScriptSignatureHint(self)
+            self._signature_hint.installEventFilter(self)
+            self.blockCountChanged.connect(self._update_line_number_width)
+            self.updateRequest.connect(self._update_line_number_area)
+            self.document().contentsChange.connect(self._on_contents_change)
+            self.setMouseTracking(True)
+            self.viewport().setMouseTracking(True)
+            self.viewport().installEventFilter(self)
+            self.cursorPositionChanged.connect(self._on_cursor_moved)
+            self._update_line_number_width(0)
+            self._highlight_current_line()
+
+        except Exception:
+            dispose_partial_widget(self, parent)
+            raise
 
     def refresh_line_number_area(self) -> None:
         self._line_area.update()
@@ -278,6 +294,9 @@ class ScriptCodeEdit(QPlainTextEdit):
             self._line_area.update()
 
     def _prepare_completer_popup(self, popup) -> None:
+        if popup.property("scriptPopupPrepared"):
+            return
+        popup.setProperty("scriptPopupPrepared", True)
         from themes.rounded_popup import COMBO_RADIUS, apply_rounded_popup, apply_transparent_popup_palette
 
         apply_rounded_popup(
@@ -1002,6 +1021,10 @@ class ScriptSignatureHint(QLabel):
         self.setWordWrap(False)
         self.apply_theme(editor._dark)
         self.hide()
+
+    @property
+    def _editor(self):
+        return self._editor_ref()
 
     def apply_theme(self, dark: bool) -> None:
         colors = _script_popup_colors()

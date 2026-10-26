@@ -1,8 +1,9 @@
 from ..parameter_panel_support import *
 from utils.window.window_activation_utils import show_and_raise_widget
 from .parameter_panel_image_viewer_dialog import ParameterPanelImageViewerDialog
-from PySide6.QtGui import QPixmap
+from .image_preview import ImagePreviewLabel
 
+from shiboken6 import isValid
 
 def directory_has_onnx(directory: str) -> bool:
     root = str(directory or "").strip()
@@ -38,7 +39,7 @@ class ParameterPanelMediaMixin:
             else:
                 file_filter = file_types
         else:
-            file_filter = param_def.get('file_filter', 'All Files (*)')
+            file_filter = param_def.get('file_filter', '所有文件 (*)')
 
         filename, _ = QFileDialog.getOpenFileName(
             self, "选择文件", self._resource_dialog_start_dir(param_def), file_filter
@@ -46,7 +47,6 @@ class ParameterPanelMediaMixin:
         if filename:
             if self._is_yolo_model_param(param_def) and not filename.lower().endswith('.onnx'):
                 ext = filename.rsplit('.', 1)[-1] if '.' in filename else ''
-                from PySide6.QtWidgets import QMessageBox
                 QMessageBox.warning(
                     self,
                     "模型格式提示",
@@ -56,15 +56,32 @@ class ParameterPanelMediaMixin:
                 return
 
             param_name = self._get_registered_widget_name(line_edit)
-            selected_value = self._store_resource_in_workspace(filename, param_name)
+            kind = self._is_yolo_model_param(param_def)
+            if "resource_kind" in param_def:
+                from app_core.card_plugins import RESOURCE_FOLDERS
+                required_dir = getattr(self, RESOURCE_FOLDERS[param_def["resource_kind"]][1])
+            else:
+                required_dir = self.yolo_dir if kind else self.images_dir
+            if param_name != "workflow_file" and not required_dir:
+                QMessageBox.critical(self, "导入失败", "当前工程资源目录未绑定，无法导入资源")
+                return
+            try:
+                selected_value = self._store_resource_in_workspace(filename, param_name)
+            except Exception as exc:
+                QMessageBox.critical(self, "导入失败", f"无法导入资源：{exc}")
+                return
             line_edit.setText(selected_value)
             self._update_current_parameter_from_widget(line_edit, selected_value)
-            self._apply_parameters(auto_close=False)
-            refresher = getattr(self, "_refresh_selects_using_source", None)
-            if callable(refresher) and param_name:
-                refresher(param_name)
+            if self.current_task_type == "脚本卡片":
+                self._plugin_parameter_controller.save_draft()
+            else:
+                self._apply_parameters(auto_close=False)
+            if param_name:
+                self._refresh_selects_using_source(param_name)
 
     def _is_yolo_model_param(self, param_def: Dict[str, Any]) -> bool:
+        if "resource_kind" in param_def:
+            return param_def["resource_kind"] == "model"
         file_types = param_def.get('file_types', [])
         if isinstance(file_types, list):
             for ft in file_types:
@@ -77,13 +94,13 @@ class ParameterPanelMediaMixin:
 
     def _resource_dialog_start_dir(self, param_def: Optional[Dict[str, Any]] = None) -> str:
         param_def = param_def if isinstance(param_def, dict) else {}
+        if "resource_kind" in param_def:
+            from app_core.card_plugins import RESOURCE_FOLDERS
+            return str(getattr(self, RESOURCE_FOLDERS[param_def["resource_kind"]][1]) or "")
         if self._is_yolo_model_param(param_def):
-            try:
-                from utils.app_paths import get_app_root
+            from utils.app_paths import get_app_root
 
-                bundled = os.path.join(get_app_root(), "yolo")
-            except Exception:
-                bundled = ""
+            bundled = os.path.join(get_app_root(), "yolo")
             return resolve_yolo_model_dialog_start_dir(
                 str(getattr(self, "yolo_dir", "") or "").strip(),
                 bundled,
@@ -140,18 +157,40 @@ class ParameterPanelMediaMixin:
         )
 
     def _hide_windows_before_screenshot(self):
-        self.hide()
-        if hasattr(self, 'main_window') and self.main_window:
-            self.main_window.hide()
-            logger.debug('截图前已隐藏主窗口和参数面板')
+        was_tool_hiding = getattr(self, "_tool_hiding", False)
+        self._tool_hiding = True
+        try:
+            self.hide()
+            if hasattr(self, 'main_window') and self.main_window:
+                self.main_window.hide()
+                logger.debug('截图前已隐藏主窗口和参数面板')
+        finally:
+            self._tool_hiding = was_tool_hiding
+
+    def _cancel_screenshot_start(self):
+        timer = getattr(self, "_screenshot_start_timer", None)
+        self._screenshot_start_timer = None
+        if timer is not None and isValid(timer):
+            timer.stop()
+            timer.deleteLater()
+        self._resources.forget_cleanup("screenshot-start")
 
     def _schedule_screenshot_overlay_start(self, line_edit: QLineEdit, hwnd):
         from PySide6.QtCore import QTimer
 
-        QTimer.singleShot(
-            200,
-            lambda edit=line_edit, target_hwnd=hwnd: self._start_screenshot_delayed(edit, target_hwnd),
-        )
+        self._cancel_screenshot_start()
+        timer = QTimer(line_edit)
+        timer.setSingleShot(True)
+        self._screenshot_start_timer = timer
+        self._resources.bind_cleanup("screenshot-start", self._cancel_screenshot_start)
+
+        def ready():
+            self._cancel_screenshot_start()
+            if self._current_screenshot_target is line_edit:
+                self._start_screenshot_delayed(line_edit, hwnd)
+
+        timer.timeout.connect(ready)
+        timer.start(200)
 
     @staticmethod
     def _is_qt_widget_alive(widget) -> bool:
@@ -163,15 +202,21 @@ class ParameterPanelMediaMixin:
         except RuntimeError:
             return False
 
-    def _start_screenshot_for_param(self, line_edit: QLineEdit):
+    def _start_screenshot_for_param(self, line_edit: QLineEdit, *, on_selected=None, on_cancelled=None, target_hwnd=None):
         try:
             logger.info(f"启动截图工具, hwnd={self.target_window_hwnd}")
-            validated_hwnd = self._resolve_validated_screenshot_hwnd()
+            validated_hwnd = target_hwnd if target_hwnd is not None else self._resolve_validated_screenshot_hwnd()
             if not validated_hwnd:
                 self._warn_no_available_screenshot_window()
                 return
 
             self._current_screenshot_param_name = self._get_registered_widget_name(line_edit)
+            if self._current_screenshot_param_name is None:
+                raise ValueError("截图目标参数未注册")
+            if on_selected is not None:
+                self._screenshot_result_callback = on_selected
+                self._screenshot_cancel_callback = on_cancelled
+            self._resources.bind_cleanup("screenshot-result", self._clear_screenshot_runtime_state)
             self._current_screenshot_target = line_edit
             self._hide_windows_before_screenshot()
             self._schedule_screenshot_overlay_start(line_edit, validated_hwnd)
@@ -179,22 +224,22 @@ class ParameterPanelMediaMixin:
             from PySide6.QtWidgets import QMessageBox
 
             logger.error(f"启动截图工具失败: {exc}", exc_info=True)
+            registered_callback = getattr(self, "_screenshot_cancel_callback", None)
+            self._on_screenshot_cancelled()
+            if on_cancelled is not None and on_cancelled is not registered_callback:
+                on_cancelled()
             QMessageBox.critical(self, "错误", f"启动截图工具失败: {str(exc)}")
 
     def _resolve_screenshot_save_dir(self) -> str:
         images_dir = str(getattr(self, "images_dir", "") or "").strip()
-        return images_dir or "images"
+        if not images_dir:
+            raise ValueError("未设置工程图片目录")
+        return images_dir
 
     def _load_screenshot_format(self):
-        screenshot_format = 'bmp'
-        try:
-            from app_core.config_store import load_config
+        from app_core.config_store import load_config
 
-            config = load_config()
-            screenshot_format = config.get('screenshot_format', 'bmp')
-        except Exception as exc:
-            logger.warning(f"加载截图格式失败，已回退到 BMP: {exc}")
-        return screenshot_format
+        return load_config()['screenshot_format']
 
     def _create_screenshot_overlay(self, target_hwnd):
         from ...selectors.screenshot_tool import ScreenshotOverlay
@@ -212,27 +257,23 @@ class ParameterPanelMediaMixin:
         self._screenshot_overlay.screenshot_taken.connect(self._on_screenshot_path_ready)
         self._screenshot_overlay.screenshot_cancelled.connect(self._on_screenshot_cancelled)
 
-    def _start_screenshot_delayed(self, line_edit: QLineEdit, hwnd=None):
+    def _start_screenshot_delayed(self, line_edit: QLineEdit, hwnd):
+        if not self._is_qt_widget_alive(line_edit) or self._current_screenshot_target is not line_edit:
+            return
         try:
-            if self._is_qt_widget_alive(line_edit):
-                self._current_screenshot_target = line_edit
-                if not getattr(self, "_current_screenshot_param_name", None):
-                    self._current_screenshot_param_name = self._get_registered_widget_name(line_edit)
-            target_hwnd = hwnd if hwnd is not None else self.target_window_hwnd
-            self._screenshot_overlay = self._create_screenshot_overlay(target_hwnd)
+            if self._current_screenshot_param_name is None:
+                raise ValueError("截图目标参数未知")
+            self._screenshot_overlay = self._own_parameter_tool(self._create_screenshot_overlay(hwnd))
             self._connect_screenshot_overlay_signals()
             if self._screenshot_overlay.capture_and_show():
                 return
 
-            logger.error('显示截图覆盖层失败')
-            self._screenshot_overlay = None
-            self._restore_windows_after_screenshot()
-            logger.info('截图覆盖层显示失败后已恢复窗口')
+            raise RuntimeError("截图覆盖层未能显示")
         except Exception as exc:
             from PySide6.QtWidgets import QMessageBox
 
             logger.error(f"启动延迟截图工具失败: {exc}", exc_info=True)
-            self._restore_windows_after_screenshot()
+            self._on_screenshot_cancelled()
             QMessageBox.critical(self, "错误", f"启动截图工具失败: {str(exc)}")
 
     def _invalidate_screenshot_template_cache(self, filepath: str):
@@ -254,9 +295,6 @@ class ParameterPanelMediaMixin:
             current = self._get_value_widget(param_name)
             if self._is_qt_widget_alive(current) and isinstance(current, QLineEdit):
                 return current
-        stale = getattr(self, "_current_screenshot_target", None)
-        if self._is_qt_widget_alive(stale) and isinstance(stale, QLineEdit):
-            return stale
         return None
 
     def _refresh_screenshot_preview(self, filepath: str, param_name: Optional[str], target_input=None):
@@ -275,6 +313,16 @@ class ParameterPanelMediaMixin:
             logger.warning(f"刷新截图预览失败: {exc}")
 
     def _clear_screenshot_runtime_state(self):
+        overlay = getattr(self, "_screenshot_overlay", None)
+        self._screenshot_overlay = None
+        if overlay is not None and isValid(overlay):
+            overlay.blockSignals(True)
+            overlay.close()
+            overlay.deleteLater()
+        self._screenshot_result_callback = None
+        self._screenshot_cancel_callback = None
+        self._cancel_screenshot_start()
+        self._resources.forget_cleanup("screenshot-result")
         self._current_screenshot_target = None
         self._current_screenshot_param_name = None
         self._screenshot_overlay = None
@@ -284,7 +332,10 @@ class ParameterPanelMediaMixin:
 
         kind = ""
         name = str(param_name or "")
-        if "dict" in name.lower():
+        definition = self.param_definitions.get(name, {})
+        if "resource_kind" in definition:
+            kind = "audio" if definition["resource_kind"] == "sound" else definition["resource_kind"]
+        elif "dict" in name.lower():
             kind = "dict"
         elif name.endswith("_image_path") or name == "image_path":
             kind = "image"
@@ -292,31 +343,26 @@ class ParameterPanelMediaMixin:
             kind = "audio"
         else:
             kind = resource_kind(filepath)
-        try:
-            return place_resource_file(
-                filepath,
-                kind=kind,
-                images_dir=str(getattr(self, "images_dir", "") or ""),
-                sounds_dir=str(getattr(self, "sounds_dir", "") or ""),
-                dicts_dir=str(getattr(self, "dicts_dir", "") or ""),
-                yolo_dir=str(getattr(self, "yolo_dir", "") or ""),
-                replays_dir=str(getattr(self, "replays_dir", "") or ""),
-                plugins_dir=str(getattr(self, "plugins_dir", "") or ""),
-            )
-        except Exception:
-            return self._normalize_single_image_parameter_value(param_name, filepath)
+        return place_resource_file(
+            filepath,
+            kind=kind,
+            images_dir=str(getattr(self, "images_dir", "") or ""),
+            sounds_dir=str(getattr(self, "sounds_dir", "") or ""),
+            dicts_dir=str(getattr(self, "dicts_dir", "") or ""),
+            yolo_dir=str(getattr(self, "yolo_dir", "") or ""),
+            replays_dir=str(getattr(self, "replays_dir", "") or ""),
+            plugins_dir=str(getattr(self, "plugins_dir", "") or ""),
+        )
 
     def _import_screenshot_to_parameter(self, filepath: str) -> None:
         param_name = getattr(self, "_current_screenshot_param_name", None)
         target_input = self._resolve_screenshot_target_input(param_name)
-        if not param_name and target_input is not None:
-            param_name = self._get_registered_widget_name(target_input)
         if not param_name:
-            param_name = "image_path"
+            raise ValueError("截图参数未知，未导入资源")
 
         normalized_path = self._store_resource_in_workspace(filepath, param_name)
         if not normalized_path:
-            normalized_path = filepath
+            raise ValueError("截图资源导入没有返回有效路径")
 
         self._invalidate_screenshot_template_cache(filepath)
         if target_input is not None:
@@ -330,17 +376,26 @@ class ParameterPanelMediaMixin:
         logger.info(f"截图已导入参数 {param_name}: {normalized_path}")
 
     def _on_screenshot_path_ready(self, filepath: str):
+        if self._current_screenshot_target is None:
+            return
+        error_message = None
         try:
             if os.path.isfile(filepath):
-                self._import_screenshot_to_parameter(filepath)
+                callback = getattr(self, "_screenshot_result_callback", None)
+                if callback is None:
+                    self._import_screenshot_to_parameter(filepath)
+                else:
+                    callback(filepath)
             else:
-                logger.error(f"截图文件未找到，无法导入: {filepath}")
-            self._clear_screenshot_runtime_state()
-            self._restore_windows_after_screenshot()
+                raise ValueError(f"截图文件不存在：{filepath}")
         except Exception as exc:
             logger.error(f"处理截图路径失败: {exc}", exc_info=True)
+            error_message = str(exc)
+        finally:
             self._clear_screenshot_runtime_state()
             self._restore_windows_after_screenshot()
+        if error_message is not None:
+            QMessageBox.critical(self, "截图失败", error_message)
 
     def _restore_windows_after_screenshot(self):
         if hasattr(self, 'main_window') and self.main_window:
@@ -349,144 +404,24 @@ class ParameterPanelMediaMixin:
         logger.debug('截图完成后已恢复参数面板和主窗口')
 
     def _on_screenshot_cancelled(self):
+        if self._current_screenshot_target is None:
+            return
         logger.info('截图已取消')
+        callback = getattr(self, "_screenshot_cancel_callback", None)
         self._clear_screenshot_runtime_state()
         self._restore_windows_after_screenshot()
+        if callback is not None:
+            callback()
 
-    _PREVIEW_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp')
-
-    def _update_image_preview(self, image_path: str, preview_label: QLabel):
-        """Update image preview."""
-        try:
-            self._reset_preview_label(preview_label)
-            if not image_path or not image_path.strip():
-                self._set_preview_status(preview_label, "未选择图片")
-                return
-
-            resolved_path = self._resolve_preview_image_path(image_path)
-            self._set_preview_image_property(preview_label, resolved_path)
-
-            validation_message = self._validate_preview_image_path(resolved_path)
-            if validation_message:
-                self._set_preview_status(preview_label, validation_message)
-                return
-
-            pixmap = self._load_preview_pixmap(resolved_path)
-            if pixmap is None or pixmap.isNull():
-                self._set_preview_status(preview_label, "无法加载图片")
-                return
-
-            self._apply_preview_pixmap(preview_label, pixmap)
-            preview_label.setToolTip(self._build_preview_tooltip(image_path, resolved_path, pixmap))
-            logger.debug(f"图片预览已更新: {resolved_path} ({pixmap.width()}x{pixmap.height()})")
-        except Exception as e:
-            logger.error(f"更新图片预览失败: {e}", exc_info=True)
-            self._set_preview_status(preview_label, f"预览失败: {e}")
-
-    def _reset_preview_label(self, preview_label: QLabel) -> None:
-        preview_label.clear()
-        preview_label.setToolTip("")
-
-    def _set_preview_status(self, preview_label: QLabel, message: str) -> None:
-        preview_label.setText(message)
-        preview_label.setProperty("image_path", "")
-
-    def _resolve_preview_image_path(self, image_path: str) -> str:
-        if os.path.exists(image_path):
-            return image_path
-        filename = os.path.basename(str(image_path or "").strip())
-        search_roots = []
-        if self.images_dir:
-            search_roots.append(self.images_dir)
-        try:
-            from utils.app_paths import get_images_dir
-
-            search_roots.append(get_images_dir("LCA"))
-        except Exception:
-            pass
-        if filename:
-            for root in search_roots:
-                if not root:
-                    continue
-                candidate = os.path.join(root, filename)
-                if os.path.isfile(candidate):
-                    return candidate
-        try:
-            from tasks.task_utils import get_image_path_resolver
-
-            resolver = get_image_path_resolver()
-            search_dirs = [self.images_dir] if self.images_dir else None
-            resolved_path = resolver.resolve(image_path, search_dirs=search_dirs)
-            if resolved_path:
-                logger.debug(f"图片路径自动解析: {image_path} -> {resolved_path}")
-                return resolved_path
-        except Exception as e:
-            logger.warning(f"路径解析器调用失败: {e}")
-        return image_path
-
-    def _set_preview_image_property(self, preview_label: QLabel, resolved_path: str) -> None:
-        preview_label.setProperty(
-            "image_path",
-            resolved_path if resolved_path and os.path.exists(resolved_path) else "",
-        )
-
-    def _validate_preview_image_path(self, resolved_path: str) -> Optional[str]:
-        if not os.path.exists(resolved_path):
-            return "文件不存在"
-        if not resolved_path.lower().endswith(self._PREVIEW_IMAGE_EXTENSIONS):
-            return "不是图片文件"
-        return None
-
-    def _load_preview_pixmap(self, resolved_path: str) -> Optional[QPixmap]:
-        pixmap = QPixmap()
-        for _ in range(3):
-            try:
-                with open(resolved_path, 'rb') as image_file:
-                    file_bytes = image_file.read()
-                if file_bytes and pixmap.loadFromData(file_bytes):
-                    return pixmap
-            except Exception:
-                pass
-            time.sleep(0.03)
-
-        fallback_pixmap = QPixmap(resolved_path)
-        if fallback_pixmap.isNull():
-            return None
-        return fallback_pixmap
-
-    def _apply_preview_pixmap(self, preview_label: QLabel, pixmap: QPixmap) -> None:
-        scaled_pixmap = pixmap.scaled(
-            max(1, preview_label.width() - 6),
-            74,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        preview_label.setPixmap(scaled_pixmap)
-        preview_label.setScaledContents(False)
-
-    def _build_preview_tooltip(self, image_path: str, resolved_path: str, pixmap: QPixmap) -> str:
-        file_size = os.path.getsize(resolved_path) / 1024
-        hint_text = "提示: 双击可查看原图（支持放大缩小）"
-        if resolved_path != image_path:
-            return (
-                f"原路径: {image_path}\n"
-                f"解析为: {resolved_path}\n"
-                f"尺寸: {pixmap.width()} x {pixmap.height()} 像素\n"
-                f"大小: {file_size:.1f} KB\n\n"
-                f"{hint_text}"
-            )
-        return (
-            f"路径: {resolved_path}\n"
-            f"尺寸: {pixmap.width()} x {pixmap.height()} 像素\n"
-            f"大小: {file_size:.1f} KB\n\n"
-            f"{hint_text}"
-        )
+    def _update_image_preview(self, image_path: str, preview_label: ImagePreviewLabel):
+        preview_label.set_image_path(image_path, self.images_dir)
 
     def _show_image_viewer(self, image_path: str):
         """Show image viewer."""
         try:
-            viewer = ParameterPanelImageViewerDialog(image_path, self)
-            viewer.exec()
+            viewer = self._resources.own_widget(ParameterPanelImageViewerDialog(image_path, self))
+            from ui.dialogs.dialog_manager import exec_dialog
+            exec_dialog(viewer)
         except Exception as e:
             logger.error(f"显示图片查看器失败: {e}", exc_info=True)
             QMessageBox.critical(self, "错误", f"无法打开图片查看器: {e}")
@@ -598,7 +533,7 @@ class ParameterPanelMediaMixin:
     def _get_multi_image_common_dir_for_display(self, file_paths):
         try:
             if len(file_paths) > 1:
-                return os.path.commonpath(file_paths)
+                return os.path.commonpath([os.path.dirname(path) for path in file_paths])
         except ValueError:
             return ""
         return ""
@@ -624,7 +559,6 @@ class ParameterPanelMediaMixin:
         if not lines:
             return []
 
-        resolver = self._create_multi_image_path_resolver()
         common_dir = None
         file_paths = []
         for line in lines:
@@ -639,7 +573,6 @@ class ParameterPanelMediaMixin:
             if not self._is_supported_multi_image_path(full_path):
                 continue
 
-            full_path = self._resolve_multi_image_full_path(full_path, line, resolver)
             file_paths.append(full_path)
         return file_paths
 
@@ -702,26 +635,6 @@ class ParameterPanelMediaMixin:
             (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp")
         )
 
-    def _create_multi_image_path_resolver(self):
-        try:
-            from tasks.task_utils import get_image_path_resolver
-
-            resolver = get_image_path_resolver()
-            return resolver
-        except Exception:
-            return None
-
-    def _resolve_multi_image_full_path(self, full_path, original_line, resolver):
-        if os.path.exists(full_path) or not resolver:
-            return full_path
-        images_dir = getattr(self, "images_dir", None)
-        search_dirs = [images_dir] if images_dir else None
-        resolved = resolver.resolve(full_path, search_dirs=search_dirs)
-        if resolved:
-            logger.debug(f"Resolved multi image path: {original_line} -> {resolved}")
-            return resolved
-        return full_path
-
     def _clear_and_update_display(self, text_edit):
         text_edit.clear()
 
@@ -755,6 +668,8 @@ class ParameterPanelMediaMixin:
                 item = layout.takeAt(0)
                 widget = item.widget()
                 if widget:
+                    for thumbnail in widget.findChildren(ThumbnailWidget):
+                        thumbnail.cancel_loading()
                     widget.deleteLater()
 
             file_paths = self._parse_image_paths(paths_text)
@@ -775,7 +690,7 @@ class ParameterPanelMediaMixin:
             for i, path in enumerate(file_paths):
                 row = i // columns
                 col = i % columns
-                thumbnail = ThumbnailWidget(path, size=60)
+                thumbnail = ThumbnailWidget(path, size=60, images_dir=self.images_dir)
                 thumbnail.clicked.connect(self._show_image_viewer)
                 thumbnail.delete_requested.connect(lambda p=path, name=param_name: self._delete_single_image(name, p))
                 grid_layout.addWidget(thumbnail, row, col)

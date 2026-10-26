@@ -1468,12 +1468,6 @@ class TaskCard(QGraphicsObject):
         always_branch_types = [
             "OCR文字识别",
             "点阵字库OCR",
-            "字库识别",
-            "OCR区域识别",
-            "图片点击",
-            "查找图片并点击",
-            "找图点击",
-            "找图功能",
         ]
         if self.task_type in always_branch_types:
             return False
@@ -1554,14 +1548,8 @@ class TaskCard(QGraphicsObject):
         
         # Update the title text immediately
         # --- MODIFIED: Change title format to support custom names ---
-        if hasattr(self, 'task_type') and self.task_type:
-            if self.custom_name:
-                self.title = f"{self.custom_name} (ID: {self.card_id})"
-            else:
-                self.title = f"{self.task_type} (ID: {self.card_id})" # Use card_id directly
-        else:
-            # Fallback title if task_type isn't set yet (shouldn't happen in normal flow)
-            self.title = f"Task (ID: {self.card_id})"
+        display_name = self.custom_name or self.task_type
+        self.title = f"{display_name} (ID: {self.card_id})"
         # --- END MODIFICATION ---
 
         self.update() # Request a repaint to show the new title

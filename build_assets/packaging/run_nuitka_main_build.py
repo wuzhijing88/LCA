@@ -59,6 +59,7 @@ INCLUDE_PACKAGE_DATA = (
 )
 
 INCLUDE_MODULES = (
+    "services.element_pick_worker",
     "services.multiprocess_ocr_pool",
     "services.multiprocess_ocr_worker",
     "services.rapidocr_ocr_service",

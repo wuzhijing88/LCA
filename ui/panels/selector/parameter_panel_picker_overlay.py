@@ -1,4 +1,6 @@
+from PySide6.QtCore import QEvent
 from ..parameter_panel_support import *
+from themes import theme_color
 from utils.window.window_activation_utils import activate_overlay_widget
 from utils.window.window_overlay_utils import (
     draw_selection_overlay,
@@ -11,12 +13,12 @@ class ParameterPanelPickerOverlay(QWidget):
     """Transparent overlay for element picking."""
 
     def __init__(self, parent_panel):
-        super().__init__()
+        super().__init__(parent_panel)
         self.parent_panel = parent_panel
         self.highlight_rect = None
         self.device_pixel_ratio = self.devicePixelRatioF()
 
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -43,9 +45,21 @@ class ParameterPanelPickerOverlay(QWidget):
         self.setFocus(Qt.FocusReason.OtherFocusReason)
         logger.debug(f"[元素拾取] showEvent: 窗口获得焦点，hasFocus={self.hasFocus()}")
 
+    def _cancel_if_active(self):
+        if not self._closing:
+            self._closing = True
+            if self.parent_panel._picker_overlay is self:
+                self.parent_panel._cancel_current_element_pick()
+        self.highlight_rect = None
+
     def hideEvent(self, event):
+        self._cancel_if_active()
         super().hideEvent(event)
-        logger.debug("[元素拾取] hideEvent: 窗口已隐藏")
+
+    def event(self, event):
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._cancel_if_active()
+        return super().event(event)
 
     def paintEvent(self, event):
         if not self.highlight_rect:
@@ -67,12 +81,14 @@ class ParameterPanelPickerOverlay(QWidget):
             f"[picker] draw rect: ({draw_rect.x()}, {draw_rect.y()}, "
             f"{draw_rect.width()}, {draw_rect.height()})"
         )
+        selection_fill = QColor(theme_color('error'))
+        selection_fill.setAlpha(30)
         draw_selection_overlay(
             painter,
             draw_rect,
-            border_color=QColor(255, 0, 0),
+            border_color=QColor(theme_color('error')),
             border_width=3,
-            fill_color=QColor(255, 0, 0, 30),
+            fill_color=selection_fill,
         )
 
     def mouseDoubleClickEvent(self, event):

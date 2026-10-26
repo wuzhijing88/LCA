@@ -163,10 +163,12 @@ class WorkflowViewIoMixin:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             task_type = dialog.selected_task_type()
-            if task_type not in task_types:
-                raise ValueError("任务选择结果不属于当前可用任务类型")
-
-            new_card = self.add_task_card(scene_pos.x(), scene_pos.y(), task_type=task_type)
+            if task_type == "脚本卡片":
+                new_card = self.add_task_card(scene_pos.x(), scene_pos.y(), task_type=task_type, parameters=dialog.selected_task_parameters())
+            else:
+                if task_type not in task_types:
+                    raise ValueError("任务选择结果不属于当前可用任务类型")
+                new_card = self.add_task_card(scene_pos.x(), scene_pos.y(), task_type=task_type)
             if new_card is None:
                 raise RuntimeError(f"新增卡片失败: {task_type}")
             self.update_card_sequence_display()
@@ -371,6 +373,9 @@ class WorkflowViewIoMixin:
         return actual_workflow
 
     def _load_current_workflow(self, workflow_data: Dict[str, Any]):
+        from app_core.card_plugins import PLUGIN_TASK_TYPE
+        from tasks import bind_task_module_for_card
+
         actual_workflow = self._validate_current_workflow_data(workflow_data)
         if not isinstance(self.task_modules, dict):
             raise TypeError("任务模块清单必须是字典")
@@ -378,6 +383,8 @@ class WorkflowViewIoMixin:
             task_type = card_data['task_type'].strip()
             if self.task_modules.get(task_type) is None:
                 raise ValueError(f"卡片 {card_data['id']} 的任务类型不可用: {task_type}")
+            if task_type == PLUGIN_TASK_TYPE:
+                bind_task_module_for_card(self.task_modules[task_type], card_data["parameters"], task_type)
         logger.info("[工作流加载] 开始")
 
         metadata = actual_workflow.get("metadata", {})
@@ -395,6 +402,7 @@ class WorkflowViewIoMixin:
                 y=card_data['pos_y'],
                 task_type=task_type,
                 card_id=card_data['id'],
+                parameters=copy.deepcopy(card_data["parameters"]) if task_type == PLUGIN_TASK_TYPE else None,
             )
             if card is None:
                 raise RuntimeError(f"卡片创建失败: {card_data['id']}")

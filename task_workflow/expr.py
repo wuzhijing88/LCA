@@ -113,8 +113,15 @@ def interpolate(text: Any, store: RuntimeStore) -> Any:
     return "".join(pieces)
 
 
+def contains_interpolation(value: Any) -> bool:
+    """判断声明的运行时输入，供资源打包保留动态引用。"""
+    return isinstance(value, str) and _INTERPOLATION.search(value) is not None
+
+
 def resolve_params(params: Any, store: RuntimeStore, *, skip_keys: Optional[Sequence[str]] = None) -> Any:
-    blocked = set(SKIP_INTERPOLATE_KEYS)
+    from app_core.card_plugins import BUNDLE_PARAMETER
+    is_plugin = isinstance(params, dict) and BUNDLE_PARAMETER in params
+    blocked = {BUNDLE_PARAMETER} if is_plugin else set(SKIP_INTERPOLATE_KEYS)
     if skip_keys:
         blocked.update(str(key) for key in skip_keys)
     return _resolve_value(params, store, blocked, parent_key="")

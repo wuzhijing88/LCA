@@ -361,10 +361,7 @@ def refresh_target_window_overlay_rect(widget, window_info, *, attr_name: str = 
 
 def overlay_point_to_client_qpoint(window_info, target_rect, overlay_pos) -> QPoint:
     if not window_info or target_rect is None or target_rect.isEmpty():
-        try:
-            return QPoint(int(overlay_pos.x()), int(overlay_pos.y()))
-        except Exception:
-            return QPoint()
+        raise ValueError("目标窗口信息或客户区无效，无法转换坐标")
 
     client_x, client_y = overlay_local_point_to_client_relative(
         window_info,

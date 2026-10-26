@@ -21,6 +21,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from themes import get_theme_manager, theme_color
+from ui.panels.background_jobs import PanelBackgroundJobs
+from ui.panels.managed_resources import PanelResources, own_background_thread, release_background_thread
+from functools import partial
 
 from ui.dialogs.script_capture_text import apply_script_capture, peek_click_coords, peek_find_image_path
 from utils.window.window_activation_utils import (
@@ -64,6 +67,8 @@ class ScriptCaptureBar(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
         self._buttons = []
+        self._plugin_mode = False
+        self._busy = False
         for kind, label, tip in CAPTURE_BUTTONS:
             button = QPushButton(label)
             button.setObjectName("scriptCaptureButton")
@@ -71,9 +76,12 @@ class ScriptCaptureBar(QWidget):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             button.setToolTip(tip)
             button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-            button.clicked.connect(lambda _checked=False, name=kind: self.capture_requested.emit(name))
+            button.setProperty("capture_kind", kind)
+            button.clicked.connect(self._request_capture)
             row.addWidget(button)
             self._buttons.append(button)
+            if kind == "image":
+                self._image_btn = button
         find_btn = QPushButton("查找")
         find_btn.setObjectName("scriptCaptureButton")
         find_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -113,6 +121,7 @@ class ScriptCaptureBar(QWidget):
         layout.addWidget(hint)
         self._hint = hint
         self._idle_hint = hint.text()
+        self._ordinary_hint = hint.text()
 
     def set_resources_visible(self, visible: bool) -> None:
         button = self._resource_btn
@@ -120,10 +129,22 @@ class ScriptCaptureBar(QWidget):
         button.setChecked(bool(visible))
         button.blockSignals(False)
 
+    def _request_capture(self):
+        self.capture_requested.emit(self.sender().property("capture_kind"))
+
     def set_busy(self, busy: bool) -> None:
+        self._busy = busy
         for button in self._buttons:
             button.setEnabled(not busy)
+        if self._plugin_mode:
+            self._resource_btn.setEnabled(False)
+            self._image_btn.setEnabled(False)
         self._hint.setText("采集中，右键或 ESC 取消。" if busy else self._idle_hint)
+
+    def set_plugin_mode(self, enabled: bool) -> None:
+        self._plugin_mode = enabled
+        self._idle_hint = "插件只包含逻辑：资源请用 参数.声明 的文件类型，由工作流传入。" if enabled else self._ordinary_hint
+        self.set_busy(self._busy)
 
 
 class ScriptCaptureController(QObject):
@@ -131,16 +152,22 @@ class ScriptCaptureController(QObject):
 
     def __init__(self, dialog, editor, bar: ScriptCaptureBar) -> None:
         super().__init__(dialog)
-        self._dialog = dialog
-        self._editor = editor
-        self._bar = bar
+        import weakref
+        self._dialog_ref = weakref.ref(dialog)
+        self._editor_ref = weakref.ref(editor)
+        self._bar_ref = weakref.ref(bar)
         self._busy = False
         self._hider: Optional[WindowHider] = None
         self._dialog_modality = None
         self._dialog_delete_on_close = None
         self._overlay = None
         self._element_host: Optional[_ScriptElementCapture] = None
+        self._escape_watcher = None
+        self._jobs = PanelBackgroundJobs(self)
+        self._resources = PanelResources()
+        self.destroyed.connect(self._resources.close)
         self._pending_capture: Optional[tuple[str, Optional[int]]] = None
+        self._active_capture_kind: Optional[str] = None
         self._launch_timer = QTimer(self)
         self._launch_timer.setSingleShot(True)
         self._launch_timer.setInterval(200)
@@ -149,12 +176,26 @@ class ScriptCaptureController(QObject):
         dialog.finished.connect(self._on_dialog_finished)
         dialog.installEventFilter(self)
 
+    @property
+    def _dialog(self):
+        return self._dialog_ref()
+
+    @property
+    def _editor(self):
+        return self._editor_ref()
+
+    @property
+    def _bar(self):
+        return self._bar_ref()
+
     def eventFilter(self, obj, event) -> bool:
-        if obj is self._dialog and event.type() == QEvent.Type.DeferredDelete:
+        if event.type() == QEvent.Type.DeferredDelete and obj is self.parent():
             self._finish(restore_editor=False)
+            obj.removeEventFilter(self)
         return super().eventFilter(obj, event)
 
     def _on_dialog_finished(self, _result: int) -> None:
+        self._dialog.removeEventFilter(self)
         self._finish(restore_editor=False)
 
     def _launch_pending(self) -> None:
@@ -166,6 +207,7 @@ class ScriptCaptureController(QObject):
     def start(self, kind: str) -> None:
         if self._busy:
             return
+        self._dialog.installEventFilter(self)
         hwnd = None
         if kind != "element":
             try:
@@ -183,56 +225,130 @@ class ScriptCaptureController(QObject):
         if kind not in {"image", "color", "coord", "offset", "region", "element"}:
             return
         if kind == "element":
-            from utils.window.element_picker import ElementPicker
+            from importlib.util import find_spec
 
-            if not ElementPicker.is_available():
+            if find_spec("uiautomation") is None:
                 QMessageBox.warning(self._dialog, "采集", "UIAutomation 不可用，无法拾取元素。")
                 return
         self._busy = True
         self._bar.set_busy(True)
+        self._active_capture_kind = kind
         self._pending_capture = (kind, hwnd)
         try:
+            if kind == "element":
+                self._start_escape_watcher()
             self._hide_host_windows()
+            if not self._busy:
+                return
             self._launch_timer.start()
         except Exception as exc:
             logger.error("准备采集失败: %s", exc, exc_info=True)
             self._finish(error=f"准备采集失败: {exc}")
 
+    def _start_escape_watcher(self) -> None:
+        from .script_element_pick import EscapeKeyWatcher
+
+        watcher = EscapeKeyWatcher(self)
+        self._escape_watcher = watcher
+        watcher.escape_pressed.connect(
+            self._cancel_element_pick_from_keyboard,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._resources.bind_cleanup("element_escape_hook", self._stop_escape_watcher)
+        try:
+            watcher.start()
+        except Exception:
+            self._stop_escape_watcher()
+            raise
+
+    def _cancel_element_pick_from_keyboard(self) -> None:
+        if self._busy and self._active_capture_kind == "element":
+            self._finish()
+
+    def _stop_escape_watcher(self) -> None:
+        watcher = self._escape_watcher
+        if watcher is None:
+            self._resources.forget_cleanup("element_escape_hook")
+            return
+        try:
+            try:
+                watcher.escape_pressed.disconnect(self._cancel_element_pick_from_keyboard)
+            except RuntimeError:
+                pass
+            watcher.stop()
+        except Exception:
+            # 保留 watcher 和清理登记，父对象销毁时仍可重试卸钩。
+            raise
+        else:
+            self._escape_watcher = None
+            self._resources.forget_cleanup("element_escape_hook")
+            watcher.deleteLater()
+
     def _hide_host_windows(self) -> None:
-        """先解除对话框模态再隐藏，否则覆盖层收不到框选。"""
+        """先登记完整恢复清单，再处理可能触发重入的 Qt 事件。"""
         dialog = self._dialog
         self._dialog_modality = dialog.windowModality()
         self._dialog_delete_on_close = dialog.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dialog.setModal(False)
-        dialog.setWindowModality(Qt.WindowModality.NonModal)
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-        QApplication.processEvents()
         self._hider = WindowHider()
+        self._resources.bind_cleanup("restore_windows", partial(_restore_capture_windows, self._hider))
         self._hider.add_window(dialog, "脚本编辑器")
         main_window = _main_window_of(dialog)
         if main_window is not None and main_window is not dialog:
             self._hider.add_window(main_window, "主窗口")
+
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        QApplication.processEvents()
+        if not self._busy:
+            return
         self._hider.hide_all()
         QApplication.processEvents()
+        if not self._busy:
+            return
 
     def _restore_host_windows(self) -> None:
-        hider = self._hider
-        self._hider = None
-        if hider is not None:
-            hider.restore_all()
-            hider.clear()
+        self._resources.forget_cleanup("restore_windows")
+        hider, self._hider = self._hider, None
+        restore_error = None
+        try:
+            if hider is not None:
+                hider.restore_all()
+        except Exception as error:
+            restore_error = error
+            logger.error("恢复脚本采集窗口失败，继续恢复编辑器：%s", error, exc_info=True)
+        finally:
+            if hider is not None:
+                try:
+                    for info in tuple(hider._windows.values()):
+                        widget = info["widget"]
+                        try:
+                            should_show = bool(info.get("hidden_by_us") or info.get("was_visible"))
+                            if should_show and not widget.property("parameterDisposed") and not widget.isVisible():
+                                widget.show()
+                        except RuntimeError:
+                            continue
+                finally:
+                    hider.clear()
+
         dialog = self._dialog
         modality = self._dialog_modality
         delete_on_close = self._dialog_delete_on_close
         self._dialog_modality = None
         self._dialog_delete_on_close = None
         if dialog is not None:
-            if modality is not None:
-                dialog.setWindowModality(modality)
-            if delete_on_close is not None:
-                dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, bool(delete_on_close))
-            dialog.raise_()
-            dialog.activateWindow()
+            try:
+                if modality is not None:
+                    dialog.setWindowModality(modality)
+                if delete_on_close is not None:
+                    dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, bool(delete_on_close))
+                dialog.show()
+                dialog.raise_()
+                dialog.activateWindow()
+            except RuntimeError:
+                logger.debug("恢复脚本编辑器时窗口已销毁")
+        if restore_error is not None:
+            raise RuntimeError(f"脚本编辑器窗口恢复时发生错误：{restore_error}") from restore_error
 
     def _launch(self, kind: str, hwnd: Optional[int]) -> None:
         if not self._busy:
@@ -270,11 +386,11 @@ class ScriptCaptureController(QObject):
         )
         overlay.screenshot_taken.connect(lambda path: self._finish(kind="image", value=path))
         overlay.screenshot_cancelled.connect(lambda: self._finish())
-        self._overlay = overlay
+        self._overlay = self._resources.own_widget(overlay)
         if not overlay.capture_and_show():
             self._finish()
             return
-        QTimer.singleShot(80, overlay._grab_overlay_input)
+        QTimer.singleShot(80, overlay, overlay._grab_overlay_input)
 
     def _start_color(self, hwnd: int) -> None:
         from ui.selectors.color_coordinate_picker import ColorCoordinatePickerOverlay
@@ -283,8 +399,8 @@ class ScriptCaptureController(QObject):
         overlay.color_picking_finished.connect(self._on_color_finished)
         overlay.picking_closed.connect(self._on_overlay_gone)
         overlay.destroyed.connect(self._on_overlay_gone)
-        self._overlay = overlay
-        if not overlay.setup_target_window() or not overlay.capture_screenshot_before_show():
+        self._overlay = self._resources.own_widget(overlay)
+        if not overlay.window_info or not overlay.capture_screenshot_before_show():
             self._finish(error="无法拍摄窗口截图，取色未开始。")
             return
         show_and_activate_overlay(overlay, log_prefix="脚本取色覆盖层", focus=True)
@@ -303,7 +419,7 @@ class ScriptCaptureController(QObject):
         overlay = CoordinateSelectorOverlay(hwnd)
         overlay.coordinate_selected.connect(lambda x, y: self._finish(kind="coord", value=(int(x), int(y))))
         overlay.selection_closed.connect(self._on_overlay_gone)
-        self._overlay = overlay
+        self._overlay = self._resources.own_widget(overlay)
         if not overlay.setup_target_window():
             self._finish(error="无法打开坐标选择。")
             return
@@ -311,13 +427,24 @@ class ScriptCaptureController(QObject):
         self._arm_overlay(overlay, "脚本取坐标覆盖层")
 
     def _start_offset(self, hwnd: int) -> None:
+        line = self._editor.textCursor().block().text()
+        card_id = getattr(self._dialog, "_card_id", None)
+        for name, directory in _task_resource_dirs_of(self._dialog).items():
+            setattr(self, name, directory)
+        self._jobs.submit("offset", partial(_resolve_offset_base, line, hwnd, card_id),
+                          partial(self._show_offset_overlay, hwnd),
+                          lambda error: self._finish(error=str(error)))
+
+    def _show_offset_overlay(self, hwnd, result):
+        if not self._busy:
+            return
         from ui.selectors.coordinate_selector import OffsetSelectorOverlay
 
-        base, rect = _resolve_offset_base(self._dialog, self._editor, hwnd)
+        base, rect = result
         overlay = OffsetSelectorOverlay(hwnd, base_client=base, base_rect=rect)
         overlay.offset_selected.connect(lambda dx, dy: self._finish(kind="offset", value=(int(dx), int(dy))))
         overlay.selection_closed.connect(self._on_overlay_gone)
-        self._overlay = overlay
+        self._overlay = self._resources.own_widget(overlay)
         if not overlay.setup_target_window():
             self._finish(error="无法打开偏移选择。")
             return
@@ -332,7 +459,7 @@ class ScriptCaptureController(QObject):
             lambda x, y, width, height: self._finish(kind="region", value=(int(x), int(y), int(width), int(height)))
         )
         overlay.overlay_closed.connect(self._on_overlay_gone)
-        self._overlay = overlay
+        self._overlay = self._resources.own_widget(overlay)
         if not overlay.setup_target_window():
             self._finish(error="无法打开框选区域。")
             return
@@ -394,33 +521,69 @@ class ScriptCaptureController(QObject):
         self, kind: Optional[str] = None, value: Any = None, error: Optional[str] = None,
         *, restore_editor: bool = True,
     ) -> None:
+        self._jobs.cancel_all()
         self._launch_timer.stop()
         self._pending_capture = None
+        self._active_capture_kind = None
         if not self._busy:
+            try:
+                self._stop_escape_watcher()
+            except Exception:
+                logger.exception("卸载脚本元素拾取 Esc 监听失败")
             return
         self._busy = False
-        overlay = self._overlay
-        self._overlay = None
+        cleanup_errors = []
+        try:
+            self._stop_escape_watcher()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+            logger.error("卸载脚本元素拾取 Esc 监听失败：%s", exc, exc_info=True)
+
+        overlay, self._overlay = self._overlay, None
         if overlay is not None:
             try:
-                overlay._closing = True
                 overlay.blockSignals(True)
                 overlay.hide()
                 overlay.close()
                 overlay.deleteLater()
-            except Exception:
-                logger.debug("关闭采集覆盖层失败", exc_info=True)
-        element_host = self._element_host
-        self._element_host = None
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.error("关闭脚本采集覆盖层失败：%s", exc, exc_info=True)
+
+        element_host, self._element_host = self._element_host, None
         if element_host is not None:
-            element_host.finished.disconnect(self._on_element_finished)
-            element_host.failed.disconnect(self._on_element_failed)
-            element_host.stop()
-            element_host.deleteLater()
-        self._restore_host_windows()
+            try:
+                try:
+                    element_host.finished.disconnect(self._on_element_finished)
+                except RuntimeError:
+                    pass
+                try:
+                    element_host.failed.disconnect(self._on_element_failed)
+                except RuntimeError:
+                    pass
+                element_host.stop()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.error("停止脚本元素拾取失败：%s", exc, exc_info=True)
+            finally:
+                element_host.deleteLater()
+
+        try:
+            self._restore_host_windows()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+            logger.error("恢复脚本编辑器窗口失败：%s", exc, exc_info=True)
+        finally:
+            try:
+                self._bar.set_busy(False)
+            except RuntimeError:
+                pass
+
         if not restore_editor:
-            self._bar.set_busy(False)
-            self._dialog.hide()
+            try:
+                self._dialog.hide()
+            except RuntimeError:
+                pass
             return
         if value is not None and kind:
             try:
@@ -428,31 +591,52 @@ class ScriptCaptureController(QObject):
             except Exception as exc:
                 logger.error("写入采集结果失败: %s", exc, exc_info=True)
                 error = error or f"写入失败: {exc}"
-        self._bar.set_busy(False)
+        if cleanup_errors:
+            error = error or f"采集已取消，但资源清理失败：{cleanup_errors[0]}"
         if error:
             QMessageBox.warning(self._dialog, "采集", error)
-        self._dialog.raise_()
-        self._dialog.activateWindow()
-        self._editor.setFocus()
+        try:
+            self._dialog.show()
+            self._dialog.raise_()
+            self._dialog.activateWindow()
+            self._editor.setFocus()
+        except RuntimeError:
+            logger.debug("脚本编辑器已销毁，跳过焦点恢复")
+
+
+def _restore_capture_windows(hider):
+    try:
+        hider.restore_all()
+    finally:
+        hider.clear()
 
 
 class _ElementOverlay(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.highlight_rect = None
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._closing = False
-        self.setMouseTracking(True)
-        sync_overlay_geometry(self)
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        self._make_click_through()
-        manager = get_theme_manager()
-        callback = self._on_theme_changed
-        manager.register_theme_change_callback(callback)
-        self.destroyed.connect(lambda _obj=None: manager.unregister_theme_change_callback(callback))
+        try:
+            self.highlight_rect = None
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            self._closing = False
+            self.setMouseTracking(True)
+            sync_overlay_geometry(self)
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self._make_click_through()
+            manager = get_theme_manager()
+            import weakref
+            owner = weakref.ref(self)
+            def callback(theme):
+                overlay = owner()
+                if overlay is not None:
+                    overlay._on_theme_changed(theme)
+            manager.register_theme_change_callback(callback)
+            self.destroyed.connect(lambda _obj=None: manager.unregister_theme_change_callback(callback))
+        except Exception:
+            self.deleteLater()
+            raise
 
     def _on_theme_changed(self, _theme=None) -> None:
         self.update()
@@ -510,33 +694,60 @@ class _ScriptElementCapture(QObject):
         self._overlay: Optional[_ElementOverlay] = None
         self._thread: Optional[threading.Thread] = None
         self._emitted = False
+        self._completion_lock = threading.Lock()
         self._cancel = threading.Event()
+        self._confirm = threading.Event()
+        self._cancel_timer = QTimer(self)
+        self._cancel_timer.setInterval(20)
+        self._cancel_timer.timeout.connect(self._poll_escape)
+        self._resources = PanelResources()
+        self._resources.bind_cleanup("element_cancel_timer", self._cancel_timer.stop)
+        self._resources.bind_cleanup("element_cancel", self._cancel.set)
+        self.destroyed.connect(self._resources.close)
         self.highlight.connect(self._set_highlight)
 
     def start(self) -> None:
-        if self._thread is not None:
-            raise ValueError("元素采集已经启动")
+        if self._thread is not None or self._emitted or self._cancel.is_set():
+            raise ValueError("元素采集会话已经启动或结束")
         self._active = True
-        overlay = _ElementOverlay()
-        self._overlay = overlay
-        show_and_activate_overlay(overlay, log_prefix="脚本元素拾取覆盖层", focus=True)
-        self._thread = threading.Thread(target=self._loop, name="lca-script-element-capture", daemon=True)
-        self._thread.start()
+        try:
+            overlay = _ElementOverlay()
+            self._resources.own_widget(overlay)
+            self._overlay = overlay
+            overlay.installEventFilter(self)
+            show_and_activate_overlay(overlay, log_prefix="脚本元素拾取覆盖层", focus=True)
+            if not self._active or self._cancel.is_set():
+                return
+            self._cancel_timer.start()
+            self._thread = threading.Thread(target=self._run_loop, name="lca-script-element-capture", daemon=True)
+            own_background_thread(self._thread, self._cancel)
+            self._thread.start()
+        except Exception:
+            if self._thread is not None:
+                release_background_thread(self._thread)
+            self.stop()
+            self._resources.close_tools()
+            raise
+
+    def _run_loop(self):
+        try:
+            self._loop()
+        finally:
+            release_background_thread(threading.current_thread())
 
     def stop(self) -> None:
-        self._active = False
-        self._cancel.set()
-        self._emitted = True
+        with self._completion_lock:
+            self._active = False
+            self._cancel.set()
+            self._emitted = True
         self.blockSignals(True)
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join()
+        self._cancel_timer.stop()
         self._thread = None
         overlay = self._overlay
         self._overlay = None
         if overlay is not None:
             try:
-                overlay._closing = True
+                overlay.removeEventFilter(self)
                 overlay.hide()
                 overlay.close()
                 overlay.deleteLater()
@@ -544,90 +755,69 @@ class _ScriptElementCapture(QObject):
                 logger.debug("关闭元素拾取覆盖层失败", exc_info=True)
 
     def _emit(self, name: Optional[str]) -> None:
-        if self._emitted or self._cancel.is_set():
-            return
-        self._emitted = True
-        self._active = False
+        with self._completion_lock:
+            if self._emitted or self._cancel.is_set():
+                return
+            self._emitted = True
+            self._active = False
+            self._cancel.set()
         self.finished.emit(name)
 
     def _fail(self, message: str) -> None:
-        if self._emitted or self._cancel.is_set():
-            return
-        self._emitted = True
-        self._active = False
+        with self._completion_lock:
+            if self._emitted or self._cancel.is_set():
+                return
+            self._emitted = True
+            self._active = False
+            self._cancel.set()
         self.failed.emit(message)
 
+    def eventFilter(self, watched, event):
+        if watched is self._overlay:
+            if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+                self._emit(None)
+                return True
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.RightButton:
+                self._confirm.set()
+                return True
+            if event.type() == QEvent.Type.Close and not getattr(watched, '_closing', False):
+                self._emit(None)
+        return super().eventFilter(watched, event)
+
+    def _poll_escape(self):
+        from .script_element_pick import escape_pressed
+        if self._active and escape_pressed():
+            self._emit(None)
+
     def _loop(self) -> None:
-        import ctypes
-        import ctypes.wintypes
-
-        from utils.input.uiautomation_runtime import import_uiautomation, uiautomation_thread_context
-
+        from .script_element_pick import pick_element
         try:
-            auto = import_uiautomation()
-        except Exception as exc:
-            logger.error("元素拾取初始化失败: %s", exc)
-            self._fail(f"元素拾取初始化失败：{exc}")
-            return
-
-        user32 = ctypes.windll.user32
-        while self._active and user32.GetAsyncKeyState(0x02) & 0x8000:
-            if self._cancel.wait(0.02):
+            info = pick_element(self._confirm, self._cancel, self._publish_highlight)
+            if info is None:
+                self._emit(None)
                 return
+            selector = {name: value.strip() for name, value in (
+                ("名称", info.name), ("自动化ID", info.automation_id), ("类名", info.class_name),
+            )}
+            if not any(selector.values()):
+                raise ValueError("没有读到控件名称、自动化ID或类名")
+            self._emit(selector)
+        except Exception as error:
+            logger.error("元素拾取失败: %s", error, exc_info=True)
+            self._fail(f"元素拾取失败：{error}")
 
-        last_rect = None
-        current = None
-        try:
-            with uiautomation_thread_context(auto):
-                while self._active:
-                    if user32.GetAsyncKeyState(0x1B) & 0x8000:
-                        self._emit(None)
-                        return
-                    if current is not None and user32.GetAsyncKeyState(0x02) & 0x8000:
-                        self._emit(_element_selector(current))
-                        return
-                    if self._cancel.wait(0.02):
-                        return
-                    point = ctypes.wintypes.POINT()
-                    user32.GetCursorPos(ctypes.byref(point))
-                    element = auto.ControlFromPoint(point.x, point.y)
-                    rect = _element_rect(element)
-                    if rect is None:
-                        continue
-                    current = element
-                    if rect != last_rect:
-                        last_rect = rect
-                        self.highlight.emit(rect)
-                    if self._cancel.wait(0.04):
-                        return
-        except Exception as exc:
-            logger.error("元素拾取失败: %s", exc, exc_info=True)
-            self._fail(f"元素拾取失败：{exc}")
+    def _publish_highlight(self, rect):
+        if not self._cancel.is_set():
+            self.highlight.emit(rect)
 
     def _set_highlight(self, rect) -> None:
         if self._overlay is not None:
             self._overlay.set_highlight(rect)
 
 
-def _element_rect(element) -> Optional[tuple]:
-    if element is None:
-        return None
-    rect = getattr(element, "BoundingRectangle", None)
-    if not rect or rect.width() <= 0 or rect.height() <= 0:
-        return None
-    return (rect.left, rect.top, rect.width(), rect.height())
-
-
-def _element_selector(element) -> dict:
-    selector = {name: str(getattr(element, attr, "") or "").strip()
-                for name, attr in (("名称", "Name"), ("自动化ID", "AutomationId"), ("类名", "ClassName"))}
-    if not any(selector.values()):
-        raise ValueError("没有读到控件名称、自动化ID或类名")
-    return selector
-
-
-def _resolve_offset_base(dialog, editor, hwnd: int):
-    line = editor.textCursor().block().text() if editor is not None else ""
+def _resolve_offset_base(line, hwnd, card_id, cancelled, progress):
+    if cancelled.is_set():
+        return None, None
     coords = peek_click_coords(line)
     if coords:
         return coords, None
@@ -640,7 +830,7 @@ def _resolve_offset_base(dialog, editor, hwnd: int):
         found, location, _reason = locate_image_in_window(
             {"image_path": path},
             hwnd,
-            card_id=getattr(dialog, "_card_id", None),
+            card_id=card_id,
         )
     except Exception as exc:
         raise ValueError(f"无法定位偏移基准图片：{exc}") from exc

@@ -5,10 +5,7 @@ from typing import Optional
 
 from PySide6.QtCore import QThread
 
-try:
-    from shiboken6 import isValid as _qt_is_valid
-except Exception:
-    _qt_is_valid = None
+from shiboken6 import isValid as _qt_is_valid
 
 from ..control_center_parts.control_center_runtime import TaskState, WindowTaskRunner
 
@@ -22,8 +19,6 @@ class ControlCenterRunnerMixin:
     def _is_qt_runner_valid(runner) -> bool:
         if runner is None:
             return False
-        if _qt_is_valid is None:
-            return True
         try:
             return bool(_qt_is_valid(runner))
         except Exception:
@@ -66,8 +61,6 @@ class ControlCenterRunnerMixin:
         running_count = 0
         target_filter = set(target_window_ids) if target_window_ids else None
         for runners in self.window_runners.values():
-            if not isinstance(runners, list):
-                runners = [runners]
             for runner in runners:
                 try:
                     if target_filter is not None and not self._runner_matches_filter(runner, target_filter):
@@ -83,11 +76,9 @@ class ControlCenterRunnerMixin:
             return ""
         try:
             current_state = runner.current_state
-            if callable(current_state):
-                current_state = current_state()
         except Exception:
             return ""
-        return str(getattr(current_state, "value", current_state) or "")
+        return current_state.value
 
     def _is_runner_pause_controllable(self, runner) -> bool:
         if runner is None:
@@ -114,8 +105,6 @@ class ControlCenterRunnerMixin:
         running_count = 0
         target_filter = set(target_window_ids) if target_window_ids else None
         for runners in self.window_runners.values():
-            if not isinstance(runners, list):
-                runners = [runners]
             for runner in runners:
                 try:
                     if target_filter is not None and not self._runner_matches_filter(runner, target_filter):
@@ -135,8 +124,6 @@ class ControlCenterRunnerMixin:
     def _count_started_runner_threads(self) -> int:
         active_count = 0
         for runners in self.window_runners.values():
-            if not isinstance(runners, list):
-                runners = [runners]
             for runner in runners:
                 try:
                     thread_running = bool(runner and runner.isRunning())
@@ -317,8 +304,6 @@ class ControlCenterRunnerMixin:
     def _is_any_runner_paused(self, target_window_ids=None) -> bool:
         target_filter = set(target_window_ids) if target_window_ids else None
         for runners in self.window_runners.values():
-            if not isinstance(runners, list):
-                runners = [runners]
             for runner in runners:
                 try:
                     if target_filter is not None and not self._runner_matches_filter(runner, target_filter):

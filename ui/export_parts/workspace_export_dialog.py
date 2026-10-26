@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 class _CatalogCheckRow(QWidget):
     def __init__(self, title: str, path: str, *, checked: bool, parent=None):
         super().__init__(parent)
+        self.setObjectName("WorkspaceExportPickerRow")
         self.check = QCheckBox(self)
         self.check.setChecked(bool(checked))
         layout = QHBoxLayout(self)
@@ -86,6 +87,7 @@ class WorkspaceExportPickerDialog(QDialog):
 
         self._list = QListWidget(self)
         self._list.setObjectName("WorkspaceExportPickerList")
+        self._list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
         self._list.setUniformItemSizes(False)
         self._list.setSpacing(2)
         layout.addWidget(self._list, 1)
@@ -127,7 +129,7 @@ class WorkspaceExportPickerDialog(QDialog):
             else:
                 checked = sid in self._preselected
             item = QListWidgetItem()
-            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             item.setData(Qt.ItemDataRole.UserRole, sid)
             row = _CatalogCheckRow(title, path, checked=checked, parent=self._list)
             row.check.toggled.connect(self._refresh_ok)

@@ -28,9 +28,11 @@ def _read_max_cached_engine_instances() -> int:
     raw_value = os.getenv("YOLO_ENGINE_MAX_CACHED_INSTANCES", "2")
     try:
         value = int(raw_value)
-    except Exception:
-        value = 2
-    return max(1, min(8, value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("YOLO 引擎缓存数量必须是整数") from exc
+    if not 1 <= value <= 8:
+        raise ValueError("YOLO 引擎缓存数量必须在 1～8 之间")
+    return value
 
 
 @dataclass
@@ -86,40 +88,33 @@ class YOLOONNXEngine:
     def _normalize_input_size(input_size: Optional[int]) -> Optional[int]:
         if input_size is None:
             return None
-        try:
-            value = int(input_size)
-        except Exception:
-            return None
-        if value <= 0:
-            return None
-        return value
+        from task_workflow.script_parameters import integer_parameter
+        return integer_parameter(input_size, "YOLO 输入尺寸", minimum=1)
 
     @classmethod
     def _build_instance_key(cls, model_path: str, input_size: Optional[int]) -> str:
-        normalized_model_path = str(model_path or "yolo/yolov8n.onnx").strip()
-        normalized_input_size = cls._normalize_input_size(input_size)
-        return f"{normalized_model_path}_{normalized_input_size}"
+        if not isinstance(model_path, (str, os.PathLike)) or not str(model_path).strip():
+            raise ValueError("YOLO 模型路径不能为空")
+        return f"{str(model_path).strip()}_{cls._normalize_input_size(input_size)}"
 
     @staticmethod
-    def _normalize_threshold(value: float, default: float) -> float:
-        try:
-            normalized = float(value)
-        except Exception:
-            normalized = default
-        if normalized < 0.0:
-            return 0.0
-        if normalized > 1.0:
-            return 1.0
-        return normalized
+    def _normalize_threshold(value: float) -> float:
+        from task_workflow.script_parameters import number_parameter
+        normalized = number_parameter(value, "YOLO 阈值")
+        if not 0 <= normalized <= 1:
+            raise ValueError("YOLO 阈值必须在 0～1 之间")
+        return float(normalized)
 
     def _apply_runtime_thresholds(self, conf_threshold: float, iou_threshold: float) -> None:
-        self.conf_threshold = self._normalize_threshold(conf_threshold, 0.5)
-        self.iou_threshold = self._normalize_threshold(iou_threshold, 0.45)
+        self.conf_threshold = self._normalize_threshold(conf_threshold)
+        self.iou_threshold = self._normalize_threshold(iou_threshold)
 
     def __new__(cls, model_path: str = "yolo/yolov8n.onnx",
                 conf_threshold: float = 0.5, iou_threshold: float = 0.45,
                 input_size: Optional[int] = None):
         """缓存模式 - 同模型/输入尺寸复用实例，并限制缓存数量。"""
+        cls._normalize_threshold(conf_threshold)
+        cls._normalize_threshold(iou_threshold)
         key = cls._build_instance_key(model_path=model_path, input_size=input_size)
         evicted_instance = None
         with cls._lock:
@@ -137,8 +132,11 @@ class YOLOONNXEngine:
         if evicted_instance is not None:
             try:
                 evicted_instance.unload_model()
-            except Exception as e:
-                logger.warning("淘汰旧YOLO引擎实例失败: %s", e)
+            except Exception:
+                with cls._lock:
+                    if cls._instances.get(key) is instance:
+                        del cls._instances[key]
+                raise
         return instance
 
     def __init__(self, model_path: str = "yolo/yolov8n.onnx",
@@ -149,6 +147,8 @@ class YOLOONNXEngine:
             return
 
         self.model_path = model_path
+        from task_workflow.card_plugin_runtime import register_owned_resource
+        register_owned_resource(model_path, "模型会话", type(self).release_resource_root)
         self.conf_threshold = 0.5
         self.iou_threshold = 0.45
         self._session = None
@@ -663,50 +663,48 @@ class YOLOONNXEngine:
         return {i: name for i, name in enumerate(self._class_names)}
 
     def unload_model(self):
-        """卸载YOLO模型，释放ONNX会话和内存"""
+        """卸载会话和模型元数据；失败交由调用者报告。"""
         with self._load_lock:
+            session = self._session
+            self._session = None
+            self._input_name = None
+            self._output_names = None
+            self._input_shape = None
+            self._class_names.clear()
+            self._model_loaded = False
+        del session
+
+    @classmethod
+    def release_resource_root(cls, root):
+        """只卸载归属于给定临时资源目录的模型。"""
+        root = Path(root).resolve()
+        with cls._lock:
+            owned = []
+            for key, instance in list(cls._instances.items()):
+                path = Path(instance.model_path)
+                if path.is_absolute() and path.resolve().is_relative_to(root):
+                    owned.append(instance)
+                    del cls._instances[key]
+        cls._release_engines(owned)
+        return len(owned)
+
+    @staticmethod
+    def _release_engines(instances):
+        failures = []
+        for instance in instances:
             try:
-                if self._session:
-                    del self._session
-                    self._session = None
-                    logger.info("YOLO模型会话已释放")
-
-                # 清理输入输出元数据
-                self._input_name = None
-                self._output_names = None
-                self._input_shape = None
-
-                # 清理类名列表
-                if self._class_names:
-                    self._class_names.clear()
-                    self._class_names = []
-
-            except Exception as e:
-                logger.error(f"卸载YOLO模型失败: {e}")
-            finally:
-                self._model_loaded = False
-                try:
-                    import gc
-                    gc.collect()
-                except Exception:
-                    pass
+                instance.unload_model()
+            except Exception as exc:
+                failures.append(str(exc))
+        if failures:
+            raise RuntimeError("YOLO 模型资源未能全部释放：" + "；".join(failures))
 
     @classmethod
     def clear_instances(cls):
-        """清理所有实例"""
         with cls._lock:
-            for instance in cls._instances.values():
-                try:
-                    instance.unload_model()
-                except Exception as e:
-                    logger.error(f"清理实例失败: {e}")
+            instances = list(cls._instances.values())
             cls._instances.clear()
-            try:
-                import gc
-                gc.collect()
-            except Exception:
-                pass
-            logger.info("已清理所有ONNX引擎实例")
+        cls._release_engines(instances)
 
 
 def get_yolo_engine(model_path: str = "yolo/yolov8n.onnx",

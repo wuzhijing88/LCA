@@ -14,6 +14,9 @@ def edge_data(line):
 
 
 class ConnectionController:
+    BRANCH_PARAMETER_KEYS = ("on_success", "success_jump_target_id",
+                             "on_failure", "failure_jump_target_id")
+
     def __init__(self, view):
         self.view = view
         self.router = OrthogonalRouter()
@@ -191,43 +194,107 @@ class ConnectionController:
         if errors:
             raise RuntimeError("；".join(errors))
         existing = [line for line in source.connections if line.start_item is source and line.line_type == kind]
-        for line in existing:
-            if line.end_item is target:
-                return line
-        old = None if kind == "random" else (existing[0] if existing else None)
-        old_data = edge_data(old) if old is not None else None
-        line = ConnectionLine(source, target, kind)
+        line = next((line for line in existing if line.end_item is target), None)
+        # 加载、粘贴和撤销只还原既有拓扑；互斥规则用于本次连线编辑。
+        editing_outputs = (not view._loading_workflow and not view._undoing_operation
+                           and not getattr(view, "_pasting_card", False))
+        reset_branches = editing_outputs and kind == "sequential" and not source.restricted_outputs
+        conflict_kinds = (
+            ("success", "failure") if kind == "sequential"
+            else ("sequential",) if kind in ("success", "failure") else ()
+        )
+        conflicts = [other for other in source.connections
+                     if other.start_item is source and other.line_type in conflict_kinds] if editing_outputs else []
+        parameters = self.parameter_change(source, target, kind)
+        if reset_branches:
+            for branch_kind in ("success", "failure"):
+                parameters["on_" + branch_kind] = "执行下一步"
+                parameters[branch_kind + "_jump_target_id"] = None
+        branch_changed = reset_branches and any(
+            key not in source.parameters or source.parameters[key] != parameters[key]
+            for key in self.BRANCH_PARAMETER_KEYS)
+        if line is not None and not conflicts and not branch_changed:
+            return line
+        new_line = line is None
+        old = existing[0] if new_line and kind != "random" and existing else None
+        removed = ([old] if old is not None else []) + conflicts
+        removed_data = [edge_data(other) for other in removed]
         original_parameters = source.parameters
+        branch_parameters = {key: original_parameters[key] for key in self.BRANCH_PARAMETER_KEYS
+                             if key in original_parameters}
+        if new_line:
+            line = ConnectionLine(source, target, kind)
         try:
-            if not view._loading_workflow:
-                retained = [other for other in view.connections if other is not old]
-                for _, points in self.plan([line], retained):
-                    line.apply_route_points(points)
-            parameters = self.parameter_change(source, target, kind)
-            self.mount(line)
+            if new_line:
+                if not view._loading_workflow:
+                    retained = [other for other in view.connections if other not in removed]
+                    for _, points in self.plan([line], retained):
+                        line.apply_route_points(points)
+                self.mount(line)
             source.parameters = parameters
             view._refresh_connection_parameter_display(source)
         except Exception:
             source.parameters = original_parameters
-            if line in view.connections:
-                self.unmount(line)
-            else:
-                line.cleanup()
-                line.deleteLater()
+            if new_line:
+                if line in view.connections:
+                    self.unmount(line)
+                else:
+                    line.cleanup()
+                    line.deleteLater()
             raise
-        if old is not None:
-            self.unmount(old)
-        if old is not None:
-            view.connection_deleted.emit(old)
-        view.connection_added.emit(source, target, kind)
+        # 新线及参数成功提交后，才完整卸载被替换的蓝线和红绿分支。
+        for other in removed:
+            self.unmount(other)
+        if kind in ("success", "failure") and conflicts:
+            self.update_sequence()
+        for other in removed:
+            view.connection_deleted.emit(other)
+        if new_line:
+            view.connection_added.emit(source, target, kind)
         if not view._loading_workflow and not view._undoing_operation:
             view._mark_workflow_dirty()
             if not view._updating_sequence:
-                if old_data is not None:
-                    view._save_undo_state("modify_connection", {"old_connection_data": old_data, "new_connection_data": edge_data(line)})
+                if conflicts or branch_changed:
+                    view._save_undo_state("switch_output_connections", {
+                        "connection_data": edge_data(line), "connection_added": new_line,
+                        "removed_connections": removed_data, "branch_parameters": branch_parameters,
+                    })
+                elif old is not None:
+                    view._save_undo_state("modify_connection", {"old_connection_data": removed_data[0], "new_connection_data": edge_data(line)})
                 elif not getattr(view, "_pasting_card", False):
                     view._save_add_connection_state_for_undo(source, target, kind)
         return line
+
+    def restore_output_connections(self, operation_data):
+        """一次撤销输出连线切换；历史只保存连线数据和四个分支参数。"""
+        view = self.view
+        data = operation_data["connection_data"]
+        source = view.cards.get(data["start_card_id"])
+        if source is None:
+            raise ValueError("撤销输出连线切换失败：源卡片不存在")
+        line = next((line for line in source.connections
+                     if line.start_item is source and line.end_item.card_id == data["end_card_id"]
+                     and line.line_type == data["line_type"]), None)
+        if line is None:
+            raise ValueError("撤销输出连线切换失败：当前连线不存在")
+        self.assert_registered(line)
+        restored = []
+        for removed in operation_data["removed_connections"]:
+            target = view.cards.get(removed["end_card_id"])
+            self.validate_endpoints(source, target, removed["line_type"])
+            restored.append((target, removed["line_type"]))
+        if operation_data["connection_added"]:
+            self.remove(line)
+        for target, kind in restored:
+            self.add(source, target, kind)
+        parameters = dict(source.parameters)
+        for key in self.BRANCH_PARAMETER_KEYS:
+            if key in operation_data["branch_parameters"]:
+                parameters[key] = operation_data["branch_parameters"][key]
+            else:
+                parameters.pop(key, None)
+        source.parameters = parameters
+        view._refresh_connection_parameter_display(source)
 
     def remove(self, line):
         view = self.view

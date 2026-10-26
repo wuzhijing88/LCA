@@ -194,10 +194,12 @@ class GlobalSettingsDialogWindowCrudMixin:
         stop_settings_plugin_bind_sweep(self)
 
     def done(self, result):
+        self._window_resize_jobs.cancel()
         self._release_window_handle_callbacks()
         super().done(result)
 
     def reject(self):
+        self._window_resize_jobs.cancel()
         try:
             self._stop_plugin_bind_sweep()
             self._discard_live_plugin_probe()
@@ -206,6 +208,7 @@ class GlobalSettingsDialogWindowCrudMixin:
         super().reject()
 
     def closeEvent(self, event):
+        self._window_resize_jobs.cancel()
         self._release_window_handle_callbacks()
         # 标题栏关闭和代码调用 close() 不一定经过 reject()，也必须停掉延迟/后台试绑。
         try:
@@ -216,6 +219,7 @@ class GlobalSettingsDialogWindowCrudMixin:
         super().closeEvent(event)
 
     def close(self):
+        self._window_resize_jobs.cancel()
         self._release_window_handle_callbacks()
         # 对话框尚未 show 时 Qt 不一定派发 closeEvent；测试和程序化关闭也要立即取消试绑。
         try:

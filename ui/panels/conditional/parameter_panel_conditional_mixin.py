@@ -2,7 +2,7 @@ from ..parameter_panel_support import *
 
 class ParameterPanelConditionalMixin:
 
-    def _refresh_conditional_widgets(self):
+    def _refresh_conditional_widgets(self, changed_parameters=None):
         """刷新条件控件的显示/隐藏状态"""
         # 保存当前滚动位置
         scroll_pos = 0
@@ -40,6 +40,10 @@ class ParameterPanelConditionalMixin:
                 # 其他类型的参数直接更新
                 self.current_parameters[name] = value
 
+        # 本次提交优先于尚未重建的旧控件值（如切换模式时重置的多图设置）。
+        if changed_parameters:
+            self.current_parameters.update(changed_parameters)
+
         # 先清除现有的控件
         self._clear_content()
 
@@ -53,7 +57,7 @@ class ParameterPanelConditionalMixin:
 
         # 恢复滚动位置
         if hasattr(self, 'scroll_area') and self.scroll_area.verticalScrollBar():
-            QTimer.singleShot(10, lambda: self.scroll_area.verticalScrollBar().setValue(scroll_pos))
+            QTimer.singleShot(10, self, lambda: self.scroll_area.verticalScrollBar().setValue(scroll_pos))
 
     def _rebuild_parameter_widgets(self, preserve_scroll: bool = True):
         """仅重建参数控件（不回收/合并参数值）"""
@@ -70,22 +74,13 @@ class ParameterPanelConditionalMixin:
             self._loading_parameter_panel = was_loading
 
         if preserve_scroll and hasattr(self, 'scroll_area') and self.scroll_area.verticalScrollBar():
-            QTimer.singleShot(10, lambda: self.scroll_area.verticalScrollBar().setValue(scroll_pos))
+            QTimer.singleShot(10, self, lambda: self.scroll_area.verticalScrollBar().setValue(scroll_pos))
 
     @staticmethod
-    def _click_rule_to_bool(value, default=True):
+    def _click_rule_to_bool(value):
         if isinstance(value, bool):
             return value
-        if value is None:
-            return default
-        if isinstance(value, (int, float)):
-            return value != 0
-        text = str(value).strip().lower()
-        if text in {'true', '1', 'yes', 'on', '是', '启用'}:
-            return True
-        if text in {'false', '0', 'no', 'off', '否', '禁用'}:
-            return False
-        return default
+        raise ValueError(f"点击开关必须是布尔值: {value!r}")
 
     _MOUSE_IMAGE_CLICK_PARAMS = {
         '---common_click_params---',
@@ -167,38 +162,6 @@ class ParameterPanelConditionalMixin:
         'element_button',
     }
 
-    _FIND_IMAGE_CLICK_PARAMS = {
-        '---click_offset---',
-        'button',
-        'click_action',
-        'enable_auto_release',
-        'hold_duration',
-        'clicks',
-        'interval',
-        'offset_selector_tool',
-        'image_position_mode',
-        'fixed_offset_x',
-        'fixed_offset_y',
-        'random_offset_x',
-        'random_offset_y',
-    }
-
-    _COORDINATE_CLICK_TASK_PARAMS = {
-        '---click_settings---',
-        'button',
-        'click_action',
-        'hold_duration',
-        'clicks',
-        'interval',
-        '---click_offset---',
-        'offset_selector_tool',
-        'position_mode',
-        'fixed_offset_x',
-        'fixed_offset_y',
-        'random_offset_x',
-        'random_offset_y',
-    }
-
     def _should_hide_click_related_parameter(self, param_name: str) -> bool:
         """根据找图/找色点击开关，隐藏点击相关参数。"""
         if not param_name:
@@ -208,34 +171,16 @@ class ParameterPanelConditionalMixin:
         current_params = getattr(self, 'current_parameters', {}) or {}
 
         if current_task_type == '模拟鼠标操作':
-            return self._should_hide_mouse_operation_click_parameter(param_name, current_task_type, current_params)
-
-        if current_task_type in {'图片点击', '查找图片并点击'}:
-            return self._should_hide_simple_click_task_parameter(
-                param_name,
-                current_params,
-                self._FIND_IMAGE_CLICK_PARAMS,
-            )
-
-        if current_task_type in {'点击指定坐标', '坐标点击', '点击坐标'}:
-            return self._should_hide_simple_click_task_parameter(
-                param_name,
-                current_params,
-                self._COORDINATE_CLICK_TASK_PARAMS,
-            )
+            return self._should_hide_mouse_operation_click_parameter(param_name, current_params)
 
         return False
 
     def _should_hide_mouse_operation_click_parameter(
         self,
         param_name: str,
-        current_task_type: str,
         current_params: Dict[str, Any],
     ) -> bool:
-        operation_mode = self._normalize_operation_mode_value(
-            current_params.get('operation_mode', ''),
-            fallback_task_type=current_task_type,
-        )
+        operation_mode = current_params['operation_mode']
         rule_mapping = {
             '找图功能': ('image_enable_click', self._MOUSE_IMAGE_CLICK_PARAMS),
             '找色功能': ('color_enable_click', self._MOUSE_COLOR_CLICK_PARAMS),
@@ -246,17 +191,7 @@ class ParameterPanelConditionalMixin:
         toggle_name, hidden_params = rule_mapping.get(operation_mode, (None, None))
         if not toggle_name or hidden_params is None:
             return False
-        if self._click_rule_to_bool(current_params.get(toggle_name, True), True):
-            return False
-        return param_name in hidden_params
-
-    def _should_hide_simple_click_task_parameter(
-        self,
-        param_name: str,
-        current_params: Dict[str, Any],
-        hidden_params: Set[str],
-    ) -> bool:
-        if self._click_rule_to_bool(current_params.get('enable_click', True), True):
+        if self._click_rule_to_bool(current_params.get(toggle_name, True)):
             return False
         return param_name in hidden_params
 
@@ -324,15 +259,14 @@ class ParameterPanelConditionalMixin:
 
                 # 特殊处理：对于依赖multi_image_mode的参数，需要额外检查operation_mode
                 if param_name == 'multi_image_mode':
-                    # 检查operation_mode是否为找图功能（兼容历史值）
                     operation_mode = self.current_parameters.get('operation_mode')
-                    if operation_mode not in {'找图功能', '图片点击', '找图点击'}:
+                    if operation_mode != '找图功能':
                         return False
 
                 return True
         except Exception as e:
             logger.error(f"参数显示条件检查失败: {e}")
-            return True  # 出错时默认显示
+            raise
 
     def _check_single_condition(self, condition: Dict[str, Any]) -> bool:
         """检查单个条件是否满足"""
@@ -355,14 +289,6 @@ class ParameterPanelConditionalMixin:
             if current_value is None and hasattr(self, 'param_definitions') and self.param_definitions:
                 param_def_lookup = self.param_definitions.get(param_name, {})
                 current_value = param_def_lookup.get('default')
-
-            # 操作模式兼容：统一旧值与新值，避免历史流程参数导致条件失效
-            if param_name == 'operation_mode':
-                current_value = self._normalize_operation_mode_value(current_value)
-                if isinstance(expected_value, list):
-                    expected_value = [self._normalize_operation_mode_value(v) for v in expected_value]
-                else:
-                    expected_value = self._normalize_operation_mode_value(expected_value)
 
             # 获取操作符，支持显式定义或自动推导
             operator = condition.get('operator')
@@ -393,7 +319,7 @@ class ParameterPanelConditionalMixin:
             return True
         except Exception as e:
             logger.error(f"条件检查失败: {e}")
-            return True  # 出错时默认显示
+            raise
 
     def _apply_condition_operator(self, current_value: Any, expected_value: Any, operator: str) -> bool:
         """应用条件操作符"""
@@ -445,11 +371,10 @@ class ParameterPanelConditionalMixin:
                     return current_value.endswith(expected_value)
                 return False
             else:
-                logger.warning(f"未知的条件操作符: {operator}，使用默认的==操作符")
-                return current_value == expected_value
+                raise ValueError(f"未知的条件操作符: {operator}")
         except Exception as e:
             logger.error(f"应用条件操作符失败: operator={operator}, current={current_value}, expected={expected_value}, error={e}")
-            return True  # 出错时默认显示
+            raise
 
     def _connect_conditional_signals(self, param_name: str, widget: QWidget):
         """为影响条件显示的参数连接信号"""
@@ -508,6 +433,8 @@ class ParameterPanelConditionalMixin:
 
     def _on_conditional_param_changed(self):
         """条件参数值发生变化时的处理"""
+        if self._loading_parameter_panel:
+            return
         logger.debug("条件参数变化，准备更新参数面板显示")
 
         # 延迟更新以避免频繁重建界面
@@ -518,6 +445,16 @@ class ParameterPanelConditionalMixin:
             self._update_timer.timeout.connect(self._update_conditional_display)
 
         self._update_timer.start(100)  # 100ms延迟
+
+    def hideEvent(self, event):
+        if not getattr(self, "_tool_hiding", False) and not self._recording_active:
+            from ..card_plugin_state import release_card_plugin_panel
+            release_card_plugin_panel(self)
+        if hasattr(self, '_update_timer'):
+            self._update_timer.stop()
+        if not getattr(self, '_tool_hiding', False) and not self._recording_active:
+            self._release_panel_runtime()
+        super().hideEvent(event)
 
     def _update_conditional_display(self):
         current_values = self._collect_current_parameters()
@@ -530,8 +467,13 @@ class ParameterPanelConditionalMixin:
 
         saved_values, focused_widget_name, cursor_position = self._capture_conditional_widget_state()
         self._merge_saved_conditional_values(saved_values)
-        self._rebuild_conditional_widgets()
-        self._restore_conditional_widget_state(saved_values, focused_widget_name, cursor_position)
+        was_loading = self._loading_parameter_panel
+        self._loading_parameter_panel = True
+        try:
+            self._rebuild_conditional_widgets()
+            self._restore_conditional_widget_state(saved_values, focused_widget_name, cursor_position)
+        finally:
+            self._loading_parameter_panel = was_loading
         self._schedule_global_config_refresh_if_needed(needs_global_config_refresh)
 
     def _sync_changed_conditional_parameters(self, current_values: Dict[str, Any]) -> None:
@@ -617,15 +559,15 @@ class ParameterPanelConditionalMixin:
                 if isinstance(widget, QLineEdit):
                     widget.setText(str(value))
                     if name == focused_widget_name:
-                        QTimer.singleShot(10, lambda w=widget, pos=cursor_position: self._restore_focus(w, pos))
+                        QTimer.singleShot(10, widget, lambda w=widget, pos=cursor_position: self._restore_focus(w, pos))
                 elif isinstance(widget, QSpinBox):
                     widget.setValue(int(value))
                     if name == focused_widget_name:
-                        QTimer.singleShot(10, lambda w=widget: w.setFocus())
+                        QTimer.singleShot(10, widget, widget.setFocus)
                 elif isinstance(widget, QDoubleSpinBox):
                     widget.setValue(float(value))
                     if name == focused_widget_name:
-                        QTimer.singleShot(10, lambda w=widget: w.setFocus())
+                        QTimer.singleShot(10, widget, widget.setFocus)
                 elif isinstance(widget, QComboBox):
                     index = widget.findData(value)
                     if index >= 0:
@@ -637,11 +579,11 @@ class ParameterPanelConditionalMixin:
                 elif isinstance(widget, QPlainTextEdit):
                     widget.setPlainText(str(value))
                     if name == focused_widget_name:
-                        QTimer.singleShot(10, lambda w=widget, pos=cursor_position: self._restore_text_focus(w, pos))
+                        QTimer.singleShot(10, widget, lambda w=widget, pos=cursor_position: self._restore_text_focus(w, pos))
                 elif isinstance(widget, QTextEdit):
                     widget.setPlainText(str(value))
                     if name == focused_widget_name:
-                        QTimer.singleShot(10, lambda w=widget, pos=cursor_position: self._restore_text_focus(w, pos))
+                        QTimer.singleShot(10, widget, lambda w=widget, pos=cursor_position: self._restore_text_focus(w, pos))
             except Exception as e:
                 logger.debug(f"恢复控件状态失败 {name}：{e}")
 
@@ -649,4 +591,4 @@ class ParameterPanelConditionalMixin:
         if not needs_global_config_refresh:
             return
         logger.info("Detected global_config condition, schedule refresh after 150ms")
-        QTimer.singleShot(150, self._force_refresh_for_global_config)
+        QTimer.singleShot(150, self, self._force_refresh_for_global_config)

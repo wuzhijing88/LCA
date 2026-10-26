@@ -20,7 +20,7 @@ from task_workflow.workflow_identity import (
     normalize_workflow_filepath,
     normalize_workflow_id,
 )
-from task_workflow.task_result import normalize_task_result
+from task_workflow.task_result import validate_task_result, validate_step_action
 from utils.input.input_guard import (
     acquire_input_guard,
     get_input_lock_timeout_seconds,
@@ -188,32 +188,20 @@ class WorkflowExecutor(QObject):
         self._max_execution_steps = self._normalize_positive_int(max_execution_steps)
         self._default_step_log_scope = str(default_step_log_scope or "main").strip() or "main"
         self._default_step_log_name = str(default_step_log_name or "").strip() or None
-        self._external_stop_checker = external_stop_checker if callable(external_stop_checker) else None
-        self._external_pause_checker = external_pause_checker if callable(external_pause_checker) else None
+        for checker in (external_stop_checker, external_pause_checker):
+            if checker is not None and not callable(checker):
+                raise TypeError("外部执行控制检查必须可调用")
+        self._external_stop_checker = external_stop_checker
+        self._external_pause_checker = external_pause_checker
         self._cleanup_runtime_image_on_finish = bool(cleanup_runtime_image_on_finish)
         self._clear_runtime_state_on_start = bool(clear_runtime_state_on_start)
         self._infinite_loop_guard_enabled = bool(infinite_loop_guard_enabled)
-
-        if isinstance(self.cards_data, list):
-            converted_cards = {}
-            for index, card in enumerate(self.cards_data):
-                if isinstance(card, dict) and card.get('id') is not None:
-                    converted_cards[card['id']] = card
-                else:
-                    logger.warning(f"跳过无效卡片数据(索引 {index}): {type(card)}")
-            self.cards_data = converted_cards
-        elif not isinstance(self.cards_data, dict):
-            logger.error(f"cards_data 格式错误: {type(self.cards_data)}")
-            self.cards_data = {}
-
-        if not isinstance(self.connections_data, list):
-            logger.error(f"connections_data 格式错误: {type(self.connections_data)}")
-            self.connections_data = []
 
         self._is_running = False
         self._current_card_id = None
         self._last_execution_success = False
         self._last_execution_message = ""
+        self._last_cleanup_errors = []
         self._last_failure_card_id = None
         self._last_failure_task_type = ""
         self._last_failure_detail = ""
@@ -398,7 +386,7 @@ class WorkflowExecutor(QObject):
                 logger.warning(f"[附加条件映射] 跳过无效卡片数据: {type(card)}")
                 continue
 
-            # 兼容旧的"监控卡片"和新的"附加条件"
+            # 只识别现行“附加条件”卡片。
             if task_type == '附加条件':
                 logger.info(f"[附加条件映射] 发现附加条件卡片: {card_id}")
                 # 查找附加条件卡片的sequential连接，找出被监控的卡片
@@ -1036,55 +1024,21 @@ class WorkflowExecutor(QObject):
 
     @staticmethod
     def _is_same_card_id(left: Any, right: Any) -> bool:
-        """判断两个卡片ID是否指向同一卡片（兼容 int/str）。"""
-        if left == right:
-            return True
-        try:
-            return int(left) == int(right)
-        except (TypeError, ValueError):
-            return str(left).strip() == str(right).strip()
+        """卡片 ID 只接受现行非负整数，不将文本或浮点数当作卡片。"""
+        return type(left) is int and type(right) is int and left >= 0 and left == right
 
     @staticmethod
     def _is_continue_action(action: Any) -> bool:
         """统一判断“继续本步骤”动作。"""
-        try:
-            from tasks.task_utils import normalize_step_action
-
-            return normalize_step_action(action) == "继续执行本步骤"
-        except Exception:
-            action_text = str(action or "").strip()
-            return action_text in ("继续执行本步骤", "继续本步骤")
+        return validate_step_action(action) == "继续执行本步骤"
 
     @staticmethod
     def _normalize_graph_card_id(card_id: Any) -> Optional[int]:
-        if card_id is None or isinstance(card_id, bool):
-            return None
-        try:
-            return int(card_id)
-        except (TypeError, ValueError):
-            text = str(card_id or "").strip()
-            if not text:
-                return None
-            try:
-                return int(float(text))
-            except (TypeError, ValueError):
-                return None
+        return card_id if type(card_id) is int and card_id >= 0 else None
 
     @staticmethod
     def _normalize_step_action_text(action: Any) -> str:
-        try:
-            from tasks.task_utils import normalize_step_action
-
-            return normalize_step_action(action)
-        except Exception:
-            action_text = str(action or "").strip()
-            if action_text in ("继续执行本步骤", "继续本步骤"):
-                return "继续执行本步骤"
-            if action_text in ("跳转到步骤", "跳转到指定步骤"):
-                return "跳转到步骤"
-            if action_text in ("停止工作流", "结束工作流", "结束流程", "终止流程"):
-                return "停止工作流"
-            return "执行下一步"
+        return validate_step_action(action)
 
     @classmethod
     def _normalize_jump_target_for_graph(cls, value: Any) -> Optional[int]:
@@ -1349,8 +1303,6 @@ class WorkflowExecutor(QObject):
 
         self._bind_resource_dirs()
         self._is_running = True
-        # 只清暂停：启动前已登记的停止请求应当生效，而不是被新一轮 run() 抹掉。
-        self.run_context.resume()
         self._wait_for_start_gate()
         if self._stop_requested or self._force_stop:
             self._is_running = False
@@ -1475,35 +1427,32 @@ class WorkflowExecutor(QObject):
                 success, message = False, preflight_error
             else:
                 success, message = self._execute_workflow()
-            self._last_execution_success = bool(success)
-            self._last_execution_message = str(message or "")
-            self.execution_finished.emit(success, message)
-
         except Exception as e:
             logger.error(f"工作流执行过程中发生错误: {e}", exc_info=True)
-            # 【修复闪退】安全发射信号，避免在对象销毁后发射
-            try:
-                self._last_execution_success = False
-                self._last_execution_message = f"执行错误: {str(e)}"
-                self.execution_finished.emit(False, f"执行错误: {str(e)}")
-            except (RuntimeError, AttributeError) as signal_err:
-                logger.debug(f"发射execution_finished信号失败（对象可能已销毁）: {signal_err}")
+            success = False
+            message = f"执行错误: {e}"
         finally:
-            self._detach_error_capture_handler()
-            from tasks.watchdog_monitor import clear_workflow_monitor_states
+            cleanup_errors = []
+            try:
+                self._detach_error_capture_handler()
+            except Exception as exc:
+                cleanup_errors.append(f"解除执行日志监听失败: {exc}")
+            try:
+                from tasks.watchdog_monitor import clear_workflow_monitor_states
 
-            clear_workflow_monitor_states(self.workflow_id)
-
-            # 工作流结束时释放所有按键
-            self._release_all_keys()
-
-            # 清理OCR上下文数据，防止影响下次执行
+                clear_workflow_monitor_states(self.workflow_id)
+            except Exception as exc:
+                cleanup_errors.append(f"清理工作流监控失败: {exc}")
+            try:
+                self._release_all_keys()
+            except Exception as exc:
+                cleanup_errors.append(f"释放输入资源失败: {exc}")
             try:
                 from task_workflow.workflow_context import clear_all_ocr_data
                 clear_all_ocr_data(workflow_id=self.workflow_id)
                 logger.info("工作流结束，已清理所有OCR上下文数据")
-            except Exception as e:
-                logger.warning(f"清理OCR上下文数据时发生错误: {e}")
+            except Exception as exc:
+                cleanup_errors.append(f"清理 OCR 上下文失败: {exc}")
 
             # 统一清理图片相关缓存（覆盖异常/停止等路径）
             if self._cleanup_runtime_image_on_finish:
@@ -1515,7 +1464,7 @@ class WorkflowExecutor(QObject):
                         cleanup_template_cache=False,
                     )
                 except Exception as cleanup_err:
-                    logger.warning(f"工作流收尾图片缓存清理失败: {cleanup_err}")
+                    cleanup_errors.append(f"清理图片缓存失败: {cleanup_err}")
 
             # 环境变量由调用方负责清理
             if context_bound:
@@ -1523,10 +1472,16 @@ class WorkflowExecutor(QObject):
                     from task_workflow.workflow_context import set_current_workflow_context
                     set_current_workflow_context(previous_thread_context)
                 except Exception as restore_exc:
-                    logger.warning(f"恢复执行线程上下文失败: {restore_exc}")
+                    cleanup_errors.append(f"恢复执行线程上下文失败: {restore_exc}")
             self._is_running = False
-
-            # 执行线程由创建者通过 execution_finished 连接退出；执行器不退出所属的任意线程。
+            self._last_cleanup_errors = cleanup_errors
+            if cleanup_errors:
+                success = False
+                message = f"{message}; " + "; ".join(cleanup_errors)
+                logger.error(message)
+        self._last_execution_success = bool(success)
+        self._last_execution_message = message
+        self.execution_finished.emit(success, message)
 
     def request_stop(self, force: bool = False):
         """请求停止执行
@@ -1542,6 +1497,8 @@ class WorkflowExecutor(QObject):
         self.run_context.request_stop("force_stop" if force else "stop_requested", force=bool(force))
         if force:
             logger.warning("强制停止模式已启用")
+        if getattr(self, "thread_session", None) is not None:
+            return
 
         # 停止请求时先清理YOLO运行态，避免残留。
         try:
@@ -1574,10 +1531,10 @@ class WorkflowExecutor(QObject):
         if self.run_context.is_paused():
             return True
         if self._external_pause_checker is not None:
-            try:
-                return bool(self._external_pause_checker())
-            except Exception as exc:
-                logger.debug(f"外部暂停检查失败: {exc}")
+            paused = self._external_pause_checker()
+            if not isinstance(paused, bool):
+                raise TypeError("外部暂停检查必须返回布尔值")
+            return paused
         return False
 
     def _task_runtime_stop_checker(self) -> bool:
@@ -1588,13 +1545,12 @@ class WorkflowExecutor(QObject):
         """外部（会话 / 代理）停止信号一旦出现，就登记到 run_context，之后无需再询问外部。"""
         if self._external_stop_checker is None:
             return False
-        try:
-            if self._external_stop_checker():
-                self.run_context.request_stop("external_stop")
-                return True
-        except Exception as exc:
-            logger.debug(f"外部停止检查失败: {exc}")
-        return False
+        stopped = self._external_stop_checker()
+        if not isinstance(stopped, bool):
+            raise TypeError("外部停止检查必须返回布尔值")
+        if stopped:
+            self.run_context.request_stop("external_stop")
+        return stopped
 
     def _check_pause_and_stop(self):
         """检查暂停和停止请求，实现无延迟响应"""
@@ -1605,18 +1561,12 @@ class WorkflowExecutor(QObject):
             return True
 
         # WGC完整销毁重建期间，阻塞任务执行，直到重建完成
-        try:
-            from utils.capture.wgc_hwnd_capture import (
-                is_wgc_rebuilding,
-                wait_wgc_rebuild_complete,
-            )
-            if is_wgc_rebuilding():
-                while is_wgc_rebuilding():
-                    if self.run_context.is_stop_requested():
-                        return True
-                    wait_wgc_rebuild_complete(timeout=0.05)
-        except Exception:
-            pass
+        from utils.capture.wgc_hwnd_capture import is_wgc_rebuilding, wait_wgc_rebuild_complete
+
+        while is_wgc_rebuilding():
+            if self.run_context.is_stop_requested() or self._external_stop_signalled():
+                return True
+            wait_wgc_rebuild_complete(timeout=0.05)
 
         # 暂停期间原地等待，但停止请求（本地或外部）随时可以打断等待
         while self._is_pause_requested():
@@ -1631,36 +1581,33 @@ class WorkflowExecutor(QObject):
 
     def _release_all_keys(self):
         """释放所有可能正在按下的按键"""
-        try:
-            defer_global_input_release = False
-            try:
-                thread_session = getattr(self, "thread_session", None)
-                if thread_session is not None and hasattr(thread_session, "should_defer_input_release"):
-                    current_thread_id = getattr(self, "thread_id", None)
-                    defer_global_input_release = bool(
-                        thread_session.should_defer_input_release(thread_id=current_thread_id)
-                    )
-            except Exception as defer_check_error:
-                logger.debug(f"检查输入释放延迟策略失败: {defer_check_error}")
+        thread_session = getattr(self, "thread_session", None)
+        if thread_session is not None:
+            deferred = thread_session.should_defer_input_release(thread_id=self.thread_id)
+            if not isinstance(deferred, bool):
+                raise TypeError("会话输入释放策略必须返回布尔值")
+            if deferred:
+                return
+        from utils.input.foreground_input_manager import get_foreground_input_manager
 
-            # 先统一释放前台输入驱动中记录的按键/鼠标按下状态
-            if not defer_global_input_release:
-                try:
-                    from utils.input.foreground_input_manager import get_foreground_input_manager
-
-                    fg_manager = get_foreground_input_manager()
-                    if fg_manager is not None:
-                        fg_manager.release_all_inputs()
-                except Exception as fg_release_error:
-                    logger.debug(f"前台输入驱动统一释放失败: {fg_release_error}")
-            else:
-                logger.debug("多线程会话仍有活跃线程，延迟本线程全局输入释放")
-
-        except Exception as e:
-            logger.error(f"释放按键时发生错误: {e}")
+        manager = get_foreground_input_manager()
+        if manager is not None:
+            manager.release_all_inputs()
 
     def _invalidate_stale_capture(self, *hwnds: Any) -> None:
-        """窗口重建后清掉旧截图会话和插件绑定，避免继续抓失效画面。"""
+        """窗口重建后清理旧句柄的输入、截图会话和插件绑定。"""
+        try:
+            stale_hwnd = int((hwnds[0] if hwnds else 0) or 0)
+        except (TypeError, ValueError):
+            stale_hwnd = 0
+        if stale_hwnd > 0:
+            try:
+                from utils.input_simulation.factory import global_input_simulator_manager
+
+                global_input_simulator_manager.invalidate_window(stale_hwnd)
+            except Exception as exc:
+                logger.warning("清理失效窗口输入模拟器失败: hwnd=%s err=%s", stale_hwnd, exc)
+
         seen = set()
         for raw_hwnd in hwnds:
             try:
@@ -2444,7 +2391,7 @@ class WorkflowExecutor(QObject):
     def _execute_card(self, card_id: int, task_type: str, card_params: Dict[str, Any]) -> tuple[Any, Any, str]:
         """执行单个卡片的逻辑"""
         try:
-            def _finalize_failure(action: str = '执行下一步', next_id=None, detail: str = "", remember_failure: bool = True):
+            def _finalize_failure(next_id=None, detail: str = "", remember_failure: bool = True):
                 if remember_failure:
                     self._remember_failure(card_id, task_type, detail)
                 return False, next_id, str(detail or "").strip()
@@ -2454,7 +2401,7 @@ class WorkflowExecutor(QObject):
             if not task_module:
                 detail = f"找不到任务类型 '{task_type}' 对应的模块"
                 logger.error(detail)
-                return _finalize_failure(detail=detail)
+                return _finalize_failure(next_id='工作流执行完成', detail=detail)
 
             # 准备执行环境参数
             # 工具 修复：使用持久计数器字典而不是每次创建新的
@@ -2469,7 +2416,7 @@ class WorkflowExecutor(QObject):
             if target_hwnd:
                 try:
                     if not WIN32GUI_AVAILABLE:
-                        logger.warning("win32gui 不可用，无法验证窗口句柄")
+                        raise RuntimeError("win32gui 不可用，无法验证窗口句柄")
                     else:
                         recovered_hwnd = self._ensure_live_target_hwnd()
                         if recovered_hwnd:
@@ -2509,7 +2456,7 @@ class WorkflowExecutor(QObject):
                     except Exception as resolve_error:
                         detail = str(resolve_error or "参数引用无法解析")
                         logger.error("卡片 %s 参数插值失败: %s", card_id, detail)
-                        return False, '执行下一步', None, detail
+                        raise ValueError(detail) from resolve_error
                     with thread_control_context(self._task_runtime_stop_checker):
                         result = task_module.execute_task(
                             params=resolved_params,
@@ -2533,16 +2480,11 @@ class WorkflowExecutor(QObject):
                             plugins_dir=self.plugins_dir,
                         )
 
-                    # 工具 修复：检查返回值是否为None，防止解包错误
-                    if result is None:
-                        detail = f"任务 '{task_type}' 未返回执行结果"
-                        logger.error(detail)
-                        return False, '执行下一步', None, detail
                     return result
 
                 detail = f"任务 '{task_type}' 缺少 execute_task 实现"
                 logger.error(detail)
-                return False, '执行下一步', None, detail
+                raise RuntimeError(detail)
 
             task_result = None
             requires_input_lock = task_requires_input_lock(
@@ -2562,7 +2504,7 @@ class WorkflowExecutor(QObject):
                 total_wait_ms = 0.0
                 while True:
                     if self._check_pause_and_stop():
-                        return _finalize_failure("停止工作流", None, remember_failure=False)
+                        return _finalize_failure(remember_failure=False)
 
                     with acquire_input_guard(owner=lock_owner, timeout=wait_slice, resource=lock_resource) as (acquired, wait_ms):
                         total_wait_ms += max(0.0, float(wait_ms))
@@ -2585,15 +2527,12 @@ class WorkflowExecutor(QObject):
                 finally:
                     self._end_card_issue_capture()
 
-            if task_result is None:
-                return _finalize_failure(detail="任务执行没有返回结果")
             try:
-                normalized_result = normalize_task_result(task_result)
+                success, action, next_card_id, task_detail = validate_task_result(task_result)
             except (TypeError, ValueError) as result_error:
                 detail = f"任务 '{task_type}' 返回结果格式无效: {result_error}"
                 logger.error(detail)
-                return _finalize_failure(detail=detail)
-            success, action, next_card_id, task_detail = normalized_result.as_legacy_tuple()
+                return _finalize_failure(next_id='工作流执行完成', detail=detail)
 
             if not success and not str(task_detail or "").strip():
                 task_detail = str(self._current_card_error_detail or "").strip()
@@ -2643,7 +2582,7 @@ class WorkflowExecutor(QObject):
                 if should_delay:
                     handle_next_step_delay(card_params, stop_checker=self._task_runtime_stop_checker)
             except Exception as exc:
-                logger.debug("延迟处理失败: %s", exc)
+                return _finalize_failure(next_id='工作流执行完成', detail=f"延迟参数无效: {exc}")
 
             # 处理返回的动作（如果附加条件没有触发）
             if action == '停止工作流':
@@ -2673,21 +2612,7 @@ class WorkflowExecutor(QObject):
                 self.error_occurred.emit(card_id, str(e))
             except (RuntimeError, AttributeError) as signal_err:
                 logger.debug(f"发射卡片错误信号失败（对象可能已销毁）: {signal_err}")
-            return _finalize_failure(detail=str(e))
-
-        finally:
-            # 【内存泄漏修复】不要每个卡片都清理WGC！
-            # WGC捕获器应该保持运行并复用，只在停止任务时清理
-            # 频繁清理和重建会导致：
-            # 1. 性能下降（每次都要重新创建后台线程和D3D设备）
-            # 2. 内存碎片（频繁分配和释放大块内存）
-            # 3. 资源泄漏（清理不完全）
-            #
-            # WGC捕获器有LRU机制，会自动管理内存（最多10个）
-            # 真正的清理在 main.py:confirm_stopped() 中执行
-            pass
-
-
+            return _finalize_failure(next_id='工作流执行完成', detail=str(e))
 
     def _find_next_card(
         self,

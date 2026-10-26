@@ -1,1 +1,1 @@
-from .parameter_panel_media_mixin import ParameterPanelMediaMixin
+"""图片预览与资源工具；具体组件按明确模块路径导入。"""

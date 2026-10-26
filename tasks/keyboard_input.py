@@ -949,9 +949,8 @@ def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
     if input_type not in {"文本输入", KEY_MOUSE_INPUT_TYPE}:
         raise ValueError("键盘输入类型只能是 文本输入 或 键盘按键，旧格式必须先经过工程转换")
     combo_sequence = str(normalized_params.get("combo_key_sequence_text", "") or "").strip()
-    normalized_params["combo_key_action"] = _normalize_key_mouse_action(
-        normalized_params.get("combo_key_action", KEY_MOUSE_ACTION_COMPLETE)
-    )
+    if "combo_key_action" in normalized_params:
+        normalized_params["combo_key_action"] = _normalize_key_mouse_action(normalized_params["combo_key_action"])
 
     if combo_sequence:
         normalized_params["combo_key_sequence_text"] = combo_sequence
@@ -961,6 +960,8 @@ def normalize_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
 
 def normalize_panel_parameters(params: Dict[str, Any]) -> Dict[str, Any]:
     """供参数面板调用的参数归一化入口。"""
+    if "combo_key_action" in params:
+        raise ValueError("combo_key_action 是脚本执行参数，不属于卡片参数面板")
     return normalize_parameters(params)
 
 
@@ -1500,36 +1501,39 @@ def _apply_recorded_combo_sequence(parameter_panel, combo_sequence: str) -> None
         pass
 
 
-def _cleanup_combo_sequence_recording(parameter_panel, keyboard_module=None, mouse_module=None) -> None:
-    """释放录制钩子并清理状态。"""
-    keyboard_hook = getattr(parameter_panel, "_combo_seq_recording_hook", None)
-    if keyboard_hook is not None and keyboard_module is not None:
+def _cleanup_combo_sequence_recording(parameter_panel, keyboard_module=None, mouse_module=None):
+    setattr(parameter_panel, '_combo_seq_recording_active', False)
+    errors = []
+    keyboard_hook = getattr(parameter_panel, '_combo_seq_recording_hook', None)
+    if keyboard_hook is not None:
         try:
-            keyboard_module.unhook(keyboard_hook)
-        except Exception:
-            pass
-
-    mouse_hooks = list(getattr(parameter_panel, "_combo_seq_recording_mouse_hooks", []) or [])
-    if mouse_hooks and mouse_module is None:
+            if keyboard_module is None:
+                raise RuntimeError('键盘录制接口不可用，无法卸载钩子')
+            try:
+                keyboard_module.unhook(keyboard_hook)
+            except (KeyError, ValueError):
+                pass
+        except Exception as error:
+            errors.append(error)
+        else:
+            setattr(parameter_panel, '_combo_seq_recording_hook', None)
+    remaining = []
+    for hook in list(getattr(parameter_panel, '_combo_seq_recording_mouse_hooks', []) or []):
         try:
-            import mouse as mouse_module
-        except Exception:
-            mouse_module = None
-    if mouse_module is not None:
-        for hook in mouse_hooks:
+            if mouse_module is None:
+                raise RuntimeError('鼠标录制接口不可用，无法卸载钩子')
             try:
                 mouse_module.unhook(hook)
-            except Exception:
+            except (KeyError, ValueError):
                 pass
-
-    setattr(parameter_panel, "_combo_seq_recording_active", False)
-    setattr(parameter_panel, "_combo_seq_recording_hook", None)
-    setattr(parameter_panel, "_combo_seq_recording_mouse_hooks", [])
-    setattr(parameter_panel, "_combo_seq_recording_events", [])
-    setattr(parameter_panel, "_combo_seq_recording_pressed_keys", set())
-    setattr(parameter_panel, "_combo_seq_recording_ignored_keys", set())
-    setattr(parameter_panel, "_combo_seq_recording_last_mouse", None)
-    setattr(parameter_panel, "_combo_seq_block_global_record_hotkey", False)
+        except Exception as error:
+            remaining.append(hook)
+            errors.append(error)
+    setattr(parameter_panel, '_combo_seq_recording_mouse_hooks', remaining)
+    for name, value in (('_combo_seq_recording_events', []), ('_combo_seq_recording_pressed_keys', set()), ('_combo_seq_recording_ignored_keys', set()), ('_combo_seq_recording_last_mouse', None), ('_combo_seq_block_global_record_hotkey', False)):
+        setattr(parameter_panel, name, value)
+    if errors:
+        raise RuntimeError(f'键鼠录制钩子卸载失败：{errors[0]}')
 
 
 def should_ignore_recorded_mouse_click(
@@ -1755,25 +1759,13 @@ def toggle_combo_key_sequence_record(params: Dict[str, Any], **kwargs) -> None:
     mouse_hooks: List[Any] = []
     try:
         keyboard_hook = keyboard.hook(_on_key_event, suppress=False)
-        mouse_hooks = [
-            mouse.on_button(lambda: _on_mouse_event("left"), buttons=("left",), types=("down",)),
-            mouse.on_button(lambda: _on_mouse_event("right"), buttons=("right",), types=("down",)),
-            mouse.on_button(lambda: _on_mouse_event("middle"), buttons=("middle",), types=("down",)),
-        ]
-    except Exception as e:
-        if keyboard_hook is not None:
-            try:
-                keyboard.unhook(keyboard_hook)
-            except Exception:
-                pass
-        for hook in mouse_hooks:
-            try:
-                mouse.unhook(hook)
-            except Exception:
-                pass
+        for button in ('left', 'right', 'middle'):
+            mouse_hooks.append(mouse.on_button(lambda selected=button: _on_mouse_event(selected), buttons=(button,), types=('down',)))
+    except Exception as error:
+        setattr(parameter_panel, '_combo_seq_recording_hook', keyboard_hook)
+        setattr(parameter_panel, '_combo_seq_recording_mouse_hooks', mouse_hooks)
         _cleanup_combo_sequence_recording(parameter_panel, keyboard, mouse)
-        logger.error(f"启动键盘按键录制失败: {e}")
-        return
+        raise RuntimeError(f'启动键鼠录制失败：{error}') from error
 
     setattr(parameter_panel, "_combo_seq_recording_active", True)
     setattr(parameter_panel, "_combo_seq_recording_hook", keyboard_hook)

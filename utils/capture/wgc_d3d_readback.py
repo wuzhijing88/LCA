@@ -59,7 +59,9 @@ _CopyResourceFn = ctypes.WINFUNCTYPE(None, c_void_p, c_void_p, c_void_p)
 
 
 def _com_ptr_value(ptr) -> int:
-    return int(ctypes.cast(ptr, c_void_p).value or 0)
+    # cast 会把 ptr 写回自身的 _objects，形成循环引用，导致 COM 资源直到 GC 才释放。
+    # 只读取指针的存储内容，不创建另一份 COM 所有权，也不改变引用关系。
+    return int(c_void_p.from_buffer(ptr).value or 0)
 
 
 def _context_vtbl(context) -> POINTER(c_void_p):
@@ -135,6 +137,7 @@ class WGCStagingReadback:
         self._staging_w = 0
         self._staging_h = 0
         self._staging_format = 0
+        self._closed = False
 
     def _ensure_staging(self, width: int, height: int, fmt: int) -> None:
         if (
@@ -183,6 +186,8 @@ class WGCStagingReadback:
             raise RuntimeError(f"不支持的像素格式: {fmt}")
 
         with self._lock:
+            if self._closed:
+                raise RuntimeError("WGC读回设备已关闭")
             self._ensure_staging(width, height, fmt)
             ctx_ptr = _com_ptr_value(self._context)
             staging_ptr = _com_ptr_value(self._staging)
@@ -201,9 +206,11 @@ class WGCStagingReadback:
                 0,
                 byref(mapped),
             )
-            if hr != 0 or not mapped.pData:
+            if hr != 0:
                 raise RuntimeError(f"ID3D11DeviceContext.Map 失败 hr=0x{hr & 0xFFFFFFFF:08X}")
             try:
+                if not mapped.pData:
+                    raise RuntimeError("ID3D11DeviceContext.Map 返回空指针")
                 result = _mapped_bgra_to_bgr(int(mapped.pData), int(mapped.RowPitch), width, height)
                 return np.ascontiguousarray(result)
             finally:
@@ -219,11 +226,9 @@ class WGCStagingReadback:
         with self._lock:
             self._drop_staging_locked()
 
-    def flush(self) -> bool:
-        return False
-
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             self._drop_staging_locked()
             self._context = None
             self._device = None

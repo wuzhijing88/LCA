@@ -1,23 +1,14 @@
+from functools import partial
+from threading import Event
+from shiboken6 import isValid
+from .element_pick_job import pick_element
+
 from ..parameter_panel_support import *
 from utils.window.window_activation_utils import show_and_activate_overlay
 from utils.input.uiautomation_runtime import import_uiautomation, uiautomation_thread_context
 from .parameter_panel_picker_overlay import ParameterPanelPickerOverlay
 from ..parameter_panel_support import logger
 from PySide6.QtCore import QThread, Signal
-from utils.window.window_binding_utils import (
-    get_active_bound_windows,
-)
-
-class _PackageListFetchThread(QThread):
-    finished = Signal(object)
-
-    def __init__(self, fetch_callback, parent=None):
-        super().__init__(parent)
-        self._fetch_callback = fetch_callback
-
-    def run(self):
-        packages = self._fetch_callback()
-        self.finished.emit(packages)
 
 class ParameterPanelSelectorMixin:
 
@@ -46,13 +37,11 @@ class ParameterPanelSelectorMixin:
 
     @Slot()
     def _close_picker_overlay(self):
-        """Close picker overlay."""
-        try:
-            if hasattr(self, '_picker_overlay') and self._picker_overlay:
-                self._picker_overlay.close()
-                self._picker_overlay = None
-        except Exception:
-            pass
+        overlay = getattr(self, '_picker_overlay', None)
+        self._picker_overlay = None
+        if overlay is not None and isValid(overlay):
+            overlay.close()
+            overlay.deleteLater()
 
     @Slot()
     def _on_picking_cancelled(self):
@@ -164,149 +153,30 @@ class ParameterPanelSelectorMixin:
             msg += f"  控件类型: {control_type_cn}"
         QMessageBox.information(self, "拾取成功", msg)
 
-    def _pick_loop(self) -> None:
-        import ctypes
-        import time
 
-        try:
-            auto = import_uiautomation()
-        except Exception as e:
-            logger.error(f"[元素拾取] UIAutomation 初始化失败: {e}")
-            self._cancel_current_element_pick()
-            return
 
-        last_rect = None
-        last_element_hash = None
-        keyboard_available, is_pressed = self._resolve_keyboard_listener()
 
-        try:
-            with uiautomation_thread_context(auto):
-                while self._picking_active:
-                    try:
-                        if self._handle_pick_shortcuts(keyboard_available, is_pressed):
-                            break
 
-                        time.sleep(0.01)
-                        element = self._get_element_at_cursor(auto, ctypes)
-                        new_rect = self._extract_element_rect(element)
-                        if new_rect is None:
-                            time.sleep(0.05)
-                            continue
 
-                        element_hash = self._hash_element_identity(element)
-                        if new_rect != last_rect or element_hash != last_element_hash:
-                            last_rect = new_rect
-                            last_element_hash = element_hash
-                            self._current_element = element
-                            logger.debug(f"[元素拾取] 检测到元素: {new_rect}, hash={element_hash}")
-                            self._update_overlay_highlight(new_rect)
 
-                        time.sleep(0.05)
-                    except Exception as e:
-                        logger.debug(f"元素拾取循环异常: {e}")
-                        time.sleep(0.05)
-        except Exception as e:
-            logger.error(f"[元素拾取] UIAutomation 线程初始化失败: {e}")
-            self._cancel_current_element_pick()
 
-    def _resolve_keyboard_listener(self):
-        try:
-            from keyboard import is_pressed
-            return True, is_pressed
-        except ImportError:
-            logger.warning("[元素拾取] keyboard库不可用，无法监听全局按键")
-            return False, None
 
-    def _handle_pick_shortcuts(self, keyboard_available: bool, is_pressed) -> bool:
-        if keyboard_available and is_pressed is not None and is_pressed('esc'):
-            logger.debug("[元素拾取] 检测到ESC键，取消拾取")
-            self._cancel_current_element_pick()
-            return True
-
-        if self._is_global_right_button_pressed() and self._current_element:
-            logger.debug("[元素拾取] 检测到右键，确认拾取")
-            self._confirm_current_element_pick()
-            return True
-
-        return False
-
-    def _is_global_right_button_pressed(self) -> bool:
-        import ctypes
-        return ctypes.windll.user32.GetAsyncKeyState(0x02) & 0x8000 != 0
-
-    def _cancel_current_element_pick(self) -> None:
-        if not getattr(self, '_picking_active', False):
+    def _cancel_current_element_pick(self):
+        if not self._picking_active:
             return
         self._picking_active = False
+        self._background_jobs.cancel('element_picker')
         self._picked_info = None
-        self._queue_picker_overlay_close()
-        self._queue_picker_callback('_on_picking_cancelled')
+        self._on_picking_cancelled()
 
-    def _confirm_current_element_pick(self) -> None:
-        if not getattr(self, '_picking_active', False) or not self._current_element:
-            return
-        self._picking_active = False
-        self._picked_info = self._build_picked_info_from_element(self._current_element)
-        self._queue_picker_overlay_close()
-        self._queue_picker_callback('_on_element_picked')
+    def _confirm_current_element_pick(self):
+        if self._picking_active:
+            self._picker_confirm.set()
 
-    def _build_picked_info_from_element(self, element):
-        try:
-            from utils.window.element_picker import ElementInfo
-
-            rect = getattr(element, 'BoundingRectangle', None)
-            return ElementInfo(
-                name=self._safe_element_attr(element, 'Name'),
-                automation_id=self._safe_element_attr(element, 'AutomationId'),
-                class_name=self._safe_element_attr(element, 'ClassName'),
-                control_type=self._safe_element_attr(element, 'ControlTypeName'),
-                bounding_rect=(rect.left, rect.top, rect.width(), rect.height()) if rect else (0, 0, 0, 0),
-            )
-        except Exception as e:
-            logger.error(f"[元素拾取] 获取属性失败: {e}")
-            return None
-
-    def _safe_element_attr(self, element, attr_name: str) -> str:
-        try:
-            return getattr(element, attr_name) or ""
-        except Exception:
-            return ""
-
-    def _queue_picker_overlay_close(self) -> None:
-        if hasattr(self, '_picker_overlay') and self._picker_overlay:
-            self._picker_overlay.highlight_rect = None
-            from PySide6.QtCore import QMetaObject, Qt as QtConst
-            QMetaObject.invokeMethod(self._picker_overlay, 'close', QtConst.QueuedConnection)
-
-    def _queue_picker_callback(self, method_name: str) -> None:
-        from PySide6.QtCore import QMetaObject, Qt as QtConst
-        QMetaObject.invokeMethod(self, method_name, QtConst.QueuedConnection)
-
-    def _get_element_at_cursor(self, auto_module, ctypes_module):
-        pt = ctypes_module.wintypes.POINT()
-        ctypes_module.windll.user32.GetCursorPos(ctypes_module.byref(pt))
-        return auto_module.ControlFromPoint(pt.x, pt.y)
-
-    def _extract_element_rect(self, element):
-        if not element:
-            return None
-        rect = getattr(element, 'BoundingRectangle', None)
-        if not rect or rect.width() <= 0 or rect.height() <= 0:
-            return None
-        return (rect.left, rect.top, rect.width(), rect.height())
-
-    def _hash_element_identity(self, element):
-        try:
-            return hash((element.ControlTypeName, element.AutomationId, element.Name))
-        except Exception:
-            return None
-
-    def _update_overlay_highlight(self, new_rect) -> None:
-        if hasattr(self, '_picker_overlay') and self._picker_overlay:
-            self._picker_overlay.highlight_rect = new_rect
-            logger.debug("[元素拾取] 设置highlight_rect并调用repaint")
-            from PySide6.QtCore import QMetaObject, Qt as QtConst
-            QMetaObject.invokeMethod(self._picker_overlay, 'repaint', QtConst.QueuedConnection)
+    def _update_overlay_highlight(self, rect):
+        if self._picker_overlay is not None:
+            self._picker_overlay.highlight_rect = rect
+            self._picker_overlay.update()
 
     def _update_highlight_border(self):
         """Update highlight border."""
@@ -333,14 +203,17 @@ class ParameterPanelSelectorMixin:
         try:
             if not self._ensure_element_picker_available():
                 return
+            if self._picking_active:
+                return
+            self._initialize_picker_runtime_state()
             self._set_element_picker_button_state(True)
             self._minimize_picker_host_window()
             self._show_picker_overlay()
-            self._initialize_picker_runtime_state()
             self._start_element_pick_thread()
         except Exception as e:
             logger.error(f"启动元素拾取失败: {e}")
-            self._set_element_picker_button_state(False)
+            self._cancel_current_element_pick()
+            QMessageBox.warning(self, "拾取失败", f"启动元素拾取失败：{e}")
 
     def _ensure_element_picker_available(self) -> bool:
         from utils.window.element_picker import ElementPicker
@@ -362,23 +235,30 @@ class ParameterPanelSelectorMixin:
             self.main_window.showMinimized()
 
     def _show_picker_overlay(self) -> None:
-        self._picker_overlay = ParameterPanelPickerOverlay(self)
+        self._picker_overlay = self._own_parameter_tool(ParameterPanelPickerOverlay(self))
         logger.debug(
             f"[元素拾取] 创建PickerOverlay: geometry={self._picker_overlay.geometry()}, "
             f"DPI={self._picker_overlay.device_pixel_ratio}"
         )
         show_and_activate_overlay(self._picker_overlay, log_prefix='元素拾取覆盖层', focus=True)
 
-    def _initialize_picker_runtime_state(self) -> None:
+    def _initialize_picker_runtime_state(self):
         self._picking_active = True
-        self._current_element = None
         self._picked_info = None
+        self._picker_confirm = Event()
 
-    def _start_element_pick_thread(self) -> None:
-        import threading
+    def _start_element_pick_thread(self):
+        def ready(info):
+            self._picking_active = False
+            self._picked_info = info
+            self._on_element_picked() if info is not None else self._on_picking_cancelled()
 
-        self._pick_thread = threading.Thread(target=self._pick_loop, daemon=True)
-        self._pick_thread.start()
+        def failed(error):
+            self._picking_active = False
+            self._on_picking_cancelled()
+            QMessageBox.warning(self, "拾取失败", f"无法读取元素：{error}")
+
+        self._background_jobs.submit('element_picker', partial(pick_element, self._picker_confirm), ready, failed, self._update_overlay_highlight)
 
     def _select_color(self, line_edit: QLineEdit):
 
@@ -422,11 +302,13 @@ class ParameterPanelSelectorMixin:
 
         from PySide6.QtCore import QTimer
 
-        QTimer.singleShot(50, translate_color_dialog_buttons)
+        QTimer.singleShot(50, dialog, translate_color_dialog_buttons)
 
-        if dialog.exec() == QDialog.Accepted:
-
-            color = dialog.selectedColor()
+        from ui.dialogs.dialog_manager import exec_dialog
+        color = exec_dialog(dialog, read_result=lambda result: dialog.selectedColor() if result == QDialog.DialogCode.Accepted else None)
+        if color is not None:
+            if self._get_registered_widget_name(line_edit) is None:
+                return
 
             if color.isValid():
 
@@ -461,7 +343,6 @@ class ParameterPanelSelectorMixin:
                 param_name = self._update_current_parameter_from_widget(line_edit, color_string)
                 if param_name:
                     updates = {param_name: color_string}
-                    self._store_color_picker_base_point(color_picker, updates)
                     self._emit_color_picker_updates(updates)
                 logger.info(f"颜色选择完成: {color_string}")
                 dialog.close()
@@ -603,7 +484,6 @@ class ParameterPanelSelectorMixin:
 
         updates = {param_name: color_string}
         self.current_parameters[param_name] = color_string
-        self._store_color_picker_base_point(color_picker, updates)
         self._emit_color_picker_updates(updates)
         if hasattr(self, "_refresh_arrow_preview"):
             self._refresh_arrow_preview(param_name)
@@ -647,7 +527,7 @@ class ParameterPanelSelectorMixin:
         "- 多点格式: 基准R,G,B|偏移X,偏移Y,R,G,B|..."
     )
 
-    def _create_color_coordinate_dialog(self):
+    def _create_color_coordinate_dialog(self, *, target_hwnd=None):
         from PySide6.QtWidgets import QDialog, QHBoxLayout, QPushButton, QVBoxLayout
         from ui.selectors.color_coordinate_picker import ColorCoordinatePickerWidget
 
@@ -664,7 +544,10 @@ class ParameterPanelSelectorMixin:
         layout.addWidget(info_label)
 
         color_picker = ColorCoordinatePickerWidget(dialog)
-        self._configure_color_coordinate_picker(color_picker)
+        dialog.finished.connect(lambda: dialog.setProperty("parameterDisposed", True))
+        dialog.finished.connect(color_picker.cleanup)
+        dialog.destroyed.connect(color_picker.cleanup)
+        self._configure_color_coordinate_picker(color_picker, target_hwnd=target_hwnd)
         layout.addWidget(color_picker)
 
         button_layout = QHBoxLayout()
@@ -689,8 +572,9 @@ class ParameterPanelSelectorMixin:
         layout.addLayout(button_layout)
         return dialog, color_picker
 
-    def _configure_color_coordinate_picker(self, color_picker):
-        target_hwnd = self._get_bound_window_hwnd()
+    def _configure_color_coordinate_picker(self, color_picker, *, target_hwnd=None):
+        if target_hwnd is None:
+            target_hwnd = self._get_target_window_hwnd()
         if target_hwnd:
             color_picker.set_target_hwnd(target_hwnd)
 
@@ -716,229 +600,17 @@ class ParameterPanelSelectorMixin:
         if self.current_card_id is not None and updates:
             self.parameters_changed.emit(self.current_card_id, updates)
 
-    def _store_color_picker_base_point(self, color_picker, updates):
-        base_point = color_picker.get_base_point()
-        if not base_point:
-            return
-        base_x, base_y = int(base_point[0]), int(base_point[1])
-        self.current_parameters["color_picker_base_x"] = base_x
-        self.current_parameters["color_picker_base_y"] = base_y
-        updates["color_picker_base_x"] = base_x
-        updates["color_picker_base_y"] = base_y
+
 
     def _show_color_coordinate_dialog(self, dialog):
-        logger.info("显示颜色坐标选择对话框（非模态）")
+        previous = getattr(self, '_color_dialog', None)
+        if previous is not None and isValid(previous):
+            previous.blockSignals(True)
+            previous.close()
+            previous.deleteLater()
+        self._color_dialog = self._own_parameter_tool(dialog)
+        dialog.destroyed.connect(lambda: setattr(self, '_color_dialog', None) if self._color_dialog is dialog else None)
         show_and_activate_overlay(dialog, log_prefix='颜色坐标对话框', focus=True)
-
-    def _select_package(self, line_edit: QLineEdit):
-        logger.info("开始获取已安装应用包名列表...")
-        try:
-            packages = self._fetch_installed_packages_list()
-            if not packages:
-                self._show_package_list_unavailable_warning()
-                return
-
-            dialog, list_widget = self._create_package_select_dialog(packages, line_edit)
-            if dialog.exec() != QDialog.Accepted:
-                return
-
-            current_item = list_widget.currentItem()
-            if not current_item:
-                logger.warning("未选择任何包名")
-                return
-
-            package_name = current_item.text()
-            self._apply_selected_package_to_line_edit(line_edit, package_name)
-            logger.info(f"用户选择了包名: {package_name}")
-        except Exception as e:
-            from PySide6.QtWidgets import QMessageBox
-
-            logger.error(f"获取应用包名列表失败: {e}", exc_info=True)
-            QMessageBox.critical(
-                self,
-                "错误",
-                f"获取应用列表时发生错误：\n\n{str(e)}\n\n请查看日志获取详细信息。",
-            )
-
-    def _create_package_search_edit(self, layout):
-        search_edit = QLineEdit()
-        search_edit.setPlaceholderText("搜索包名...")
-        layout.addWidget(search_edit)
-        return search_edit
-
-    def _create_package_list_widget(self, packages, layout):
-        list_widget = QListWidget()
-        list_widget.addItems(packages)
-        layout.addWidget(list_widget)
-        return list_widget
-
-    def _apply_package_search_filter(self, list_widget, text):
-        needle = text.lower()
-        for index in range(list_widget.count()):
-            item = list_widget.item(index)
-            item.setHidden(needle not in item.text().lower())
-
-    def _apply_selected_package_to_line_edit(self, line_edit, package_name):
-        line_edit.setText(package_name)
-        param_name = self._update_current_parameter_from_widget(line_edit, package_name)
-        if param_name and self.current_card_id is not None:
-            self.parameters_changed.emit(self.current_card_id, {param_name: package_name})
-
-    def _create_package_select_dialog(self, packages, line_edit):
-        from PySide6.QtWidgets import QDialog, QLabel, QPushButton, QVBoxLayout
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"选择应用包名 (共{len(packages)}个)")
-        dialog.setMinimumSize(500, 400)
-
-        layout = QVBoxLayout(dialog)
-        info_label = QLabel(f"找到 {len(packages)} 个已安装的第三方应用：")
-        layout.addWidget(info_label)
-
-        search_edit = self._create_package_search_edit(layout)
-        list_widget = self._create_package_list_widget(packages, layout)
-        search_edit.textChanged.connect(
-            lambda text, widget=list_widget: self._apply_package_search_filter(widget, text)
-        )
-
-        button_layout = QHBoxLayout()
-        ok_button = QPushButton("确定")
-        cancel_button = QPushButton("取消")
-        ok_button.clicked.connect(dialog.accept)
-        cancel_button.clicked.connect(dialog.reject)
-        button_layout.addWidget(ok_button)
-        button_layout.addWidget(cancel_button)
-        layout.addLayout(button_layout)
-
-        def on_item_double_clicked(item):
-            self._apply_selected_package_to_line_edit(line_edit, item.text())
-            dialog.accept()
-
-        list_widget.itemDoubleClicked.connect(on_item_double_clicked)
-        return dialog, list_widget
-
-    def _refresh_package_list(self, combo_box: QComboBox):
-        logger.info("开始刷新已安装应用包名列表...")
-        refresh_button = self._find_package_refresh_button(combo_box)
-        self._set_package_refresh_button_state(refresh_button, False, "刷新中")
-        current_text = combo_box.currentText().strip()
-        thread = self._create_package_fetch_thread()
-
-        def on_packages_fetched(packages):
-            try:
-                self._set_package_refresh_button_state(refresh_button, True, "刷新")
-                self._apply_package_fetch_result(combo_box, current_text, packages)
-            except Exception as e:
-                logger.error(f"处理应用包名列表失败: {e}", exc_info=True)
-                self._show_package_refresh_error(e)
-            finally:
-                self._forget_package_fetch_thread(thread)
-                try:
-                    if thread:
-                        QTimer.singleShot(0, thread.deleteLater)
-                except Exception:
-                    pass
-
-        thread.finished.connect(on_packages_fetched)
-        thread.start()
-        self._remember_package_fetch_thread(thread)
-
-    def _fetch_installed_packages_list(self):
-        try:
-            from tasks import app_manager_task
-
-            return app_manager_task.get_installed_packages_list()
-        except Exception as e:
-            logger.error(f"获取应用包名列表失败: {e}", exc_info=True)
-            return None
-
-    def _create_package_fetch_thread(self):
-        return _PackageListFetchThread(self._fetch_installed_packages_list)
-
-    def _show_package_list_unavailable_warning(self):
-        from PySide6.QtWidgets import QMessageBox
-
-        QMessageBox.warning(
-            self,
-            "无法获取应用列表",
-            "未能获取已安装应用列表?\n\n"
-            "可能的原因：\n"
-            "1. ADB未正确连接\n"
-            "2. 没有可用的模拟器设备\n"
-            "3. 设备上没有安装第三方应用\n\n"
-            "请检查ADB连接状态和设备。",
-        )
-
-    def _restore_package_combo_selection(self, combo_box: QComboBox, current_text: str, packages):
-        combo_box.clear()
-        combo_box.addItems(packages)
-        if current_text and current_text in packages:
-            index = combo_box.findText(current_text)
-            if index >= 0:
-                combo_box.setCurrentIndex(index)
-            return
-        if current_text:
-            combo_box.addItem(current_text)
-            combo_box.setCurrentText(current_text)
-
-    def _apply_package_fetch_result(self, combo_box: QComboBox, current_text: str, packages):
-        from shiboken6 import isValid
-
-        if not isValid(combo_box) or not isValid(self):
-            logger.warning("刷新完成时控件已被销毁，跳过更新")
-            return
-        if packages is None or not packages:
-            self._show_package_list_unavailable_warning()
-            return
-
-        self._restore_package_combo_selection(combo_box, current_text, packages)
-        logger.info(f"成功刷新包名列表，共 {len(packages)} 个应用")
-
-    def _show_package_refresh_error(self, error):
-        try:
-            from shiboken6 import isValid
-
-            if isValid(self):
-                from PySide6.QtWidgets import QMessageBox
-
-                QMessageBox.critical(
-                    self,
-                    "错误",
-                    f"刷新应用列表时发生错误：\n\n{str(error)}\n\n请查看日志获取详细信息。",
-                )
-        except Exception:
-            pass
-
-    def _find_package_refresh_button(self, combo_box: QComboBox):
-        parent = combo_box.parent()
-        if parent is None:
-            return None
-        for child in parent.children():
-            if isinstance(child, QPushButton) and "刷新" in child.text():
-                return child
-        return None
-
-    def _set_package_refresh_button_state(self, refresh_button, enabled: bool, text: str):
-        try:
-            from shiboken6 import isValid
-
-            if refresh_button and isValid(refresh_button):
-                refresh_button.setEnabled(enabled)
-                refresh_button.setText(text)
-        except Exception:
-            pass
-
-    def _remember_package_fetch_thread(self, thread):
-        if not hasattr(self, "_fetch_threads"):
-            self._fetch_threads = []
-        self._fetch_threads.append(thread)
-
-    def _forget_package_fetch_thread(self, thread):
-        try:
-            if thread and hasattr(self, "_fetch_threads") and thread in self._fetch_threads:
-                self._fetch_threads.remove(thread)
-        except Exception:
-            pass
 
     def _select_ocr_region(self, param_name: str):
         """启动OCR区域选择工具"""
@@ -948,7 +620,7 @@ class ParameterPanelSelectorMixin:
             from ui.selectors.ocr_region_selector import OCRRegionSelectorWidget
 
             # 获取绑定的窗口句柄
-            target_window_hwnd = self._get_bound_window_hwnd()
+            target_window_hwnd = self._get_target_window_hwnd()
 
             if not target_window_hwnd:
                 from PySide6.QtWidgets import QMessageBox
@@ -957,21 +629,9 @@ class ParameterPanelSelectorMixin:
                 return
 
             # 创建区域选择器，直接传递窗口句柄
-            self.region_selector = OCRRegionSelectorWidget(self)
+            self.region_selector = self._create_ocr_region_selector("region_selector")
 
-            # 设置目标窗口句柄
-            if hasattr(self.region_selector, 'set_target_window_hwnd'):
-                self.region_selector.set_target_window_hwnd(target_window_hwnd)
-            elif hasattr(self.region_selector, 'set_target_window'):
-                # 兼容旧版本，获取窗口标题
-                try:
-                    import win32gui
-                    window_title = win32gui.GetWindowText(target_window_hwnd)
-                    self.region_selector.set_target_window(window_title)
-                except Exception as e:
-                    logger.warning(f"获取窗口标题失败: {e}")
-                    # 直接使用句柄作为标题
-                    self.region_selector.set_target_window(f"窗口{target_window_hwnd}")
+            self.region_selector.set_target_window_hwnd(target_window_hwnd)
 
             # 连接信号
             self.region_selector.region_selected.connect(
@@ -979,7 +639,7 @@ class ParameterPanelSelectorMixin:
             )
 
             # 开始选择
-            self.region_selector.start_selection()
+            self._start_parameter_tool(self.region_selector)
 
         except Exception as e:
             from PySide6.QtWidgets import QMessageBox
@@ -990,51 +650,34 @@ class ParameterPanelSelectorMixin:
 
     def _get_enabled_bound_windows_for_selector(self) -> List[Dict[str, Any]]:
         candidates = []
-
-        try:
-            if self.main_window is not None:
-                if hasattr(self.main_window, "bound_windows") and isinstance(self.main_window.bound_windows, list):
-                    candidates = self.main_window.bound_windows
-                elif hasattr(self.main_window, "config"):
-                    config = self.main_window.config
-                    if isinstance(config, dict):
-                        candidates = get_active_bound_windows(config)
-                    else:
-                        active_windows = getattr(config, "active_bound_windows", None)
-                        if isinstance(active_windows, list):
-                            candidates = active_windows
-                        elif hasattr(config, "bound_windows"):
-                            candidates = config.bound_windows or []
-
-            if not candidates and self.parent_window is not None:
-                if hasattr(self.parent_window, "bound_windows") and isinstance(self.parent_window.bound_windows, list):
-                    candidates = self.parent_window.bound_windows
-                elif hasattr(self.parent_window, "config"):
-                    config = self.parent_window.config
-                    if isinstance(config, dict):
-                        candidates = get_active_bound_windows(config)
-                    else:
-                        active_windows = getattr(config, "active_bound_windows", None)
-                        if isinstance(active_windows, list):
-                            candidates = active_windows
-                        elif hasattr(config, "bound_windows"):
-                            candidates = config.bound_windows or []
-        except Exception as e:
-            logger.debug(f"绑定窗口选择器来源失败：{e}")
-            return []
-
-        enabled_windows = []
-        for window_info in candidates or []:
-            if not isinstance(window_info, dict):
+        for host in (self.main_window, self.parent_window):
+            if host is None:
                 continue
-            if not window_info.get("enabled", True):
+            if hasattr(host, "bound_windows"):
+                candidates = host.bound_windows
+                break
+            if hasattr(host, "config"):
+                config = host.config
+                if isinstance(config, dict):
+                    candidates = config.get("bound_windows", [])
+                else:
+                    candidates = config.bound_windows
+                break
+        if not isinstance(candidates, list):
+            raise TypeError("绑定窗口必须是列表")
+        enabled_windows = []
+        for window_info in candidates:
+            if not isinstance(window_info, dict):
+                raise TypeError("绑定窗口配置必须是字典")
+            enabled = window_info.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise TypeError("绑定窗口启用状态必须是布尔值")
+            if not enabled:
                 continue
             enabled_windows.append(window_info)
         return enabled_windows
 
-    def _get_bound_window_hwnd(self) -> Optional[int]:
-        """获取当前绑定的窗口句柄（与坐标/截图工具同一套实时解析）。"""
-        return self._get_target_window_hwnd()
+
 
     def _on_ocr_region_selected(self, param_name: str, x: int, y: int, width: int, height: int):
         """处理OCR区域选择完成"""
@@ -1132,22 +775,24 @@ class ParameterPanelSelectorMixin:
         """启动多点坐标选择工具"""
         logger.info(f"多点坐标选择按钮被点击，参数名: {param_name}")
 
+        selector = None
         try:
             from ui.selectors.coordinate_selector import MultiPointCoordinateSelectorWidget
 
-            # 创建多点坐标选择器
-            self.multi_coordinate_selector = MultiPointCoordinateSelectorWidget(self)
-
-            # 获取目标窗口句柄
             target_window_hwnd = self._get_target_window_hwnd()
-            if target_window_hwnd:
-                self.multi_coordinate_selector.target_window_hwnd = target_window_hwnd
-                logger.info(f"设置多点坐标选择器窗口句柄: {target_window_hwnd}")
-            else:
-                logger.error("未找到目标窗口句柄")
-                from PySide6.QtWidgets import QMessageBox
+            if not target_window_hwnd:
                 QMessageBox.warning(self, "错误", "未找到目标窗口，请先绑定窗口")
                 return
+            existing = getattr(self, 'multi_coordinate_selector', None)
+            if existing is not None and isValid(existing) and not existing.property("parameterDisposed"):
+                logger.info("多点坐标采集尚未结束，忽略重复启动")
+                return
+            selector = MultiPointCoordinateSelectorWidget(self)
+            self.multi_coordinate_selector = self._own_parameter_tool(selector)
+            self.multi_coordinate_selector.target_window_hwnd = target_window_hwnd
+            self.multi_coordinate_selector.selection_finished.connect(
+                self.multi_coordinate_selector.close, Qt.ConnectionType.QueuedConnection,
+            )
 
             # 连接信号
             self.multi_coordinate_selector.coordinates_selected.connect(
@@ -1156,11 +801,13 @@ class ParameterPanelSelectorMixin:
 
             # 开始选择
             logger.info("开始启动多点坐标选择器...")
-            self.multi_coordinate_selector.start_selection()
+            self._start_parameter_tool(self.multi_coordinate_selector)
 
         except Exception as e:
+            if selector is not None and isValid(selector):
+                selector.close()
+                selector.deleteLater()
             logger.error(f"启动多点坐标选择工具失败: {e}")
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "错误", f"启动多点坐标选择工具失败: {str(e)}")
 
     def _on_multi_coordinates_selected(self, param_name: str, coordinates: list, timestamps: list):
@@ -1170,13 +817,10 @@ class ParameterPanelSelectorMixin:
 
             # 将坐标列表和时间戳转换为文本格式
             # 格式: x,y,timestamp
-            if timestamps and len(timestamps) == len(coordinates):
-                coord_text = "\n".join([f"{x},{y},{t:.3f}" for (x, y), t in zip(coordinates, timestamps)])
-                logger.info(f"已保存带时间戳的路径点: {len(coordinates)}个点, 总时长={timestamps[-1]:.3f}s")
-            else:
-                # 如果没有时间戳，使用原格式
-                coord_text = "\n".join([f"{x},{y}" for x, y in coordinates])
-                logger.warning("未获取时间戳，使用默认格式保存坐标")
+            if not coordinates or len(timestamps) != len(coordinates):
+                raise ValueError("采集坐标与时间戳数量不一致，不能保存拖拽路径")
+            coord_text = "\n".join(f"{x},{y},{t:.3f}" for (x, y), t in zip(coordinates, timestamps))
+            logger.info(f"已保存带时间戳的路径点：{len(coordinates)} 个点")
 
             # 更新对应的文本编辑框
             if param_name in self.widgets:
@@ -1192,275 +836,63 @@ class ParameterPanelSelectorMixin:
             self._apply_parameters(auto_close=False)
 
         except Exception as e:
-            logger.error(f"处理多点坐标选择结果失败: {e}")
+            logger.exception("处理多点坐标选择结果失败")
+            QMessageBox.warning(self, "错误", f"保存拖拽路径失败：{e}")
 
     def _ensure_offset_selector(self):
+        existing = self.offset_selector
+        if existing is not None and (not isValid(existing) or existing.property("parameterDisposed")):
+            self.offset_selector = None
         from ui.selectors.coordinate_selector import OffsetSelectorWidget
 
         if self.offset_selector is None:
-            self.offset_selector = OffsetSelectorWidget(self)
+            self.offset_selector = self._own_parameter_tool(OffsetSelectorWidget(self))
             self.offset_selector.offset_selected.connect(self._handle_offset_selected)
         return self.offset_selector
 
-    def _select_offset(self, param_name: str):
-        logger.info(f"偏移选择按钮被点击，参数名: {param_name}")
+    def _select_offset(self, param_name):
+        from .offset_reference import OffsetReferenceLookup
         try:
-            offset_selector = self._ensure_offset_selector()
-            self._offset_param_name = param_name
-
-            target_window_hwnd = self._get_target_window_hwnd()
-            if not target_window_hwnd:
-                logger.error("未找到目标窗口句柄")
-                from PySide6.QtWidgets import QMessageBox
-
-                QMessageBox.warning(
-                    self,
-                    "错误",
-                    "未找到目标窗口，请先绑定窗口",
-                )
-                return
-
-            offset_selector.target_window_hwnd = target_window_hwnd
-            logger.info(
-                f"设置偏移选择器窗口句柄: {target_window_hwnd}"
-            )
-            offset_selector.base_point = None
-            offset_selector.base_rect = None
-
-            base_x, base_y, base_rect = self._resolve_offset_base_for_selection(param_name)
-            if base_x is not None and base_y is not None:
-                offset_selector.set_base_point(int(base_x), int(base_y))
-            if base_rect is not None:
+            hwnd = self._get_target_window_hwnd()
+            if hwnd is None:
+                raise ValueError('没有可用的绑定窗口，无法选择偏移')
+            values = self._collect_current_parameters()
+            if 'image_paths' in values:
+                values['image_paths'] = self._convert_display_to_full_paths(values['image_paths'])
+            lookup = OffsetReferenceLookup(values, self.param_definitions[param_name], hwnd, self.current_card_id)
+            def ready(result):
                 try:
-                    offset_selector.set_base_rect(*base_rect)
-                except Exception:
-                    pass
+                    if self._get_target_window_hwnd() != hwnd:
+                        raise ValueError('绑定窗口已经改变，请重新选择偏移')
+                    selector = self._ensure_offset_selector()
+                    self._offset_param_name = param_name
+                    selector.target_window_hwnd = hwnd
+                    selector.base_point = None
+                    selector.base_rect = None
+                    x, y, rect = result
+                    if x is not None and y is not None:
+                        selector.set_base_point(x, y)
+                    if rect is not None:
+                        selector.set_base_rect(*rect)
+                    self._start_parameter_tool(selector)
+                except Exception as error:
+                    failed(error)
+            def failed(error):
+                logger.error('定位偏移基准失败：%s', error)
+                QMessageBox.warning(self, '选择偏移失败', str(error))
+            self._background_jobs.submit('offset-reference', lookup.resolve, ready, failed)
+        except Exception as error:
+            QMessageBox.warning(self, '选择偏移失败', str(error))
 
-            offset_selector.start_selection()
-        except Exception as exc:
-            logger.error(f"启动偏移选择工具失败: {exc}")
-            from PySide6.QtWidgets import QMessageBox
 
-            QMessageBox.warning(
-                self,
-                "错误",
-                f"启动偏移选择工具失败: {str(exc)}",
-            )
 
-    def _resolve_offset_base_for_selection(self, param_name: str):
-        base_x = None
-        base_y = None
-        base_rect = None
 
-        param_def = self.param_definitions.get(param_name, {})
-        related_params = param_def.get("related_params", [])
-        if "coordinate_fixed_offset_x" in related_params or "fixed_offset_x" in related_params:
-            base_x = self.current_parameters.get("coordinate_x")
-            base_y = self.current_parameters.get("coordinate_y")
-        elif "image_fixed_offset_x" in related_params:
-            base = self._get_image_center_for_offset()
-            if base:
-                if len(base) >= 3:
-                    base_x, base_y, base_rect = base[0], base[1], base[2]
-                else:
-                    base_x, base_y = base[0], base[1]
-        elif "color_fixed_offset_x" in related_params:
-            base = self._get_color_center_for_offset()
-            if base:
-                base_x, base_y = base
-        return base_x, base_y, base_rect
 
-    def _get_image_center_for_offset(self):
-        from task_workflow.resource_path import format_resource_text, unwrap_resource_path
 
-        image_path = unwrap_resource_path(self.current_parameters.get("image_path")) or ""
-        image_paths = format_resource_text(self.current_parameters.get("image_paths"))
-        if not image_path and not image_paths:
-            logger.warning("偏移选择: 未配置图片路径，无法获取图片中心点")
-            return None
 
-        target_window_hwnd = self._get_target_window_hwnd()
-        if not target_window_hwnd:
-            logger.warning("偏移选择: 未绑定窗口，无法获取图片中心点")
-            return None
 
-        try:
-            from tasks.image_match_click import locate_image_in_window
-        except Exception as exc:
-            logger.warning(f"偏移选择: 加载图像识别工具失败: {exc}")
-            return None
 
-        params = dict(self.current_parameters or {})
-        if not image_path and image_paths:
-            for raw_line in re.split(r"[\r\n;]+", image_paths):
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "  # " in line:
-                    line = line.split("  # ", 1)[0].strip()
-                if line:
-                    params["image_path"] = line
-                    break
 
-        found, location, _ = locate_image_in_window(
-            params=params,
-            target_hwnd=target_window_hwnd,
-            card_id=self.current_card_id,
-        )
-        if not found or not location:
-            logger.warning("偏移选择: 未找到图片中心点")
-            return None
-
-        x, y, w, h = location[:4]
-        center_x = int(x + w / 2)
-        center_y = int(y + h / 2)
-        rect = (int(x), int(y), int(w), int(h))
-        return center_x, center_y, rect
-
-    def _build_color_match_payload_for_offset(self, target_color_str: str):
-        text = str(target_color_str or "").strip()
-        if not text:
-            return None
-
-        color_mode = "single"
-        colors_data: List[Dict[str, Any]] = []
-        try:
-            if "|" in text:
-                color_mode = "multipoint"
-                parts = [part.strip() for part in text.split("|") if part.strip()]
-                if not parts:
-                    return None
-                for idx, part in enumerate(parts):
-                    values = [int(value.strip()) for value in part.split(",")]
-                    if idx == 0:
-                        if len(values) != 3:
-                            return None
-                        r, g, b = values
-                        colors_data.append({"offset": (0, 0), "rgb": (r, g, b), "bgr": (b, g, r)})
-                    else:
-                        if len(values) != 5:
-                            return None
-                        ox, oy, r, g, b = values
-                        colors_data.append({"offset": (ox, oy), "rgb": (r, g, b), "bgr": (b, g, r)})
-            elif ";" in text:
-                color_mode = "multi"
-                parts = [part.strip() for part in text.split(";") if part.strip()]
-                if not parts:
-                    return None
-                for part in parts:
-                    values = [int(value.strip()) for value in part.split(",")]
-                    if len(values) != 3:
-                        return None
-                    r, g, b = values
-                    colors_data.append({"rgb": (r, g, b), "bgr": (b, g, r)})
-            else:
-                values = [int(value.strip()) for value in text.split(",")]
-                if len(values) != 3:
-                    return None
-                r, g, b = values
-                colors_data.append({"rgb": (r, g, b), "bgr": (b, g, r)})
-        except Exception:
-            return None
-
-        if not colors_data:
-            return None
-        return color_mode, colors_data
-
-    def _find_color_center_for_offset(self):
-        target_color_str = str(self.current_parameters.get("target_color", "") or "").strip()
-        if not target_color_str:
-            return None
-
-        target_window_hwnd = self._get_target_window_hwnd()
-        if not target_window_hwnd:
-            return None
-
-        payload = self._build_color_match_payload_for_offset(target_color_str)
-        if not payload:
-            return None
-
-        color_mode, colors_data = payload
-        roi = None
-        if bool(self.current_parameters.get("search_region_enabled", False)):
-            try:
-                rx = int(self.current_parameters.get("search_region_x", 0) or 0)
-                ry = int(self.current_parameters.get("search_region_y", 0) or 0)
-                rw = int(self.current_parameters.get("search_region_width", 0) or 0)
-                rh = int(self.current_parameters.get("search_region_height", 0) or 0)
-                if rw > 0 and rh > 0:
-                    roi = (rx, ry, rw, rh)
-            except Exception:
-                roi = None
-
-        try:
-            from services.screenshot_pool import capture_and_find_color
-
-            find_response = capture_and_find_color(
-                hwnd=int(target_window_hwnd),
-                color_mode=color_mode,
-                colors_data=colors_data,
-                h_tolerance=10,
-                s_tolerance=40,
-                v_tolerance=40,
-                min_pixel_count=1,
-                client_area_only=True,
-                use_cache=False,
-                timeout=4.0,
-                roi=roi,
-            )
-        except Exception as exc:
-            logger.warning(f"偏移选择: 实时查找颜色中心失败: {exc}")
-            return None
-
-        if not bool(find_response.get("success")) or not bool(find_response.get("found")):
-            return None
-
-        center = find_response.get("center")
-        if isinstance(center, (list, tuple)) and len(center) >= 2:
-            try:
-                return int(center[0]), int(center[1])
-            except Exception:
-                return None
-        return None
-
-    def _get_color_center_for_offset(self):
-        live_center = self._find_color_center_for_offset()
-        if live_center is not None:
-            try:
-                live_x, live_y = int(live_center[0]), int(live_center[1])
-                self.current_parameters["color_picker_base_x"] = live_x
-                self.current_parameters["color_picker_base_y"] = live_y
-                return live_x, live_y
-            except Exception:
-                pass
-
-        manual_x = self.current_parameters.get("color_picker_base_x")
-        manual_y = self.current_parameters.get("color_picker_base_y")
-        if manual_x is not None and manual_y is not None:
-            try:
-                return int(manual_x), int(manual_y)
-            except Exception:
-                pass
-
-        card_id = self.current_card_id
-        if card_id is None:
-            logger.warning("偏移选择: 未找到当前卡片ID，无法读取找色中心点")
-            return None
-
-        try:
-            from task_workflow.workflow_context import get_workflow_context
-
-            context = get_workflow_context()
-            x = context.get_card_data(card_id, "color_target_x")
-            y = context.get_card_data(card_id, "color_target_y")
-        except Exception as exc:
-            logger.warning(f"偏移选择: 读取找色中心点失败: {exc}")
-            return None
-
-        if x is None or y is None:
-            logger.warning("偏移选择: 未找到找色中心点，请先执行找色")
-            return None
-        return int(x), int(y)
 
     def _handle_offset_selected(self, dx: int, dy: int):
         param_name = self._offset_param_name
@@ -1469,19 +901,15 @@ class ParameterPanelSelectorMixin:
             return
         self._on_offset_selected(param_name, dx, dy)
 
-    def _build_offset_updates(self, param_name: str, dx: int, dy: int):
-        param_def = self.param_definitions.get(param_name, {})
-        related_params = param_def.get(
-            "related_params",
-            ["fixed_offset_x", "fixed_offset_y", "position_mode"],
-        )
-        offset_x_param = related_params[0] if len(related_params) > 0 else "fixed_offset_x"
-        offset_y_param = related_params[1] if len(related_params) > 1 else "fixed_offset_y"
-        mode_param = related_params[2] if len(related_params) > 2 else None
-
-        updates = {offset_x_param: dx, offset_y_param: dy}
-        if mode_param:
-            updates[mode_param] = "固定偏移"
+    def _build_offset_updates(self, param_name, dx, dy):
+        related = self.param_definitions[param_name]['related_params']
+        if len(related) not in (2, 3) or any(name not in self.param_definitions for name in related):
+            raise ValueError('偏移工具的参数定义无效')
+        updates = {related[0]: int(dx), related[1]: int(dy)}
+        if len(related) == 3:
+            if '固定偏移' not in self.param_definitions[related[2]]['options']:
+                raise ValueError('偏移工具的模式定义无效')
+            updates[related[2]] = '固定偏移'
         return updates
 
     def _apply_offset_widget_value(self, widget, value) -> bool:
@@ -1543,22 +971,25 @@ class ParameterPanelSelectorMixin:
         """启动坐标选择工具（带显示更新）"""
         logger.info(f"坐标选择按钮被点击（带显示），参数名: {param_name}")
 
+        selector = None
         try:
             from ui.selectors.coordinate_selector import CoordinateSelectorWidget
 
             # 创建坐标选择器
-            self.coordinate_selector = CoordinateSelectorWidget(self)
-
-            # 获取目标窗口句柄
+            existing = getattr(self, 'coordinate_selector', None)
+            if existing is not None and isValid(existing) and not existing.property("parameterDisposed"):
+                logger.info("坐标采集尚未结束，忽略重复启动")
+                return
             target_window_hwnd = self._get_target_window_hwnd()
-            if target_window_hwnd:
-                self.coordinate_selector.target_window_hwnd = target_window_hwnd
-                logger.info(f"设置坐标选择器窗口句柄: {target_window_hwnd}")
-            else:
-                logger.error("未找到目标窗口句柄")
-                from PySide6.QtWidgets import QMessageBox
+            if not target_window_hwnd:
                 QMessageBox.warning(self, "错误", "未找到目标窗口，请先绑定窗口")
                 return
+            selector = CoordinateSelectorWidget(self)
+            self.coordinate_selector = self._own_parameter_tool(selector)
+            self.coordinate_selector.target_window_hwnd = target_window_hwnd
+            self.coordinate_selector.selection_finished.connect(
+                self.coordinate_selector.close, Qt.ConnectionType.QueuedConnection,
+            )
 
             # 连接信号
             self.coordinate_selector.coordinate_selected.connect(
@@ -1566,11 +997,13 @@ class ParameterPanelSelectorMixin:
             )
 
             # 开始选择
-            self.coordinate_selector.start_selection()
+            self._start_parameter_tool(self.coordinate_selector)
 
         except Exception as e:
+            if selector is not None and isValid(selector):
+                selector.close()
+                selector.deleteLater()
             logger.error(f"启动坐标选择工具失败: {e}")
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "错误", f"启动坐标选择工具失败: {str(e)}")
 
     def _on_coordinate_selected_with_display(self, param_name: str, x: int, y: int):
@@ -1620,25 +1053,34 @@ class ParameterPanelSelectorMixin:
 
     def _select_coordinate(self, param_name: str):
         logger.info(f"坐标选择按钮被点击，参数名: {param_name}")
+        selector = None
         try:
-            from PySide6.QtWidgets import QMessageBox
             from ui.selectors.coordinate_selector import CoordinateSelectorWidget
 
-            self.coordinate_selector = CoordinateSelectorWidget(self)
+            existing = getattr(self, 'coordinate_selector', None)
+            if existing is not None and isValid(existing) and not existing.property("parameterDisposed"):
+                logger.info("坐标采集尚未结束，忽略重复启动")
+                return
             target_window_hwnd = self._get_target_window_hwnd()
             if not target_window_hwnd:
-                logger.error("未找到目标窗口句柄")
                 QMessageBox.warning(self, "错误", "未找到目标窗口，请先绑定窗口")
                 return
-
+            selector = CoordinateSelectorWidget(self)
+            self.coordinate_selector = self._own_parameter_tool(selector)
             self.coordinate_selector.target_window_hwnd = target_window_hwnd
+            self.coordinate_selector.selection_finished.connect(
+                self.coordinate_selector.close, Qt.ConnectionType.QueuedConnection,
+            )
+
             logger.info(f"设置坐标选择器窗口句柄: {target_window_hwnd}")
             self.coordinate_selector.coordinate_selected.connect(
                 lambda x, y, selected_param=param_name: self._on_coordinate_selected(selected_param, x, y)
             )
-            self.coordinate_selector.start_selection()
+            self._start_parameter_tool(self.coordinate_selector)
         except Exception as e:
-            from PySide6.QtWidgets import QMessageBox
+            if selector is not None and isValid(selector):
+                selector.close()
+                selector.deleteLater()
 
             logger.error(f"启动坐标选择工具失败: {e}")
             QMessageBox.warning(self, "错误", f"启动坐标选择工具失败: {str(e)}")
@@ -1649,7 +1091,6 @@ class ParameterPanelSelectorMixin:
         "drag_end_coordinate_selector": ("drag_end_position", "更新拖拽终点"),
         "move_start_coordinate_selector": ("move_start_position", "更新鼠标移动起点"),
         "move_end_coordinate_selector": ("move_end_position", "更新鼠标移动终点"),
-        "drag_coordinate_selector": ("drag_start_position", "更新拖拽起点(旧版)"),
     }
 
     def _set_widget_value(self, widget, value):
@@ -1684,14 +1125,6 @@ class ParameterPanelSelectorMixin:
         self.current_parameters["combo_seq_mouse_y"] = y
         changed_params["combo_seq_mouse_x"] = x
         changed_params["combo_seq_mouse_y"] = y
-
-        self._set_named_widget_value("combo_mouse_x", x)
-        self._set_named_widget_value("combo_mouse_y", y)
-        if "combo_mouse_x" in self.current_parameters or "combo_mouse_y" in self.current_parameters:
-            self.current_parameters["combo_mouse_x"] = x
-            self.current_parameters["combo_mouse_y"] = y
-            changed_params["combo_mouse_x"] = x
-            changed_params["combo_mouse_y"] = y
 
         logger.info(f"更新组合键鼠标坐标: x={x}, y={y}")
         self._emit_coordinate_updates(changed_params)
@@ -1893,24 +1326,19 @@ class ParameterPanelSelectorMixin:
     def _create_ocr_region_selector(self, attr_name: str):
         from ui.selectors.ocr_region_selector import OCRRegionSelectorWidget
 
-        selector = OCRRegionSelectorWidget(self)
+        previous = getattr(self, attr_name, None)
+        if previous is not None and isValid(previous):
+            previous.close()
+        selector = self._own_parameter_tool(OCRRegionSelectorWidget(self))
         setattr(self, attr_name, selector)
+        selector.selection_finished.connect(selector.close, Qt.ConnectionType.QueuedConnection)
         return selector
 
     def _configure_ocr_region_selector_target(self, selector, scene_name: str):
-        target_hwnd = self._get_bound_window_hwnd()
-        if target_hwnd:
-            logger.info(f"Use hwnd for {scene_name}: {target_hwnd}")
-            if hasattr(selector, 'set_target_hwnd'):
-                selector.set_target_hwnd(target_hwnd)
-            else:
-                selector.target_window_hwnd = target_hwnd
-            return
-
-        logger.warning('未找到窗口句柄，回退到窗口标题')
-        target_window_title = self._get_first_window_for_selection()
-        if target_window_title and hasattr(selector, 'set_target_window'):
-            selector.set_target_window(target_window_title)
+        target_hwnd = self._get_target_window_hwnd()
+        if not target_hwnd:
+            raise ValueError("没有可用的绑定窗口，无法选择识别区域")
+        selector.set_target_window_hwnd(target_hwnd)
 
     def _start_ocr_region_selection(
         self,
@@ -1925,15 +1353,13 @@ class ParameterPanelSelectorMixin:
             self._configure_ocr_region_selector_target(selector, scene_name)
             selector.set_region(*initial_region)
             selector.region_selected.connect(on_region_selected)
-            selector.start_selection()
+            self._start_parameter_tool(selector)
         except Exception as exc:
+            selector = getattr(self, selector_attr_name, None)
+            if selector is not None and isValid(selector):
+                selector.close()
             from PySide6.QtWidgets import QMessageBox
-
-            QMessageBox.warning(
-                self,
-                "错误",
-                f"{error_prefix}: {str(exc)}",
-            )
+            QMessageBox.warning(self, "错误", f"{error_prefix}: {exc}")
 
     def _store_prefixed_region_values(self, prefix: str, x: int, y: int, width: int, height: int):
         self.current_parameters[f'{prefix}_x'] = x

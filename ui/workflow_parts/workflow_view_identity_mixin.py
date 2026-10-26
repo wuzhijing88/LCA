@@ -1,5 +1,6 @@
 from .workflow_view_common import *
 from ..system_parts.message_box_translator import show_warning_box
+from task_workflow.thread_start import is_thread_start_task_type, validate_thread_target
 
 
 class WorkflowViewIdentityMixin:
@@ -233,6 +234,16 @@ class WorkflowViewIdentityMixin:
             raise TypeError(f"卡片 {card.card_id} 的参数必须是字典")
         updated = copy.deepcopy(card.parameters)
 
+        for parameter_name, definition in card.param_definitions.items():
+            if definition.get('widget_hint') != 'thread_target_selector' or parameter_name not in updated:
+                continue
+            value = updated[parameter_name]
+            validate_thread_target(value)
+            if isinstance(value, list):
+                updated[parameter_name] = [str(id_mapping.get(int(target), int(target))) for target in value]
+            elif value not in {'当前线程', '全部线程'}:
+                updated[parameter_name] = str(id_mapping.get(int(value), int(value)))
+
         for parameter_name in self._reference_parameter_names(card):
             if parameter_name not in updated or updated[parameter_name] is None:
                 continue
@@ -351,6 +362,18 @@ class WorkflowViewIdentityMixin:
                 raise RuntimeError(f"卡片登记不一致: {card_id}")
             if not isinstance(card.parameters, dict):
                 raise TypeError(f"卡片 {card_id} 的参数必须是字典")
+            for parameter_name, definition in card.param_definitions.items():
+                if definition.get('widget_hint') != 'thread_target_selector' or parameter_name not in card.parameters:
+                    continue
+                value = card.parameters[parameter_name]
+                validate_thread_target(value)
+                if isinstance(value, str) and value in {'当前线程', '全部线程'}:
+                    continue
+                targets = value if isinstance(value, list) else [value]
+                for target in targets:
+                    target_card = self.cards.get(int(target))
+                    if target_card is None or not is_thread_start_task_type(target_card.task_type):
+                        raise ValueError(f"卡片 {card_id} 的目标线程不存在: {target}")
             for parameter_name in self._reference_parameter_names(card):
                 target_id = card.parameters.get(parameter_name)
                 if target_id is None:

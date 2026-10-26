@@ -1,3 +1,5 @@
+import copy
+
 from ..parameter_panel_support import *
 from utils.window.window_activation_utils import show_and_raise_widget
 
@@ -7,29 +9,38 @@ class ParameterPanelPresentationMixin:
     def show_parameters(self, card_id: int, task_type: str, param_definitions: Dict[str, Dict[str, Any]],
                        current_parameters: Dict[str, Any], workflow_cards_info: Dict[int, tuple[str, int]] = None,
                        images_dir: str = None, target_window_hwnd: int = None, task_module=None, main_window=None,
-                       custom_name: str = None, sounds_dir: str = None):
+                       custom_name: str = None, sounds_dir: str = None, resource_dirs: Optional[dict] = None):
         logger.info(f"显示参数面板: 卡片={card_id}, 任务={task_type}")
         if task_type == "自定义脚本":
             logger.warning("自定义脚本使用独立编辑器，已忽略参数面板请求")
             return
 
-        if not self._prepare_parameter_panel_request(card_id, task_type, custom_name, task_module, main_window):
-            return
-
         self._loading_parameter_panel = True
         try:
-            self._load_parameter_panel_values(card_id, param_definitions, current_parameters)
+            self._release_panel_runtime()
+            if not self._prepare_parameter_panel_request(card_id, task_type, custom_name, task_module, main_window):
+                return
+            param_definitions = copy.deepcopy(param_definitions)
             self._store_parameter_panel_context(
                 param_definitions,
                 workflow_cards_info,
                 images_dir,
                 target_window_hwnd,
                 sounds_dir,
+                resource_dirs,
             )
+            self._load_parameter_panel_values(card_id, param_definitions, current_parameters)
             self._restore_dynamic_select_options()
             self._log_parameter_panel_state()
             self._show_parameter_panel_window(card_id, task_type, custom_name)
-            self._opened_parameters_snapshot = dict(self.current_parameters)
+            self._opened_parameters_snapshot = copy.deepcopy(self.current_parameters)
+        except Exception:
+            self._clear_content()
+            self.current_card_id = None
+            self.current_parameters.clear()
+            self._opened_parameters_snapshot.clear()
+            self.hide()
+            raise
         finally:
             self._loading_parameter_panel = False
         self._check_and_register_record_hotkey()
@@ -39,35 +50,32 @@ class ParameterPanelPresentationMixin:
         self._restore_standard_footer_buttons()
         self._set_footer_buttons_visible(True)
 
-        if not isinstance(card_id, int) or card_id < 0:
-            logger.error(f"无效的卡片ID: {card_id}")
-            return False
+        if isinstance(card_id, bool) or not isinstance(card_id, int) or card_id < 0:
+            raise ValueError(f"无效的卡片编号：{card_id}")
 
-        if not task_type:
-            logger.error("任务类型为空")
-            return False
+        if not isinstance(task_type, str) or not task_type.strip():
+            raise ValueError("任务类型必须是非空字符串")
 
         self.current_card_id = card_id
         self.current_task_type = task_type
         self.current_custom_name = custom_name
 
-        if main_window is not None:
-            self.main_window = main_window
-        if task_module is not None:
-            self.task_module = task_module
+        identity = (id(main_window), main_window.workflow_tab_widget.get_current_task_id()) if main_window is not None else None
+        if identity != getattr(self, "_runtime_workflow_identity", None):
+            self.runtime_parameters.clear()
+        self._runtime_workflow_identity = identity
+        self.main_window = main_window
+        self.task_module = task_module
         return True
 
-    def _load_parameter_panel_values(self, card_id: int, param_definitions: Dict[str, Dict[str, Any]], current_parameters: Dict[str, Any]) -> None:
-        self.current_parameters = current_parameters.copy()
+    def _load_parameter_panel_values(self, card_id, param_definitions, current_parameters):
+        self.current_parameters = copy.deepcopy(current_parameters)
+        self._validate_panel_parameter_names(param_definitions)
+        self._fill_missing_parameter_defaults(param_definitions)
         self._normalize_task_specific_parameters()
+        self._validate_panel_parameter_names(param_definitions)
         self._normalize_operation_mode_parameter(param_definitions)
         self._log_initial_jump_targets()
-
-        obsolete_params = self._prune_obsolete_panel_parameters(param_definitions)
-        if obsolete_params:
-            self._prune_obsolete_params_in_workflow(obsolete_params)
-
-        self._fill_missing_parameter_defaults(param_definitions)
         self._merge_runtime_only_parameters(card_id, param_definitions)
 
     def _log_initial_jump_targets(self) -> None:
@@ -75,22 +83,15 @@ class ParameterPanelPresentationMixin:
             if key in self.current_parameters:
                 logger.info(f"[INIT] {key} = {self.current_parameters[key]}")
 
-    def _prune_obsolete_panel_parameters(self, param_definitions: Dict[str, Dict[str, Any]]) -> List[str]:
-        valid_param_names = set(param_definitions.keys())
-        obsolete_params = [
-            param_name
-            for param_name in self.current_parameters.keys()
-            if param_name not in valid_param_names and not param_name.startswith('---') and not param_name.startswith('_')
-        ]
-        for param_name in obsolete_params:
-            logger.debug(f"remove obsolete parameter: {param_name} = {self.current_parameters[param_name]}")
-            del self.current_parameters[param_name]
-        return obsolete_params
+    def _validate_panel_parameter_names(self, param_definitions):
+        unknown = [name for name in self.current_parameters if name not in param_definitions and not name.startswith('_') and not name.startswith('---')]
+        if unknown:
+            raise ValueError(f"参数不属于当前卡片定义：{'、'.join(unknown)}，请先转换为现行工程格式")
 
     def _fill_missing_parameter_defaults(self, param_definitions: Dict[str, Dict[str, Any]]) -> None:
         for param_name, param_def in param_definitions.items():
             if param_name not in self.current_parameters and 'default' in param_def:
-                default_value = param_def['default']
+                default_value = copy.deepcopy(param_def['default'])
                 self.current_parameters[param_name] = default_value
                 logger.debug(f"fill default parameter: {param_name} = {default_value}")
 
@@ -99,17 +100,13 @@ class ParameterPanelPresentationMixin:
         if task_module is None:
             return
 
-        for hook_name in ("normalize_panel_parameters", "normalize_parameters"):
-            normalize_hook = getattr(task_module, hook_name, None)
-            if not callable(normalize_hook):
-                continue
-            try:
-                normalized_params = normalize_hook(self.current_parameters)
-                if isinstance(normalized_params, dict):
-                    self.current_parameters = normalized_params
-            except Exception as e:
-                logger.warning(f"任务参数归一化失败({hook_name}): {e}")
-            break
+        normalize_hook = getattr(task_module, "normalize_panel_parameters", None)
+        if normalize_hook is None:
+            return
+        normalized_params = normalize_hook(self.current_parameters)
+        if not isinstance(normalized_params, dict):
+            raise TypeError("任务面板参数处理结果必须是字典")
+        self.current_parameters = normalized_params
 
     def _merge_runtime_only_parameters(self, card_id: int, param_definitions: Dict[str, Dict[str, Any]]) -> None:
         for param_name, param_def in param_definitions.items():
@@ -131,11 +128,15 @@ class ParameterPanelPresentationMixin:
         images_dir: Optional[str],
         target_window_hwnd: Optional[int],
         sounds_dir: Optional[str] = None,
+        resource_dirs: Optional[dict] = None,
     ) -> None:
         self.param_definitions = param_definitions
         self.workflow_cards_info = workflow_cards_info or {}
         self.images_dir = images_dir
         self.sounds_dir = sounds_dir
+        directories = resource_dirs or {}
+        for key in ("dicts_dir", "yolo_dir", "replays_dir", "plugins_dir"):
+            setattr(self, key, str(directories.get(key) or ""))
         self.target_window_hwnd = target_window_hwnd
 
     def _restore_dynamic_select_options(self) -> None:

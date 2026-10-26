@@ -4,7 +4,8 @@ import json
 import logging
 import os
 import shutil
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Optional, Tuple
 
 from app_core.player.exe_branding import brand_runtime_exe
@@ -17,22 +18,14 @@ from app_core.player.runtime_config import (
     apply_player_ui_hotkeys,
     snapshot_export_runtime_config,
 )
-from app_core.player.secure_package import seal_package_files, secure_remove_path
+from app_core.player.secure_package import seal_package_files
 from ui.export_parts.collector import CollectionResult, collection_to_memory_files
 from ui.export_parts.standalone_installer import build_standalone_installer
-from utils.app_paths import get_app_root, get_resource_path, is_packaged_runtime, resolve_running_executable
+from utils.app_paths import get_app_root, get_resource_path, is_packaged_runtime
 
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Optional[Callable[[int, str], None]]
-
-RUNTIME_DIRNAME = "runtime"
-# 根目录应保持干净；这些文件默认设为隐藏
-_HIDDEN_ROOT_FILES = (
-    "package.lcap",
-    "package.key",
-    "launcher.cfg",
-)
 
 EXCLUDE_DIR_NAMES = {
     ".git",
@@ -55,8 +48,10 @@ EXCLUDE_FILE_NAMES = {
 
 
 def safe_export_name(app_name: str) -> str:
-    cleaned = "".join(ch for ch in str(app_name or "").strip() if ch not in '<>:"/\\|?*')
+    cleaned = "".join(ch for ch in str(app_name or "").strip() if ch not in '<>:"/\\|?*' and ord(ch) >= 32)
     cleaned = cleaned.strip(" .")
+    if cleaned.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        cleaned = "_" + cleaned
     return cleaned or "独立程序"
 
 
@@ -76,16 +71,16 @@ def build_manifest_and_ui_files(
     try:
         req_w = int(required_client_width or 0)
         req_h = int(required_client_height or 0)
-    except (TypeError, ValueError):
-        req_w = req_h = 0
-    if req_w <= 0 or req_h <= 0:
-        req_w = req_h = 0
+    except (TypeError, ValueError) as exc:
+        raise ValueError("独立程序分辨率必须是整数") from exc
+    if req_w < 0 or req_h < 0 or bool(req_w) != bool(req_h):
+        raise ValueError("独立程序分辨率必须同时填写宽度和高度")
     from app_core.player.script_metadata import validate_release_metadata
 
     normalized_scripts = []
     for raw_script in list(scripts or []):
         if not isinstance(raw_script, dict):
-            continue
+            raise ValueError("独立程序脚本元数据格式无效")
         item = dict(raw_script)
         item.update(validate_release_metadata(item))
         normalized_scripts.append(item)
@@ -148,10 +143,13 @@ def collect_ui_asset_files(asset_map: dict | None) -> Dict[str, bytes]:
     if not asset_map:
         return files
     for rel, source in asset_map.items():
-        rel_text = str(rel or "").replace("\\", "/").lstrip("/")
+        rel_text = str(rel or "").replace("\\", "/")
+        logical = PurePosixPath(rel_text)
+        if logical.is_absolute() or ".." in logical.parts or len(logical.parts) < 2 or logical.parts[0] != "ui_assets" or ":" in rel_text:
+            raise ValueError(f"界面资源路径无效: {rel_text}")
         src = Path(str(source or ""))
-        if not rel_text or not src.is_file():
-            continue
+        if not src.is_file():
+            raise FileNotFoundError(f"界面资源文件不存在: {source}")
         files[rel_text] = src.read_bytes()
     return files
 
@@ -175,25 +173,15 @@ def _should_skip(path: Path, root: Path) -> bool:
     return False
 
 
-def _copy_or_link_file(source: Path, destination: Path) -> None:
+def _copy_runtime_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        return
-    try:
-        os.link(source, destination)
-        return
-    except OSError:
-        pass
     shutil.copy2(source, destination)
 
 
 def _report_progress(progress: ProgressCallback, value: int, message: str) -> None:
     if progress is None:
         return
-    try:
-        progress(max(0, min(100, int(value))), str(message or ""))
-    except Exception:
-        logger.debug("进度回调失败", exc_info=True)
+    progress(max(0, min(100, int(value))), str(message or ""))
 
 
 def copy_runtime_tree(
@@ -203,10 +191,16 @@ def copy_runtime_tree(
     progress: ProgressCallback = None,
     progress_start: int = 20,
     progress_end: int = 70,
+    cancel_check: Callable[[], None] | None = None,
 ) -> None:
     destination_root.mkdir(parents=True, exist_ok=True)
     files: list[Path] = []
-    for current, dirnames, filenames in os.walk(source_root):
+    def walk_error(error):
+        raise error
+
+    for current, dirnames, filenames in os.walk(source_root, onerror=walk_error):
+        if cancel_check:
+            cancel_check()
         current_path = Path(current)
         dirnames[:] = [name for name in dirnames if name not in EXCLUDE_DIR_NAMES]
         for filename in filenames:
@@ -219,7 +213,9 @@ def copy_runtime_tree(
     _report_progress(progress, progress_start, f"正在复制运行时（0/{total}）…")
     for index, source in enumerate(files, start=1):
         relative = source.relative_to(source_root)
-        _copy_or_link_file(source, destination_root / relative)
+        if cancel_check:
+            cancel_check()
+        _copy_runtime_file(source, destination_root / relative)
         if index == 1 or index == total or index % 25 == 0:
             ratio = index / total
             value = progress_start + int((progress_end - progress_start) * ratio)
@@ -236,7 +232,7 @@ def _runtime_has_main_engine(root: Path) -> bool:
 
 def resolve_bundled_runtime_root() -> Path:
     """定位同一主程序运行时（main.dist）。独立程序与编辑器共用二进制，靠 exe 内嵌入口印记分流。"""
-    for env_name in ("LCA_RUNTIME", "LCA_PLAYER_RUNTIME"):
+    for env_name in ("LCA_RUNTIME",):
         env = str(os.environ.get(env_name) or "").strip()
         if not env:
             continue
@@ -252,11 +248,9 @@ def resolve_bundled_runtime_root() -> Path:
     if is_packaged_runtime():
         # 从已安装/已打包的编辑器导出时，运行时就在自身目录
         candidates.append(project_root)
-        candidates.append(project_root.parent / "main.dist")
     candidates.extend(
         [
             project_root / "build_assets" / "packaging" / "build_output" / "main.dist",
-            project_root / "build_assets" / "packaging" / "main.dist",
         ]
     )
     for candidate in candidates:
@@ -290,24 +284,12 @@ def resolve_export_engine() -> Tuple[str, Optional[Path]]:
     )
 
 
-def _hide_path(path: Path) -> None:
-    if os.name != "nt" or not path.exists():
-        return
-    try:
-        import ctypes
-
-        # FILE_ATTRIBUTE_HIDDEN
-        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x2)
-    except Exception:
-        pass
-
-
 def _default_export_icon(icon_path: str = "") -> str:
     text = str(icon_path or "").strip()
-    if text and os.path.isfile(text):
-        return text
-    fallback = Path(get_resource_path("icon.ico"))
-    return str(fallback) if fallback.is_file() else ""
+    icon = Path(text) if text else Path(get_resource_path("icon.ico"))
+    if not icon.is_file():
+        raise FileNotFoundError(f"程序图标不存在: {icon}")
+    return str(icon)
 
 
 def _prepare_payload_dir(
@@ -319,6 +301,7 @@ def _prepare_payload_dir(
     sealed_lcap: Path,
     bind_id: bytes | None = None,
     progress: ProgressCallback = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> Path:
     """
     安装包 payload：
@@ -329,7 +312,7 @@ def _prepare_payload_dir(
     安装目录内不得残留 main.exe；入口只认 exe 内嵌印记。
     """
     if payload_dir.exists():
-        shutil.rmtree(payload_dir, ignore_errors=True)
+        raise FileExistsError(f"安装包临时目录已存在: {payload_dir}")
     payload_dir.mkdir(parents=True, exist_ok=True)
 
     copy_runtime_tree(
@@ -338,15 +321,15 @@ def _prepare_payload_dir(
         progress=progress,
         progress_start=25,
         progress_end=72,
+        cancel_check=cancel_check,
     )
     _report_progress(progress, 74, "正在写入程序名称、图标与入口印记…")
     source_exe = resolve_runtime_main_exe(runtime_root)
     flat_main = payload_dir / "main.exe"
     exe_name = f"{safe_export_name(app_name)}.exe"
     target_exe = payload_dir / exe_name
-    brand_source = flat_main if flat_main.is_file() else source_exe
     brand_runtime_exe(
-        brand_source,
+        source_exe,
         target_exe,
         icon_path=icon_path,
         entry_mode="player",
@@ -354,11 +337,8 @@ def _prepare_payload_dir(
     )
     # 安装目录落地 icon.ico，供卸载项 / 快捷方式 /「应用和功能」显示自定义图标
     ico_text = str(icon_path or "").strip()
-    if ico_text and os.path.isfile(ico_text):
-        try:
-            shutil.copy2(ico_text, payload_dir / "icon.ico")
-        except OSError:
-            logger.warning("复制安装目录图标失败: %s", ico_text, exc_info=True)
+    if ico_text:
+        shutil.copy2(ico_text, payload_dir / "icon.ico")
     from app_core.player.entry_stamp import (
         ENTRY_PLAYER,
         read_entry_stamp_info_from_exe,
@@ -376,32 +356,18 @@ def _prepare_payload_dir(
         )
 
     # 去掉仍带编辑器身份的 main.exe，只保留已盖播放器印记的设计名.exe
-    if flat_main.is_file():
-        try:
-            if flat_main.resolve() != target_exe.resolve():
-                flat_main.unlink()
-        except OSError:
-            try:
-                flat_main.unlink()
-            except OSError:
-                pass
+    if flat_main != target_exe:
+        flat_main.unlink()
     flat_player = payload_dir / "player.exe"
-    if flat_player.is_file():
-        try:
-            if flat_player.resolve() != target_exe.resolve():
-                flat_player.unlink()
-        except OSError:
-            pass
+    if flat_player.is_file() and flat_player != target_exe:
+        flat_player.unlink()
 
     shutil.copy2(sealed_lcap, payload_dir / "package.lcap")
     # 清理旧版旁路入口标记（入口已写入 exe PE 资源）
     for stale_marker in ("player.mode", "launcher.cfg", "package.key"):
         stale_path = payload_dir / stale_marker
         if stale_path.exists():
-            try:
-                stale_path.unlink()
-            except OSError:
-                pass
+            stale_path.unlink()
     (payload_dir / "userdata").mkdir(parents=True, exist_ok=True)
 
     if not (payload_dir / "package.lcap").is_file():
@@ -428,6 +394,7 @@ def assemble_standalone_export(
     entry_script_id: str = "",
     runtime_config: dict | None = None,
     progress: ProgressCallback = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> Path:
     """
     制作独立程序安装包。
@@ -436,6 +403,8 @@ def assemble_standalone_export(
     if collection.errors:
         raise ValueError("独立程序包仍有未解决的错误，拒绝导出")
 
+    if cancel_check:
+        cancel_check()
     _report_progress(progress, 2, "正在检查运行时…")
     engine_mode, runtime_root = resolve_export_engine()
     if engine_mode != "bundled" or runtime_root is None:
@@ -445,21 +414,19 @@ def assemble_standalone_export(
             "或设置环境变量 LCA_RUNTIME。"
         )
 
-    output_dir = Path(output_dir)
+    if not str(output_dir).strip():
+        raise ValueError("请选择安装包保存位置")
+    output_dir = Path(output_dir).resolve()
+    runtime_root = runtime_root.resolve()
+    if output_dir == runtime_root or runtime_root in output_dir.parents:
+        raise ValueError("保存位置不能在运行时目录内，请选择其他目录")
     output_dir.mkdir(parents=True, exist_ok=True)
     icon_path = _default_export_icon(icon_path)
     display_name = str(app_name or "").strip() or "独立程序"
     safe_name = safe_export_name(display_name)
 
-    work_dir = output_dir / f".{safe_name}_build"
-    leftover_package = work_dir / "package"
-    if leftover_package.exists():
-        secure_remove_path(leftover_package)
-    if work_dir.exists():
-        shutil.rmtree(work_dir, ignore_errors=True)
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
+    with tempfile.TemporaryDirectory(prefix=f".{safe_name}_build_", dir=output_dir) as work_name:
+        work_dir = Path(work_name)
         _report_progress(progress, 8, "正在打包工作流与界面…")
         package_files = collection_to_memory_files(collection)
         package_files.update(
@@ -483,15 +450,17 @@ def assemble_standalone_export(
         import secrets
 
         from app_core.player.package_integrity import stamp_package_files
-        from app_core.player.secure_package import cleanup_extracted_package
 
         # 同一随机 bind_id 写入 package.lcap 与播放器 exe 印记，防挪包混用
         package_bind_id = secrets.token_bytes(16)
         package_files = stamp_package_files(package_files)
 
         _report_progress(progress, 16, "正在加密程序包…")
-        cleanup_extracted_package(work_dir)
+        if cancel_check:
+            cancel_check()
         lcap_path = seal_package_files(package_files, work_dir, bind_id=package_bind_id)
+        if cancel_check:
+            cancel_check()
 
         payload_dir = work_dir / "payload"
         branded_exe = _prepare_payload_dir(
@@ -502,6 +471,7 @@ def assemble_standalone_export(
             sealed_lcap=lcap_path,
             bind_id=package_bind_id,
             progress=progress,
+            cancel_check=cancel_check,
         )
 
         _report_progress(progress, 82, "正在压缩安装包（Inno Setup，首次可能需数分钟）…")
@@ -514,35 +484,9 @@ def assemble_standalone_export(
             version=version or "1.0.0",
             publisher=(company or "LCA"),
             progress=progress,
+            cancel_check=cancel_check,
         )
-    finally:
         _report_progress(progress, 94, "正在清理临时文件…")
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-    # 清掉输出目录里旧的绿色版残留，只保留安装包
-    keep = {setup_path.name}
-    for child in list(output_dir.iterdir()):
-        if child.name in keep:
-            continue
-        if child.name.startswith("."):
-            try:
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    child.unlink(missing_ok=True)
-            except OSError:
-                pass
-            continue
-        # 旧导出：runtime / launcher / lcap / 旧 exe 等
-        try:
-            if child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
-            elif child.suffix.lower() == ".exe" and child.name != setup_path.name:
-                child.unlink(missing_ok=True)
-            elif child.name in {"package.lcap", "package.key", "launcher.cfg"}:
-                child.unlink(missing_ok=True)
-        except OSError:
-            pass
 
     _report_progress(progress, 100, "制作完成")
     return setup_path

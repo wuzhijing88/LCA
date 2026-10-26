@@ -130,18 +130,13 @@ def default_window_size() -> Dict[str, int]:
 
 def _theme_default(key: str) -> str:
     """从主题色板取默认色，避免业务代码写死 hex。"""
-    try:
-        from themes import theme_color
+    from themes import theme_color
 
-        return theme_color(key)
-    except Exception:
-        from themes.theme_manager import ThemeManager
-
-        return ThemeManager.THEME_COLORS["light"].get(key, ThemeManager.THEME_COLORS["light"]["text"])
+    return theme_color(key)
 
 
 def default_background() -> Dict[str, Any]:
-    # w/h 为 0 表示铺满窗口，兼容旧包
+    # w/h 为 0 表示铺满窗口。
     return {"mode": "color", "color": _theme_default("canvas"), "image": "", "x": 0, "y": 0, "w": 0, "h": 0}
 
 
@@ -257,7 +252,7 @@ def default_player_widgets(app_name: str = "") -> List[Dict[str, Any]]:
     ]
 
 
-def default_player_ui(app_name: str = "", *, with_widgets: bool = True) -> Dict[str, Any]:
+def default_player_ui(app_name: str = "") -> Dict[str, Any]:
     title = _text(app_name) or "独立程序"
     payload: Dict[str, Any] = {
         "title": title,
@@ -270,13 +265,11 @@ def default_player_ui(app_name: str = "", *, with_widgets: bool = True) -> Dict[
         "start_hotkey": DEFAULT_HOTKEYS["start_task_hotkey"],
         "stop_hotkey": DEFAULT_HOTKEYS["stop_task_hotkey"],
         "pause_hotkey": DEFAULT_HOTKEYS["pause_workflow_hotkey"],
-        "skin_image": "",
         "about": "",
         "window": default_window_size(),
         "background": default_background(),
     }
-    if with_widgets:
-        payload["widgets"] = default_player_widgets(title)
+    payload["widgets"] = default_player_widgets(title)
     return payload
 
 
@@ -471,73 +464,6 @@ def _normalize_widget(raw: Any) -> Optional[Dict[str, Any]]:
     return widget
 
 
-def _fold_loop_settings_into_script_list(raw: Any) -> List[Any]:
-    """把旧版独立「循环设置」并进脚本列表后丢弃。"""
-    if not isinstance(raw, list):
-        return []
-    loop_src: Optional[Dict[str, Any]] = None
-    others: List[Any] = []
-    for item in raw:
-        if isinstance(item, Mapping) and str(item.get("type") or "").lower() == "loop_settings":
-            if loop_src is None:
-                loop_src = dict(item)
-            continue
-        others.append(item)
-    if loop_src is None:
-        return others
-    loops_by_id: Dict[str, Any] = {}
-    for entry in loop_src.get("items") or []:
-        if not isinstance(entry, Mapping):
-            continue
-        sid = str(entry.get("id") or "").strip()
-        if sid:
-            loops_by_id[sid] = entry.get("loops", 1)
-    group = loop_src.get("group_loops", 1)
-    merged = False
-    result: List[Any] = []
-    for item in others:
-        if (
-            not merged
-            and isinstance(item, Mapping)
-            and str(item.get("type") or "").lower() == "script_list"
-        ):
-            item = dict(item)
-            item["group_loops"] = group
-            items: List[Any] = []
-            seen: set[str] = set()
-            for entry in item.get("items") or []:
-                if not isinstance(entry, Mapping):
-                    continue
-                entry = dict(entry)
-                sid = str(entry.get("id") or "").strip()
-                if sid and sid in loops_by_id:
-                    entry["loops"] = loops_by_id[sid]
-                if sid:
-                    seen.add(sid)
-                items.append(entry)
-            for entry in loop_src.get("items") or []:
-                if not isinstance(entry, Mapping):
-                    continue
-                sid = str(entry.get("id") or "").strip()
-                if not sid or sid in seen:
-                    continue
-                seen.add(sid)
-                items.append(dict(entry))
-            item["items"] = items
-            result.append(item)
-            merged = True
-        else:
-            result.append(item)
-    if not merged:
-        converted = dict(loop_src)
-        converted["type"] = "script_list"
-        title = _text(converted.get("title"), "脚本")
-        converted["title"] = "脚本" if title in ("", "循环") else title
-        converted["group_loops"] = group
-        result.insert(0, converted)
-    return result
-
-
 def normalize_player_widgets(raw: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw, list):
         return []
@@ -545,7 +471,9 @@ def normalize_player_widgets(raw: Any) -> List[Dict[str, Any]]:
     seen_actions = set()
     seen_tabs = False
     seen_schedule = False
-    for item in _fold_loop_settings_into_script_list(raw):
+    for item in raw:
+        if isinstance(item, Mapping) and item.get("type") == "loop_settings":
+            raise ValueError("独立循环控件已停用，请使用现行脚本列表格式")
         widget = _normalize_widget(item)
         if widget is None:
             continue
@@ -606,22 +534,13 @@ def player_close_hides_to_tray(layout: str, *, quit_on_close: bool) -> bool:
     return str(layout or "") == "tray" and bool(quit_on_close)
 
 
-def has_custom_widgets(ui: Mapping[str, Any] | None) -> bool:
-    if not isinstance(ui, Mapping):
-        return False
-    widgets = ui.get("widgets")
-    return isinstance(widgets, list) and len(widgets) > 0
-
-
 def normalize_player_ui(raw: Any, app_name: str = "") -> Dict[str, Any]:
-    """
-    归一化 ui.json。
-    - 若含 widgets：按画布协议解析（设计器导出）。
-    - 若无 widgets：保留旧字段，不注入默认 widgets，保证旧包走固定布局回退。
-    """
-    normalized = default_player_ui(app_name, with_widgets=False)
-    if not isinstance(raw, Mapping):
-        return normalized
+    """解析现行画布 UI；旧布局必须先转换，不能在播放器中切换实现。"""
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("widgets"), list):
+        raise ValueError("独立程序界面必须包含现行 widgets 列表")
+    if "skin_image" in raw:
+        raise ValueError("独立程序界面含旧皮肤字段，请使用 background.image")
+    normalized = default_player_ui(app_name)
 
     normalized["title"] = _text(raw.get("title"), normalized["title"])
     layout = _text(raw.get("layout"), "mini").lower()
@@ -638,52 +557,37 @@ def normalize_player_ui(raw: Any, app_name: str = "") -> Dict[str, Any]:
     normalized["start_hotkey"] = _text(raw.get("start_hotkey"), normalized["start_hotkey"]).upper()
     normalized["stop_hotkey"] = _text(raw.get("stop_hotkey"), normalized["stop_hotkey"]).upper()
     normalized["pause_hotkey"] = _text(raw.get("pause_hotkey"), normalized["pause_hotkey"]).upper()
-    normalized["skin_image"] = _text(raw.get("skin_image")).replace("\\", "/")
     normalized["about"] = _text(raw.get("about"))
     normalized["window"] = _normalize_window(raw.get("window"))
     normalized["background"] = _normalize_background(raw.get("background"))
 
-    # 兼容旧 skin_image → background.image
-    if normalized["skin_image"] and not normalized["background"].get("image"):
-        normalized["background"]["mode"] = "image"
-        normalized["background"]["image"] = normalized["skin_image"]
-
-    if "widgets" in raw:
-        widgets = normalize_player_widgets(raw.get("widgets"))
-        normalized["widgets"] = widgets
-        # 有日志控件时同步 show_log
-        log_visible = any(w.get("type") == "log" and w.get("visible", True) for w in widgets)
-        if any(w.get("type") == "log" for w in widgets):
-            normalized["show_log"] = log_visible
-        list_ids = [str(w.get("id") or "") for w in widgets if w.get("type") == "script_list" and w.get("id")]
-        order_raw = raw.get("list_order")
-        list_order: list[str] = []
-        if isinstance(order_raw, list):
-            for item in order_raw:
-                sid = _text(item)
-                if sid and sid in list_ids and sid not in list_order:
-                    list_order.append(sid)
-        for sid in list_ids:
-            if sid not in list_order:
+    widgets = normalize_player_widgets(raw.get("widgets"))
+    normalized["widgets"] = widgets
+    # 有日志控件时同步 show_log
+    log_visible = any(w.get("type") == "log" and w.get("visible", True) for w in widgets)
+    if any(w.get("type") == "log" for w in widgets):
+        normalized["show_log"] = log_visible
+    list_ids = [str(w.get("id") or "") for w in widgets if w.get("type") == "script_list" and w.get("id")]
+    order_raw = raw.get("list_order")
+    list_order: list[str] = []
+    if isinstance(order_raw, list):
+        for item in order_raw:
+            sid = _text(item)
+            if sid and sid in list_ids and sid not in list_order:
                 list_order.append(sid)
-        normalized["list_order"] = list_order
-        lom = _text(raw.get("list_order_mode"), "fixed").lower()
-        normalized["list_order_mode"] = lom if lom in ("fixed", "random") else "fixed"
+    for sid in list_ids:
+        if sid not in list_order:
+            list_order.append(sid)
+    normalized["list_order"] = list_order
+    lom = _text(raw.get("list_order_mode"), "fixed").lower()
+    normalized["list_order_mode"] = lom if lom in ("fixed", "random") else "fixed"
     return normalized
 
 
 def ensure_designer_ui(raw: Any = None, app_name: str = "") -> Dict[str, Any]:
-    """设计器/一键导出用：保证带默认 widgets。"""
-    if isinstance(raw, Mapping) and has_custom_widgets(raw):
-        return normalize_player_ui(raw, app_name=app_name)
-    base = default_player_ui(app_name, with_widgets=True)
-    if isinstance(raw, Mapping):
-        merged = dict(base)
-        merged.update({k: v for k, v in raw.items() if k != "widgets"})
-        if has_custom_widgets(raw):
-            merged["widgets"] = raw["widgets"]
-        return normalize_player_ui(merged, app_name=app_name)
-    return normalize_player_ui(base, app_name=app_name)
+    """新建时提供默认画布；已有配置必须满足现行格式，空画布保留。"""
+    seed = default_player_ui(app_name) if raw is None or raw == {} else raw
+    return normalize_player_ui(seed, app_name=app_name)
 
 
 def collect_ui_asset_refs(ui: Mapping[str, Any]) -> List[str]:

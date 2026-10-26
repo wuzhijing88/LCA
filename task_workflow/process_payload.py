@@ -51,11 +51,11 @@ def _validate_payload_inputs(
         if connection.get("start_card_id") is None or connection.get("end_card_id") is None:
             raise ValueError(f"连接数据缺少起点或终点: index={index}")
 
-    if not str(execution_mode or "").strip():
+    if not isinstance(execution_mode, str) or not execution_mode.strip():
         raise ValueError("execution_mode 不能为空")
     if not is_supported_screenshot_engine(screenshot_engine):
         raise ValueError(f"不支持的 screenshot_engine: {screenshot_engine!r}")
-    if not str(workflow_id or "").strip():
+    if not isinstance(workflow_id, str) or not workflow_id.strip():
         raise ValueError("workflow_id 不能为空")
     if bound_windows is not None:
         if not isinstance(bound_windows, list):
@@ -64,7 +64,7 @@ def _validate_payload_inputs(
             raise TypeError("bound_windows 中的窗口配置必须是字典")
 
     for start_card_id in start_card_ids:
-        if start_card_id not in cards_data and str(start_card_id) not in cards_data:
+        if start_card_id not in cards_data:
             raise ValueError(f"线程起点卡片不存在: {start_card_id}")
 
 
@@ -105,9 +105,25 @@ def build_process_workflow_payload(
     )
     primary_start_id = normalized_start_ids[0]
 
-    single_thread_target_hwnd = target_hwnd
-    single_thread_target_window_title = target_window_title
     safe_bound_windows = list(bound_windows or [])
+    from task_workflow.thread_window_binding import enabled_bound_windows, require_window_dimension
+    from utils.window.hwnd_utils import as_hwnd
+
+    if target_hwnd is not None and (isinstance(target_hwnd, bool) or not isinstance(target_hwnd, int)):
+        raise TypeError("目标窗口句柄必须是整数")
+    if target_window_title is not None and not isinstance(target_window_title, str):
+        raise TypeError("目标窗口标题必须是字符串")
+    normalized_target_hwnd = as_hwnd(target_hwnd) if target_hwnd is not None else None
+    single_thread_target_hwnd = normalized_target_hwnd
+    single_thread_target_window_title = target_window_title
+    default_bind_ids = [
+        window["bind_id"] for window in enabled_bound_windows(safe_bound_windows)
+        if normalized_target_hwnd is not None and window["hwnd"] == normalized_target_hwnd
+    ]
+    if len(default_bind_ids) > 1:
+        raise ValueError("默认目标窗口对应多个绑定标识")
+    default_bind_id = default_bind_ids[0] if default_bind_ids else None
+    single_thread_target_bind_id = default_bind_id
 
     if len(normalized_start_ids) == 1:
         single_thread_window_configs = resolve_thread_window_configs(
@@ -120,15 +136,10 @@ def build_process_workflow_payload(
         if single_thread_window_config:
             single_thread_target_hwnd = single_thread_window_config["target_hwnd"]
             single_thread_target_window_title = single_thread_window_config["target_window_title"]
+            single_thread_target_bind_id = single_thread_window_config["bind_id"]
 
-    try:
-        required_width = int(custom_width or 0)
-    except (TypeError, ValueError):
-        required_width = 0
-    try:
-        required_height = int(custom_height or 0)
-    except (TypeError, ValueError):
-        required_height = 0
+    required_width = require_window_dimension(custom_width, "窗口宽度")
+    required_height = require_window_dimension(custom_height, "窗口高度")
 
     payload: Dict[str, Any] = {
         "payload_version": 2,
@@ -145,6 +156,7 @@ def build_process_workflow_payload(
         "workflow_id": str(workflow_id).strip(),
         "workflow_filepath": workflow_filepath,
         "bound_windows": safe_bound_windows,
+        "target_bind_id": default_bind_id,
         "custom_width": required_width,
         "custom_height": required_height,
     }
@@ -153,15 +165,18 @@ def build_process_workflow_payload(
         payload["workflow_reference"] = {"memory_uri": memory_uri}
         payload.pop("cards_data", None)
         payload.pop("connections_data", None)
-    elif prefer_file_reference and workflow_filepath:
+    elif prefer_file_reference:
+        if not workflow_filepath:
+            raise ValueError("文件引用模式缺少工作流路径")
         workflow_path = os.path.abspath(str(workflow_filepath))
-        if os.path.isfile(workflow_path):
-            payload["workflow_reference"] = {
-                "path": workflow_path,
-                "sha256": _sha256_file(workflow_path),
-            }
-            payload.pop("cards_data", None)
-            payload.pop("connections_data", None)
+        if not os.path.isfile(workflow_path):
+            raise FileNotFoundError(f"工作流引用文件不存在: {workflow_path}")
+        payload["workflow_reference"] = {
+            "path": workflow_path,
+            "sha256": _sha256_file(workflow_path),
+        }
+        payload.pop("cards_data", None)
+        payload.pop("connections_data", None)
 
     if len(normalized_start_ids) > 1:
         thread_window_configs = resolve_thread_window_configs(
@@ -174,7 +189,7 @@ def build_process_workflow_payload(
             {
                 "session_mode": "multi_thread",
                 "target_window_title": target_window_title,
-                "target_hwnd": target_hwnd,
+                "target_hwnd": normalized_target_hwnd,
                 "start_card_ids": normalized_start_ids,
                 "thread_labels": dict(thread_labels or {}),
                 "thread_window_configs": thread_window_configs,
@@ -187,6 +202,7 @@ def build_process_workflow_payload(
             "session_mode": "single",
             "target_window_title": single_thread_target_window_title,
             "target_hwnd": single_thread_target_hwnd,
+            "target_bind_id": single_thread_target_bind_id,
             "start_card_id": primary_start_id,
             "test_mode": test_mode,
         }

@@ -87,11 +87,10 @@ class AsyncScreenshotPipeline:
             )
 
             self.request_futures[request_id] = future
-            future.add_done_callback(
-                lambda done_future, rid=request_id: self._on_future_done(rid, done_future)
-            )
-            if future.done():
-                self._on_future_done(request_id, future)
+        # 已完成的 Future 会同步执行回调，注册时不能持有回调需要的锁。
+        future.add_done_callback(
+            lambda done_future, rid=request_id: self._on_future_done(rid, done_future)
+        )
         logger.debug(f"截图请求已提交: {request_id} (hwnd={hwnd})")
 
         return future
@@ -146,11 +145,6 @@ class AsyncScreenshotPipeline:
             logger.error(f"截图请求异常 {request_id}: {e}", exc_info=True)
             return None
 
-        finally:
-            # 清理请求记录
-            with self._lock:
-                self.request_futures.pop(request_id, None)
-
     def request_screenshot_sync(self, hwnd: int, timeout: float = 2.0,
                                use_cache: bool = False,
                                client_area_only: bool = True) -> Optional[np.ndarray]:
@@ -195,8 +189,6 @@ class AsyncScreenshotPipeline:
             wait: 是否等待所有任务完成
         """
         with self._lock:
-            if not self._running:
-                return
             self._running = False
             futures_snapshot = list(self.request_futures.values())
 
@@ -214,7 +206,6 @@ class AsyncScreenshotPipeline:
 
         with self._lock:
             pending_count = len(self.request_futures)
-            self.request_futures.clear()
         if pending_count > 0:
             logger.warning(f"还有 {pending_count} 个截图请求未完成")
 
@@ -248,11 +239,10 @@ _global_lock = threading.Lock()
 def get_global_pipeline() -> AsyncScreenshotPipeline:
     """获取全局异步截图管道"""
     global _global_pipeline
-    if _global_pipeline is None:
-        with _global_lock:
-            if _global_pipeline is None:
-                _global_pipeline = AsyncScreenshotPipeline(max_workers=2)
-    return _global_pipeline
+    with _global_lock:
+        if _global_pipeline is None:
+            _global_pipeline = AsyncScreenshotPipeline(max_workers=2)
+        return _global_pipeline
 
 
 def shutdown_global_pipeline():
@@ -260,9 +250,6 @@ def shutdown_global_pipeline():
     global _global_pipeline
     with _global_lock:
         pipeline = _global_pipeline
-        _global_pipeline = None
-    if pipeline is not None:
-        pipeline.shutdown(wait=True)
-
-
-# 简化的API
+        if pipeline is not None:
+            pipeline.shutdown(wait=True)
+            _global_pipeline = None

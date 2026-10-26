@@ -151,7 +151,6 @@ def _handle_success(action: str, jump_id: Optional[int], card_id: Optional[int])
         action=action,
         jump_id=jump_id,
         card_id=card_id,
-        require_jump_target=True,
     )
     if result[1] == "跳转到步骤":
         logger.info(f"点击成功，跳转到步骤 {result[2]}")
@@ -172,7 +171,6 @@ def _handle_failure(action: str, jump_id: Optional[int], card_id: Optional[int])
         action=action,
         jump_id=jump_id,
         card_id=card_id,
-        require_jump_target=True,
     )
     if result[1] == "跳转到步骤":
         logger.warning(f"点击失败，跳转到步骤 {result[2]}")
@@ -1002,7 +1000,7 @@ def _execute_color_click(params: Dict[str, Any], execution_mode: str, target_hwn
         last_result: Optional[Tuple[bool, str, Optional[int]]] = None
         for attempt in range(1, max_attempts + 1):
             if callable(stop_checker) and stop_checker():
-                return False, '任务已停止', None
+                return False, '停止工作流', None
             if attempt > 1:
                 logger.info(f"[找色功能] 开始第{attempt}次识别尝试")
 
@@ -2755,6 +2753,9 @@ def preview_image_recognition(params: Dict[str, Any], target_hwnd: Optional[int]
 def preview_color_recognition(params: Dict[str, Any], target_hwnd: Optional[int] = None, main_window=None, parameter_panel=None):
     """测试找色识别功能（复用找色执行链路，仅识别不点击）。"""
     def restore_windows():
+        cancellation = getattr(parameter_panel, "_cancelled", None)
+        if cancellation is not None and cancellation.is_set():
+            return
         try:
             from PySide6.QtCore import QTimer
 
@@ -2883,6 +2884,7 @@ def preview_color_recognition(params: Dict[str, Any], target_hwnd: Optional[int]
             match_results,
             restore_windows,
             source_size=overlay_source_size,
+            owner=parameter_panel,
         )
 
         logger.info("=" * 60)

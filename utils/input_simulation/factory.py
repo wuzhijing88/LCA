@@ -405,6 +405,17 @@ class GlobalInputSimulatorManager:
         self._close_simulators(simulators)
         logger.info("输入模拟器缓存已清除")
 
+    def invalidate_window(self, hwnd: int) -> None:
+        """使指定窗口的缓存实例失效，并完成实例资源释放。"""
+        handle = int(hwnd or 0)
+        if handle <= 0:
+            raise ValueError("窗口句柄无效")
+        with self._lock:
+            keys = [key for key in self._simulators if key[1] == handle]
+            simulators = self._evict_cache_keys_unlocked(keys)
+        self._close_simulators(simulators)
+        logger.info("窗口输入模拟器缓存已失效: hwnd=%s", handle)
+
     def get_default_operation_mode(self) -> str:
         """获取默认操作模式"""
         return self._default_operation_mode

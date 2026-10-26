@@ -159,12 +159,8 @@ def build_worker_process_env(
         env["PATH"] = _prepend_path_once(env.get("PATH"), scripts_dir)
 
     if include_plugin_attach:
-        try:
-            from utils.plugin.runtime import plugin_attach_env
-
-            env.update(plugin_attach_env())
-        except Exception:
-            pass
+        from utils.plugin.runtime import plugin_attach_env
+        env.update(plugin_attach_env())
     return env
 
 

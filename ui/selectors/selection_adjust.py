@@ -8,7 +8,6 @@ from typing import Optional
 from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtWidgets import QPushButton
 
-from themes import theme_color, theme_rgba
 
 SELECTION_MIN_SIZE = 10
 SELECTION_BORDER_MARGIN = 8
@@ -207,81 +206,8 @@ def create_overlay_adjust_buttons(parent, on_confirm, on_reselect):
 
 
 def apply_overlay_adjust_button_style(confirm_button, reselect_button) -> None:
-    confirm_id = confirm_button.objectName() or "overlayAdjustConfirmButton"
-    reselect_id = reselect_button.objectName() or "overlayAdjustReselectButton"
-    accent = theme_color("accent")
-    accent_hover = theme_color("accent_hover")
-    accent_pressed = theme_color("accent_pressed")
-    accent_text = theme_color("accent_text")
-    text = theme_color("text")
-    text_disabled = theme_color("text_disabled")
-    surface = theme_color("surface")
-    border_light = theme_color("border_light")
-    surface_rgba = theme_rgba("surface", 228)
-    hover_rgba = theme_rgba("hover", 240)
-    pressed_rgba = theme_rgba("pressed", 246)
-    border_rgba = theme_rgba("border", 235)
-
-    common_style = (
-        "outline: none;"
-        "border-radius: 10px;"
-        "padding: 0 14px;"
-        'font-family: "Microsoft YaHei";'
-        "font-size: 12px;"
-        "font-weight: 600;"
-        "min-height: 30px;"
-        "letter-spacing: 0.5px;"
-    )
-    style = f"""
-        QPushButton#{confirm_id} {{
-            {common_style}
-            background-color: {accent};
-            color: {accent_text};
-            border: 1px solid {accent};
-        }}
-        QPushButton#{confirm_id}:hover {{
-            background-color: {accent_hover};
-            border-color: {accent_hover};
-        }}
-        QPushButton#{confirm_id}:pressed {{
-            background-color: {accent_pressed};
-            border-color: {accent_pressed};
-        }}
-        QPushButton#{confirm_id}:focus {{
-            outline: none;
-            border: 1px solid {accent_hover};
-        }}
-        QPushButton#{confirm_id}:disabled {{
-            background-color: {surface};
-            color: {text_disabled};
-            border: 1px solid {border_light};
-        }}
-        QPushButton#{reselect_id} {{
-            {common_style}
-            background-color: {surface_rgba};
-            color: {text};
-            border: 1px solid {border_rgba};
-        }}
-        QPushButton#{reselect_id}:hover {{
-            background-color: {hover_rgba};
-            border-color: {border_rgba};
-        }}
-        QPushButton#{reselect_id}:pressed {{
-            background-color: {pressed_rgba};
-            border-color: {border_rgba};
-        }}
-        QPushButton#{reselect_id}:focus {{
-            outline: none;
-            border: 1px solid {border_rgba};
-        }}
-        QPushButton#{reselect_id}:disabled {{
-            background-color: {surface};
-            color: {text_disabled};
-            border: 1px solid {border_light};
-        }}
-    """
-    confirm_button.setStyleSheet(style)
-    reselect_button.setStyleSheet(style)
+    from themes.capture_tools import apply_capture_action_buttons
+    apply_capture_action_buttons(confirm_button, reselect_button)
 
 
 def update_adjust_buttons_position(

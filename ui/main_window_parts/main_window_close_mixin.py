@@ -238,6 +238,8 @@ class MainWindowCloseMixin:
             execution_log_panel.cleanup()
             execution_log_panel.deleteLater()
             self._execution_log_panel = None
+        if getattr(self, "_window_monitor_timer", None) is not None:
+            self._stop_window_monitor()
         logger.info("closeEvent: 接受关闭事件，UI立即退出，后台继续清理...")
         event.accept()
         # 显式调用 QApplication.quit()

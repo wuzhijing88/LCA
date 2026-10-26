@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import logging
 import os
+import copy
+import json
+import hashlib
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QBuffer, QEvent, QIODevice, QObject, QUrl, Qt, QThread, Signal
+from PySide6.QtCore import QBuffer, QEvent, QIODevice, QObject, QTimer, QUrl, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
     QCloseEvent,
     QDesktopServices,
@@ -50,7 +54,6 @@ from app_core.ai_assistant import (
     AI_WORKFLOW_EXTS,
     AIProviderConfig,
     DEFAULT_BASE_URL,
-    DEFAULT_MODEL,
     FILE_ONLY_PROMPT,
     MAX_AI_IMAGE_BYTES,
     MAX_AI_IMAGES_PER_TURN,
@@ -62,9 +65,13 @@ from app_core.ai_assistant import (
     build_ai_chat_messages,
     complete_ai_chat,
     chat_system_prompt,
+    collect_editor_workflow_snapshot,
+    collect_workflow_resources,
     editor_task_types,
-    editor_workflow_bundle,
+    editor_resource_dirs,
+    format_editor_workflow_context,
     format_uploaded_workflows_context,
+    inspect_uploaded_workflow_file,
     load_ai_provider_settings,
     normalize_ai_base_url,
     proposal_source_workflow,
@@ -78,15 +85,19 @@ from app_core.ai_workflow import (
     write_workflow_lca,
 )
 from app_core.lca_format.constants import LCA_EXTENSION, LCA_SAVE_FILTER
-from app_core.ai_chat_format import format_ai_thinking_html, format_ai_transcript_html
+from app_core.ai_chat_format import format_ai_transcript_html, iter_message_segments
+from app_core.ai_stream import AICancellation, AIRequestCancelled
+from app_core.ai_models import fetch_ai_models
+from themes import ThemedComboBox
 from app_core.ai_sessions import (
+    MAX_ACTIVITY,
+    MAX_SESSIONS,
     append_message,
     chat_history,
     create_session,
     delete_session,
     get_session,
     latest_attached_files,
-    latest_user_files,
     load_ai_sessions,
     rename_session,
     save_ai_sessions,
@@ -109,37 +120,107 @@ _WORKFLOW_FILE_FILTER = "工作流 (*.json *.lca)"
 _PREVIEW_MIN_SCALE = 0.05
 _PREVIEW_MAX_SCALE = 16.0
 _PREVIEW_ZOOM_STEP = 1.15
+_MAX_ACTIVE_TASKS = 4
+_MAX_QUEUED_TURNS = 8
+
+
+@dataclass
+class _AIRequest:
+    config: AIProviderConfig
+    prompt: str
+    images: list
+    files: list
+    context_files: list
+    snapshot: dict
+    resource_dirs: dict
+    task_types: list
+
+
+@dataclass
+class _AIRun:
+    worker: Any
+    request: _AIRequest
+    message: dict
+    status: str = "正在请求 AI 服务…"
+    content_parts: list = field(default_factory=list)
+    round_content: bool = False
+    next_request: Optional[_AIRequest] = None
 
 
 class _AIWorker(QThread):
-    completed = Signal(str, str)
+    completed = Signal(str)
     failed = Signal(str)
-    progressed = Signal(str)
+    cancelled = Signal()
+    event_received = Signal(object)
 
-    def __init__(self, config: AIProviderConfig, messages, parent=None):
+    def __init__(self, session_id: str, request: _AIRequest, history, parent=None):
         super().__init__(parent)
-        self._config = config
-        self._messages = messages
+        self.session_id = session_id
+        self.request = request
+        self.history = history
+        self.cancel_token = AICancellation()
+
+    def cancel(self):
+        self.cancel_token.cancel()
+        self.requestInterruption()
 
     def run(self) -> None:
-        def progress(message):
-            if self.isInterruptionRequested():
-                raise InterruptedError("AI 请求已取消")
-            self.progressed.emit(message)
-
         try:
-            if self.isInterruptionRequested():
-                return
-            text, thinking = complete_ai_chat(
-                self._config,
-                self._messages,
-                progress=progress,
+            self.cancel_token.check()
+            request = self.request
+            workflow = request.snapshot.get("workflow")
+            resources = collect_workflow_resources(workflow, request.resource_dirs, cancel=self.cancel_token)
+            self.cancel_token.check()
+            images = [{"path": item["abs_path"], "data_url": item["data_url"]}
+                      for item in resources if item.get("attach_index", 0) > 0]
+            messages = build_ai_chat_messages(
+                chat_system_prompt(
+                    workflow_context=format_editor_workflow_context(request.snapshot, resources=resources),
+                    uploaded_workflow_context=format_uploaded_workflows_context(request.context_files),
+                ), self.history, extra_images=images,
             )
-            if not self.isInterruptionRequested():
-                self.completed.emit(text, thinking)
+            if request.context_files:
+                source = inspect_uploaded_workflow_file(request.context_files[0]["path"],
+                                                       display_name=request.context_files[0]["name"])
+                workflow = source.get("workflow") if source.get("status") == "ok" else None
+            text, _ = complete_ai_chat(
+                request.config, messages, use_cache=False,
+                on_event=self.event_received.emit, cancel=self.cancel_token,
+                tool_context={"workflow": workflow, "task_types": request.task_types},
+            )
+            self.cancel_token.check()
+            self.completed.emit(text)
+        except AIRequestCancelled:
+            self.cancelled.emit()
         except Exception as exc:
-            if not self.isInterruptionRequested():
-                self.failed.emit(str(exc))
+            self.failed.emit(str(exc))
+        finally:
+            self.history = []
+
+
+class _AIModelsWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: AIProviderConfig, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.cancel_token = AICancellation()
+
+    def cancel(self):
+        self.cancel_token.cancel()
+        self.requestInterruption()
+
+    def run(self):
+        try:
+            models = fetch_ai_models(self.config, cancel=self.cancel_token)
+            self.cancel_token.check()
+            self.completed.emit(models)
+        except AIRequestCancelled:
+            return
+        except Exception as exc:
+            self.failed.emit(str(exc).replace(self.config.api_key, "[已隐藏]")
+                             if self.config.api_key else str(exc))
 
 
 class _AIPromptEnterFilter(QObject):
@@ -394,23 +475,49 @@ class AIAssistantDialog(QDialog):
     def __init__(self, main_window=None):
         super().__init__(main_window)
         self.main_window = main_window
+        self._owner = main_window
+        if self._owner is not None:
+            self._owner.installEventFilter(self)
         self._store: Dict[str, Any] = {}
         self._session_id = ""
         self._loading_session = False
-        self._worker: Optional[_AIWorker] = None
+        self._runs: Dict[str, _AIRun] = {}
+        self._queues: Dict[str, list] = {}
+        self._retry_requests: Dict[str, _AIRequest] = {}
+        self._drafts: Dict[str, dict] = {}
+        self._expanded_activity: Dict[str, set] = {}
+        self._closing = False
+        self._storage_error = ""
+        self._retired = False
+        self._retiring_workers = []
+        self._models_worker = None
+        self._model_workers = []
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(60)
+        self._render_timer.timeout.connect(self._render_chat)
+        self._checkpoint_timer = QTimer(self)
+        self._checkpoint_timer.setSingleShot(True)
+        self._checkpoint_timer.setInterval(1000)
+        self._checkpoint_timer.timeout.connect(self._persist_sessions)
         self._copy_payloads: List[str] = []
+        self._payload_contexts: List[dict] = []
         self._image_paths: List[str] = []
         self._image_preview: Optional[AIImagePreviewDialog] = None
         self._pending_images: List[Dict[str, Any]] = []
         self._pending_files: List[Dict[str, Any]] = []
-        self._thinking_live = False
         self._prompt_filter = _AIPromptEnterFilter(self)
-        self._build_ui()
-        self._load_sessions()
-        self._load_provider_into_form()
-        self._refresh_session_list()
-        self._render_chat()
-        self._register_theme_callback()
+        try:
+            self._build_ui()
+            self._load_sessions()
+            self._load_provider_into_form()
+            self._refresh_session_list()
+            self._render_chat()
+            self._register_theme_callback()
+        except Exception:
+            self._shutdown_runs()
+            super().deleteLater()
+            raise
 
     def refresh_for_main_window(self, main_window=None) -> None:
         if main_window is not None:
@@ -419,7 +526,7 @@ class AIAssistantDialog(QDialog):
     def _build_ui(self) -> None:
         self.setObjectName("aiAssistantDialog")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setWindowTitle("AI 助手")
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowFlag(Qt.WindowType.Window, True)
@@ -478,8 +585,28 @@ class AIAssistantDialog(QDialog):
         self.base_url_edit = QLineEdit()
         self.base_url_edit.setPlaceholderText(DEFAULT_BASE_URL)
         self.base_url_edit.editingFinished.connect(self._complete_base_url)
-        self.model_edit = QLineEdit()
-        self.model_edit.setPlaceholderText(DEFAULT_MODEL)
+        self.model_combo = ThemedComboBox()
+        self.model_combo.setObjectName("aiModelCombo")
+        self.model_combo.setEditable(True)
+        self.model_combo.setInsertPolicy(ThemedComboBox.InsertPolicy.NoInsert)
+        self.model_combo.setMaxVisibleItems(12)
+        self.model_combo.setMinimumContentsLength(20)
+        self.model_combo.setSizeAdjustPolicy(
+            ThemedComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.model_combo.lineEdit().setPlaceholderText("选择或填写模型")
+        self.model_combo.setToolTip("获取服务返回的模型列表后选择，也可填写服务提供的模型 ID。")
+        self.fetch_models_button = QPushButton("获取模型")
+        self.fetch_models_button.setObjectName("aiFetchModelsButton")
+        self.fetch_models_button.clicked.connect(self._fetch_models)
+        model_row = QHBoxLayout()
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(6)
+        model_row.addWidget(self.model_combo, 1)
+        model_row.addWidget(self.fetch_models_button)
+        self.model_status = QLabel("尚未获取模型列表，当前模型的支持情况未知。")
+        self.model_status.setWordWrap(True)
+        self.model_status.setTextFormat(Qt.TextFormat.PlainText)
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_edit.setPlaceholderText("只保存在本机，不写入工作流")
@@ -487,9 +614,13 @@ class AIAssistantDialog(QDialog):
         self.timeout_spin.setRange(5, 300)
         self.timeout_spin.setValue(90)
         form.addRow("服务地址", self.base_url_edit)
-        form.addRow("模型", self.model_edit)
+        form.addRow("模型", model_row)
+        form.addRow("", self.model_status)
         form.addRow("API Key", self.api_key_edit)
         form.addRow("超时(秒)", self.timeout_spin)
+        self.base_url_edit.textChanged.connect(self._invalidate_models)
+        self.api_key_edit.textChanged.connect(self._invalidate_models)
+        self.timeout_spin.valueChanged.connect(self._invalidate_models)
         self.settings_panel = panel
         panel.setVisible(self.settings_button.isChecked())
         return panel
@@ -570,6 +701,21 @@ class AIAssistantDialog(QDialog):
         self.prompt_edit.setAcceptDrops(True)
         self.prompt_edit.installEventFilter(self._prompt_filter)
         layout.addWidget(self.prompt_edit)
+        self.queue_panel = QWidget()
+        queue_layout = QVBoxLayout(self.queue_panel)
+        queue_layout.setContentsMargins(0, 0, 0, 0)
+        queue_header = QHBoxLayout()
+        queue_header.addWidget(QLabel("待发送消息"))
+        queue_header.addStretch(1)
+        remove_queued = QPushButton("移除选中")
+        remove_queued.clicked.connect(self._remove_queued_request)
+        queue_header.addWidget(remove_queued)
+        queue_layout.addLayout(queue_header)
+        self.queue_list = QListWidget()
+        self.queue_list.setMaximumHeight(80)
+        queue_layout.addWidget(self.queue_list)
+        self.queue_panel.hide()
+        layout.addWidget(self.queue_panel)
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 0, 0, 0)
         self.status_label = QLabel("")
@@ -584,10 +730,24 @@ class AIAssistantDialog(QDialog):
         self.send_button = QPushButton("发送")
         self.send_button.setProperty("primary", True)
         self.send_button.clicked.connect(self.send_current_prompt)
+        self.stop_button = QPushButton("停止")
+        self.stop_button.setToolTip("停止当前任务并清空本会话的待发送队列，保留已收到的内容")
+        self.stop_button.clicked.connect(self.stop_current_task)
+        self.stop_button.setVisible(False)
+        self.retry_button = QPushButton("重试")
+        self.retry_button.clicked.connect(self.retry_current_task)
+        self.retry_button.setVisible(False)
+        self.steer_button = QPushButton("立即补充")
+        self.steer_button.setToolTip("停止本轮，按输入框中的补充说明立即继续；其他排队消息保持原顺序")
+        self.steer_button.clicked.connect(lambda: self.send_current_prompt(interrupt=True))
+        self.steer_button.hide()
         footer.addWidget(self.status_label, 1)
         footer.addWidget(self.image_button)
         footer.addWidget(self.file_button)
         footer.addWidget(self.review_button)
+        footer.addWidget(self.retry_button)
+        footer.addWidget(self.stop_button)
+        footer.addWidget(self.steer_button)
         footer.addWidget(self.send_button)
         layout.addLayout(footer)
         return panel
@@ -610,27 +770,86 @@ class AIAssistantDialog(QDialog):
         self._render_chat()
 
     def done(self, result) -> None:
-        self._persist_sessions()
-        self._save_provider_from_form()
-        self._save_window_state()
-        super().done(result)
+        self._shutdown_runs()
+        try:
+            self._persist_sessions()
+            self._save_provider_from_form()
+            self._save_window_state()
+        finally:
+            super().done(result)
+            self.request_delete()
 
     def request_delete(self):
-        """关闭立即解绑 UI，网络请求收尾前保留工作线程的 Qt 父对象。"""
+        if self._retired:
+            return
+        self._retired = True
+        self._shutdown_runs()
+        self._persist_sessions()
         if self._image_preview is not None:
             self._image_preview.close()
             self._image_preview = None
-        worker, self._worker = self._worker, None
-        if worker is not None:
-            worker.requestInterruption()
+        for worker in self._retiring_workers:
             for signal, slot in (
                 (worker.completed, self._on_reply),
                 (worker.failed, self._on_reply_failed),
-                (worker.progressed, self._on_reply_progress),
+                (worker.cancelled, self._on_reply_cancelled),
+                (worker.event_received, self._on_run_event),
                 (worker.finished, self._on_reply_finished),
             ):
                 signal.disconnect(slot)
-        retire_dialog(self, (worker,))
+        for worker in self._model_workers:
+            worker.completed.disconnect(self._on_models_loaded)
+            worker.failed.disconnect(self._on_models_failed)
+            worker.finished.disconnect(self._on_models_finished)
+        retire_dialog(self, [*self._retiring_workers, *self._model_workers])
+
+    def _shutdown_runs(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._cancel_models_request()
+        if self._owner is not None and isValid(self._owner):
+            self._owner.removeEventFilter(self)
+        self._render_timer.stop()
+        self._checkpoint_timer.stop()
+        self._flush_stream_content()
+        for run in self._runs.values():
+            run.worker.cancel()
+            if run.next_request is not None:
+                self._remove_request_attachments(run.next_request)
+            if run.message.get("run_status") in {"running", "stopping"}:
+                run.message["run_status"] = "cancelled"
+                run.message["error"] = "窗口已关闭，本次任务已停止，部分内容不代表完整结论。"
+            self._retiring_workers.append(run.worker)
+        self._runs.clear()
+        for session_id in list(self._queues):
+            self._discard_queue(session_id)
+        self._retry_requests.clear()
+        self._drafts.clear()
+        self._pending_images.clear()
+        self._pending_files.clear()
+
+    def deleteLater(self):
+        if (self._runs or self._model_workers) and not self._closing:
+            self.request_delete()
+            return
+        super().deleteLater()
+
+    def eventFilter(self, watched, event):
+        if watched is self._owner and event.type() == QEvent.Type.DeferredDelete:
+            self.request_delete()
+        return super().eventFilter(watched, event)
+
+    def hideEvent(self, event):
+        self._render_timer.stop()
+        if self._models_worker is not None:
+            self._cancel_models_request()
+            self.model_status.setText("已取消获取模型，模型支持情况未知。")
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._render_chat()
 
     def _load_settings_visible(self) -> bool:
         try:
@@ -643,6 +862,9 @@ class AIAssistantDialog(QDialog):
     def _toggle_settings(self) -> None:
         visible = self.settings_button.isChecked()
         self.settings_panel.setVisible(visible)
+        if not visible and self._models_worker is not None:
+            self._cancel_models_request()
+            self.model_status.setText("已取消获取模型，模型支持情况未知。")
         try:
             from utils.instance_runtime import create_app_settings
 
@@ -671,35 +893,106 @@ class AIAssistantDialog(QDialog):
 
     def _load_provider_into_form(self) -> None:
         values = load_ai_provider_settings()
-        self.base_url_edit.setText(str(values.get("base_url") or DEFAULT_BASE_URL))
-        self.model_edit.setText(str(values.get("model") or DEFAULT_MODEL))
-        self.api_key_edit.setText(str(values.get("api_key") or ""))
-        self.timeout_spin.setValue(int(values.get("timeout") or 90))
+        self.base_url_edit.setText(values["base_url"])
+        self.model_combo.setEditText(values["model"])
+        self.api_key_edit.setText(values["api_key"])
+        self.timeout_spin.setValue(values["timeout"])
+        self.model_status.setText("尚未获取模型列表，当前模型的支持情况未知。")
 
     def _complete_base_url(self) -> None:
+        if not self.base_url_edit.text().strip():
+            return
         completed = normalize_ai_base_url(self.base_url_edit.text())
         if self.base_url_edit.text() != completed:
             self.base_url_edit.setText(completed)
 
     def _save_provider_from_form(self) -> None:
         self._complete_base_url()
-        try:
-            save_ai_provider_settings(
-                base_url=self.base_url_edit.text(),
-                model=self.model_edit.text(),
-                api_key=self.api_key_edit.text(),
-                timeout=int(self.timeout_spin.value()),
-            )
-        except Exception:
-            logger.debug("保存 AI 设置失败", exc_info=True)
+        save_ai_provider_settings(
+            base_url=self.base_url_edit.text(),
+            model=self.model_combo.currentText(),
+            api_key=self.api_key_edit.text(),
+            timeout=int(self.timeout_spin.value()),
+        )
 
     def _provider_config(self) -> AIProviderConfig:
         return AIProviderConfig(
-            str(self.base_url_edit.text() or "").strip(),
-            str(self.model_edit.text() or "").strip(),
-            str(self.api_key_edit.text() or ""),
-            int(self.timeout_spin.value() or 90),
+            self.base_url_edit.text().strip(),
+            self.model_combo.currentText().strip(),
+            self.api_key_edit.text(),
+            self.timeout_spin.value(),
         )
+
+    def _clear_model_options(self):
+        current = self.model_combo.currentText()
+        self.model_combo.clear()
+        self.model_combo.setEditText(current)
+
+    def _cancel_models_request(self):
+        if self._models_worker is not None:
+            self._models_worker.cancel()
+            self._models_worker = None
+            self.fetch_models_button.setText("正在取消…")
+
+    def _invalidate_models(self):
+        self._cancel_models_request()
+        self._clear_model_options()
+        self.model_status.setText("服务设置已变更，请重新获取模型；当前模型支持情况未知。")
+
+    def _fetch_models(self):
+        if self._closing or self._model_workers:
+            return
+        config = self._provider_config()
+        if not config.base_url or not config.api_key.strip():
+            self.model_status.setText("请先填写服务地址和 API Key，再获取模型。")
+            return
+        self._clear_model_options()
+        worker = _AIModelsWorker(config, self)
+        self._models_worker = worker
+        self._model_workers.append(worker)
+        worker.completed.connect(self._on_models_loaded)
+        worker.failed.connect(self._on_models_failed)
+        worker.finished.connect(self._on_models_finished)
+        self.fetch_models_button.setEnabled(False)
+        self.fetch_models_button.setText("获取中…")
+        self.model_combo.setEnabled(False)
+        self.model_status.setText("正在获取当前服务支持的模型…")
+        worker.start()
+
+    @Slot(object)
+    def _on_models_loaded(self, models):
+        if self._closing or self.sender() is not self._models_worker:
+            return
+        current = self.model_combo.currentText().strip()
+        self.model_combo.clear()
+        self.model_combo.addItems(models)
+        index = self.model_combo.findText(current, Qt.MatchFlag.MatchExactly)
+        self.model_combo.setCurrentIndex(index)
+        if index < 0:
+            self.model_combo.setEditText("")
+        self.model_status.setText(f"已获取 {len(models)} 个模型，请从下拉列表选择。")
+
+    @Slot(str)
+    def _on_models_failed(self, error):
+        if self._closing or self.sender() is not self._models_worker:
+            return
+        self.model_status.setText(f"获取模型失败：{error}；模型支持情况未知，未自动切换模型。")
+
+    @Slot()
+    def _on_models_finished(self):
+        if self._retired:
+            return
+        worker = self.sender()
+        if worker is self._models_worker:
+            self._models_worker = None
+        self._model_workers.remove(worker)
+        worker.completed.disconnect(self._on_models_loaded)
+        worker.failed.disconnect(self._on_models_failed)
+        worker.finished.disconnect(self._on_models_finished)
+        worker.deleteLater()
+        self.fetch_models_button.setEnabled(not self._closing)
+        self.fetch_models_button.setText("获取模型")
+        self.model_combo.setEnabled(not self._closing)
 
     def _current_session(self) -> Optional[Dict[str, Any]]:
         return get_session(self._store, self._session_id)
@@ -715,10 +1008,20 @@ class AIAssistantDialog(QDialog):
     def _persist_sessions(self) -> None:
         if not self._store:
             return
+        self._flush_stream_content()
+        self._checkpoint_timer.stop()
         try:
             save_ai_sessions(self._store)
-        except Exception:
+            self._storage_error = ""
+        except Exception as exc:
+            self._storage_error = f"保存 AI 会话失败：{exc}；结果尚未持久保存。"
+            self._set_status(self._storage_error)
             logger.debug("保存 AI 会话失败", exc_info=True)
+
+    def _flush_stream_content(self):
+        for run in self._runs.values():
+            if run.message.get("run_status") in {"running", "stopping"}:
+                run.message["content"] = "".join(run.content_parts).rstrip()
 
     def _refresh_session_list(self) -> None:
         self._loading_session = True
@@ -726,7 +1029,14 @@ class AIAssistantDialog(QDialog):
             self.session_list.clear()
             current_item = None
             for session in self._store.get("sessions") or []:
-                item = QListWidgetItem(str(session.get("title") or "新对话"))
+                session_id = session.get("id")
+                label = str(session.get("title") or "新对话")
+                run = self._runs.get(session_id)
+                if run is not None:
+                    label += " · " + {"running": "执行中", "stopping": "停止中", "completed": "已完成",
+                                      "failed": "失败", "cancelled": "已停止"}[run.message["run_status"]]
+                item = QListWidgetItem(label)
+                item.setToolTip(label)
                 item.setData(Qt.ItemDataRole.UserRole, session.get("id"))
                 self.session_list.addItem(item)
                 if session.get("id") == self._session_id:
@@ -755,20 +1065,31 @@ class AIAssistantDialog(QDialog):
     def _render_chat(self) -> None:
         if not hasattr(self, "chat_view") or self.chat_view is None:
             return
+        self._render_timer.stop()
+        self._flush_stream_content()
+        scrollbar = self.chat_view.verticalScrollBar()
+        position = scrollbar.value()
+        follow = position >= scrollbar.maximum() - 24
         session = self._current_session()
+        messages = list((session or {}).get("messages") or [])
         colors = self._theme_colors()
         html, payloads, image_paths = format_ai_transcript_html(
-            list((session or {}).get("messages") or []),
-            colors,
+            messages, colors, expanded_activity=self._expanded_activity.get(self._session_id, set()),
         )
-        if self._thinking_live:
-            live = format_ai_thinking_html("", colors, live=True)
-            html = f"{html}<div>{live}</div>"
+        contexts = []
+        attached = []
+        for message in messages:
+            if message.get("role") == "user" and message.get("files"):
+                attached = message["files"]
+            for kind, _, _ in iter_message_segments(message.get("content", "")):
+                if kind == "fence":
+                    source_files = message.get("source_files", []) if message.get("role") == "assistant" else attached
+                    contexts.append({"files": source_files, "message": message})
+        self._payload_contexts = contexts
         self._copy_payloads = payloads
         self._image_paths = image_paths
         self.chat_view.setHtml(html)
-        scrollbar = self.chat_view.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        scrollbar.setValue(scrollbar.maximum() if follow else position)
 
     def _on_chat_anchor(self, url: QUrl) -> None:
         if url.scheme() in {"http", "https"}:
@@ -780,6 +1101,13 @@ class AIAssistantDialog(QDialog):
             index = int(index_text)
         except ValueError:
             index = -1
+        if url.scheme() == "activity":
+            messages = (self._current_session() or {}).get("messages", [])
+            if 0 <= index < len(messages):
+                expanded = self._expanded_activity.setdefault(self._session_id, set())
+                expanded.symmetric_difference_update({index})
+                self._render_chat()
+            return
         if url.scheme() == "apply":
             self._apply_workflow_payload(index)
             return
@@ -832,12 +1160,13 @@ class AIAssistantDialog(QDialog):
             return
         body = self._copy_payloads[index]
         try:
+            context = self._workflow_payload_context(index)
             ops = parse_workflow_proposal(body)
         except ValueError as exc:
             QMessageBox.warning(self, "无法应用", str(exc))
             self._set_status(str(exc))
             return
-        uploaded_files = latest_user_files(self._current_session())
+        uploaded_files = context["files"]
         source_workflow = None
         confirm = f"是否覆盖当前正在编辑的工作流？共 {len(ops)} 项操作。"
         if uploaded_files:
@@ -856,6 +1185,7 @@ class AIAssistantDialog(QDialog):
         if mode is None:
             return
         try:
+            self._verify_workflow_source(context)
             result = apply_editor_workflow(
                 self.main_window,
                 body,
@@ -903,10 +1233,11 @@ class AIAssistantDialog(QDialog):
             return
         body = self._copy_payloads[index]
         try:
+            context = self._workflow_payload_context(index)
             parse_workflow_proposal(body)
             source, display_name = proposal_source_workflow(
                 self.main_window,
-                latest_user_files(self._current_session()),
+                context["files"],
             )
             types = editor_task_types(self.main_window)
             if not types:
@@ -930,6 +1261,7 @@ class AIAssistantDialog(QDialog):
         if not path:
             return
         try:
+            self._verify_workflow_source(context)
             saved = write_workflow_lca(path, workflow, display_name=display_name)
         except Exception as exc:
             QMessageBox.warning(self, "下载失败", str(exc))
@@ -940,6 +1272,24 @@ class AIAssistantDialog(QDialog):
             f"{len(workflow.get('cards') or [])} 张卡片、"
             f"{len(workflow.get('connections') or [])} 条连线。"
         )
+
+    def _workflow_payload_context(self, index):
+        if not 0 <= index < len(self._payload_contexts):
+            raise ValueError("找不到该方案对应的会话上下文，请重新审查。")
+        context = self._payload_contexts[index]
+        message = context["message"]
+        if message.get("run_status") != "completed":
+            raise ValueError("该任务尚未完整完成，不能应用或下载其中的工作流。")
+        self._verify_workflow_source(context)
+        return context
+
+    def _verify_workflow_source(self, context):
+        message = context["message"]
+        fingerprint = message.get("source_fingerprint")
+        if fingerprint:
+            current = collect_editor_workflow_snapshot(self.main_window)
+            if current.get("status") == "error" or self._workflow_fingerprint(current.get("workflow")) != fingerprint:
+                raise ValueError("当前画布与提交任务时不同，请重新审查后再应用或下载，避免覆盖后续修改。")
 
     def _append_chat_message(self, role: str, content: str, images=None, files=None, thinking: str = "") -> None:
         if not self._session_id:
@@ -960,11 +1310,30 @@ class AIAssistantDialog(QDialog):
     def _switch_session(self, session_id: str) -> None:
         if not session_id or session_id == self._session_id:
             return
+        if get_session(self._store, session_id) is None:
+            return
+        self._save_draft()
         set_current_session(self._store, session_id)
         self._session_id = session_id
         save_ai_sessions(self._store)
         self._refresh_session_list()
+        self._restore_draft()
+        self._refresh_controls()
         self._render_chat()
+
+    def _save_draft(self):
+        self._drafts[self._session_id] = {"prompt": self.prompt_edit.toPlainText(),
+                                        "images": self._pending_images, "files": self._pending_files}
+
+    def _restore_draft(self):
+        draft = self._drafts.get(self._session_id, {})
+        self.prompt_edit.setPlainText(draft.get("prompt", ""))
+        self._pending_images = draft.get("images", [])
+        self._pending_files = draft.get("files", [])
+        self._refresh_pending_images()
+        self._refresh_pending_files()
+        self._expanded_activity.setdefault(self._session_id, set())
+        self.chat_view.verticalScrollBar().setValue(self.chat_view.verticalScrollBar().maximum())
 
     def _on_session_item_changed(self, current, _previous) -> None:
         if self._loading_session or current is None:
@@ -974,10 +1343,16 @@ class AIAssistantDialog(QDialog):
             self._switch_session(str(session_id))
 
     def _on_new_session(self) -> None:
+        if len(self._store.get("sessions", [])) >= MAX_SESSIONS:
+            self._set_status(f"最多保留 {MAX_SESSIONS} 个会话，请先删除不再需要的会话。")
+            return
+        self._save_draft()
         session = create_session(self._store)
         self._session_id = str(session["id"])
         save_ai_sessions(self._store)
         self._refresh_session_list()
+        self._restore_draft()
+        self._refresh_controls()
         self._render_chat()
         self._set_status("已新建对话。")
         self.prompt_edit.setFocus()
@@ -997,6 +1372,9 @@ class AIAssistantDialog(QDialog):
         session = self._current_session()
         if session is None:
             return
+        if self._session_id in self._runs:
+            self._set_status("请先停止本会话任务，待停止完成后再删除会话。")
+            return
         choice = QMessageBox.question(
             self,
             "删除对话",
@@ -1006,40 +1384,53 @@ class AIAssistantDialog(QDialog):
         )
         if choice != QMessageBox.StandardButton.Yes:
             return
+        self._discard_queue(self._session_id)
+        self._drafts.pop(self._session_id, None)
+        self._expanded_activity.pop(self._session_id, None)
+        self._retry_requests.pop(self._session_id, None)
         next_session = delete_session(self._store, self._session_id)
         self._session_id = str((next_session or {}).get("id") or "")
         save_ai_sessions(self._store)
         self._refresh_session_list()
+        self._restore_draft()
+        self._refresh_controls()
         self._render_chat()
         self._set_status("对话已删除。")
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
-    def _set_busy(self, busy: bool) -> None:
-        for widget in (
-            self.base_url_edit,
-            self.model_edit,
-            self.api_key_edit,
-            self.timeout_spin,
-            self.prompt_edit,
-            self.image_button,
-            self.image_strip,
-            self.file_button,
-            self.file_strip,
-            self.session_list,
-            self.get_button,
-            self.settings_button,
-            self.review_button,
-            *self._session_buttons,
-        ):
-            widget.setEnabled(not busy)
-        self.send_button.setEnabled(not busy)
+    def _refresh_controls(self):
+        run = self._runs.get(self._session_id)
+        stopping = run is not None and run.message.get("run_status") == "stopping"
+        self.send_button.setEnabled(not stopping and (run is not None or len(self._runs) < _MAX_ACTIVE_TASKS))
+        self.send_button.setText("加入队列" if run is not None else "发送")
+        self.stop_button.setVisible(run is not None)
+        self.stop_button.setEnabled(not stopping)
+        self.steer_button.setVisible(run is not None)
+        self.steer_button.setEnabled(not stopping)
+        self.retry_button.setVisible(run is None and self._session_id in self._retry_requests)
+        self.review_button.setEnabled(self.send_button.isEnabled())
+        queued = len(self._queues.get(self._session_id, []))
+        selected = self.queue_list.currentRow()
+        self.queue_list.clear()
+        for request in self._queues.get(self._session_id, []):
+            item = QListWidgetItem(request.prompt[:100] or "图片或工作流附件")
+            item.setToolTip(request.prompt[:2000])
+            self.queue_list.addItem(item)
+        if queued:
+            self.queue_list.setCurrentRow(min(max(selected, 0), queued - 1))
+        self.queue_panel.setVisible(bool(queued))
+        if run is not None:
+            self._set_status(run.status + (f" · 待发送 {queued} 条" if queued else ""))
+        elif self._session_id in self._retry_requests:
+            self._set_status("任务未完成，可重试或发送补充说明。")
+        else:
+            self._set_status("")
+        if self._storage_error:
+            self._set_status(self._storage_error)
 
-    def _is_current_worker(self, worker) -> bool:
-        return worker is None or worker is self._worker
-
-    def send_current_prompt(self) -> None:
+    def send_current_prompt(self, *, interrupt=False) -> None:
         if not self.send_button.isEnabled():
             return
         prompt = self.prompt_edit.toPlainText().strip()
@@ -1050,97 +1441,236 @@ class AIAssistantDialog(QDialog):
             return
         if not prompt and pending_files:
             prompt = FILE_ONLY_PROMPT
-        if not self._session_id:
-            self._load_sessions()
-        images = []
-        files = []
-        if pending:
-            try:
+        images, files = [], []
+        try:
+            if pending:
                 images = write_session_images(self._session_id, pending)
-            except Exception as exc:
-                QMessageBox.warning(self, "无法添加图片", str(exc))
-                return
-        if pending_files:
-            try:
+            if pending_files:
                 files = write_session_files(self._session_id, pending_files)
-            except Exception as exc:
-                QMessageBox.warning(self, "无法添加文件", str(exc))
-                return
+            accepted = self._send_prompt(prompt, images, files, interrupt=interrupt)
+        except Exception as exc:
+            accepted = False
+            QMessageBox.warning(self, "无法发送", str(exc))
+        if not accepted:
+            for item in images + files:
+                if os.path.isfile(item["path"]):
+                    os.remove(item["path"])
+            return
         self.prompt_edit.clear()
         self._pending_images.clear()
         self._pending_files.clear()
         self._refresh_pending_images()
         self._refresh_pending_files()
-        self._send_prompt(prompt, images, files)
 
     def review_current_workflow(self) -> None:
-        if not self.send_button.isEnabled():
-            return
-        self._send_prompt(REVIEW_WORKFLOW_PROMPT)
+        if self.send_button.isEnabled():
+            self._send_prompt(REVIEW_WORKFLOW_PROMPT)
 
-    def _send_prompt(self, prompt: str, images=None, files=None) -> None:
-        self._save_provider_from_form()
-        self._append_chat_message("user", prompt, images, files=files)
+    def _send_prompt(self, prompt: str, images=None, files=None, *, interrupt=False) -> bool:
+        if self._closing:
+            return False
+        run = self._runs.get(self._session_id)
+        if run is None and len(self._runs) >= _MAX_ACTIVE_TASKS:
+            self._set_status(f"最多同时运行 {_MAX_ACTIVE_TASKS} 个会话，请先停止或等待其他任务。")
+            return False
+        if run is not None and run.message.get("run_status") == "stopping":
+            return False
+        if not interrupt and sum(len(queue) for queue in self._queues.values()) >= _MAX_QUEUED_TURNS:
+            self._set_status(f"待发送队列最多 {_MAX_QUEUED_TURNS} 条，请先等待任务完成。")
+            return False
         try:
-            context, workflow_images = editor_workflow_bundle(self.main_window)
-            uploaded = format_uploaded_workflows_context(
-                files or latest_attached_files(self._current_session())
-            )
-            messages = build_ai_chat_messages(
-                chat_system_prompt(
-                    workflow_context=context,
-                    uploaded_workflow_context=uploaded,
-                ),
-                chat_history(self._current_session()),
-                extra_images=workflow_images,
-            )
+            config = self._provider_config()
+            if not config.base_url:
+                raise ValueError("请先在设置中填写服务地址，不能自动使用默认服务")
+            if not config.model:
+                raise ValueError("请先在设置中选择或填写模型，不能自动使用默认模型")
+            if not config.api_key.strip():
+                raise ValueError("请先在设置中填写 API Key")
+            self._save_provider_from_form()
+            snapshot = copy.deepcopy(collect_editor_workflow_snapshot(self.main_window))
+            if snapshot.get("status") == "error":
+                raise ValueError("无法读取当前工作流：" + snapshot["error"])
+            if len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8")) > MAX_AI_WORKFLOW_FILE_BYTES:
+                raise ValueError("当前工作流快照超过 8 MB，不能提交 AI 任务")
+            request = _AIRequest(config, prompt, list(images or []), list(files or []),
+                                 list(files or latest_attached_files(self._current_session())),
+                                 snapshot, dict(editor_resource_dirs(self.main_window)),
+                                 list(editor_task_types(self.main_window)))
         except Exception as exc:
             self._set_status(str(exc))
-            return
-        self._thinking_live = False
-        self._set_status("正在请求 AI 服务…")
-        self._set_busy(True)
-        self._worker = _AIWorker(self._provider_config(), messages, self)
-        self._worker.completed.connect(self._on_reply)
-        self._worker.failed.connect(self._on_reply_failed)
-        self._worker.progressed.connect(self._on_reply_progress)
-        self._worker.finished.connect(self._on_reply_finished)
-        self._worker.start()
+            return False
+        if run is not None:
+            if interrupt:
+                run.next_request = request
+                run.message["run_status"] = "stopping"
+                run.status = "正在停止本轮并接收补充说明…"
+                run.worker.cancel()
+            else:
+                self._queues.setdefault(self._session_id, []).append(request)
+            self._refresh_controls()
+        else:
+            self._start_request(self._session_id, request)
+        return True
 
-    def _on_reply_finished(self) -> None:
+    @staticmethod
+    def _workflow_fingerprint(workflow):
+        return hashlib.sha256(json.dumps(workflow, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _start_request(self, session_id, request, *, append_user=True):
+        session = get_session(self._store, session_id)
+        if session is None or self._closing:
+            return
+        if append_user:
+            append_message(self._store, session_id, "user", request.prompt,
+                           images=request.images, files=request.files)
+        history = copy.deepcopy(chat_history(session))
+        append_message(self._store, session_id, "assistant", "正在处理…")
+        message = session["messages"][-1]
+        message.update(content="", run_status="running", activity=[], plan=[])
+        message["source_files"] = request.context_files
+        if not request.context_files:
+            message["source_fingerprint"] = self._workflow_fingerprint(request.snapshot.get("workflow"))
+        worker = _AIWorker(session_id, request, history, self)
+        self._runs[session_id] = _AIRun(worker, request, message)
+        self._retry_requests.pop(session_id, None)
+        worker.completed.connect(self._on_reply)
+        worker.failed.connect(self._on_reply_failed)
+        worker.cancelled.connect(self._on_reply_cancelled)
+        worker.event_received.connect(self._on_run_event)
+        worker.finished.connect(self._on_reply_finished)
+        self._persist_sessions()
+        self._refresh_session_list()
+        self._refresh_controls()
+        self._render_chat()
+        worker.start()
+
+    def _sender_run(self):
         worker = self.sender()
-        if not self._is_current_worker(worker) or not _widget_alive(self):
-            return
-        self._set_busy(False)
-        if worker is self._worker:
-            self._worker = None
-        if worker is not None:
-            worker.deleteLater()
+        if self._closing or worker is None:
+            return None
+        run = self._runs.get(worker.session_id)
+        return run if run is not None and run.worker is worker else None
 
-    def _on_reply_progress(self, line: str) -> None:
-        if not self._is_current_worker(self.sender()) or not _widget_alive(self):
+    def _on_run_event(self, event):
+        run = self._sender_run()
+        if run is None or run.message["run_status"] != "running":
             return
-        text = str(line or "").strip()
-        if not text:
+        kind = event["type"]
+        update_controls = kind != "content" or not run.round_content
+        if kind == "content":
+            if not run.round_content:
+                run.status = "正在输出回复…"
+            run.content_parts.append(event["text"])
+            run.round_content = True
+        elif kind == "round":
+            if run.round_content:
+                run.content_parts.append("\n\n")
+                run.round_content = False
+            run.status = event["text"]
+        elif kind == "plan":
+            run.message["plan"] = event["steps"]
+        else:
+            run.status = event["text"]
+            activity = run.message["activity"]
+            activity.append(event["text"][:1000])
+            del activity[:-MAX_ACTIVITY]
+        if not self._checkpoint_timer.isActive():
+            self._checkpoint_timer.start()
+        if run.worker.session_id == self._session_id:
+            if update_controls:
+                self._refresh_controls()
+            if self.isVisible() and not self._render_timer.isActive():
+                self._render_timer.start()
+
+    def _finish_run(self, status, error="", text=None):
+        run = self._sender_run()
+        if run is None:
             return
-        self._set_status(text)
-        if not self._thinking_live:
-            self._thinking_live = True
+        if run.message["run_status"] == "stopping":
+            status, error, text = "cancelled", "已停止；已收到的部分内容不代表完整结论。", None
+        run.message["run_status"] = status
+        run.message["content"] = text if text is not None else "".join(run.content_parts).rstrip()
+        if error:
+            run.message["error"] = error
+        if status != "completed" and run.next_request is None:
+            self._retry_requests[run.worker.session_id] = run.request
+            self._discard_queue(run.worker.session_id)
+        self._persist_sessions()
+        self._refresh_session_list()
+        if run.worker.session_id == self._session_id:
             self._render_chat()
 
-    def _on_reply(self, text: str, thinking: str = "") -> None:
-        if not self._is_current_worker(self.sender()) or not _widget_alive(self):
-            return
-        self._thinking_live = False
-        self._append_chat_message("assistant", text)
-        self._set_status("已回复。")
+    def _on_reply(self, text: str):
+        self._finish_run("completed", text=text)
 
-    def _on_reply_failed(self, message: str) -> None:
-        if not self._is_current_worker(self.sender()) or not _widget_alive(self):
+    def _on_reply_failed(self, message: str):
+        self._finish_run("failed", "请求失败：" + message)
+
+    def _on_reply_cancelled(self):
+        self._finish_run("cancelled", "已停止；已收到的部分内容不代表完整结论。")
+
+    def _on_reply_finished(self):
+        run = self._sender_run()
+        if run is None:
             return
-        self._thinking_live = False
-        self._append_chat_message("assistant", f"请求失败：{message}")
-        self._set_status(f"请求失败：{message}")
+        if run.message["run_status"] in {"running", "stopping"}:
+            self._finish_run("failed", "后台任务在完成前退出，原因未知；本次结果不完整。")
+        session_id = run.worker.session_id
+        del self._runs[session_id]
+        run.worker.deleteLater()
+        if not self._runs:
+            self._checkpoint_timer.stop()
+        queue = self._queues.get(session_id, [])
+        if run.next_request is not None:
+            self._start_request(session_id, run.next_request)
+        elif run.message["run_status"] == "completed" and queue:
+            request = queue.pop(0)
+            if not queue:
+                self._queues.pop(session_id, None)
+            self._start_request(session_id, request)
+        self._refresh_session_list()
+        self._refresh_controls()
+
+    def _discard_queue(self, session_id):
+        for request in self._queues.pop(session_id, []):
+            self._remove_request_attachments(request)
+
+    @staticmethod
+    def _remove_request_attachments(request):
+        for item in request.images + request.files:
+            if os.path.isfile(item["path"]):
+                os.remove(item["path"])
+
+    def _remove_queued_request(self):
+        queue = self._queues.get(self._session_id, [])
+        index = self.queue_list.currentRow()
+        if 0 <= index < len(queue):
+            self._remove_request_attachments(queue.pop(index))
+            if not queue:
+                self._queues.pop(self._session_id, None)
+            self._refresh_controls()
+
+    def stop_current_task(self):
+        run = self._runs.get(self._session_id)
+        if run is None:
+            return
+        if run.next_request is not None:
+            self._remove_request_attachments(run.next_request)
+            run.next_request = None
+        self._discard_queue(self._session_id)
+        run.message["run_status"] = "stopping"
+        run.status = "正在停止当前请求…"
+        run.worker.cancel()
+        self._refresh_controls()
+        self._render_chat()
+
+    def retry_current_task(self):
+        if self._session_id in self._runs or len(self._runs) >= _MAX_ACTIVE_TASKS:
+            return
+        request = self._retry_requests.get(self._session_id)
+        if request is not None:
+            self._start_request(self._session_id, request, append_user=False)
+
 
     def dragEnterEvent(self, event) -> None:
         if self.can_accept_drop_mime(event.mimeData()):
@@ -1275,6 +1805,7 @@ class AIAssistantDialog(QDialog):
         self._add_pending_image(bytes(buffer.data()), "image/png", "粘贴.png")
 
     def _add_pending_image(self, data: bytes, mime: str, name: str) -> None:
+        self._check_draft_size(len(data))
         if len(self._pending_images) >= MAX_AI_IMAGES_PER_TURN:
             raise ValueError(f"一次最多添加 {MAX_AI_IMAGES_PER_TURN} 张图片")
         if not data:
@@ -1348,6 +1879,7 @@ class AIAssistantDialog(QDialog):
         self._add_pending_file(data, os.path.basename(path))
 
     def _add_pending_file(self, data: bytes, name: str) -> None:
+        self._check_draft_size(len(data))
         if len(self._pending_files) >= MAX_AI_WORKFLOW_FILES_PER_TURN:
             raise ValueError(f"一次最多上传 {MAX_AI_WORKFLOW_FILES_PER_TURN} 个工作流文件")
         if not data:
@@ -1360,6 +1892,13 @@ class AIAssistantDialog(QDialog):
         attachable_workflow_suffix(filename)
         self._pending_files.append({"data": bytes(data), "name": filename})
         self._refresh_pending_files()
+
+    def _check_draft_size(self, extra):
+        drafts = [draft for session_id, draft in self._drafts.items() if session_id != self._session_id]
+        drafts.append({"images": self._pending_images, "files": self._pending_files})
+        total = sum(len(item["data"]) for draft in drafts for item in draft.get("images", []) + draft.get("files", []))
+        if total + extra > 64 * 1024 * 1024:
+            raise ValueError("所有会话的待发送附件合计不能超过 64 MB，请先发送或移除附件。")
 
     def _remove_pending_file(self, index: int) -> None:
         if 0 <= index < len(self._pending_files):

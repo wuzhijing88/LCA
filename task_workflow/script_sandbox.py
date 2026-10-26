@@ -22,6 +22,7 @@ from task_workflow.script_parameters import (
     text_parameter as _text,
 )
 from task_workflow.script_image import IMAGE_METHODS, ImageApi
+from task_workflow.card_plugin_runtime import PluginParameterView, PluginOutputView
 
 from task_workflow.script_pure import (
     script_for_iterable,
@@ -306,7 +307,7 @@ ALLOWED_CALLS = {
     *_EXCEPTION_NAMES,
 }
 
-ALLOWED_CALL_ROOTS = frozenset({*COMMAND_NAMES, *_BUILTIN_CALLS, *_TRANSLATED_BUILTIN_CALLS, *_EXCEPTION_NAMES})
+ALLOWED_CALL_ROOTS = frozenset({"参数", "输出", *COMMAND_NAMES, *_BUILTIN_CALLS, *_TRANSLATED_BUILTIN_CALLS, *_EXCEPTION_NAMES})
 
 _CN_IDENT_MAP = {
     "导入": "import",
@@ -1154,12 +1155,14 @@ class _AttrView:
             raise ScriptError("禁止访问该属性")
         key = FIELD_ALIASES.get(name, name)
         if isinstance(self._payload, dict) and key in self._payload:
-            return _wrap(self._payload[key])
+            value = self._payload[key]
+            return value if key == "outputs" else _wrap(value)
         raise ScriptError(f"没有字段: {name}")
 
     def __getitem__(self, key: Any) -> Any:
         if isinstance(self._payload, dict):
-            return _wrap(self._payload[key])
+            value = self._payload[key]
+            return value if key == "outputs" else _wrap(value)
         if isinstance(self._payload, list):
             return _wrap(self._payload[int(key)])
         raise ScriptError("该值不支持下标")
@@ -3160,6 +3163,11 @@ def run_script(
     invoke=None,
 ) -> tuple[bool, str]:
     validate_script(source)
+    if context is None or context.get("plugin_invocation") is None:
+        from app_core.card_plugins import plugin_command_paths
+        commands = plugin_command_paths(source)
+        if commands:
+            raise ScriptError("插件命令只能在插件模式的脚本卡片中执行：" + "、".join(commands))
     placeholder = unfilled_placeholder_error(source)
     if placeholder:
         raise ScriptError(placeholder)
@@ -3179,6 +3187,7 @@ def run_script(
         elif isinstance(node, ast.ExceptHandler) and node.name:
             debug_variable_names.add(str(node.name))
     tree = _ForCountWrap().visit(tree)
+    plugin_invocation = (context or {}).get("plugin_invocation")
     tree = _GuardInsert().visit(tree)
     ast.fix_missing_locations(tree)
     runtime_logger = logger_obj or logger
@@ -3189,6 +3198,8 @@ def run_script(
     def _read_image_resource(path):
         from task_workflow.script_resources import read_resource_bytes
 
+        if plugin_invocation is not None:
+            plugin_invocation.require_resource("image", path)
         data = read_resource_bytes(path, **host._resource_dirs())
         if data is None:
             raise ValueError("资源不存在：" + str(path))
@@ -3271,6 +3282,8 @@ def run_script(
         "__iter_count": script_for_iterable,
         "变量": _VarsApi(store),
         "图像": image_api,
+        "参数": PluginParameterView(runtime_context.get("plugin_invocation")),
+        "输出": PluginOutputView(runtime_context.get("plugin_invocation")),
         "区域": _RegionApi(host),
         "上次": _StoreView(store),
         "文字": _StoreView(store, "ocr"),
@@ -3423,6 +3436,20 @@ def run_script(
         "ArithmeticError": ArithmeticError,
         "AssertionError": AssertionError,
     })
+    if plugin_invocation is not None:
+        from task_workflow.card_plugin_runtime import guard_resource_command
+        from app_core.card_plugins import RESOURCE_COMMAND_ARGUMENTS
+        for name, (kind, parameter, _position, multiple) in RESOURCE_COMMAND_ARGUMENTS.items():
+            if "." in name:
+                continue
+            command = dict.__getitem__(namespace, name)
+            if isinstance(command, _CallableLast):
+                command._callback = guard_resource_command(command._callback, plugin_invocation, kind, parameter, more_parameter="更多图片" if multiple else None)
+            else:
+                namespace[name] = guard_resource_command(command, plugin_invocation, kind, parameter, more_parameter="更多图片" if multiple else None)
+        components = dict.__getitem__(namespace, "组件")
+        components.加载 = guard_resource_command(components.加载, plugin_invocation, "component", "入口", component=True)
+        components.运行 = guard_resource_command(components.运行, plugin_invocation, "component", "程序")
     for name in COMMAND_NAMES:
         value = dict.get(namespace, name)
         if value is not None:

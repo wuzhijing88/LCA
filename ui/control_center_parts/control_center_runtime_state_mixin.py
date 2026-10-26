@@ -57,8 +57,10 @@ class WindowTaskRunnerStateMixin:
         if self._current_state == TaskState.STOPPING and not self._task_completed_emitted:
             self._set_state(TaskState.STOPPED, "工作流已中断", force=True)
             self._emit_task_completed_once(False)
-        if self._cleanup_deferred_until_finish and not self._is_cleaned:
+        if not self._is_cleaned:
             self._cleanup_thread()
+        if self._last_execution_success is not None:
+            self._emit_task_completed_once(self._last_execution_success)
 
     def _can_transition_to(self, new_state: TaskState) -> bool:
         return can_transition(self._current_state, new_state)
@@ -71,10 +73,7 @@ class WindowTaskRunnerStateMixin:
     @property
     def is_running(self) -> bool:
         """检查是否正在运行"""
-        try:
-            thread_running = bool(self.isRunning())
-        except Exception:
-            thread_running = False
+        thread_running = self.isRunning()
         return bool(
             thread_running
             or self._cleanup_deferred_until_finish

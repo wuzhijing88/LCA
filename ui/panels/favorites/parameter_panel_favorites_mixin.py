@@ -48,6 +48,12 @@ class ParameterPanelFavoritesMixin:
 
         """显示工作流收藏列表"""
 
+        self._release_panel_runtime()
+        self.current_parameters.clear()
+        self._opened_parameters_snapshot.clear()
+        self.param_definitions = {}
+        self.workflow_cards_info = {}
+        self.task_module = None
         self._favorites_mode = True
 
         self._restore_standard_footer_buttons()
@@ -73,7 +79,7 @@ class ParameterPanelFavoritesMixin:
         self.manually_closed = False
 
         show_and_raise_widget(self, log_prefix='收藏面板展示')
-        QTimer.singleShot(0, self._position_panel)
+        QTimer.singleShot(0, self, self._position_panel)
 
         if hasattr(self, 'reset_button') and self.reset_button is not None:
             self.reset_button.setVisible(False)
@@ -267,38 +273,11 @@ class ParameterPanelFavoritesMixin:
         header_layout.addWidget(header_name, 1)
         parent_layout.addLayout(header_layout)
 
-    def _favorites_list_style(self) -> str:
-        from themes import theme_rgba
 
-        return (
-            "QListWidget#favoritesList { outline: none; }"
-            "QListWidget#favoritesList::item {"
-            " margin: 0px;"
-            " padding: 0px;"
-            " border: 1px solid transparent;"
-            " border-radius: 6px;"
-            "}"
-            "QListWidget#favoritesList::item:selected {"
-            f" background-color: {theme_rgba('accent', 48, '#0078d4')};"
-            f" border: 1px solid {theme_rgba('accent', 140, '#0078d4')};"
-            "}"
-            "QListWidget#favoritesList::item:selected:active {"
-            f" background-color: {theme_rgba('accent', 58, '#0078d4')};"
-            f" border: 1px solid {theme_rgba('accent', 165, '#0078d4')};"
-            "}"
-            "QListWidget#favoritesList::item:selected:!active {"
-            f" background-color: {theme_rgba('accent', 42, '#0078d4')};"
-            f" border: 1px solid {theme_rgba('accent', 120, '#0078d4')};"
-            "}"
-            "QListWidget#favoritesList::item:hover:!selected {"
-            f" background-color: {theme_rgba('text', 26, '#333333')};"
-            "}"
-        )
 
     def _create_favorites_list_widget(self):
         favorites_list = QListWidget()
         favorites_list.setObjectName("favoritesList")
-        favorites_list.setStyleSheet(self._favorites_list_style())
         favorites_list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         favorites_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         favorites_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -315,7 +294,7 @@ class ParameterPanelFavoritesMixin:
         self._favorites_list.verticalScrollBar().rangeChanged.connect(
             lambda *_: self._update_favorites_header_margins()
         )
-        QTimer.singleShot(0, self._update_favorites_header_margins)
+        QTimer.singleShot(0, self, self._update_favorites_header_margins)
 
     def _create_favorites_list_section(self, parent_layout):
         favorites_list = self._create_favorites_list_widget()
@@ -326,7 +305,7 @@ class ParameterPanelFavoritesMixin:
     def _create_favorites_start_button(self, parent_layout):
         self._favorites_start_btn = QPushButton("启动选中的工作流")
         self._favorites_start_btn.setMinimumHeight(36)
-        self._favorites_start_btn.setStyleSheet("font-weight: bold;")
+        self._favorites_start_btn.setObjectName("favoritesStartButton")
         self._favorites_start_btn.clicked.connect(self._on_favorites_start_batch)
         parent_layout.addWidget(self._favorites_start_btn)
 
@@ -365,7 +344,7 @@ class ParameterPanelFavoritesMixin:
     def _add_favorites_list_item(self, fav: dict):
         item_widget = QWidget()
         item_widget.setAutoFillBackground(False)
-        item_widget.setStyleSheet("background-color: transparent;")
+        item_widget.setProperty("favoritesItem", True)
 
         layout = QHBoxLayout(item_widget)
         metrics = getattr(self, "_favorites_col_metrics", None) or {
@@ -432,7 +411,7 @@ class ParameterPanelFavoritesMixin:
 
         if not hasattr(self, "_favorites_event_filters"):
             self._favorites_event_filters = []
-        selection_filter = FavoritesItemEventFilter(self, list_item)
+        selection_filter = FavoritesItemEventFilter(self, list_item, item_widget)
         item_widget.installEventFilter(selection_filter)
         checkbox.installEventFilter(selection_filter)
         name_label.installEventFilter(selection_filter)
@@ -1093,10 +1072,6 @@ class ParameterPanelFavoritesMixin:
         )
         QMessageBox.information(self, "资源路径已更新", message)
 
-    def _on_favorites_execute_single(self, filepath: str):
-        """兼容旧入口：统一改为启动已勾选的工作流"""
-        _ = filepath
-        self._on_favorites_start_batch()
 
     def _on_favorites_start_batch(self):
         """启动批量执行"""

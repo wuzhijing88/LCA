@@ -3,8 +3,7 @@
 """
 PrintWindow 截图引擎
 
-借鉴 OP gdi/gdi2：UpdateWindow 后重试、flags=0 兼容、GetDIBits 读图。
-仍优先 PW_RENDERFULLCONTENT；失败不回退 BitBlt / 其他引擎。
+使用 PW_RENDERFULLCONTENT 和 GetDIBits 读图。
 """
 
 import ctypes
@@ -18,7 +17,7 @@ import numpy as np
 import win32gui
 import win32ui
 
-from utils.capture.hwnd_capture_utils import CaptureStats, crop_frame_by_hwnd, get_window_rect_with_dwm, resolve_capture_target
+from utils.capture.hwnd_capture_utils import GDICaptureResources, CaptureStats, crop_frame_by_hwnd, get_window_rect_with_dwm, resolve_capture_target
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +68,6 @@ def _user32():
     lib = ctypes.WinDLL("user32", use_last_error=True)
     lib.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
     lib.PrintWindow.restype = wintypes.BOOL
-    lib.UpdateWindow.argtypes = [wintypes.HWND]
-    lib.UpdateWindow.restype = wintypes.BOOL
     return lib
 
 
@@ -86,8 +83,6 @@ def _gdi32():
         wintypes.UINT,
     ]
     lib.GetDIBits.restype = ctypes.c_int
-    lib.GetBitmapBits.argtypes = [wintypes.HBITMAP, ctypes.c_long, ctypes.c_void_p]
-    lib.GetBitmapBits.restype = ctypes.c_long
     lib.PatBlt.argtypes = [
         wintypes.HDC,
         ctypes.c_int,
@@ -100,28 +95,9 @@ def _gdi32():
     return lib
 
 
-def print_window_with_op_retry(hwnd: int, hdc: int, user32=None) -> bool:
-    """先 RENDERFULLCONTENT，失败则 UpdateWindow 再试，最后 flags=0。不走 BitBlt。"""
+def print_window(hwnd: int, hdc: int, user32=None) -> bool:
     lib = user32 if user32 is not None else _user32()
-    target = int(hwnd)
-    target_dc = int(hdc)
-
-    if lib.PrintWindow(target, target_dc, PW_RENDERFULLCONTENT):
-        return True
-
-    try:
-        lib.UpdateWindow(target)
-    except Exception:
-        logger.debug("UpdateWindow 失败，继续 PrintWindow 重试", exc_info=True)
-
-    if lib.PrintWindow(target, target_dc, PW_RENDERFULLCONTENT):
-        logger.debug("PrintWindow 在 UpdateWindow 后成功: hwnd=%s", target)
-        return True
-
-    if lib.PrintWindow(target, target_dc, 0):
-        logger.debug("PrintWindow 以 flags=0 成功: hwnd=%s", target)
-        return True
-    return False
+    return bool(lib.PrintWindow(int(hwnd), int(hdc), PW_RENDERFULLCONTENT))
 
 
 def _new_bitmap_info(width: int, height: int, top_down: bool) -> BITMAPINFO:
@@ -143,7 +119,7 @@ def read_printwindow_bitmap_bgra(
     height: int,
     gdi32=None,
 ) -> Optional[np.ndarray]:
-    """优先 GetDIBits；仅当读同一张 HBITMAP 失败时才用 GetBitmapBits。"""
+    """以自上而下的32位格式读取位图，失败返回空。"""
     if width <= 0 or height <= 0:
         return None
 
@@ -168,14 +144,7 @@ def read_printwindow_bitmap_bgra(
     if _getdibits(True):
         return np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 4)).copy()
 
-    if _getdibits(False):
-        img = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 4)).copy()
-        return np.ascontiguousarray(np.flipud(img))
-
-    bits = lib.GetBitmapBits(int(hbitmap), nbytes, buf_ptr)
-    if int(bits or 0) != nbytes:
-        return None
-    return np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 4)).copy()
+    return None
 
 
 class PrintWindowCapture:
@@ -187,6 +156,8 @@ class PrintWindowCapture:
         self.lock = threading.Lock()
         # PrintWindow 在多线程并发下可能出现跨窗口错帧，统一串行化抓图链路。
         self._capture_lock = threading.Lock()
+        self._pending_resources = []
+        self._closed = False
         self.auto_fix_black_borders = True
         self._black_border_threshold = 8
         self._black_border_min_ratio = 0.02
@@ -224,7 +195,7 @@ class PrintWindowCapture:
             return img_bgr[y:y + bh, x:x + bw].copy()
         except Exception as e:
             logger.debug(f"黑边修复失败：{e}")
-            return img_bgr
+            raise
 
     def capture_window(
         self,
@@ -257,6 +228,8 @@ class PrintWindowCapture:
         try:
             self._capture_lock.acquire()
             capture_lock_acquired = True
+            if self._closed or self._pending_resources:
+                raise RuntimeError("截图器已关闭或有资源尚未清理")
 
             if not win32gui.IsWindow(target_hwnd) or not win32gui.IsWindow(capture_hwnd):
                 _set_last_failure_reason("无效的窗口句柄")
@@ -286,32 +259,27 @@ class PrintWindowCapture:
             capture_width = width
             capture_height = height
 
-            dc_window = win32gui.GetWindowDC(capture_hwnd)
+            source_dc = win32gui.GetWindowDC(capture_hwnd)
+            if not source_dc:
+                raise RuntimeError("无法取得窗口DC")
+            dc_window = source_dc
             dc_mem = win32ui.CreateDCFromHandle(dc_window)
             dc_compatible = dc_mem.CreateCompatibleDC()
 
-            bitmap = win32ui.CreateBitmap()
-            bitmap.CreateCompatibleBitmap(dc_mem, capture_width, capture_height)
+            created_bitmap = win32ui.CreateBitmap()
+            created_bitmap.CreateCompatibleBitmap(dc_mem, capture_width, capture_height)
+            bitmap = created_bitmap
             old_bitmap = dc_compatible.SelectObject(bitmap)
             mem_hdc = dc_compatible.GetSafeHdc()
 
-            try:
-                _gdi32().PatBlt(int(mem_hdc), 0, 0, capture_width, capture_height, BLACKNESS)
-            except Exception:
-                logger.debug("PrintWindow 清空位图失败，继续抓图", exc_info=True)
-
-            if not print_window_with_op_retry(capture_hwnd, mem_hdc):
-                _set_last_failure_reason(
-                    f"PrintWindow 调用失败: hwnd={capture_hwnd}（已重试 UpdateWindow 与 flags=0，未回退 BitBlt）"
-                )
-                logger.error(f"PrintWindow 调用失败: hwnd={capture_hwnd}")
+            if not _gdi32().PatBlt(int(mem_hdc), 0, 0, capture_width, capture_height, BLACKNESS):
+                raise RuntimeError("PrintWindow清空位图失败")
+            if not print_window(capture_hwnd, mem_hdc):
+                _set_last_failure_reason(f"PrintWindow调用失败：窗口{capture_hwnd}")
                 return None
-
             if old_bitmap is not None:
-                try:
-                    dc_compatible.SelectObject(old_bitmap)
-                except Exception:
-                    logger.debug("PrintWindow 还原位图失败", exc_info=True)
+                dc_compatible.SelectObject(old_bitmap)
+                old_bitmap = None
 
             img = read_printwindow_bitmap_bgra(
                 hdc=int(mem_hdc),
@@ -365,40 +333,18 @@ class PrintWindowCapture:
             return None
 
         finally:
-            try:
-                if dc_compatible is not None and old_bitmap is not None:
-                    dc_compatible.SelectObject(old_bitmap)
-            except Exception:
-                pass
-
-            try:
-                if bitmap:
-                    win32gui.DeleteObject(bitmap.GetHandle())
-            except Exception:
-                pass
-
-            try:
-                if dc_compatible:
-                    dc_compatible.DeleteDC()
-            except Exception:
-                pass
-
-            try:
-                if dc_mem:
-                    dc_mem.DeleteDC()
-            except Exception:
-                pass
-
-            try:
-                if dc_window:
-                    win32gui.ReleaseDC(capture_hwnd, dc_window)
-            except Exception:
-                pass
             if capture_lock_acquired:
+                resources = GDICaptureResources(
+                    capture_hwnd, dc_window, dc_mem, dc_compatible, bitmap, old_bitmap
+                )
                 try:
-                    self._capture_lock.release()
+                    resources.close()
                 except Exception:
-                    pass
+                    if not resources.closed:
+                        self._pending_resources.append(resources)
+                    raise
+                finally:
+                    self._capture_lock.release()
 
     def get_pixel_color(
         self,
@@ -434,9 +380,29 @@ class PrintWindowCapture:
             logger.error(f"获取像素颜色失败: {e}")
             return None
 
+    def _close_pending_resources(self):
+        errors = []
+        pending, self._pending_resources = self._pending_resources, []
+        for resources in pending:
+            try:
+                resources.close()
+            except Exception as exc:
+                if not resources.closed:
+                    self._pending_resources.append(resources)
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError("截图资源清理未完成：" + "；".join(errors))
+
     def cleanup(self, hwnd: int = None):
-        """清理资源"""
-        logger.debug(f"PrintWindow 资源已清理: hwnd={hwnd}")
+        """等待当前截图退出，再关闭此前未能释放的资源。"""
+        with self._capture_lock:
+            self._close_pending_resources()
+            if hwnd is None:
+                self._closed = True
+
+    def clear_runtime_cache(self, hwnd: int = None):
+        with self._capture_lock:
+            self._close_pending_resources()
 
     def get_stats(self) -> dict:
         """获取统计信息"""
@@ -458,11 +424,16 @@ _global_lock = threading.Lock()
 def get_global_capture() -> PrintWindowCapture:
     """获取全局截图器实例"""
     global _global_capture
-    if _global_capture is None:
-        with _global_lock:
-            if _global_capture is None:
-                _global_capture = PrintWindowCapture()
-    return _global_capture
+    with _global_lock:
+        if _global_capture is None:
+            _global_capture = PrintWindowCapture()
+        return _global_capture
+
+
+def get_existing_global_capture() -> Optional[PrintWindowCapture]:
+    """读取已存在的截图器，不为统计查询创建资源。"""
+    with _global_lock:
+        return _global_capture
 
 
 def capture_window_printwindow(
@@ -495,15 +466,13 @@ def get_pixel_color_printwindow(
 
 
 def cleanup_printwindow(hwnd: int = None):
-    """清理资源（全局接口）"""
+    """清理成功后才解除全局所有权。"""
     global _global_capture
     with _global_lock:
-        capture = _global_capture
-        if hwnd is None:
-            _global_capture = None
-
-    if capture:
-        capture.cleanup(hwnd)
+        if _global_capture is not None:
+            _global_capture.cleanup(hwnd)
+            if hwnd is None:
+                _global_capture = None
 
 
 def clear_printwindow_runtime_cache(hwnd: int = None):
@@ -511,7 +480,7 @@ def clear_printwindow_runtime_cache(hwnd: int = None):
     with _global_lock:
         capture = _global_capture
     if capture:
-        capture.cleanup(hwnd)
+        capture.clear_runtime_cache(hwnd)
 
 
 def is_printwindow_available() -> bool:

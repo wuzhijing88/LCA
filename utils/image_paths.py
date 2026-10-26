@@ -38,9 +38,11 @@ class ImagePathResolver:
         raw = os.getenv("IMAGE_PATH_CACHE_MAX_ENTRIES", "4096")
         try:
             value = int(raw)
-        except (TypeError, ValueError):
-            value = 4096
-        return max(256, min(65536, value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("图片路径缓存上限必须是整数") from exc
+        if not 256 <= value <= 65536:
+            raise ValueError("图片路径缓存上限必须在 256～65536 之间")
+        return value
 
     def _prune_cache_locked(self):
         while len(self._path_cache) > self._max_cache_entries:
@@ -84,19 +86,16 @@ class ImagePathResolver:
                 self._path_cache[cache_key] = resolved
                 self._path_cache.move_to_end(cache_key)
                 self._prune_cache_locked()
+            from task_workflow.card_plugin_runtime import register_owned_resource
+            register_owned_resource(resolved, "路径缓存", self.release_resource_root)
         return resolved
 
     def _resolve_cache_key(self, raw_path: str, search_dirs: Optional[List[str]]) -> str:
         extra = ""
         if search_dirs:
             extra = "|" + "|".join(str(item or "") for item in search_dirs)
-        bound = ""
-        try:
-            from task_workflow.resource_context import bound_search_dirs
-
-            bound = "|".join(str(item or "") for item in bound_search_dirs())
-        except Exception:
-            bound = ""
+        from task_workflow.resource_context import bound_search_dirs
+        bound = "|".join(str(item or "") for item in bound_search_dirs())
         return f"{raw_path}||{bound}{extra}"
 
     def resolve_many(
@@ -132,6 +131,14 @@ class ImagePathResolver:
                     drop_keys.append(key)
             for key in drop_keys:
                 self._path_cache.pop(key, None)
+
+    def release_resource_root(self, root):
+        root = Path(root).resolve()
+        with self._cache_lock:
+            owned = [key for key, value in self._path_cache.items() if value and Path(value).is_absolute() and Path(value).resolve().is_relative_to(root)]
+            for key in owned:
+                del self._path_cache[key]
+        return len(owned)
 
     def clear_cache(self):
         self.invalidate()

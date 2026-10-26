@@ -13,27 +13,12 @@ def open_dict_maker(params: Dict[str, Any], **kwargs) -> bool:
     """打开点阵字库制作对话框，并把结果回填到参数面板。"""
     from ui.dialogs.dict_maker_dialog import DictMakerDialog, apply_dict_maker_result_to_panel
 
-    parent = kwargs.get("parameter_panel") or kwargs.get("main_window")
-    images_dir = ""
-    dicts_dir = ""
-    panel = kwargs.get("parameter_panel")
-    if panel is not None:
-        images_dir = str(getattr(panel, "images_dir", "") or "").strip()
-        dicts_dir = str(getattr(panel, "dicts_dir", "") or "").strip()
+    panel = kwargs['parameter_panel']
+    images_dir = str(panel.images_dir or '').strip()
+    dicts_dir = str(panel.dicts_dir or '').strip()
     if not images_dir or not dicts_dir:
-        main_window = kwargs.get("main_window")
-        if main_window is not None and hasattr(main_window, "_current_task_resource_dirs"):
-            dirs = main_window._current_task_resource_dirs()
-            images_dir = images_dir or str(dirs.get("images_dir") or "")
-            dicts_dir = dicts_dir or str(dirs.get("dicts_dir") or "")
-        elif main_window is not None and hasattr(main_window, "_resolve_task_images_dir"):
-            images_dir = images_dir or str(main_window._resolve_task_images_dir() or "").strip()
-        elif main_window is not None:
-            images_dir = images_dir or str(getattr(main_window, "images_dir", "") or "").strip()
-    if not dicts_dir:
-        from task_workflow.resource_context import current_dicts_dir
-
-        dicts_dir = str(current_dicts_dir() or "").strip()
+        raise ValueError('当前工程字库目录未绑定，无法制作字库')
+    parent = panel
     dialog = DictMakerDialog(
         parent,
         target_hwnd=kwargs.get("target_hwnd"),
@@ -41,12 +26,10 @@ def open_dict_maker(params: Dict[str, Any], **kwargs) -> bool:
         images_dir=images_dir,
         dicts_dir=dicts_dir,
     )
-    if dialog.exec():
-        apply_dict_maker_result_to_panel(
-            kwargs.get("parameter_panel"),
-            dialog.saved_dict_path,
-            dialog.saved_color_format,
-        )
+    from ui.dialogs.dialog_manager import exec_dialog
+    saved = exec_dialog(dialog, read_result=lambda result: (dialog.saved_dict_path, dialog.saved_color_format) if result else None)
+    if saved is not None:
+        apply_dict_maker_result_to_panel(panel, *saved)
     return True
 
 

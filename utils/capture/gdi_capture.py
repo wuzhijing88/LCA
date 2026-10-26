@@ -17,9 +17,8 @@ import logging
 import numpy as np
 import threading
 from typing import Optional, Tuple
-from dataclasses import dataclass
 
-from utils.capture.hwnd_capture_utils import CaptureStats, crop_frame_by_hwnd, get_window_rect_with_dwm, resolve_capture_target
+from utils.capture.hwnd_capture_utils import GDICaptureResources, CaptureStats, crop_frame_by_hwnd, get_window_rect_with_dwm, resolve_capture_target
 from utils.window.multi_monitor_manager import get_virtual_screen_bounds
 
 logger = logging.getLogger(__name__)
@@ -38,6 +37,8 @@ class GDICapture:
         self.stats = CaptureStats()
         self.lock = threading.Lock()
         self._capture_lock = threading.Lock()
+        self._pending_resources = []
+        self._closed = False
 
     def capture_window(
         self,
@@ -64,6 +65,7 @@ class GDICapture:
         dc_mem = None
         dc_compatible = None
         bitmap = None
+        old_bitmap = None
         capture_lock_acquired = False
         target_info = resolve_capture_target(hwnd)
         target_hwnd = target_info.target_hwnd
@@ -72,6 +74,8 @@ class GDICapture:
         try:
             self._capture_lock.acquire()
             capture_lock_acquired = True
+            if self._closed or self._pending_resources:
+                raise RuntimeError("截图器已关闭或有资源尚未清理")
 
             # 检查窗口有效性
             if not win32gui.IsWindow(target_hwnd):
@@ -90,7 +94,10 @@ class GDICapture:
                 logger.error(f"无效的窗口尺寸: {width}x{height}")
                 return None
 
-            dc_window = win32gui.GetWindowDC(capture_hwnd)
+            source_dc = win32gui.GetWindowDC(capture_hwnd)
+            if not source_dc:
+                raise RuntimeError("无法取得窗口DC")
+            dc_window = source_dc
             dc_mem = win32ui.CreateDCFromHandle(dc_window)
             logger.debug(
                 f"GDI 严格句柄模式: target={target_hwnd}, capture={capture_hwnd}, client={client_area_only}"
@@ -99,9 +106,10 @@ class GDICapture:
             dc_compatible = dc_mem.CreateCompatibleDC()
 
             # 创建位图
-            bitmap = win32ui.CreateBitmap()
-            bitmap.CreateCompatibleBitmap(dc_mem, width, height)
-            dc_compatible.SelectObject(bitmap)
+            created_bitmap = win32ui.CreateBitmap()
+            created_bitmap.CreateCompatibleBitmap(dc_mem, width, height)
+            bitmap = created_bitmap
+            old_bitmap = dc_compatible.SelectObject(bitmap)
 
             # 使用 BitBlt 复制
             result = dc_compatible.BitBlt(
@@ -157,35 +165,18 @@ class GDICapture:
             return None
 
         finally:
-            # 清理资源
-            try:
-                if bitmap:
-                    win32gui.DeleteObject(bitmap.GetHandle())
-            except Exception:
-                pass
-
-            try:
-                if dc_compatible:
-                    dc_compatible.DeleteDC()
-            except Exception:
-                pass
-
-            try:
-                if dc_mem:
-                    dc_mem.DeleteDC()
-            except Exception:
-                pass
-
-            try:
-                if dc_window:
-                    win32gui.ReleaseDC(capture_hwnd, dc_window)
-            except Exception:
-                pass
             if capture_lock_acquired:
+                resources = GDICaptureResources(
+                    capture_hwnd, dc_window, dc_mem, dc_compatible, bitmap, old_bitmap
+                )
                 try:
-                    self._capture_lock.release()
+                    resources.close()
                 except Exception:
-                    pass
+                    if not resources.closed:
+                        self._pending_resources.append(resources)
+                    raise
+                finally:
+                    self._capture_lock.release()
 
     def capture_screen(
         self,
@@ -199,11 +190,14 @@ class GDICapture:
         dc_mem = None
         dc_compatible = None
         bitmap = None
+        old_bitmap = None
         capture_lock_acquired = False
 
         try:
             self._capture_lock.acquire()
             capture_lock_acquired = True
+            if self._closed or self._pending_resources:
+                raise RuntimeError("截图器已关闭或有资源尚未清理")
 
             virtual_left, virtual_top, virtual_width, virtual_height = get_virtual_screen_bounds()
             if virtual_width <= 0 or virtual_height <= 0:
@@ -237,13 +231,17 @@ class GDICapture:
                 )
                 return None
 
-            dc_screen = win32gui.GetDC(0)
+            source_dc = win32gui.GetDC(0)
+            if not source_dc:
+                raise RuntimeError("无法取得屏幕DC")
+            dc_screen = source_dc
             dc_mem = win32ui.CreateDCFromHandle(dc_screen)
             dc_compatible = dc_mem.CreateCompatibleDC()
 
-            bitmap = win32ui.CreateBitmap()
-            bitmap.CreateCompatibleBitmap(dc_mem, width, height)
-            dc_compatible.SelectObject(bitmap)
+            created_bitmap = win32ui.CreateBitmap()
+            created_bitmap.CreateCompatibleBitmap(dc_mem, width, height)
+            bitmap = created_bitmap
+            old_bitmap = dc_compatible.SelectObject(bitmap)
 
             result = dc_compatible.BitBlt(
                 (0, 0),
@@ -276,35 +274,18 @@ class GDICapture:
                 self.stats.failed_captures += 1
             return None
         finally:
-            try:
-                if bitmap:
-                    win32gui.DeleteObject(bitmap.GetHandle())
-            except Exception:
-                pass
-
-            try:
-                if dc_compatible:
-                    dc_compatible.DeleteDC()
-            except Exception:
-                pass
-
-            try:
-                if dc_mem:
-                    dc_mem.DeleteDC()
-            except Exception:
-                pass
-
-            try:
-                if dc_screen:
-                    win32gui.ReleaseDC(0, dc_screen)
-            except Exception:
-                pass
-
             if capture_lock_acquired:
+                resources = GDICaptureResources(
+                    0, dc_screen, dc_mem, dc_compatible, bitmap, old_bitmap
+                )
                 try:
-                    self._capture_lock.release()
+                    resources.close()
                 except Exception:
-                    pass
+                    if not resources.closed:
+                        self._pending_resources.append(resources)
+                    raise
+                finally:
+                    self._capture_lock.release()
 
     def get_pixel_color(
         self,
@@ -340,9 +321,29 @@ class GDICapture:
             logger.error(f"获取像素颜色失败: {e}")
             return None
 
+    def _close_pending_resources(self):
+        errors = []
+        pending, self._pending_resources = self._pending_resources, []
+        for resources in pending:
+            try:
+                resources.close()
+            except Exception as exc:
+                if not resources.closed:
+                    self._pending_resources.append(resources)
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError("截图资源清理未完成：" + "；".join(errors))
+
     def cleanup(self, hwnd: int = None):
-        """清理资源"""
-        logger.debug(f"GDI 资源已清理: hwnd={hwnd}")
+        """等待当前截图退出，再关闭此前未能释放的资源。"""
+        with self._capture_lock:
+            self._close_pending_resources()
+            if hwnd is None:
+                self._closed = True
+
+    def clear_runtime_cache(self, hwnd: int = None):
+        with self._capture_lock:
+            self._close_pending_resources()
 
     def get_stats(self) -> dict:
         """获取统计信息"""
@@ -364,11 +365,16 @@ _global_lock = threading.Lock()
 def get_global_capture() -> GDICapture:
     """获取全局截图器实例"""
     global _global_capture
-    if _global_capture is None:
-        with _global_lock:
-            if _global_capture is None:
-                _global_capture = GDICapture()
-    return _global_capture
+    with _global_lock:
+        if _global_capture is None:
+            _global_capture = GDICapture()
+        return _global_capture
+
+
+def get_existing_global_capture() -> Optional[GDICapture]:
+    """读取已存在的截图器，不为统计查询创建资源。"""
+    with _global_lock:
+        return _global_capture
 
 
 def capture_window_gdi(
@@ -409,15 +415,13 @@ def get_pixel_color_gdi(
 
 
 def cleanup_gdi(hwnd: int = None):
-    """清理资源（全局接口）"""
+    """清理成功后才解除全局所有权。"""
     global _global_capture
     with _global_lock:
-        capture = _global_capture
-        if hwnd is None:
-            _global_capture = None
-
-    if capture:
-        capture.cleanup(hwnd)
+        if _global_capture is not None:
+            _global_capture.cleanup(hwnd)
+            if hwnd is None:
+                _global_capture = None
 
 
 def clear_gdi_runtime_cache(hwnd: int = None):
@@ -425,7 +429,7 @@ def clear_gdi_runtime_cache(hwnd: int = None):
     with _global_lock:
         capture = _global_capture
     if capture:
-        capture.cleanup(hwnd)
+        capture.clear_runtime_cache(hwnd)
 
 
 def is_gdi_available() -> bool:

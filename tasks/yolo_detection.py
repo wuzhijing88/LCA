@@ -10,6 +10,7 @@ YOLO目标检测任务模块：参数定义、单次检测执行、结果写入�
 import ast
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -26,6 +27,7 @@ from tasks.yolo_overlay_runtime import (
 logger = logging.getLogger(__name__)
 
 _missing_classes_file_warned = set()
+_missing_classes_file_lock = threading.RLock()
 
 
 def requires_input_lock(_params: Dict[str, Any]) -> bool:
@@ -38,9 +40,12 @@ def _notify_missing_classes_file(model_path: Path) -> None:
             key = str(model_path.resolve())
         except Exception:
             key = str(model_path)
-        if key in _missing_classes_file_warned:
-            return
-        _missing_classes_file_warned.add(key)
+        with _missing_classes_file_lock:
+            if key in _missing_classes_file_warned:
+                return
+            _missing_classes_file_warned.add(key)
+        from task_workflow.card_plugin_runtime import register_owned_resource
+        register_owned_resource(model_path, "模型类别提示缓存", release_resource_root)
 
         from PySide6.QtWidgets import QMessageBox, QApplication
         if QApplication.instance() is None:
@@ -698,3 +703,12 @@ def get_params_definition() -> Dict[str, Dict[str, Any]]:
 
     return merge_params_definitions(params, get_standard_next_step_delay_params())
 
+
+
+def release_resource_root(root):
+    """注销属于已结束脚本卡片的模型提示记录。"""
+    root = Path(root).resolve()
+    with _missing_classes_file_lock:
+        owned = [key for key in _missing_classes_file_warned if Path(key).is_absolute() and Path(key).resolve().is_relative_to(root)]
+        _missing_classes_file_warned.difference_update(owned)
+    return len(owned)

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import logging
-import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
 
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QEvent, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog,
@@ -28,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from app_core.player.package import ensure_designer_ui
 from ui.dialogs.dialog_manager import exec_dialog
+from themes import apply_rounded_popup
 from app_core.player.window_resolution import normalize_required_client_size
 from ui.export_parts.assembler import assemble_standalone_export, safe_export_name
 from ui.export_parts.player_dev_run import runtime_config_from_main
@@ -35,6 +34,7 @@ from ui.export_parts.player_ui_designer import PlayerUiDesignerDialog
 from ui.export_parts.standalone_installer import (
     INNO_CHINESE_LANG_HELP,
     INNO_SETUP_DOWNLOAD_PAGE,
+    ExportCancelled,
     MissingChineseLanguageError,
     MissingInnoSetupError,
     OutdatedInnoSetupError,
@@ -42,8 +42,6 @@ from ui.export_parts.standalone_installer import (
 )
 from ui.widgets.no_wheel_spinbox import NoWheelSpinBox as _NoWheelSpinBox
 from utils.app_paths import get_images_dir, get_sounds_dir, get_user_data_dir
-
-logger = logging.getLogger(__name__)
 
 # 全局草稿：关闭「制作独立程序」对话框后仍保留，仅手动重置时清除
 _DRAFT_FILENAME = "standalone_export_draft.json"
@@ -59,10 +57,11 @@ def _load_export_draft() -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.warning("读取独立程序导出草稿失败: %s", path, exc_info=True)
-        return {}
-    return data if isinstance(data, dict) else {}
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError(f"读取独立程序导出草稿失败: {path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"独立程序导出草稿格式无效: {path}")
+    return data
 
 
 def _save_export_draft(
@@ -75,14 +74,10 @@ def _save_export_draft(
     required_client_width: int = 0,
     required_client_height: int = 0,
 ) -> None:
-    try:
-        req_w = max(0, int(required_client_width or 0))
-    except (TypeError, ValueError):
-        req_w = 0
-    try:
-        req_h = max(0, int(required_client_height or 0))
-    except (TypeError, ValueError):
-        req_h = 0
+    req_w = int(required_client_width or 0)
+    req_h = int(required_client_height or 0)
+    if req_w < 0 or req_h < 0:
+        raise ValueError("独立程序草稿的分辨率不能为负数")
     payload = {
         "ui": deepcopy(ui) if isinstance(ui, dict) else None,
         "asset_map": {
@@ -100,61 +95,82 @@ def _save_export_draft(
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        logger.warning("保存独立程序导出草稿失败: %s", path, exc_info=True)
+    except OSError as exc:
+        raise OSError(f"保存独立程序导出草稿失败: {path}") from exc
 
 
 def _clear_export_draft() -> None:
     path = _draft_path()
-    try:
-        if path.is_file():
-            path.unlink()
-    except OSError:
-        logger.warning("删除独立程序导出草稿失败: %s", path, exc_info=True)
+    path.unlink(missing_ok=True)
 
 
 def _default_desktop_dir() -> Path:
-    """解析当前用户桌面目录（兼容中文系统「桌面」）。"""
-    if os.name == "nt":
-        try:
-            import ctypes
-            from ctypes import wintypes
+    """使用 Windows 桌面目录，不猜测重定向后的目录。"""
+    import ctypes
+    from ctypes import wintypes
 
-            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
-            # CSIDL_DESKTOPDIRECTORY = 0x0010
-            if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf) == 0:
-                desktop = Path(buf.value)
-                if desktop.is_dir():
-                    return desktop
-        except Exception:
-            pass
-    for candidate in (Path.home() / "Desktop", Path.home() / "桌面"):
-        if candidate.is_dir():
-            return candidate
-    return Path.home()
+    buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+    result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf)
+    if result != 0 or not Path(buf.value).is_dir():
+        raise OSError("无法读取当前用户的桌面目录")
+    return Path(buf.value)
 
 
 class _AssembleWorker(QThread):
     progress = Signal(int, str)
-    succeeded = Signal(object)
-    failed = Signal(object)
 
-    def __init__(self, kwargs: dict):
-        super().__init__()
-        self._kwargs = kwargs
+    def __init__(self, kwargs: dict, *, catalog: list, entry_id: str, parent):
+        super().__init__(parent)
+        self._kwargs = deepcopy(kwargs)
+        self._catalog = deepcopy(catalog)
+        self._entry_id = entry_id
+        self.setup_path = None
+        self.error = None
+        self.warnings = []
+        # 直接销毁父窗口也必须先等后台释放子进程和临时目录。
+        parent.destroyed.connect(self.cancel_and_wait)
+
+    def cancel_and_wait(self, *_args):
+        self.requestInterruption()
+        self.wait()
+
+    def _check_cancelled(self):
+        if self.isInterruptionRequested():
+            raise ExportCancelled("已取消制作安装包")
 
     def run(self):
         try:
+            from ui.export_parts.export_scripts import apply_catalog_to_ui_exclusive, collect_multi_script_package
+
             def on_progress(value: int, message: str):
                 self.progress.emit(int(value), str(message or ""))
 
-            setup_path = assemble_standalone_export(
+            self._check_cancelled()
+            require_iscc()
+            on_progress(1, "正在收集工作流资源…")
+            collection, scripts_meta = collect_multi_script_package(
+                self._catalog, entry_id=self._entry_id, cancel_check=self._check_cancelled,
+            )
+            self._check_cancelled()
+            if collection.errors:
+                raise ValueError("导出前需要先处理这些问题：\n\n" + "\n".join(collection.errors[:12]))
+            self.warnings = list(collection.warnings)
+            self.setup_path = assemble_standalone_export(
                 progress=on_progress,
+                cancel_check=self._check_cancelled,
+                collection=collection,
+                scripts=scripts_meta,
+                entry_script_id=self._entry_id,
+                ui=apply_catalog_to_ui_exclusive(self._kwargs.pop("ui"), self._catalog),
                 **self._kwargs,
             )
-            self.succeeded.emit(setup_path)
         except Exception as exc:
-            self.failed.emit(exc)
+            self.error = exc
+            # 不让异常回溯继续持有整份工作流、资源字节和构建局部对象。
+            exc.__traceback__ = None
+        finally:
+            self._kwargs.clear()
+            self._catalog.clear()
 
 
 class StandaloneExportDialog(QDialog):
@@ -170,6 +186,7 @@ class StandaloneExportDialog(QDialog):
         self._ui_payload = None
         self._ui_asset_map: dict[str, str] = {}
         self._worker: _AssembleWorker | None = None
+        self._closing = False
         self._progress: QProgressDialog | None = None
         self._export_app_name = ""
         self._export_warnings: list[str] = []
@@ -184,14 +201,10 @@ class StandaloneExportDialog(QDialog):
         raw_ids = draft.get("catalog_ids")
         if isinstance(raw_ids, list):
             self._draft_catalog_ids = [str(x).strip() for x in raw_ids if str(x).strip()]
-        try:
-            draft_w = max(0, int(draft.get("required_client_width") or 0))
-        except (TypeError, ValueError):
-            draft_w = 0
-        try:
-            draft_h = max(0, int(draft.get("required_client_height") or 0))
-        except (TypeError, ValueError):
-            draft_h = 0
+        draft_w = int(draft.get("required_client_width") or 0)
+        draft_h = int(draft.get("required_client_height") or 0)
+        if draft_w < 0 or draft_h < 0:
+            raise ValueError("独立程序草稿的分辨率不能为负数")
         draft_req = (draft_w, draft_h)
 
         default_name = draft_name or self._default_app_name()
@@ -201,7 +214,7 @@ class StandaloneExportDialog(QDialog):
         self._ui_asset_map = {
             str(k): str(v)
             for k, v in dict(draft_assets or {}).items()
-            if str(k).strip() and str(v).strip() and Path(str(v)).is_file()
+            if str(k).strip() and str(v).strip()
         }
 
         root = QVBoxLayout(self)
@@ -251,7 +264,7 @@ class StandaloneExportDialog(QDialog):
         output_row.addWidget(_browse_btn(self._choose_output), 0)
         basic_form.addRow(_form_label("保存位置"), output_row)
 
-        self._icon_edit = QLineEdit(draft_icon if draft_icon and Path(draft_icon).is_file() else "")
+        self._icon_edit = QLineEdit(draft_icon)
         self._icon_edit.setPlaceholderText("可选，默认使用内置图标")
         self._icon_edit.setClearButtonEnabled(True)
         self._icon_edit.setMinimumHeight(field_h)
@@ -311,7 +324,7 @@ class StandaloneExportDialog(QDialog):
 
         self._design_status = QLabel("未定制（将使用默认界面）")
         self._design_status.setWordWrap(True)
-        self._design_status.setStyleSheet("color: palette(mid);")
+        self._design_status.setObjectName("StandaloneExportDesignStatus")
         ui_layout.addWidget(self._design_status)
 
         design_row = QHBoxLayout()
@@ -351,8 +364,8 @@ class StandaloneExportDialog(QDialog):
         if current_task is None:
             return default_name
         name = str(getattr(current_task, "name", "") or "").strip()
-        if name.endswith(".json"):
-            name = name[:-5]
+        if name.lower().endswith(".lca"):
+            name = name[:-4]
         return name or default_name
 
     def _on_output_edited(self, _text: str):
@@ -385,14 +398,16 @@ class StandaloneExportDialog(QDialog):
         return isinstance(self._ui_payload, dict) or bool(self._ui_asset_map)
 
     def _refresh_design_status(self):
+        customized = self._has_custom_design()
+        self._design_status.setProperty("customized", customized)
+        self._design_status.style().unpolish(self._design_status)
+        self._design_status.style().polish(self._design_status)
         if not self._has_custom_design():
             self._design_status.setText("当前使用默认运行界面。可点下方按钮打开设计器定制。")
-            self._design_status.setStyleSheet("color: palette(mid);")
             self._reset_design_btn.setEnabled(False)
             return
         widget_count = len((self._ui_payload or {}).get("widgets") or [])
         self._design_status.setText(f"已定制界面（{widget_count} 个控件），关闭本对话框也会保留。")
-        self._design_status.setStyleSheet("color: #0a7a32;")
         self._reset_design_btn.setEnabled(True)
 
     def _persist_draft(self, *_args):
@@ -521,8 +536,10 @@ class StandaloneExportDialog(QDialog):
         catalog = self._session_catalog()
         entry_id = self._default_entry_id(catalog)
         entry = next((item for item in catalog if item.get("id") == entry_id), None)
-        workflow_data = dict((entry or catalog[0]).get("workflow_data") or {})
-        parent_file = str((entry or catalog[0]).get("filepath") or "")
+        if entry is None:
+            raise ValueError(f"入口脚本不在导出目录中: {entry_id}")
+        workflow_data = dict(entry.get("workflow_data") or {})
+        parent_file = str(entry.get("filepath") or "")
         from task_workflow.workspace import resolve_runtime_resource_dirs
 
         resource_dirs = resolve_runtime_resource_dirs(
@@ -597,20 +614,10 @@ class StandaloneExportDialog(QDialog):
         task_manager = getattr(self._main, "task_manager", None)
         if tab_widget is None or task_manager is None:
             return None
-        getter = getattr(tab_widget, "get_current_task_id", None)
-        if not callable(getter):
-            return None
-        task_id = getter()
+        task_id = tab_widget.get_current_task_id()
         if task_id is None:
             return None
-        get_task = getattr(task_manager, "get_task", None)
-        if callable(get_task):
-            return get_task(task_id)
-        tasks = getattr(task_manager, "get_all_tasks", lambda: [])()
-        for task in tasks:
-            if getattr(task, "task_id", None) == task_id:
-                return task
-        return None
+        return task_manager.get_task(task_id)
 
     def _parent_workflow_file(self) -> str:
         task = self._current_task()
@@ -623,13 +630,7 @@ class StandaloneExportDialog(QDialog):
             return
         if getattr(panel, "current_card_id", None) is None:
             return
-        apply = getattr(panel, "_apply_parameters", None)
-        if not callable(apply):
-            return
-        try:
-            apply(auto_close=False)
-        except Exception:
-            logger.exception("导出前同步参数面板失败")
+        panel._apply_parameters(auto_close=False)
 
     def _prompt_inno_setup_download(self, *, title: str, text: str, detail: str = ""):
         box = QMessageBox(self)
@@ -646,8 +647,8 @@ class StandaloneExportDialog(QDialog):
         )
         open_btn = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("稍后再说", QMessageBox.ButtonRole.RejectRole)
-        exec_dialog(box)
-        if box.clickedButton() == open_btn:
+        open_download = exec_dialog(box, read_result=lambda _result: box.clickedButton() == open_btn)
+        if open_download:
             QDesktopServices.openUrl(QUrl(INNO_SETUP_DOWNLOAD_PAGE))
 
     def _prompt_install_inno_setup(self, detail: str = ""):
@@ -679,33 +680,43 @@ class StandaloneExportDialog(QDialog):
         )
         open_btn = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("知道了", QMessageBox.ButtonRole.RejectRole)
-        exec_dialog(box)
-        if box.clickedButton() == open_btn:
+        open_download = exec_dialog(box, read_result=lambda _result: box.clickedButton() == open_btn)
+        if open_download:
             QDesktopServices.openUrl(QUrl(INNO_CHINESE_LANG_HELP))
 
     def _is_exporting(self) -> bool:
-        return self._worker is not None and self._worker.isRunning()
+        return self._worker is not None
+
+    def _cancel_export(self):
+        self._closing = True
+        if self._worker is not None:
+            self._worker.requestInterruption()
+        self._close_progress()
 
     def reject(self):
-        if self._is_exporting():
-            QMessageBox.information(self, "正在制作", "安装包制作中，请等待完成后再关闭。")
-            return
+        self._cancel_export()
         super().reject()
 
     def closeEvent(self, event):
-        if self._is_exporting():
-            event.ignore()
-            QMessageBox.information(self, "正在制作", "安装包制作中，请等待完成后再关闭。")
-            return
+        self._cancel_export()
         self._persist_draft()
         super().closeEvent(event)
 
+    def event(self, event):
+        if event.type() == QEvent.Type.DeferredDelete and self._worker is not None:
+            self._cancel_export()
+            self._disconnect_worker_signals()
+            self._worker.cancel_and_wait()
+        return super().event(event)
+
     def _set_busy(self, busy: bool):
         self._export_button.setEnabled(not busy)
-        self._cancel_button.setEnabled(not busy)
+        self._cancel_button.setEnabled(True)
         self._name_edit.setEnabled(not busy)
         self._output_edit.setEnabled(not busy)
         self._icon_edit.setEnabled(not busy)
+        self._req_width_spin.setEnabled(not busy)
+        self._req_height_spin.setEnabled(not busy)
         self._design_btn.setEnabled(not busy)
         self._reset_design_btn.setEnabled(False if busy else self._has_custom_design())
         self._export_button.setText("制作中…" if busy else "制作安装包")
@@ -716,8 +727,7 @@ class StandaloneExportDialog(QDialog):
             return
         for signal, slot in (
             (worker.progress, self._on_export_progress),
-            (worker.succeeded, self._on_export_succeeded),
-            (worker.failed, self._on_export_failed),
+            (worker.finished, self._on_export_finished),
         ):
             try:
                 signal.disconnect(slot)
@@ -730,6 +740,7 @@ class StandaloneExportDialog(QDialog):
         if progress is None:
             return
         try:
+            progress.canceled.disconnect(self.reject)
             progress.hide()
             progress.close()
             progress.deleteLater()
@@ -749,11 +760,25 @@ class StandaloneExportDialog(QDialog):
             # 进度框已销毁或正在关闭
             self._progress = None
 
-    def _on_export_succeeded(self, setup_path):
+    def _on_export_finished(self):
+        worker = self._worker
+        if worker is None:
+            return
         self._disconnect_worker_signals()
-        self._close_progress()
-        self._set_busy(False)
         self._worker = None
+        error, setup_path = worker.error, worker.setup_path
+        self._export_warnings = worker.warnings
+        worker.deleteLater()
+        self._close_progress()
+        if self._closing or isinstance(error, ExportCancelled):
+            return
+        self._set_busy(False)
+        if error is not None:
+            self._on_export_failed(error)
+        else:
+            self._on_export_succeeded(setup_path)
+
+    def _on_export_succeeded(self, setup_path):
         notes = []
         if self._export_warnings:
             notes.append("注意：\n" + "\n".join(self._export_warnings[:8]))
@@ -767,10 +792,6 @@ class StandaloneExportDialog(QDialog):
         self.accept()
 
     def _on_export_failed(self, exc):
-        self._disconnect_worker_signals()
-        self._close_progress()
-        self._set_busy(False)
-        self._worker = None
         if isinstance(exc, MissingInnoSetupError):
             self._prompt_install_inno_setup(str(exc))
             return
@@ -783,25 +804,34 @@ class StandaloneExportDialog(QDialog):
         QMessageBox.critical(self, "制作失败", str(exc))
 
     def _export(self):
-        if self._is_exporting():
-            return
-
         try:
-            require_iscc()
-        except MissingInnoSetupError as exc:
-            self._prompt_install_inno_setup(str(exc))
-            return
-        except OutdatedInnoSetupError as exc:
-            self._prompt_outdated_inno_setup(str(exc))
+            self._start_export()
+        except Exception as exc:
+            worker = self._worker
+            if worker is not None:
+                worker.cancel_and_wait()
+                self._disconnect_worker_signals()
+                self._worker = None
+                worker.deleteLater()
+            self._close_progress()
+            self._set_busy(False)
+            QMessageBox.critical(self, "无法制作", str(exc))
+
+    def _start_export(self):
+        if self._is_exporting():
             return
 
         from ui.export_parts.export_scripts import (
             apply_catalog_to_ui_exclusive,
             assert_script_lists_exclusive,
-            collect_multi_script_package,
             select_scripts_for_export,
         )
 
+        output_text = self._output_edit.text().strip()
+        if not output_text:
+            QMessageBox.warning(self, "无法制作", "请选择保存位置")
+            return
+        output_dir = Path(output_text)
         self._flush_parameter_panel_for_export()
 
         if not self._validate_required_client_size():
@@ -810,10 +840,6 @@ class StandaloneExportDialog(QDialog):
             return
 
         app_name = self._name_edit.text().strip() or "独立程序"
-        output_dir = Path(self._output_edit.text().strip() or "")
-        if not output_dir:
-            QMessageBox.warning(self, "无法制作", "请选择保存位置")
-            return
         required_width, required_height = self._required_client_size()
 
         catalog = self._session_catalog()
@@ -831,43 +857,34 @@ class StandaloneExportDialog(QDialog):
             entry_id=entry_id,
             ui=ui_seed,
         )
-        entry = next((item for item in export_catalog if str(item.get("id") or "") == str(entry_id)), export_catalog[0])
-        from task_workflow.workspace import resolve_runtime_resource_dirs
-
-        resource_dirs = resolve_runtime_resource_dirs(
-            dict(entry.get("workflow_data") or {}),
-            workflow_filepath=str(entry.get("filepath") or ""),
-            default_images_dir=str(getattr(self._main, "images_dir", "") or get_images_dir("LCA")),
-        )
-        collection, scripts_meta = collect_multi_script_package(
-            export_catalog,
-            entry_id=entry_id,
-            images_dir=str(resource_dirs.get("images_dir") or get_images_dir("LCA")),
-            sounds_dir=str(resource_dirs.get("sounds_dir") or get_sounds_dir("LCA")),
-        )
-        if collection.errors:
-            QMessageBox.warning(
-                self,
-                "无法制作",
-                "导出前需要先处理这些问题：\n\n" + "\n".join(collection.errors[:12]),
-            )
-            return
-
         ui = apply_catalog_to_ui_exclusive(ui_seed, export_catalog)
         # 标题跟随程序名（若用户未在设计器里改过，仍以程序名为准）
         if not self._ui_payload:
             ui["title"] = app_name
 
         self._export_app_name = app_name
-        self._export_warnings = list(collection.warnings or [])
+        kwargs = {
+            "output_dir": output_dir,
+            "app_name": app_name,
+            "description": "",
+            "ui": ui,
+            "icon_path": self._icon_edit.text().strip(),
+            "company": "",
+            "version": "1.0.0",
+            "ui_asset_map": self._ui_asset_map,
+            "required_client_width": required_width,
+            "required_client_height": required_height,
+            "runtime_config": runtime_config_from_main(self._main),
+        }
         self._set_busy(True)
 
-        # cancel 用空串再移除按钮；不要传 None，部分环境下会导致标签异常
-        self._progress = QProgressDialog("正在准备制作安装包…", "", 0, 100, self)
+        self._closing = False
+        self._progress = QProgressDialog("正在准备制作安装包…", "取消", 0, 100, self)
         self._progress.setWindowTitle("制作安装包")
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress.setMinimumDuration(0)
-        self._progress.setCancelButton(None)
+        self._progress.canceled.connect(self.reject)
+        apply_rounded_popup(self._progress, frameless=False)
         self._progress.setValue(0)
         self._progress.setAutoClose(False)
         self._progress.setAutoReset(False)
@@ -875,26 +892,12 @@ class StandaloneExportDialog(QDialog):
         self._progress.show()
 
         worker = _AssembleWorker(
-            {
-                "output_dir": output_dir,
-                "app_name": app_name,
-                "description": "",
-                "collection": collection,
-                "ui": ui,
-                "icon_path": self._icon_edit.text().strip(),
-                "company": "",
-                "version": "1.0.0",
-                "ui_asset_map": self._ui_asset_map,
-                "required_client_width": required_width,
-                "required_client_height": required_height,
-                "scripts": scripts_meta,
-                "entry_script_id": entry_id,
-                "runtime_config": runtime_config_from_main(self._main),
-            }
+            kwargs,
+            catalog=export_catalog,
+            entry_id=entry_id,
+            parent=self,
         )
         worker.progress.connect(self._on_export_progress)
-        worker.succeeded.connect(self._on_export_succeeded)
-        worker.failed.connect(self._on_export_failed)
-        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_export_finished)
         self._worker = worker
         worker.start()

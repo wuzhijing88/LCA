@@ -192,9 +192,9 @@ class MainWindowWindowValidationMixin:
 
         """启动运行时窗口监控"""
 
-        if self._window_monitor_enabled and not self._window_monitor_timer.isActive():
+        self._window_invalid_count.clear()
 
-            self._window_invalid_count.clear()
+        if self._window_monitor_enabled and not self._window_monitor_timer.isActive():
 
             self._window_monitor_timer.start(self._window_monitor_interval)
 
@@ -216,8 +216,6 @@ class MainWindowWindowValidationMixin:
 
         """运行时检查窗口有效性"""
 
-        import win32gui
-
         if not hasattr(self, 'bound_windows') or not self.bound_windows:
 
             return
@@ -232,9 +230,22 @@ class MainWindowWindowValidationMixin:
 
         if not is_running:
 
-            # 任务未运行时不需要频繁检查
+            # 空闲时也刷新已关闭后重开的窗口，并立即同步到主配置。
+            try:
+                from utils.window.window_identity import refresh_bound_windows
+
+                if refresh_bound_windows(self.bound_windows):
+                    self._save_config_silent()
+                    logger.info("[窗口监控] 空闲期间已自动重连并保存绑定窗口")
+                    refresh_selectors = getattr(self, "_refresh_all_ocr_region_selectors", None)
+                    if callable(refresh_selectors):
+                        refresh_selectors()
+            except Exception as exc:
+                logger.warning("[窗口监控] 空闲期间刷新绑定窗口失败: %s", exc)
 
             return
+
+        import win32gui
 
         enabled_windows = [w for w in self.bound_windows if w.get('enabled', True)]
 
@@ -315,6 +326,10 @@ class MainWindowWindowValidationMixin:
                 self._save_config_silent()
 
                 logger.info("[窗口监控] 已保存恢复的窗口配置")
+
+                refresh_selectors = getattr(self, "_refresh_all_ocr_region_selectors", None)
+                if callable(refresh_selectors):
+                    refresh_selectors()
 
             except Exception as e:
 

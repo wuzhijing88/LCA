@@ -87,17 +87,21 @@ class MainWindowWorkflowCanvasMixin:
         # 使用两列按钮布局的对话框选择任务类型
         from ui.dialogs.select_task_dialog import SelectTaskDialog
         dialog = SelectTaskDialog(task_types, self)
-        result = dialog.exec()
-        if result == QDialog.DialogCode.Accepted:
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
             task_type = dialog.selected_task_type()
-        else:
-            task_type = None
-        dialog.deleteLater()
-        if task_type is None:
-            return
-        if task_type:
-            center_view = self.workflow_view.mapToScene(self.workflow_view.viewport().rect().center())
-            self.workflow_view.add_task_card(center_view.x(), center_view.y(), task_type=task_type)
+            if task_type:
+                center_view = self.workflow_view.mapToScene(self.workflow_view.viewport().rect().center())
+                if task_type == "脚本卡片":
+                    self.workflow_view.add_task_card(center_view.x(), center_view.y(), task_type=task_type, parameters=dialog.selected_task_parameters())
+                else:
+                    self.workflow_view.add_task_card(center_view.x(), center_view.y(), task_type=task_type)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法添加卡片", str(exc))
+        finally:
+            dialog.deleteLater()
+
     def _reset_all_workflow_card_states(self, reason: str = ""):
         """执行前重置所有工作流卡片状态"""
         if reason:

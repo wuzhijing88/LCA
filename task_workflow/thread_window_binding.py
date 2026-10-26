@@ -13,18 +13,21 @@ THREAD_WINDOW_LIMIT_PARAM = "bound_window_id"
 
 
 def bound_window_selector_choices(windows: Any) -> List[Tuple[str, str]]:
-    from app_core.control_plane import ensure_bind_id
-
     choices: List[Tuple[str, str]] = []
     if not isinstance(windows, list):
-        return choices
+        raise TypeError("绑定窗口必须是列表")
+    seen: set[str] = set()
     for idx, window_info in enumerate(windows, 1):
         if not isinstance(window_info, dict):
-            continue
-        bind_id = ensure_bind_id(window_info)
-        if not bind_id:
-            continue
-        title = str(window_info.get("title") or f"窗口{idx}").strip() or f"窗口{idx}"
+            raise TypeError(f"绑定窗口配置必须是字典: index={idx}")
+        bind_id = _require_bind_id(window_info.get("bind_id"))
+        if bind_id in seen:
+            raise ValueError(f"窗口绑定标识重复: {bind_id}")
+        seen.add(bind_id)
+        title = window_info.get("title", "")
+        if not isinstance(title, str):
+            raise TypeError(f"绑定窗口标题必须是字符串: index={idx}")
+        title = title.strip()
         choices.append((f"窗口{idx}: {title}", bind_id))
     return choices
 
@@ -38,6 +41,8 @@ def is_valid_thread_window_limit_connection(
     end_task_type: Any,
     line_type: Any,
 ) -> bool:
+    if is_thread_window_limit_task_type(end_task_type):
+        return False
     if not is_thread_window_limit_task_type(start_task_type):
         return True
     return (
@@ -53,18 +58,33 @@ def _require_int(value: Any, field_name: str) -> int:
     return value
 
 
+def _require_bind_id(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("窗口绑定标识必须是非空字符串")
+    return value
+
+
+def require_window_dimension(value: Any, field_name: str) -> int:
+    if value is None:
+        return 0
+    dimension = _require_int(value, field_name)
+    if dimension < 0:
+        raise ValueError(f"{field_name} 不能为负数")
+    return dimension
+
+
 def _normalize_cards(cards_data: Any) -> Dict[int, Dict[str, Any]]:
     if not isinstance(cards_data, dict) or not cards_data:
         raise ValueError("cards_data 必须是非空字典")
 
     normalized: Dict[int, Dict[str, Any]] = {}
     for raw_key, card in cards_data.items():
+        _require_int(raw_key, "卡片字典键")
         if not isinstance(card, dict):
             raise TypeError(f"卡片数据必须是字典: key={raw_key!r}")
         card_id = _require_int(card.get("id"), f"卡片ID(key={raw_key!r})")
-        existing = normalized.get(card_id)
-        if existing is not None and existing != card:
-            raise ValueError(f"卡片ID重复且内容冲突: {card_id}")
+        if card_id < 0 or raw_key != card_id:
+            raise ValueError(f"卡片字典键与非负整数ID不一致: {raw_key!r}, {card_id}")
         normalized[card_id] = card
     return normalized
 
@@ -115,6 +135,8 @@ def _normalize_connections(
         end_card = cards.get(end_id)
         if start_card is None or end_card is None:
             raise ValueError(f"连接引用了不存在的卡片: index={index}, {start_id}->{end_id}")
+        if is_thread_window_limit_task_type(end_card.get("task_type")):
+            raise ValueError(f"线程窗口限制卡 {end_id} 不允许输入连线")
 
         connection_key = (start_id, end_id, line_type)
         if connection_key in seen:
@@ -133,31 +155,34 @@ def _normalize_connections(
     return incoming_map
 
 
-def _get_enabled_bound_windows(bound_windows: Any) -> List[Dict[str, Any]]:
+def enabled_bound_windows(bound_windows: Any) -> List[Dict[str, Any]]:
     if not isinstance(bound_windows, list):
         raise TypeError("bound_windows 必须是列表")
 
     enabled_windows: List[Dict[str, Any]] = []
+    seen: set[str] = set()
     for index, window_info in enumerate(bound_windows):
         if not isinstance(window_info, dict):
             raise TypeError(f"绑定窗口配置必须是字典: index={index}")
         enabled = window_info.get("enabled", True)
         if not isinstance(enabled, bool):
             raise TypeError(f"绑定窗口 enabled 必须是布尔值: index={index}")
+        bind_id = _require_bind_id(window_info.get("bind_id"))
+        if bind_id in seen:
+            raise ValueError(f"窗口绑定标识重复: {bind_id}")
+        seen.add(bind_id)
         if not enabled:
             continue
 
         raw_hwnd = window_info.get("hwnd")
-        if isinstance(raw_hwnd, bool):
-            raise TypeError(f"绑定窗口句柄必须是整数: index={index}")
+        _require_int(raw_hwnd, f"绑定窗口句柄(index={index})")
         hwnd = as_hwnd(raw_hwnd)
         if hwnd == 0:
             raise ValueError(f"绑定窗口句柄必须大于0: index={index}")
-        window_info["hwnd"] = hwnd
         title = window_info.get("title", "")
         if not isinstance(title, str):
             raise TypeError(f"绑定窗口标题必须是字符串: index={index}")
-        enabled_windows.append(window_info)
+        enabled_windows.append({**window_info, "hwnd": hwnd})
     return enabled_windows
 
 
@@ -178,7 +203,7 @@ def resolve_thread_window_configs(
     cards = _normalize_cards(cards_data)
     normalized_start_ids = _normalize_start_card_ids(start_card_ids, cards)
     incoming_map = _normalize_connections(connections_data, cards)
-    enabled_windows = _get_enabled_bound_windows(bound_windows)
+    enabled_windows = enabled_bound_windows(bound_windows)
     resolved: Dict[int, Dict[str, Any]] = {}
 
     for start_id in normalized_start_ids:
@@ -204,13 +229,11 @@ def resolve_thread_window_configs(
         raw_bind_id = parameters.get(THREAD_WINDOW_LIMIT_PARAM)
         if raw_bind_id is None:
             continue
-        bind_id = str(raw_bind_id).strip()
-        if not bind_id:
-            continue
+        bind_id = _require_bind_id(raw_bind_id)
 
         selected_window = None
         for window_info in enabled_windows:
-            if str(window_info.get("bind_id") or "").strip() == bind_id:
+            if window_info["bind_id"] == bind_id:
                 selected_window = window_info
                 break
         if selected_window is None:

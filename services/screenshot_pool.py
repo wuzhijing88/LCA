@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -20,8 +22,9 @@ from utils.match.resolution_aware_matcher import smart_match_template
 from utils.capture.screenshot_helper import (
     _capture_with_engine,
     cleanup_screenshot_engine,
+    cleanup_screenshot_engine_runtime as _cleanup_engine_runtime_impl,
+    _clear_screenshot_cache_by_engine,
     cleanup_screenshot_engines_on_stop as _cleanup_screenshot_engines_on_stop_impl,
-    clear_screenshot_cache as _clear_screenshot_cache_impl,
     get_last_screenshot_error as _get_last_capture_error,
     get_screenshot_engine,
     get_screenshot_info,
@@ -31,71 +34,58 @@ logger = logging.getLogger(__name__)
 
 _MOTION_STATE_LOCK = threading.RLock()
 _MOTION_STATE: Dict[str, np.ndarray] = {}
+_MOTION_STATE_GENERATION = 0
 
 _WORKER_LIMIT_LOCK = threading.Lock()
 _WORKER_LIMIT_OVERRIDE: Optional[int] = None
-_WORKER_GATE_LOCK = threading.Lock()
-_WORKER_GATE: Optional[threading.BoundedSemaphore] = None
-_WORKER_GATE_LIMIT: int = 0
+_WORKER_GATE_CONDITION = threading.Condition()
+_WORKER_ACTIVE = 0
 
 _CAPTURE_SHARE_LOCK = threading.RLock()
 _CAPTURE_INFLIGHT: Dict[Tuple[int, bool, str], "_CaptureInFlight"] = {}
+_CAPTURE_CLEANUP_LOCK = threading.Lock()
+_CAPTURE_CLEANUP_TARGET = None
 
 
 class _CaptureInFlight:
-    __slots__ = ("event", "frame", "error")
+    __slots__ = ("event", "finished", "frame", "error")
 
     def __init__(self) -> None:
         self.event = threading.Event()
+        self.finished = threading.Event()
         self.frame: Optional[np.ndarray] = None
         self.error: str = ""
 
 
 def _normalize_engine(engine: Optional[str]) -> str:
-    text = str(engine or "").strip().lower()
     from utils.capture.engine_ids import is_supported_screenshot_engine
-
-    if is_supported_screenshot_engine(text):
-        return text
-    try:
-        current = str(get_screenshot_engine() or "wgc").strip().lower()
-        if is_supported_screenshot_engine(current):
-            return current
-    except Exception:
-        pass
-    return "wgc"
+    text = get_screenshot_engine() if engine is None else str(engine).strip().lower()
+    if not is_supported_screenshot_engine(text):
+        raise ValueError(f"未知的截图引擎：{text}")
+    return text
 
 
-def _normalize_roi(roi: Optional[Tuple[int, int, int, int]], width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
+def _normalize_roi(roi, width: int, height: int):
+    if roi is None:
+        return None
     if not isinstance(roi, (list, tuple)) or len(roi) != 4:
-        return None
-    try:
-        x, y, w, h = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
-    except Exception:
-        return None
-    if w <= 0 or h <= 0:
-        return None
-    if x < 0 or y < 0:
-        return None
-    x2 = min(width, x + w)
-    y2 = min(height, y + h)
-    if x >= x2 or y >= y2:
-        return None
-    return (x, y, x2 - x, y2 - y)
+        raise ValueError("截图区域必须包含x、y、宽、高")
+    x, y, w, h = (int(value) for value in roi)
+    if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
+        raise ValueError("截图区域超出画面或尺寸无效")
+    return x, y, w, h
 
 
-def _extract_roi_frame(frame: np.ndarray, roi: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
-    if frame is None or not isinstance(frame, np.ndarray) or frame.size <= 0:
-        return frame
+def _extract_roi_frame(frame: np.ndarray, roi) -> np.ndarray:
     normalized = _normalize_roi(roi, frame.shape[1], frame.shape[0])
     if normalized is None:
         return frame
     x, y, w, h = normalized
-    return frame[y : y + h, x : x + w]
+    return frame[y:y+h, x:x+w]
 
 
 def _build_capture_key(hwnd: int, client_area_only: bool, engine_name: str) -> Tuple[int, bool, str]:
-    return (int(hwnd), bool(client_area_only), str(engine_name or "wgc").strip().lower())
+    return (int(hwnd), bool(client_area_only), str(engine_name).strip().lower())
 
 
 def _resolve_effective_worker_limit() -> int:
@@ -103,48 +93,96 @@ def _resolve_effective_worker_limit() -> int:
     with _WORKER_LIMIT_LOCK:
         override = _WORKER_LIMIT_OVERRIDE
     if override is not None:
-        return max(1, min(hard, int(override)))
+        if not 1 <= int(override) <= hard:
+            raise ValueError(f"截图工作线程上限必须在1到{hard}之间")
+        return int(override)
     default_limit = min(3, hard)
     raw = os.getenv("LCA_SCREENSHOT_WORKER_LIMIT")
     if raw is None:
         return default_limit
     try:
         value = int(raw)
-    except Exception:
-        value = default_limit
-    return max(1, min(hard, value))
+    except ValueError as exc:
+        raise ValueError("截图工作线程上限必须是整数") from exc
+    if not 1 <= value <= hard:
+        raise ValueError(f"截图工作线程上限必须在1到{hard}之间")
+    return value
 
 
-def _acquire_capture_worker_slot(timeout: float) -> Optional[threading.BoundedSemaphore]:
-    limit = _resolve_effective_worker_limit()
-    semaphore: Optional[threading.BoundedSemaphore]
-    with _WORKER_GATE_LOCK:
-        global _WORKER_GATE, _WORKER_GATE_LIMIT
-        if _WORKER_GATE is None or _WORKER_GATE_LIMIT != limit:
-            _WORKER_GATE = threading.BoundedSemaphore(limit)
-            _WORKER_GATE_LIMIT = limit
-        semaphore = _WORKER_GATE
-    if semaphore is None:
-        return None
-    wait_timeout = max(0.1, float(timeout))
-    acquired = semaphore.acquire(timeout=wait_timeout)
-    if not acquired:
-        return None
-    return semaphore
+class _CaptureWorkerSlot:
+    def __init__(self):
+        self._released = False
+
+    def release(self):
+        global _WORKER_ACTIVE
+        with _WORKER_GATE_CONDITION:
+            if self._released:
+                raise RuntimeError("截图工作槽已释放")
+            self._released = True
+            _WORKER_ACTIVE -= 1
+            _WORKER_GATE_CONDITION.notify_all()
+
+
+def _acquire_capture_worker_slot(timeout: float, cancelled: Optional[threading.Event] = None):
+    global _WORKER_ACTIVE
+
+    def is_cancelled():
+        return cancelled is not None and cancelled.is_set()
+
+    with _WORKER_GATE_CONDITION:
+        if not _WORKER_GATE_CONDITION.wait_for(
+            lambda: is_cancelled() or _WORKER_ACTIVE < _resolve_effective_worker_limit(),
+            timeout=float(timeout),
+        ):
+            return None
+        if is_cancelled():
+            return None
+        _WORKER_ACTIVE += 1
+        return _CaptureWorkerSlot()
 
 
 def _clear_shared_capture_state(hwnd: Optional[int] = None) -> None:
     with _CAPTURE_SHARE_LOCK:
-        if hwnd is None:
-            _CAPTURE_INFLIGHT.clear()
-            return
+        for key, inflight in _CAPTURE_INFLIGHT.items():
+            if hwnd is None or key[0] == int(hwnd):
+                # 保留正在执行的所有者，防止清理后同一窗口又启动一轮原生抓图。
+                inflight.error = "截图运行态已清理"
+                inflight.frame = None
+                inflight.event.set()
+    with _WORKER_GATE_CONDITION:
+        _WORKER_GATE_CONDITION.notify_all()
+
+
+def _capture_matches_target(key, hwnd, engine):
+    return (hwnd is None or key[0] == hwnd) and (engine is None or key[2] == engine)
+
+
+@contextmanager
+def _quiesce_capture_requests(hwnd=None, engine=None):
+    """销毁资源前拦住对应的新请求，并等待已有所有者退出原生调用。"""
+    global _CAPTURE_CLEANUP_TARGET
+    hwnd_value = None if hwnd is None else int(hwnd)
+    with _CAPTURE_CLEANUP_LOCK:
+        with _CAPTURE_SHARE_LOCK:
+            _CAPTURE_CLEANUP_TARGET = (hwnd_value, engine)
+            pending = []
+            for key, inflight in _CAPTURE_INFLIGHT.items():
+                if _capture_matches_target(key, hwnd_value, engine):
+                    inflight.error = "截图运行态已清理"
+                    inflight.frame = None
+                    inflight.event.set()
+                    pending.append(inflight.finished)
+        with _WORKER_GATE_CONDITION:
+            _WORKER_GATE_CONDITION.notify_all()
         try:
-            hwnd_value = int(hwnd)
-        except Exception:
-            return
-        keys_to_remove = [key for key in _CAPTURE_INFLIGHT.keys() if int(key[0]) == hwnd_value]
-        for key in keys_to_remove:
-            _CAPTURE_INFLIGHT.pop(key, None)
+            deadline = time.monotonic() + 35.0
+            for finished in pending:
+                if not finished.wait(max(0, deadline - time.monotonic())):
+                    raise RuntimeError("截图请求尚未结束，不能销毁正在使用的引擎资源")
+            yield
+        finally:
+            with _CAPTURE_SHARE_LOCK:
+                _CAPTURE_CLEANUP_TARGET = None
 
 
 def _build_capture_failed_error(engine: Optional[str]) -> str:
@@ -181,6 +219,10 @@ def capture_window(
     inflight: Optional[_CaptureInFlight] = None
     # 同窗口同引擎并发请求：仅共享同一轮 in-flight 抓帧结果，抓帧完成即失效。
     with _CAPTURE_SHARE_LOCK:
+        if _CAPTURE_CLEANUP_TARGET is not None and _capture_matches_target(
+            capture_key, *_CAPTURE_CLEANUP_TARGET
+        ):
+            return None
         inflight = _CAPTURE_INFLIGHT.get(capture_key)
         if inflight is None:
             inflight = _CaptureInFlight()
@@ -188,33 +230,35 @@ def capture_window(
             owner = True
 
     if owner:
-        slot = _acquire_capture_worker_slot(timeout_value)
-        if slot is None:
-            inflight.error = "capture_worker_limit_timeout"
-            inflight.event.set()
-            with _CAPTURE_SHARE_LOCK:
-                _CAPTURE_INFLIGHT.pop(capture_key, None)
-            return None
+        slot = None
         try:
-            captured = _capture_with_engine(
-                hwnd=hwnd_value,
-                client_area_only=bool(client_area_only),
-                engine=engine_name,
-                timeout=timeout_value,
-            )
-            if captured is not None and isinstance(captured, np.ndarray) and captured.size > 0:
-                frame = captured
-                inflight.frame = captured
-            else:
-                inflight.error = "capture_failed"
-        finally:
-            try:
-                slot.release()
-            except Exception:
-                pass
-            inflight.event.set()
+            slot = _acquire_capture_worker_slot(timeout_value, cancelled=inflight.event)
+            if slot is None:
+                with _CAPTURE_SHARE_LOCK:
+                    if not inflight.error:
+                        inflight.error = "capture_worker_limit_timeout"
+                return None
             with _CAPTURE_SHARE_LOCK:
-                _CAPTURE_INFLIGHT.pop(capture_key, None)
+                if inflight.error:
+                    return None
+            captured = _capture_with_engine(
+                hwnd=hwnd_value, client_area_only=bool(client_area_only),
+                engine=engine_name, timeout=timeout_value,
+            )
+            with _CAPTURE_SHARE_LOCK:
+                if not inflight.error and isinstance(captured, np.ndarray) and captured.size > 0:
+                    frame = captured
+                    inflight.frame = captured
+                elif not inflight.error:
+                    inflight.error = "capture_failed"
+        finally:
+            if slot is not None:
+                slot.release()
+            with _CAPTURE_SHARE_LOCK:
+                inflight.event.set()
+                if _CAPTURE_INFLIGHT.get(capture_key) is inflight:
+                    _CAPTURE_INFLIGHT.pop(capture_key)
+                inflight.finished.set()
     else:
         wait_seconds = max(0.6, timeout_value + 0.3)
         if inflight is None or (not inflight.event.wait(timeout=wait_seconds)):
@@ -440,9 +484,10 @@ def capture_and_find_color(
         failed["error"] = "invalid_colors_data"
         return failed
 
-    mode = str(color_mode or "single").strip().lower()
+    mode = str(color_mode).strip().lower()
     if mode not in {"single", "multi", "multipoint"}:
-        mode = "single"
+        failed["error"] = "未知的颜色查找模式"
+        return failed
 
     positions: List[Tuple[int, int]] = []
 
@@ -592,6 +637,8 @@ def capture_and_check_motion(
         "error": "unknown_error",
     }
 
+    with _MOTION_STATE_LOCK:
+        state_generation = _MOTION_STATE_GENERATION
     frame = capture_window(
         hwnd=hwnd,
         client_area_only=client_area_only,
@@ -614,7 +661,14 @@ def capture_and_check_motion(
     motion_threshold_value = max(1, int(motion_threshold))
 
     with _MOTION_STATE_LOCK:
+        if state_generation != _MOTION_STATE_GENERATION:
+            failed["error"] = "运动检测状态已清理，本次截图已失效"
+            return failed
         previous = _MOTION_STATE.get(key)
+        total_bytes = sum(value.nbytes for name, value in _MOTION_STATE.items() if name != key)
+        if (previous is None and len(_MOTION_STATE) >= 64) or total_bytes + gray.nbytes > 128 * 1024 * 1024:
+            failed["error"] = "运动检测缓存已达上限，请先清理状态"
+            return failed
         if reset_baseline or previous is None:
             _MOTION_STATE[key] = gray
             return {
@@ -654,8 +708,10 @@ def capture_and_check_motion(
 
 
 def clear_motion_state(state_key: Optional[str] = None) -> bool:
+    global _MOTION_STATE_GENERATION
     with _MOTION_STATE_LOCK:
         if state_key is None:
+            _MOTION_STATE_GENERATION += 1
             _MOTION_STATE.clear()
             return True
         key = str(state_key).strip()
@@ -667,16 +723,15 @@ def clear_motion_state(state_key: Optional[str] = None) -> bool:
 
 def clear_screenshot_engine_cache(hwnd: Optional[int] = None) -> bool:
     try:
-        _clear_screenshot_cache_impl(hwnd=hwnd)
-        _clear_shared_capture_state(hwnd=hwnd)
-        return True
+        return clear_screenshot_cache(hwnd=hwnd, engine=get_screenshot_engine())
     except Exception:
         return False
 
 
 def clear_screenshot_cache(hwnd: Optional[int] = None, engine: Optional[str] = None) -> bool:
-    _ = engine
-    return clear_screenshot_engine_cache(hwnd=hwnd)
+    engine_name = _normalize_engine(engine)
+    with _quiesce_capture_requests(hwnd=hwnd, engine=engine_name):
+        return _clear_screenshot_cache_by_engine(hwnd=hwnd, engine=engine_name)
 
 
 def cleanup_screenshot_engine_runtime(
@@ -684,15 +739,15 @@ def cleanup_screenshot_engine_runtime(
     hwnd: Optional[int] = None,
     cleanup_d3d: bool = False,
 ) -> None:
-    _ = engine
-    _ = cleanup_d3d
-    cleanup_screenshot_engine(hwnd=hwnd)
-    _clear_shared_capture_state(hwnd=hwnd)
+    engine_name = _normalize_engine(engine)
+    with _quiesce_capture_requests(hwnd=hwnd, engine=engine_name):
+        _cleanup_engine_runtime_impl(engine=engine_name, hwnd=hwnd, cleanup_d3d=cleanup_d3d)
 
 
 def cleanup_screenshot_runtime() -> None:
-    cleanup_screenshot_engine(hwnd=None)
-    _clear_shared_capture_state(hwnd=None)
+    with _quiesce_capture_requests():
+        clear_screenshot_runtime_state(hwnd=None)
+        cleanup_screenshot_engine(hwnd=None)
 
 
 def clear_screenshot_runtime_state(hwnd: Optional[int] = None) -> None:
@@ -704,18 +759,22 @@ def clear_screenshot_runtime_state(hwnd: Optional[int] = None) -> None:
 
 def cleanup_screenshot_engines_on_stop(keep_current_engine: bool = True) -> None:
     """停止任务时的截图清理入口：先清共享帧/移动检测运行态，再交给引擎层清理，最后解除插件对目标窗口的绑定。"""
-    try:
+    with _quiesce_capture_requests():
+        errors = []
         clear_screenshot_runtime_state(hwnd=None)
-    except Exception as exc:
-        logger.debug("停止时清理截图运行态失败: %s", exc)
-    _cleanup_screenshot_engines_on_stop_impl(keep_current_engine=keep_current_engine)
-    try:
-        from utils.plugin.session import unbind_shared_plugin_windows
+        try:
+            _cleanup_screenshot_engines_on_stop_impl(keep_current_engine=keep_current_engine)
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
+            from utils.plugin.session import unbind_shared_plugin_windows
 
-        if unbind_shared_plugin_windows():
-            logger.info("停止时已解除插件窗口绑定")
-    except Exception as exc:
-        logger.debug("停止时解除插件绑定失败: %s", exc)
+            if unbind_shared_plugin_windows():
+                logger.info("停止时已解除插件窗口绑定")
+        except Exception as exc:
+            errors.append(f"解除插件绑定失败：{exc}")
+        if errors:
+            raise RuntimeError("停止时截图资源清理未完成：" + "；".join(errors))
 
 
 def get_screenshot_capabilities() -> Dict[str, bool]:
@@ -744,48 +803,27 @@ def get_last_screenshot_error(engine: Optional[str] = None) -> str:
 
 
 def get_screenshot_worker_hard_limit() -> int:
-    try:
-        return max(1, int(os.cpu_count() or 1))
-    except Exception:
-        return 1
+    count = os.cpu_count()
+    if count is None or count <= 0:
+        raise RuntimeError("无法确定CPU数量，截图工作线程上限未知")
+    return count
 
 
 def get_screenshot_worker_limit() -> int:
-    """Return the effective concurrent screenshot worker limit."""
-    try:
-        return int(_resolve_effective_worker_limit())
-    except Exception:
-        return get_screenshot_worker_hard_limit()
+    return _resolve_effective_worker_limit()
 
 
 def set_screenshot_worker_limit(limit: Optional[int] = None) -> int:
     global _WORKER_LIMIT_OVERRIDE
+    if limit is not None:
+        value = int(limit)
+        hard = get_screenshot_worker_hard_limit()
+        if not 1 <= value <= hard:
+            raise ValueError(f"截图工作线程上限必须在1到{hard}之间")
+    else:
+        value = None
     with _WORKER_LIMIT_LOCK:
-        if limit is None:
-            _WORKER_LIMIT_OVERRIDE = None
-            hard = get_screenshot_worker_hard_limit()
-            default_limit = min(3, hard)
-            raw = os.getenv("LCA_SCREENSHOT_WORKER_LIMIT")
-            if raw is None:
-                value = default_limit
-            else:
-                try:
-                    value = int(raw)
-                except Exception:
-                    value = default_limit
-                value = max(1, min(hard, value))
-        else:
-            hard = get_screenshot_worker_hard_limit()
-            try:
-                value = int(limit)
-            except Exception:
-                value = hard
-            value = max(1, min(hard, value))
-            _WORKER_LIMIT_OVERRIDE = value
-    with _WORKER_GATE_LOCK:
-        global _WORKER_GATE, _WORKER_GATE_LIMIT
-        _WORKER_GATE = None
-        _WORKER_GATE_LIMIT = 0
-    if limit is None:
-        return value
-    return value
+        _WORKER_LIMIT_OVERRIDE = value
+    with _WORKER_GATE_CONDITION:
+        _WORKER_GATE_CONDITION.notify_all()
+    return _resolve_effective_worker_limit()

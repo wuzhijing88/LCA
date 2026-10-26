@@ -6,7 +6,10 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, Signal, QTimer
+from functools import partial
+from ui.panels.background_jobs import PanelBackgroundJobs
+from ui.panels.media.image_preview import read_preview_image
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -88,6 +91,11 @@ class ScriptResourcePanel(QWidget):
         self._items: List[Dict[str, Any]] = []
         self._source = ""
         self._binding_error = ""
+        self._icon_jobs = PanelBackgroundJobs(self)
+        self._icon_rows = {}
+        self._icon_timer = QTimer(self)
+        self._icon_timer.setSingleShot(True)
+        self._icon_timer.timeout.connect(self._refresh_visible_icons)
         self._build_ui()
 
     def bind(
@@ -120,6 +128,7 @@ class ScriptResourcePanel(QWidget):
         self._status.setText(f"资源绑定失败：{message}" if message else "")
 
     def reload(self) -> None:
+        self._clear_resource_icons()
         if not self._images_dir:
             self._items = []
             self._list.clear()
@@ -147,10 +156,8 @@ class ScriptResourcePanel(QWidget):
             row = QListWidgetItem(self._item_label(item))
             row.setData(Qt.ItemDataRole.UserRole, item)
             row.setToolTip(self._item_tip(item))
-            icon = self._item_icon(item)
-            if icon is not None:
-                row.setIcon(icon)
             self._list.addItem(row)
+            row.setSizeHint(QSize(-1, self._list.iconSize().height() + 12))
             if item.get("path") == selected:
                 current = row
         if current is not None:
@@ -160,6 +167,7 @@ class ScriptResourcePanel(QWidget):
         self._empty.setVisible(not self._items)
         self._list.setVisible(bool(self._items))
         self._sync_buttons()
+        self._icon_timer.start(0)
 
     def current_item(self) -> Optional[Dict[str, Any]]:
         row = self._list.currentItem()
@@ -212,6 +220,7 @@ class ScriptResourcePanel(QWidget):
         listing.customContextMenuRequested.connect(self._on_menu)
         layout.addWidget(listing, 1)
         self._list = listing
+        listing.verticalScrollBar().valueChanged.connect(self._schedule_icon_refresh)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
@@ -258,15 +267,7 @@ class ScriptResourcePanel(QWidget):
             lines.append("这张卡截过/导入过，脚本里还没用。")
         return "\n".join(part for part in lines if part)
 
-    def _item_icon(self, item: Dict[str, Any]) -> Optional[QIcon]:
-        path = str(item.get("abs_path") or "")
-        if item.get("kind") == "image" and path and os.path.isfile(path):
-            pixmap = QPixmap(path)
-            if not pixmap.isNull():
-                return QIcon(
-                    pixmap.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                )
-        return None
+
 
     def _sync_buttons(self) -> None:
         self._buttons["import"].setEnabled(bool(self._images_dir))
@@ -301,7 +302,10 @@ class ScriptResourcePanel(QWidget):
             menu.addAction("重命名", self._on_rename)
         if self._is_managed_item(item):
             menu.addAction("删除", self._on_delete)
-        menu.exec(self._list.mapToGlobal(pos))
+        try:
+            menu.exec(self._list.mapToGlobal(pos))
+        finally:
+            menu.deleteLater()
 
     def _on_import(self) -> None:
         path, selected = QFileDialog.getOpenFileName(
@@ -348,10 +352,9 @@ class ScriptResourcePanel(QWidget):
             row = QListWidgetItem(self._item_label(imported))
             row.setData(Qt.ItemDataRole.UserRole, imported)
             row.setToolTip(self._item_tip(imported))
-            icon = self._item_icon(imported)
-            if icon is not None:
-                row.setIcon(icon)
             self._list.addItem(row)
+            row.setSizeHint(QSize(-1, self._list.iconSize().height() + 12))
+            self._icon_timer.start(0)
             self._items.append(imported)
             self._list.setCurrentItem(row)
             self._empty.setVisible(False)
@@ -511,29 +514,14 @@ class ScriptResourcePanel(QWidget):
             return
         self.reload()
 
-    def _preview(self, item: Dict[str, Any]) -> None:
-        path = str(item.get("abs_path") or "")
-        if not path or not os.path.isfile(path):
-            QMessageBox.information(self, "预览", "文件不在。")
-            return
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            QMessageBox.information(self, "预览", "打不开这张图。")
-            return
-        from PySide6.QtWidgets import QDialog
+    def _preview(self, item):
+        from ui.panels.media.parameter_panel_image_viewer_dialog import ParameterPanelImageViewerDialog
+        from ui.dialogs.dialog_manager import exec_dialog
 
-        dialog = QDialog(self)
-        dialog.setWindowTitle(str(item.get("name") or "预览"))
-        dialog.resize(min(720, max(320, pixmap.width() + 24)), min(560, max(240, pixmap.height() + 24)))
-        label = QLabel(dialog)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setPixmap(
-            pixmap.scaled(700, 520, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        )
-        box = QVBoxLayout(dialog)
-        box.addWidget(label)
-        dialog.exec()
-        dialog.deleteLater()
+        path = str(item.get('abs_path') or '')
+        if not path:
+            raise ValueError('资源缺少原图路径')
+        exec_dialog(ParameterPanelImageViewerDialog(path, self))
 
     def _select_path(self, path: str) -> bool:
         needle = str(path or "")
@@ -544,3 +532,65 @@ class ScriptResourcePanel(QWidget):
                 self._list.setCurrentRow(index)
                 return True
         return False
+
+    def _clear_resource_icons(self):
+        from shiboken6 import isValid
+        self._icon_timer.stop()
+        self._icon_jobs.cancel_all()
+        for row in self._icon_rows.values():
+            if isValid(row):
+                row.setIcon(QIcon())
+        self._icon_rows.clear()
+
+    def _schedule_icon_refresh(self):
+        self._icon_timer.start(0)
+
+    def _refresh_visible_icons(self):
+        if not self.isVisible() or not self._list.isVisible():
+            self._clear_resource_icons()
+            return
+        viewport = self._list.viewport()
+        rows = set()
+        step = max(1, self._list.fontMetrics().height())
+        for y in range(0, viewport.height(), step):
+            index = self._list.indexAt(QPoint(4, y))
+            if index.isValid():
+                rows.add(index.row())
+        visible = {str(index) for index in sorted(rows)[:64]}
+        for key in set(self._icon_rows) - visible:
+            self._icon_jobs.cancel(key)
+            self._icon_rows.pop(key).setIcon(QIcon())
+        for index in sorted(rows)[:64]:
+            row = self._list.item(index)
+            key = str(index)
+            if key in self._icon_rows:
+                continue
+            item = row.data(Qt.ItemDataRole.UserRole)
+            if item.get('kind') != 'image' or not item.get('exists'):
+                continue
+            self._icon_rows[key] = row
+            def loaded(image, target=row):
+                if image is not None:
+                    target.setIcon(QIcon(QPixmap.fromImage(image)))
+            def failed(error, target=row):
+                target.setToolTip(target.toolTip() + f'\n缩略图加载失败：{error}')
+            self._icon_jobs.submit(key, partial(_read_resource_icon, item['abs_path']), loaded, failed)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._icon_timer.start(0)
+
+    def hideEvent(self, event):
+        self._clear_resource_icons()
+        super().hideEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._icon_timer.start(0)
+
+
+def _read_resource_icon(path, cancelled, progress):
+    result = read_preview_image(path, "", QSize(48, 48), cancelled)
+    if result.error:
+        raise ValueError(result.error)
+    return result.image

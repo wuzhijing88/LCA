@@ -68,13 +68,12 @@ def set_window_manager(manager):
 try:
     import utils.capture.wgc_hwnd_capture as _wgc_module
     from utils.capture.wgc_hwnd_capture import (
-        capture_window_wgc as _capture_window_wgc_raw,
+        capture_window_wgc_optimized as _capture_window_wgc_raw,
         clear_wgc_cache as _clear_wgc_cache_raw,
         cleanup_wgc as _cleanup_wgc_raw,
         get_existing_global_capture as _get_existing_wgc_capture,
         get_global_capture as _get_global_wgc_capture,
         get_last_wgc_capture_failure_reason as _get_last_wgc_failure_reason,
-        shutdown_wgc as _shutdown_wgc_raw,
     )
 except Exception as e:
     _wgc_module = None
@@ -84,7 +83,6 @@ except Exception as e:
     _get_existing_wgc_capture = None
     _get_global_wgc_capture = None
     _get_last_wgc_failure_reason = None
-    _shutdown_wgc_raw = None
     logger.warning(f"[ERROR] WGC 引擎不可用: {e}")
 
 try:
@@ -92,7 +90,7 @@ try:
         capture_window_printwindow as _capture_window_printwindow_raw,
         clear_printwindow_runtime_cache as _clear_printwindow_runtime_cache_raw,
         cleanup_printwindow as _cleanup_printwindow_raw,
-        get_global_capture as _get_printwindow_capture,
+        get_existing_global_capture as _get_printwindow_capture,
         get_last_printwindow_capture_failure_reason as _get_last_printwindow_failure_reason,
         get_pixel_color_printwindow as _get_pixel_color_printwindow_raw,
         is_printwindow_available as _is_printwindow_available_raw,
@@ -113,7 +111,7 @@ try:
         capture_window_gdi as _capture_window_gdi_raw,
         clear_gdi_runtime_cache as _clear_gdi_runtime_cache_raw,
         cleanup_gdi as _cleanup_gdi_raw,
-        get_global_capture as _get_gdi_capture,
+        get_existing_global_capture as _get_gdi_capture,
         get_pixel_color_gdi as _get_pixel_color_gdi_raw,
         is_gdi_available as _is_gdi_available_raw,
     )
@@ -134,7 +132,7 @@ try:
         clear_dxgi_runtime_cache as _clear_dxgi_runtime_cache_raw,
         cleanup_dxgi as _cleanup_dxgi_raw,
         get_dxgi_monitors as _get_dxgi_monitors_raw,
-        get_global_capture as _get_dxgi_capture,
+        get_existing_global_capture as _get_dxgi_capture,
         get_last_dxgi_capture_failure_reason as _get_last_dxgi_failure_reason,
         get_pixel_color_dxgi as _get_pixel_color_dxgi_raw,
         is_dxgi_available as _is_dxgi_available_raw,
@@ -170,11 +168,11 @@ except Exception as e:
     logger.warning(f"[ERROR] 插件截图引擎不可用: {e}")
 
 
-def _safe_timeout_ms(timeout: float, default_ms: int = 4000) -> int:
-    try:
-        return max(100, int(float(timeout) * 1000))
-    except Exception:
-        return int(default_ms)
+def _safe_timeout_ms(timeout: float) -> int:
+    value = int(float(timeout) * 1000)
+    if value <= 0 or value > 30000:
+        raise ValueError("截图超时必须大于0且不超过30秒")
+    return value
 
 
 def _pixel_color_from_frame(frame, x: int, y: int):
@@ -260,8 +258,7 @@ def get_pixel_color_printwindow(hwnd: int, x: int, y: int, client_coords: bool =
             return _get_pixel_color_printwindow_raw(hwnd, x, y, client_coords)
         except Exception:
             return None
-    frame = capture_window_printwindow(hwnd, client_area_only=client_coords)
-    return _pixel_color_from_frame(frame, x, y)
+    return None
 
 
 def get_pixel_color_gdi(hwnd: int, x: int, y: int, client_coords: bool = True):
@@ -270,8 +267,7 @@ def get_pixel_color_gdi(hwnd: int, x: int, y: int, client_coords: bool = True):
             return _get_pixel_color_gdi_raw(hwnd, x, y, client_coords)
         except Exception:
             return None
-    frame = capture_window_gdi(hwnd, client_area_only=client_coords)
-    return _pixel_color_from_frame(frame, x, y)
+    return None
 
 
 def get_pixel_color_dxgi(hwnd: int, x: int, y: int, client_coords: bool = True):
@@ -280,8 +276,7 @@ def get_pixel_color_dxgi(hwnd: int, x: int, y: int, client_coords: bool = True):
             return _get_pixel_color_dxgi_raw(hwnd, x, y, client_coords)
         except Exception:
             return None
-    frame = capture_window_dxgi(hwnd, client_area_only=client_coords)
-    return _pixel_color_from_frame(frame, x, y)
+    return None
 
 
 def is_wgc_available() -> bool:
@@ -352,8 +347,7 @@ def get_pixel_color_plugin(hwnd: int, x: int, y: int, display: str, client_coord
             return _get_pixel_color_plugin_raw(hwnd, x, y, display, client_coords)
         except Exception:
             return None
-    frame = capture_window_plugin(hwnd, display, client_area_only=client_coords)
-    return _pixel_color_from_frame(frame, x, y)
+    return None
 
 
 def get_dxgi_monitors():
@@ -366,34 +360,7 @@ def get_dxgi_monitors():
 
 
 def probe_dxgi_runtime_available() -> bool:
-    if not is_dxgi_available():
-        return False
-    try:
-        monitors = get_dxgi_monitors()
-        if monitors:
-            return True
-    except Exception:
-        pass
-    try:
-        from utils.capture.dxgi_capture import cleanup_dxgi, get_dxgi_monitors as _get_dxgi_monitors_retry
-        cleanup_dxgi(hwnd=None)
-        return bool(_get_dxgi_monitors_retry())
-    except Exception:
-        return False
-
-
-def shutdown_wgc():
-    if callable(_shutdown_wgc_raw):
-        try:
-            _shutdown_wgc_raw()
-            return
-        except Exception:
-            pass
-    if callable(_cleanup_wgc_raw):
-        try:
-            _cleanup_wgc_raw(hwnd=None, cleanup_d3d=False)
-        except Exception:
-            pass
+    return bool(is_dxgi_available() and get_dxgi_monitors())
 
 
 def get_wgc_stats() -> dict:
@@ -412,11 +379,9 @@ def get_wgc_stats() -> dict:
 
 
 def clear_wgc_cache(hwnd: int = None):
-    if callable(_clear_wgc_cache_raw):
-        try:
-            _clear_wgc_cache_raw(hwnd=hwnd)
-        except Exception:
-            pass
+    if not callable(_clear_wgc_cache_raw):
+        raise RuntimeError("WGC缓存清理接口不可用")
+    _clear_wgc_cache_raw(hwnd=hwnd)
 
 
 def get_existing_global_capture():
@@ -437,8 +402,8 @@ def get_global_capture():
     return None
 
 
-def _build_engine_caps(plugin_available: Optional[bool] = None) -> dict:
-    plugin_ok = bool(is_plugin_available()) if plugin_available is None else bool(plugin_available)
+def _build_engine_caps() -> dict:
+    plugin_ok = bool(is_plugin_available())
     caps = {
         "wgc": bool(is_wgc_available()),
         "printwindow": bool(is_printwindow_available()),
@@ -451,8 +416,7 @@ def _build_engine_caps(plugin_available: Optional[bool] = None) -> dict:
     return caps
 
 
-_DEFAULT_ENGINE_CAPS = _build_engine_caps(plugin_available=False)
-_ENGINE_CAPS_CACHE = dict(_DEFAULT_ENGINE_CAPS)
+_ENGINE_CAPS_CACHE = {}
 _ENGINE_CAPS_CACHE_TS = 0.0
 _ENGINE_CAPS_CACHE_TTL_SEC = 2.0
 
@@ -462,7 +426,9 @@ def _normalize_engine_caps(raw_caps) -> Optional[dict]:
         return None
     normalized = {}
     for engine_name in SUPPORTED_SCREENSHOT_ENGINES:
-        normalized[engine_name] = bool(raw_caps.get(engine_name, False))
+        if engine_name not in raw_caps or not isinstance(raw_caps[engine_name], bool):
+            return None
+        normalized[engine_name] = raw_caps[engine_name]
     return normalized
 
 
@@ -470,25 +436,17 @@ def _query_engine_caps() -> dict:
     return _build_engine_caps()
 
 
-def _get_engine_caps(force_refresh: bool = False, allow_spawn: bool = False) -> dict:
+def _get_engine_caps(force_refresh: bool = False) -> dict:
     global _ENGINE_CAPS_CACHE, _ENGINE_CAPS_CACHE_TS
-    _ = allow_spawn
-    try:
-        now = time.perf_counter()
-        if (
-            (not force_refresh)
-            and _ENGINE_CAPS_CACHE
-            and (now - _ENGINE_CAPS_CACHE_TS) <= _ENGINE_CAPS_CACHE_TTL_SEC
-        ):
-            return dict(_ENGINE_CAPS_CACHE)
-        normalized = _normalize_engine_caps(_query_engine_caps())
-        if normalized is None:
-            return dict(_ENGINE_CAPS_CACHE) if _ENGINE_CAPS_CACHE else dict(_DEFAULT_ENGINE_CAPS)
-        _ENGINE_CAPS_CACHE = dict(normalized)
-        _ENGINE_CAPS_CACHE_TS = now
+    now = time.perf_counter()
+    if not force_refresh and _ENGINE_CAPS_CACHE and now - _ENGINE_CAPS_CACHE_TS <= _ENGINE_CAPS_CACHE_TTL_SEC:
         return dict(_ENGINE_CAPS_CACHE)
-    except Exception:
-        return dict(_ENGINE_CAPS_CACHE) if _ENGINE_CAPS_CACHE else dict(_DEFAULT_ENGINE_CAPS)
+    normalized = _normalize_engine_caps(_query_engine_caps())
+    if normalized is None:
+        raise RuntimeError("截图引擎能力查询结果未知")
+    _ENGINE_CAPS_CACHE = dict(normalized)
+    _ENGINE_CAPS_CACHE_TS = now
+    return dict(normalized)
 
 
 def get_last_screenshot_error(engine: Optional[str] = None) -> str:
@@ -517,15 +475,11 @@ def get_last_screenshot_error(engine: Optional[str] = None) -> str:
 
 
 def clear_screenshot_engine_cache(hwnd: int = None):
-    try:
-        target_engine = str(get_screenshot_engine() or "").strip().lower()
-    except Exception:
-        target_engine = "wgc"
-    return _clear_screenshot_cache_by_engine(hwnd=hwnd, engine=target_engine)
+    return _clear_screenshot_cache_by_engine(hwnd=hwnd, engine=get_screenshot_engine())
 
 
 def _clear_screenshot_cache_by_engine(hwnd: Optional[int] = None, engine: Optional[str] = None) -> bool:
-    target_engine = str(engine or get_screenshot_engine()).strip().lower()
+    target_engine = get_screenshot_engine() if engine is None else str(engine).strip().lower()
     try:
         if target_engine == "wgc":
             clear_wgc_cache(hwnd=hwnd)
@@ -549,55 +503,64 @@ def cleanup_screenshot_engine_runtime(
     hwnd: Optional[int] = None,
     cleanup_d3d: bool = False,
 ):
-    target_engine = str(engine or get_screenshot_engine()).strip().lower()
-    try:
-        if target_engine == "wgc":
-            if callable(_cleanup_wgc_raw):
-                _cleanup_wgc_raw(hwnd=hwnd, cleanup_d3d=cleanup_d3d if hwnd is None else False)
-        elif target_engine == "printwindow" and callable(_cleanup_printwindow_raw):
-            _cleanup_printwindow_raw(hwnd=hwnd)
-        elif target_engine == "gdi" and callable(_cleanup_gdi_raw):
-            _cleanup_gdi_raw(hwnd=hwnd)
-        elif target_engine == "dxgi" and callable(_cleanup_dxgi_raw):
-            _cleanup_dxgi_raw(hwnd=hwnd)
-        elif is_plugin_screenshot_engine(target_engine) and callable(_cleanup_plugin_raw):
-            _cleanup_plugin_raw(hwnd=hwnd)
-    except Exception:
-        pass
+    target_engine = get_screenshot_engine() if engine is None else str(engine).strip().lower()
+    if not is_supported_screenshot_engine(target_engine):
+        raise ValueError(f"未知的截图引擎：{target_engine}")
+    if target_engine == "wgc":
+        if callable(_cleanup_wgc_raw):
+            _cleanup_wgc_raw(hwnd=hwnd, cleanup_d3d=cleanup_d3d if hwnd is None else False)
+        return
+    cleanup = {
+        "printwindow": _cleanup_printwindow_raw,
+        "gdi": _cleanup_gdi_raw,
+        "dxgi": _cleanup_dxgi_raw,
+    }.get(target_engine)
+    if is_plugin_screenshot_engine(target_engine):
+        cleanup = _cleanup_plugin_raw
+    if callable(cleanup):
+        cleanup(hwnd=hwnd)
 
 
 def cleanup_screenshot_runtime() -> None:
-    cleanup_screenshot_engine_runtime(engine="wgc", hwnd=None, cleanup_d3d=False)
-    cleanup_screenshot_engine_runtime(engine="printwindow", hwnd=None, cleanup_d3d=False)
-    cleanup_screenshot_engine_runtime(engine="gdi", hwnd=None, cleanup_d3d=False)
-    cleanup_screenshot_engine_runtime(engine="dxgi", hwnd=None, cleanup_d3d=False)
-    for engine_name in SUPPORTED_SCREENSHOT_ENGINES:
-        if is_plugin_screenshot_engine(engine_name):
-            cleanup_screenshot_engine_runtime(engine=engine_name, hwnd=None, cleanup_d3d=False)
-            break
+    errors = []
+    engines = ["wgc", "printwindow", "gdi", "dxgi"]
+    plugins = [name for name in SUPPORTED_SCREENSHOT_ENGINES if is_plugin_screenshot_engine(name)]
+    if plugins:
+        engines.append(plugins[0])
+    for name in engines:
+        try:
+            cleanup_screenshot_engine_runtime(engine=name, hwnd=None, cleanup_d3d=True)
+        except Exception as exc:
+            errors.append(f"{name}：{exc}")
+    if errors:
+        raise RuntimeError("截图资源清理未完成：" + "；".join(errors))
 
 
 def _cleanup_inactive_engines_after_switch(active_engine: str) -> None:
     target_engine = str(active_engine or "").strip().lower()
+    errors = []
+    plugin_cleaned = False
     for engine_name in SUPPORTED_SCREENSHOT_ENGINES:
         if engine_name == target_engine:
             continue
-        try:
-            _clear_screenshot_cache_by_engine(hwnd=None, engine=engine_name)
-        except Exception:
-            pass
+        if is_plugin_screenshot_engine(engine_name):
+            if is_plugin_screenshot_engine(target_engine) or plugin_cleaned:
+                continue
+            plugin_cleaned = True
         try:
             cleanup_screenshot_engine_runtime(
                 engine=engine_name,
                 hwnd=None,
                 cleanup_d3d=(engine_name == "wgc"),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(f"{engine_name}：{exc}")
+    if errors:
+        raise RuntimeError("切换截图引擎后资源清理未完成：" + "；".join(errors))
 
 
 def get_screenshot_capabilities() -> dict:
-    return _get_engine_caps(force_refresh=True, allow_spawn=True)
+    return _get_engine_caps(force_refresh=True)
 
 
 def get_screenshot_diagnostics() -> dict:
@@ -622,23 +585,26 @@ def get_screenshot_stats(engine: Optional[str] = None) -> dict:
         return get_wgc_stats()
     if target_engine == "printwindow" and callable(_get_printwindow_capture):
         try:
-            return dict((_get_printwindow_capture().get_stats() or {}))
+            capture = _get_printwindow_capture()
+            return dict(capture.get_stats()) if capture is not None else {}
         except Exception:
             return {}
     if target_engine == "gdi" and callable(_get_gdi_capture):
         try:
-            return dict((_get_gdi_capture().get_stats() or {}))
+            capture = _get_gdi_capture()
+            return dict(capture.get_stats()) if capture is not None else {}
         except Exception:
             return {}
     if target_engine == "dxgi" and callable(_get_dxgi_capture):
         try:
-            return dict((_get_dxgi_capture().get_stats() or {}))
+            capture = _get_dxgi_capture()
+            return dict(capture.get_stats()) if capture is not None else {}
         except Exception:
             return {}
     return {}
 
 
-caps = _get_engine_caps(force_refresh=False, allow_spawn=False)
+caps = _get_engine_caps(force_refresh=False)
 WGC_AVAILABLE = bool(caps.get("wgc", False))
 PRINTWINDOW_AVAILABLE = bool(caps.get("printwindow", False))
 GDI_AVAILABLE = bool(caps.get("gdi", False))
@@ -666,35 +632,8 @@ def set_screenshot_engine(engine: str) -> bool:
     # 只在短时间内持锁读取当前状态，避免能力探测长期占用锁导致 UI 卡顿。
     with _engine_lock:
         previous_engine = str(_current_engine or "").strip().lower()
-        available_map = {
-            'wgc': bool(WGC_AVAILABLE),
-            'printwindow': bool(PRINTWINDOW_AVAILABLE),
-            'gdi': bool(GDI_AVAILABLE),
-            'dxgi': bool(DXGI_AVAILABLE),
-        }
-        if is_plugin_screenshot_engine(requested_engine):
-            available_map[requested_engine] = bool(is_plugin_available())
 
-    try:
-        # 用户显式切换引擎时，主动刷新能力探测，避免读取过期状态。
-        for attempt in range(4):
-            dynamic_caps = _get_engine_caps(force_refresh=True, allow_spawn=True)  # type: ignore[name-defined]
-            if isinstance(dynamic_caps, dict):
-                available_map.update({key: bool(value) for key, value in dynamic_caps.items()})
-            if available_map.get(requested_engine, False):
-                break
-            if attempt < 3:
-                time.sleep(0.12 * (attempt + 1))
-    except Exception:
-        pass
-
-    if requested_engine == "dxgi" and not available_map.get("dxgi", False):
-        # DXGI 能力若误判，以运行态探测做二次确认。
-        try:
-            if bool(probe_dxgi_runtime_available()):
-                available_map["dxgi"] = True
-        except Exception:
-            pass
+    available_map = _get_engine_caps(force_refresh=True)
 
     # 与运行时能力保持一致，避免调用方读取过期常量。
     with _engine_lock:
@@ -709,24 +648,7 @@ def set_screenshot_engine(engine: str) -> bool:
             _current_engine = requested_engine
         if previous_engine and previous_engine != requested_engine:
             _cleanup_inactive_engines_after_switch(active_engine=requested_engine)
-        detail = ""
-        if requested_engine == "dxgi":
-            probe_notes = []
-            try:
-                from utils.capture.dxgi_capture import is_dxgi_available as _is_dxgi_available
-                from utils.capture.dxgi_capture import get_dxgi_monitors as _get_dxgi_monitors
-                main_probe_available = bool(_is_dxgi_available())
-                probe_notes.append(f"main_probe_available={main_probe_available}")
-                if main_probe_available:
-                    try:
-                        probe_notes.append(f"main_probe_monitors={len(_get_dxgi_monitors())}")
-                    except Exception as monitor_exc:
-                        probe_notes.append(f"main_probe_monitors_error={type(monitor_exc).__name__}")
-            except Exception as probe_exc:
-                probe_notes.append(f"main_probe_exception={type(probe_exc).__name__}")
-            if probe_notes:
-                detail = " (" + ", ".join(probe_notes) + ")"
-        raise RuntimeError(f"截图引擎 {requested_engine} 不可用{detail}")
+        raise RuntimeError(f"截图引擎 {requested_engine} 不可用")
 
     with _engine_lock:
         _current_engine = requested_engine
@@ -743,21 +665,13 @@ def get_screenshot_engine() -> str:
 
 
 def capture_desktop_frame(engine: str = "") -> Optional[np.ndarray]:
-    """桌面句柄不能走窗口采集，改抓虚拟屏幕。"""
-    engine_name = str(engine or "").strip().lower()
+    engine_name = get_screenshot_engine() if not engine else str(engine).strip().lower()
     if engine_name == "dxgi":
-        frame = capture_screen_dxgi()
-        if frame is not None:
-            return frame
-        logger.warning("DXGI 无法采集桌面，改用 GDI 屏幕采集")
-    if not callable(_capture_screen_gdi_raw):
-        logger.error("GDI 屏幕采集不可用，无法抓取桌面")
-        return None
-    try:
+        return capture_screen_dxgi()
+    if engine_name == "gdi" and callable(_capture_screen_gdi_raw):
         return _capture_screen_gdi_raw()
-    except Exception as exc:
-        logger.error("GDI 屏幕采集失败: %s", exc)
-        return None
+    logger.error("截图引擎%s不支持桌面截图", engine_name)
+    return None
 
 
 def _capture_with_engine(
@@ -781,7 +695,7 @@ def _capture_with_engine(
         from utils.window.window_identity import is_desktop_window
 
         if is_desktop_window(hwnd):
-            logger.info("目标是桌面，改用屏幕采集（WGC/PrintWindow 不能抓桌面句柄）")
+            logger.debug("按指定引擎执行桌面截图")
             return capture_desktop_frame(engine)
 
         captured = None
@@ -797,21 +711,6 @@ def _capture_with_engine(
             captured = capture_window_plugin(hwnd, engine, client_area_only, timeout=timeout)
         else:
             raise ValueError(f"未知的截图引擎: {engine}")
-        # All screenshot consumers share this recovery point.  A frame pool
-        # can miss one request during a busy workflow; retry once so OCR,
-        # template matching, color matching and motion checks behave alike.
-        if captured is None:
-            retry_timeout = max(0.1, min(float(timeout), 2.0))
-            if engine == 'wgc':
-                captured = capture_window_wgc(hwnd, client_area_only, timeout=retry_timeout)
-            elif engine == 'printwindow':
-                captured = capture_window_printwindow(hwnd, client_area_only, timeout=retry_timeout)
-            elif engine == 'gdi':
-                captured = capture_window_gdi(hwnd, client_area_only, timeout=retry_timeout)
-            elif engine == 'dxgi':
-                captured = capture_window_dxgi(hwnd, client_area_only, timeout=retry_timeout)
-            elif is_plugin_screenshot_engine(engine):
-                captured = capture_window_plugin(hwnd, engine, client_area_only, timeout=retry_timeout)
         if captured is None:
             try:
                 last_error = str(get_last_screenshot_error(engine=engine) or "").strip()
@@ -1036,11 +935,7 @@ def is_screenshot_available():
     Returns:
         bool: True 如果至少有一个引擎可用
     """
-    try:
-        caps = _get_engine_caps()  # type: ignore[name-defined]
-        return any(bool(v) for v in caps.values())
-    except Exception:
-        return WGC_AVAILABLE or PRINTWINDOW_AVAILABLE or GDI_AVAILABLE or DXGI_AVAILABLE
+    return any(_get_engine_caps().values())
 
 def get_screenshot_info():
     """
@@ -1050,6 +945,7 @@ def get_screenshot_info():
         dict: 截图引擎信息
     """
     engine = get_screenshot_engine()
+    caps = _get_engine_caps()
 
     engine_names = {
         'wgc': 'WGC (Windows Graphics Capture)',
@@ -1067,23 +963,13 @@ def get_screenshot_info():
 
     info = {
         'current_engine': engine,
-        'current_engine_name': engine_names.get(engine, 'Unknown'),
-        'wgc_available': WGC_AVAILABLE,
-        'printwindow_available': PRINTWINDOW_AVAILABLE,
-        'gdi_available': GDI_AVAILABLE,
-        'dxgi_available': DXGI_AVAILABLE,
+        'current_engine_name': engine_names.get(engine, screenshot_engine_log_label(engine)),
+        'wgc_available': caps['wgc'],
+        'printwindow_available': caps['printwindow'],
+        'gdi_available': caps['gdi'],
+        'dxgi_available': caps['dxgi'],
         'features': engine_features.get(engine, [])
     }
-    try:
-        caps = _get_engine_caps()  # type: ignore[name-defined]
-        if isinstance(caps, dict):
-            info['wgc_available'] = bool(caps.get('wgc', info['wgc_available']))
-            info['printwindow_available'] = bool(caps.get('printwindow', info['printwindow_available']))
-            info['gdi_available'] = bool(caps.get('gdi', info['gdi_available']))
-            info['dxgi_available'] = bool(caps.get('dxgi', info['dxgi_available']))
-    except Exception:
-        pass
-
     # 添加当前引擎的统计信息
     try:
         info['stats'] = dict(get_screenshot_stats(engine=engine) or {})
@@ -1098,58 +984,35 @@ def clear_screenshot_cache(hwnd: int = None):
     Args:
         hwnd: 窗口句柄，None表示清空所有缓存
     """
-    try:
-        clear_screenshot_engine_cache(hwnd=hwnd)
-    except Exception as e:
-        logger.error(f"清空缓存失败: {e}")
+    return clear_screenshot_engine_cache(hwnd=hwnd)
 
 def cleanup_screenshot_engine(hwnd: int = None):
-    """清理截图引擎资源
-
-    Args:
-        hwnd: 窗口句柄，None表示清理所有资源
-    """
-    try:
-        # 全量清理时先停异步截图管道，避免引擎被并发占用
-        if hwnd is None:
+    if hwnd is None:
+        errors = []
+        for cleanup in (_shutdown_existing_async_pipeline, cleanup_screenshot_runtime):
             try:
-                _shutdown_existing_async_pipeline()
-            except Exception:
-                pass
-
-        if hwnd is None:
-            cleanup_screenshot_runtime()
-        else:
-            cleanup_screenshot_engine_runtime(engine=get_screenshot_engine(), hwnd=hwnd, cleanup_d3d=False)
-    except Exception as e:
-        logger.error(f"清理引擎资源失败: {e}")
+                cleanup()
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError("截图资源清理未完成：" + "；".join(errors))
+    else:
+        cleanup_screenshot_engine_runtime(engine=get_screenshot_engine(), hwnd=hwnd, cleanup_d3d=False)
 
 
 def cleanup_all_screenshot_engines():
-    """清理所有截图引擎资源（程序退出时调用）"""
+    """退出时尝试所有清理入口，失败不得报告完成。"""
     global _window_manager
-
-    try:
-        # 先关闭异步截图任务，避免清理过程中仍有截图任务占用引擎资源
+    errors = []
+    for cleanup in (_shutdown_existing_async_pipeline, cleanup_screenshot_runtime):
         try:
-            if _shutdown_existing_async_pipeline():
-                logger.debug("异步截图管道已清理")
-        except Exception as e:
-            logger.error(f"异步截图管道清理失败: {e}")
-
-        # 统一清理截图引擎
-        try:
-            cleanup_screenshot_runtime()
-            logger.debug("截图引擎资源已清理")
-        except Exception as e:
-            logger.error(f"截图引擎清理失败: {e}")
-
-        # 清理窗口管理器引用
-        _window_manager = None
-
-        logger.info("所有截图引擎资源已清理")
-    except Exception as e:
-        logger.error(f"清理所有截图引擎失败: {e}")
+            cleanup()
+        except Exception as exc:
+            errors.append(str(exc))
+    _window_manager = None
+    if errors:
+        raise RuntimeError("截图资源清理未完成：" + "；".join(errors))
+    logger.info("所有截图引擎资源已清理")
 
 
 def _soft_cleanup_engine_runtime(engine: str, hwnd: int = None) -> bool:
@@ -1183,142 +1046,35 @@ def _soft_cleanup_engine_runtime(engine: str, hwnd: int = None) -> bool:
 
 
 def cleanup_screenshot_engines_on_stop(keep_current_engine: bool = True):
-    """停止任务时清理截图资源，默认保留当前引擎实例避免重复初始化。"""
+    errors = []
     try:
+        _shutdown_existing_async_pipeline()
+    except Exception as exc:
+        errors.append(str(exc))
+    if not keep_current_engine:
         try:
-            _shutdown_existing_async_pipeline()
-        except Exception as e:
-            logger.error(f"停止时异步截图管道清理失败: {e}")
-
-        if not bool(keep_current_engine):
             cleanup_screenshot_runtime()
-            logger.info("停止时已清理全部截图引擎")
-            return
-
-        try:
-            current_engine = str(get_screenshot_engine() or "").strip().lower()
-        except Exception:
-            current_engine = ""
-
-        valid_engines = set(SUPPORTED_SCREENSHOT_ENGINES)
-        if current_engine not in valid_engines:
-            cleanup_screenshot_runtime()
-            logger.warning("停止时当前截图引擎未知，已回退为全量清理")
-            return
-
-        _soft_cleanup_engine_runtime(current_engine, hwnd=None)
-
-        for engine_name in SUPPORTED_SCREENSHOT_ENGINES:
-            if engine_name == current_engine:
+        except Exception as exc:
+            errors.append(str(exc))
+        if errors:
+            raise RuntimeError("停止时截图资源清理未完成：" + "；".join(errors))
+        return
+    current = get_screenshot_engine()
+    if not is_supported_screenshot_engine(current):
+        raise RuntimeError("当前截图引擎未知，无法确定清理范围")
+    if not _soft_cleanup_engine_runtime(current, hwnd=None):
+        errors.append(f"{current}缓存清理失败")
+    plugin_cleaned = False
+    for name in SUPPORTED_SCREENSHOT_ENGINES:
+        if name == current:
+            continue
+        if is_plugin_screenshot_engine(name):
+            if is_plugin_screenshot_engine(current) or plugin_cleaned:
                 continue
-            try:
-                _clear_screenshot_cache_by_engine(hwnd=None, engine=engine_name)
-            except Exception:
-                pass
-            try:
-                cleanup_screenshot_engine_runtime(
-                    engine=engine_name,
-                    hwnd=None,
-                    cleanup_d3d=(engine_name == "wgc"),
-                )
-            except Exception:
-                pass
-
-        logger.info(f"停止时截图引擎已清理（保留当前引擎实例）: {current_engine}")
-    except Exception as e:
-        logger.error(f"停止时清理截图引擎失败: {e}")
-
-# ==================== 测试代码 ====================
-
-if __name__ == "__main__":
-    import time
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
-    logger.info("=" * 80)
-    logger.info("截图助手模块测试")
-    logger.info("=" * 80)
-
-    # 检查可用性
-    if not is_screenshot_available():
-        logger.info("\n[ERROR] 截图功能不可用")
-        logger.info(get_screenshot_info())
-        exit(1)
-
-    logger.info("\n[OK] 截图功能可用")
-    logger.info("\n引擎信息:")
-    info = get_screenshot_info()
-    for key, value in info.items():
-        if key != 'stats':
-            logger.info(f"  {key}: {value}")
-
-    logger.info("\n可用窗口:")
-    windows = []
-
-    def callback(hwnd, extra):
-        if win32gui.IsWindowVisible(hwnd):
-            title = win32gui.GetWindowText(hwnd)
-            if title:
-                windows.append((hwnd, title))
-
-    win32gui.EnumWindows(callback, None)
-
-    for i, (hwnd, title) in enumerate(windows[:10]):
-        logger.info(f"{i+1}. {title[:60]} (HWND: {hwnd})")
-
-    # 选择窗口
-    try:
-        choice = int(input("\n选择窗口编号 (直接回车选择第1个): ") or "1")
-        test_hwnd, title = windows[choice - 1]
-    except Exception:
-        test_hwnd, title = windows[0]
-
-    logger.info(f"\n测试窗口: {title}")
-    logger.info(f"HWND: {test_hwnd}")
-
-    # 测试截图
-    logger.info("\n" + "=" * 80)
-    logger.info("测试: 窗口截图")
-    logger.info("=" * 80)
-
-    start = time.time()
-    screenshot = take_window_screenshot(test_hwnd, client_area_only=True)
-    elapsed_ms = (time.time() - start) * 1000
-
-    if screenshot is not None:
-        logger.info("[OK] 截图成功")
-        logger.info(f"  尺寸: {screenshot.size}")
-        logger.info(f"  耗时: {elapsed_ms:.1f}ms")
-        screenshot.save("screenshot_test.png")
-        logger.info("  已保存: screenshot_test.png")
-    else:
-        logger.info("✗ 截图失败")
-
-    # 测试取色
-    logger.info("\n" + "=" * 80)
-    logger.info("测试: 像素颜色获取")
-    logger.info("=" * 80)
-
-    color = get_window_pixel_color(test_hwnd, 100, 100, client_coords=True)
-    if color:
-        logger.info(f"[OK] 坐标 (100, 100) 的颜色: R={color[0]}, G={color[1]}, B={color[2]}")
-    else:
-        logger.info("[ERROR] 获取颜色失败")
-
-    # 统计信息
-    logger.info("\n" + "=" * 80)
-    logger.info("统计信息")
-    logger.info("=" * 80)
-
-    info = get_screenshot_info()
-    if 'stats' in info:
-        for key, value in info['stats'].items():
-            logger.info(f"  {key}: {value}")
-
-    logger.info("\n" + "=" * 80)
-    logger.info("测试完成")
-    logger.info("=" * 80)
-
+            plugin_cleaned = True
+        try:
+            cleanup_screenshot_engine_runtime(engine=name, hwnd=None, cleanup_d3d=(name == "wgc"))
+        except Exception as exc:
+            errors.append(f"{name}：{exc}")
+    if errors:
+        raise RuntimeError("停止时截图资源清理未完成：" + "；".join(errors))

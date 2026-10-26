@@ -1,3 +1,5 @@
+import copy
+
 """
 录制回放步骤编辑器对话框
 提供完善的步骤查看、编辑、增删改查功能
@@ -17,6 +19,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QThread, QTimer
 from PySide6.QtGui import QColor
 from themes import get_theme_manager, theme_color
+from ui.panels.managed_resources import PanelResources
 from ui.panels.recording.parameter_panel_recording_replay_thread import ParameterPanelReplayThread
 from utils.window.window_activation_utils import (
     resolve_replay_window_offsets_from_config,
@@ -35,7 +38,9 @@ class ActionEditorDialog(QDialog):
 
     def __init__(self, actions: List[Dict[str, Any]], recording_area: str = "全屏录制", parent=None, recording_mode: str = "绝对坐标"):
         super().__init__(parent)
-        self.actions = actions.copy() if actions else []
+        self._resources = PanelResources()
+        self.destroyed.connect(self._resources.close)
+        self.actions = copy.deepcopy(actions) if actions else []
         self.recording_area = recording_area  # 保存录制区域信息
         self.recording_mode = recording_mode  # 保存录制模式信息
         self.current_row = -1
@@ -44,9 +49,11 @@ class ActionEditorDialog(QDialog):
         self._replay_thread = None
         self.init_ui()
         self.load_actions()
+        self._register_theme_callback()
 
     def init_ui(self):
         """初始化UI"""
+        self.setObjectName("actionEditorDialog")
         self.setWindowTitle("步骤编辑器")
         self.setMinimumSize(720, 480)
         available_geometry = get_available_geometry_for_widget(self.parentWidget() or self)
@@ -306,130 +313,38 @@ class ActionEditorDialog(QDialog):
 
         main_layout.addLayout(bottom_layout)
 
-        self._apply_theme_styles()
         self._show_detail_placeholder()
 
-    def _apply_theme_styles(self):
-        """补充步骤编辑器局部样式，使详情区与全局主题一致。"""
-        try:
-            theme_manager = get_theme_manager()
-            text_secondary = theme_manager.get_color("text_secondary")
-            text_color = theme_manager.get_color("text")
-            border = theme_manager.get_color("border")
-            border_light = theme_manager.get_color("border_light")
-            detail_background = theme_manager.get_color("card")
-            button_background = theme_manager.get_color("surface")
-            button_hover_background = theme_manager.get_color("hover")
-            button_pressed_background = theme_manager.get_color("pressed")
-            button_border = theme_manager.get_color("border")
-            button_hover_border = theme_manager.get_color("border_light")
-            button_disabled_background = theme_manager.get_color("canvas")
-            button_disabled_text = theme_manager.get_color("text_disabled")
-            button_disabled_border = theme_manager.get_color("border")
-        except Exception:
-            text_secondary = "#666666"
-            text_color = "#333333"
-            border = "#e0e0e0"
-            border_light = "#eeeeee"
-            detail_background = "#ffffff"
-            button_background = "#f5f5f5"
-            button_hover_background = "#e8e8e8"
-            button_pressed_background = "#d8d8d8"
-            button_border = "#e0e0e0"
-            button_hover_border = "#eeeeee"
-            button_disabled_background = "#fafafa"
-            button_disabled_text = "#999999"
-            button_disabled_border = "#e0e0e0"
+    def _register_theme_callback(self):
+        import weakref
+        manager = get_theme_manager()
+        owner = weakref.ref(self)
+        def changed(theme):
+            dialog = owner()
+            if dialog is not None:
+                dialog._on_theme_changed(theme)
+        manager.register_theme_change_callback(changed)
+        self.destroyed.connect(lambda: manager.unregister_theme_change_callback(changed))
 
-        self.setStyleSheet(
-            f"""
-            QLabel#actionEditorStatsLabel {{
-                color: {text_secondary};
-                padding: 0;
-            }}
+    def _on_theme_changed(self, theme):
+        for row, action in enumerate(self.actions):
+            item = self.table.item(row, 3)
+            if item is not None:
+                item.setForeground(self._action_type_color(action.get("type")))
+        if 0 <= self.current_row < len(self.actions):
+            self.show_action_detail(self.actions[self.current_row])
+        else:
+            self._show_detail_placeholder()
 
-            QLabel#actionEditorBulkTimeHint {{
-                color: {text_secondary};
-                padding-top: 2px;
-            }}
-
-            QPushButton {{
-                background-color: {button_background};
-                color: {text_color};
-                border: 1px solid {button_border};
-                border-radius: 4px;
-                padding: 6px 14px;
-                min-height: 24px;
-            }}
-
-            QPushButton:hover {{
-                background-color: {button_hover_background};
-                border-color: {button_hover_border};
-            }}
-
-            QPushButton:pressed {{
-                background-color: {button_pressed_background};
-                border-color: {button_border};
-            }}
-
-            QPushButton:disabled {{
-                background-color: {button_disabled_background};
-                color: {button_disabled_text};
-                border-color: {button_disabled_border};
-            }}
-
-            QTextEdit#actionEditorDetailText {{
-                background-color: {detail_background};
-                border: 1px solid {border};
-                border-radius: 8px;
-                padding: 10px;
-            }}
-
-            QTextEdit#actionEditorDetailText:focus {{
-                border-color: {border_light};
-            }}
-
-            QSplitter#actionEditorMainSplitter::handle {{
-                background: transparent;
-            }}
-
-            QGroupBox#actionEditorListGroup,
-            QGroupBox#actionEditorDetailGroup,
-            QGroupBox#actionEditorQuickEditGroup {{
-                margin-top: 8px;
-                padding-top: 8px;
-            }}
-
-            QGroupBox#actionEditorListGroup::title,
-            QGroupBox#actionEditorDetailGroup::title,
-            QGroupBox#actionEditorQuickEditGroup::title {{
-                left: 8px;
-                padding: 0 6px;
-            }}
-            """
-        )
+    @staticmethod
+    def _action_type_color(action_type):
+        token = {"mouse_move": "info", "mouse_move_relative": "accent_hover",
+                 "mouse_click": "success", "key_press": "warning",
+                 "key_release": "warning", "mouse_scroll": "accent"}.get(action_type, "text")
+        return QColor(theme_color(token))
 
     def _get_detail_theme_colors(self) -> Dict[str, str]:
-        """获取详情区渲染所需的主题颜色。"""
-        defaults = {
-            "text": "#333333",
-            "text_secondary": "#666666",
-            "surface": "#f5f5f5",
-            "card": "#ffffff",
-            "border": "#e0e0e0",
-        }
-
-        try:
-            theme_manager = get_theme_manager()
-            return {
-                "text": theme_manager.get_color("text"),
-                "text_secondary": theme_manager.get_color("text_secondary"),
-                "surface": theme_manager.get_color("surface"),
-                "card": theme_manager.get_color("card"),
-                "border": theme_manager.get_color("border"),
-            }
-        except Exception:
-            return defaults
+        return {name: theme_color(name) for name in ("text", "text_secondary", "surface", "card", "border")}
 
     def _show_detail_placeholder(self):
         """显示默认占位内容。"""
@@ -513,7 +428,7 @@ class ActionEditorDialog(QDialog):
         checkbox_layout.addWidget(start_checkbox)
         checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         checkbox_layout.setContentsMargins(0, 0, 0, 0)
-        checkbox_widget.setStyleSheet("background: transparent;")  # 透明背景
+        checkbox_widget.setObjectName("actionEditorStartCell")
         self.table.setCellWidget(row, 0, checkbox_widget)
 
         # 连接复选框信号，确保只有一个被选中
@@ -532,17 +447,7 @@ class ActionEditorDialog(QDialog):
         type_display = self.get_type_display_name(action_type)
         type_item = QTableWidgetItem(type_display)
 
-        # 类型色走主题令牌，暗色下也能看清
-        if action_type == 'mouse_move':
-            type_item.setForeground(QColor(theme_color("info", "#0078d4")))
-        elif action_type == 'mouse_move_relative':
-            type_item.setForeground(QColor(theme_color("accent_hover", "#1084d8")))
-        elif action_type == 'mouse_click':
-            type_item.setForeground(QColor(theme_color("success", "#107c10")))
-        elif action_type in ['key_press', 'key_release']:
-            type_item.setForeground(QColor(theme_color("warning", "#ff8c00")))
-        elif action_type == 'mouse_scroll':
-            type_item.setForeground(QColor(theme_color("accent", "#0078d4")))
+        type_item.setForeground(self._action_type_color(action_type))
 
         self.table.setItem(row, 3, type_item)
 
@@ -1261,6 +1166,7 @@ class ActionEditorDialog(QDialog):
             window_offset_y,
             recording_mode,
         )
+        self._resources.own_thread(self._replay_thread)
         self._replay_thread.step_changed.connect(self.highlight_step)
         self._replay_thread.result_signal.connect(self._on_test_replay_result)
         self._replay_thread.finished.connect(self._on_replay_thread_finished)
@@ -1268,6 +1174,8 @@ class ActionEditorDialog(QDialog):
 
     def _on_test_replay_result(self, success: bool, message: str):
         """处理测试回放结果。"""
+        if self.sender() is not self._replay_thread:
+            return
         def handle_result():
             self.clear_all_highlights()
             if success:
@@ -1278,34 +1186,14 @@ class ActionEditorDialog(QDialog):
         self._run_on_ui_thread(handle_result, "处理测试回放结果失败")
 
     def _on_replay_thread_finished(self):
-        """回放线程结束清理"""
-        thread = getattr(self, '_replay_thread', None)
-        if not thread:
-            return
-        self._replay_thread = None
-        try:
-            thread.deleteLater()
-        except RuntimeError:
-            pass
+        if self.sender() is self._replay_thread:
+            self._replay_thread = None
 
     def _stop_active_replay_thread(self):
-        """关闭对话框前停止测试回放线程。"""
-        thread = getattr(self, '_replay_thread', None)
-        if not thread or not thread.isRunning():
-            return
-
-        try:
-            thread.stop()
-        except Exception as exc:
-            logger.error(f"停止测试回放线程失败: {exc}", exc_info=True)
-            return
-
-        if hasattr(thread, 'wait'):
-            try:
-                if not thread.wait(1500):
-                    logger.warning("测试回放线程未在关闭前及时退出")
-            except Exception as exc:
-                logger.error(f"等待测试回放线程退出失败: {exc}", exc_info=True)
+        self._replay_thread = None
+        errors = self._resources.close()
+        if errors:
+            raise RuntimeError(f"停止步骤回放失败：{errors[0]}")
 
     def _run_on_ui_thread(self, callback, error_prefix: str):
         """确保回调在UI线程执行。"""
@@ -1329,7 +1217,7 @@ class ActionEditorDialog(QDialog):
         def do_highlight():
             from PySide6.QtGui import QBrush
 
-            highlight = QColor(theme_color("warning", "#ff8c00"))
+            highlight = QColor(theme_color("warning"))
             highlight.setAlpha(72)
             # 清除之前的高亮
             for i in range(self.table.rowCount()):
@@ -1373,6 +1261,10 @@ class ActionEditorDialog(QDialog):
         """取消按钮。"""
         self._stop_active_replay_thread()
         super().reject()
+
+    def hideEvent(self, event):
+        self._stop_active_replay_thread()
+        super().hideEvent(event)
 
     def closeEvent(self, event):
         """关闭窗口时确保回放线程退出。"""

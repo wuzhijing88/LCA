@@ -104,80 +104,56 @@ def _hwnd_from_window_info(window_info: Optional[Dict[str, Any]], hwnd_alive) ->
     return None
 
 
-def _enabled_bound_hwnds(windows: Optional[List[Dict[str, Any]]]) -> set:
-    hwnds = set()
-    if not isinstance(windows, list):
-        return hwnds
-    for item in windows:
-        if not isinstance(item, dict) or not item.get("enabled", True):
-            continue
-        for key in ("hwnd", "display_hwnd"):
-            handle = as_hwnd(item.get(key))
-            if handle:
-                hwnds.add(handle)
-    return hwnds
-
-
-def _host_enabled_bound_hwnds(host: Any) -> Optional[set]:
-    """当前启用的绑定句柄。运行时 bound_windows 优先，不并入配置里的旧副本。"""
-    if host is None:
-        return None
-    runtime = getattr(host, "bound_windows", None)
-    if isinstance(runtime, list):
-        return _enabled_bound_hwnds(runtime)
-    config = getattr(host, "config", None)
-    if isinstance(config, dict):
-        return _enabled_bound_hwnds(get_native_bound_windows(config))
-    return None
-
-
 def resolve_live_target_hwnd(
     host: Any,
     cached_hwnd: Optional[Any] = None,
     *,
     hwnd_alive: Optional[Any] = None,
 ) -> Optional[int]:
-    """按当前绑定列表解析截图/取点用的目标窗口句柄。
+    """采集只读取宿主当前启用的绑定，不依赖工作流旧句柄的有效性检查。
 
-    顺序：宿主任务绑定、运行时 bound_windows、配置、调用方缓存。
-    已从绑定列表移除的句柄一律不用，即使窗口还开着。
+    当前任务仍在绑定列表内时选择它，否则选择列表中第一个启用项。
+    选定记录失效时仅按其身份重连，不尝试其他窗口或旧配置、旧缓存。
+    无宿主的独立采集使用调用方明确传入的窗口。
     """
-    alive = hwnd_alive or is_window_alive
+    alive = is_window_alive if hwnd_alive is None else hwnd_alive
     if host is None:
         return _alive_hwnd(cached_hwnd, alive)
 
-    candidates: List[Any] = []
-    resolve_preferred = getattr(host, "_resolve_panel_target_hwnd", None)
-    if callable(resolve_preferred):
-        preferred = resolve_preferred()
-        if preferred:
-            candidates.append(preferred)
+    windows = getattr(host, "bound_windows", None)
+    if not isinstance(windows, list):
+        raise ValueError("当前窗口绑定列表不可用，无法确定采集窗口")
+    enabled_windows = []
+    for window_info in windows:
+        if not isinstance(window_info, dict) or type(window_info.get("enabled")) is not bool:
+            raise ValueError("当前窗口绑定记录无效，无法确定采集窗口")
+        if window_info["enabled"]:
+            enabled_windows.append(window_info)
+    if not enabled_windows:
+        return None
 
-    bound_windows = getattr(host, "bound_windows", None)
-    if not isinstance(bound_windows, list):
-        bound_windows = get_native_bound_windows(getattr(host, "config", None))
-    for window_info in bound_windows:
-        if not isinstance(window_info, dict) or not window_info.get("enabled", True):
-            continue
-        from_bound = _hwnd_from_window_info(window_info, alive)
-        if from_bound:
-            candidates.append(from_bound)
-            break
-
-    if cached_hwnd:
-        candidates.append(cached_hwnd)
-
-    bound_hwnds = _host_enabled_bound_hwnds(host)
-    seen = set()
-    for candidate in candidates:
-        handle = _alive_hwnd(candidate, alive)
-        if not handle or handle in seen:
-            continue
-        seen.add(handle)
-        if bound_hwnds is not None and handle not in bound_hwnds:
-            continue
-        return handle
-    return None
+    selected = enabled_windows[0]
+    tab_widget = getattr(host, "workflow_tab_widget", None)
+    if tab_widget is not None:
+        task_id = tab_widget.get_current_task_id()
+        if task_id is not None:
+            task = tab_widget.task_manager.get_task(task_id)
+            if task is None:
+                raise ValueError("当前工作流任务已经失效，无法确定采集窗口")
+            task_bind_id = getattr(task, "bound_window_id", None)
+            task_hwnd = as_hwnd(task.target_hwnd)
+            for window_info in enabled_windows:
+                if task_bind_id is not None:
+                    matches_task = window_info.get("bind_id") == task_bind_id
+                else:
+                    matches_task = bool(task_hwnd) and task_hwnd in (
+                        as_hwnd(window_info.get("hwnd")),
+                        as_hwnd(window_info.get("display_hwnd")),
+                    )
+                if matches_task:
+                    selected = window_info
+                    break
+    return _hwnd_from_window_info(selected, alive)
 
 
 def get_active_window_binding_mode(config: Optional[Dict[str, Any]]) -> str:

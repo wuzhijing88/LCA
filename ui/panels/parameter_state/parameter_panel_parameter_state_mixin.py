@@ -1,4 +1,9 @@
+import copy
+
+import math
+
 from ..parameter_panel_support import *
+from ..thread_target_selector import ThreadTargetSelector
 
 class ParameterPanelParameterStateMixin:
 
@@ -14,8 +19,16 @@ class ParameterPanelParameterStateMixin:
         self,
         name: str,
         widget: QComboBox,
-        normalize_operation_mode: bool = False,
+        for_submission: bool,
     ):
+        if for_submission and widget.property("dynamic_loading"):
+            raise ValueError(f"参数 {name} 的可选值尚未加载完成")
+        if for_submission and widget.property("dynamic_error"):
+            raise ValueError(f"参数 {name} 的可选值读取失败，请修正资源后重试")
+        if for_submission and widget.currentIndex() < 0:
+            raise ValueError(f"参数 {name} 没有有效的选项")
+        if for_submission and widget.property("invalid_value") is not None and widget.currentData() == widget.property("invalid_value"):
+            raise ValueError(f"参数 {name} 的当前选项无效")
         current_data = widget.currentData()
         param_def = self.param_definitions.get(name, {})
         widget_hint = param_def.get('widget_hint', '')
@@ -23,46 +36,45 @@ class ParameterPanelParameterStateMixin:
             return current_data
 
         selected_value = current_data if current_data is not None else widget.currentText()
-        if normalize_operation_mode and name == 'operation_mode':
-            selected_value = self._normalize_operation_mode_value(
-                selected_value,
-                fallback_task_type=self.current_task_type or '',
-            )
         return selected_value
 
     def _extract_line_edit_parameter_value(
         self,
         name: str,
         widget: QLineEdit,
-        prefer_existing_on_empty: bool,
-        prefer_existing_on_invalid: bool,
-        log_invalid: bool,
+        for_submission: bool,
     ):
         text_value = widget.text()
         param_def = self.param_definitions.get(name, {})
         param_type = param_def.get('type', 'text')
 
-        if param_type in ['int', 'integer']:
-            existing_value = self.current_parameters.get(name, param_def.get('default', 0))
-            if not text_value:
-                return existing_value if prefer_existing_on_empty else 0
+        if param_type in ['int', 'integer', 'float', 'double']:
+            label = param_def.get('label', name)
+            text = text_value.strip()
+            if not text and not for_submission:
+                return text_value
+            if not text:
+                raise ValueError(f"{label}不能为空")
+            if re.search(r"\{\{[^{}]+\}\}", text):
+                remainder = re.sub(r"\{\{[^{}]+\}\}", "", text)
+                if "{{" in remainder or "}}" in remainder:
+                    raise ValueError(f"{label}的变量表达式无效")
+                return text_value
             try:
-                return int(text_value)
-            except ValueError:
-                if log_invalid:
-                    logger.warning(f'Invalid int value for {name}: {text_value}')
-                return existing_value if prefer_existing_on_invalid else param_def.get('default', 0)
-
-        if param_type in ['float', 'double']:
-            existing_value = self.current_parameters.get(name, param_def.get('default', 0.0))
-            if not text_value:
-                return existing_value if prefer_existing_on_empty else 0.0
-            try:
-                return float(text_value)
-            except ValueError:
-                if log_invalid:
-                    logger.warning(f'Invalid float value for {name}: {text_value}')
-                return existing_value if prefer_existing_on_invalid else param_def.get('default', 0.0)
+                value = int(text) if param_type in ['int', 'integer'] else float(text)
+            except ValueError as exc:
+                if not for_submission:
+                    return text_value
+                raise ValueError(f"{label}必须填写有效数字或变量表达式") from exc
+            if not math.isfinite(value) and not for_submission:
+                return text_value
+            if not math.isfinite(value):
+                raise ValueError(f"{label}必须是有限数字")
+            if 'min' in param_def and value < param_def['min'] and for_submission:
+                raise ValueError(f"{label}不能小于{param_def['min']}")
+            if 'max' in param_def and value > param_def['max'] and for_submission:
+                raise ValueError(f"{label}不能大于{param_def['max']}")
+            return value
 
         return self._normalize_single_image_parameter_value(name, text_value)
 
@@ -117,7 +129,6 @@ class ParameterPanelParameterStateMixin:
         name: str,
         widget,
         *,
-        normalize_operation_mode: bool,
         convert_image_paths: bool,
         prefer_existing_on_empty: bool,
         prefer_existing_on_invalid: bool,
@@ -127,6 +138,8 @@ class ParameterPanelParameterStateMixin:
         restore_list_widget_property: bool,
         log_invalid_numeric: bool,
     ):
+        if isinstance(widget, ThreadTargetSelector):
+            return True, widget.value(for_submission=not prefer_existing_on_invalid)
         if isinstance(widget, QCheckBox):
             return True, widget.isChecked()
         if isinstance(widget, QSpinBox):
@@ -137,7 +150,7 @@ class ParameterPanelParameterStateMixin:
             return True, self._extract_combobox_parameter_value(
                 name,
                 widget,
-                normalize_operation_mode,
+                for_submission=not prefer_existing_on_invalid,
             )
         if isinstance(widget, QPlainTextEdit):
             return True, widget.toPlainText()
@@ -150,9 +163,7 @@ class ParameterPanelParameterStateMixin:
             return True, self._extract_line_edit_parameter_value(
                 name,
                 widget,
-                prefer_existing_on_empty=prefer_existing_on_empty,
-                prefer_existing_on_invalid=prefer_existing_on_invalid,
-                log_invalid=log_invalid_numeric,
+                for_submission=not prefer_existing_on_invalid,
             )
         if hasattr(widget, 'button_group'):
             return True, self._extract_button_group_parameter_value(
@@ -213,7 +224,6 @@ class ParameterPanelParameterStateMixin:
                 handled, value = self._extract_parameter_value_from_widget(
                     name,
                     widget,
-                    normalize_operation_mode=True,
                     convert_image_paths=True,
                     prefer_existing_on_empty=False,
                     prefer_existing_on_invalid=False,
@@ -239,6 +249,7 @@ class ParameterPanelParameterStateMixin:
                     logger.info(f'[APPLY] collect selector parameter {name} = {value}')
             except Exception as error:
                 logger.error(f'读取参数失败 {name}：{error}')
+                raise
         return visible_parameters
 
     def _collect_condition_affecting_parameter_names(self) -> Set[str]:
@@ -277,15 +288,9 @@ class ParameterPanelParameterStateMixin:
     def _apply_operation_mode_change_defaults(self, new_parameters: Dict[str, Any]) -> None:
         if 'operation_mode' not in new_parameters:
             return
-        old_operation_mode = self._normalize_operation_mode_value(
-            self.current_parameters.get('operation_mode'),
-            fallback_task_type=self.current_task_type or '',
-        )
-        new_operation_mode = self._normalize_operation_mode_value(
-            new_parameters['operation_mode'],
-            fallback_task_type=self.current_task_type or '',
-        )
-        new_parameters['operation_mode'] = new_operation_mode
+        self._normalize_operation_mode_parameter(parameters=new_parameters)
+        old_operation_mode = self.current_parameters.get('operation_mode')
+        new_operation_mode = new_parameters['operation_mode']
         if old_operation_mode == new_operation_mode:
             return
         logger.info(
@@ -293,10 +298,7 @@ class ParameterPanelParameterStateMixin:
             f'{new_operation_mode}, reset dependent parameters'
         )
         if 'multi_image_mode' in self.param_definitions:
-            default_multi_mode = self.param_definitions['multi_image_mode'].get(
-                'default',
-                '单图识别',
-            )
+            default_multi_mode = self.param_definitions['multi_image_mode']['default']
             new_parameters['multi_image_mode'] = default_multi_mode
             logger.info(f'Reset multi_image_mode to default: {default_multi_mode}')
 
@@ -329,6 +331,8 @@ class ParameterPanelParameterStateMixin:
             return
         from ui.panels.parameter_compare import collect_changed_parameters
 
+        changes = dict(changes)
+        self._apply_operation_mode_change_defaults(changes)
         real_changes = collect_changed_parameters(self.current_parameters, changes)
         self.current_parameters.update(changes)
         if getattr(self, "_loading_parameter_panel", False):
@@ -338,9 +342,12 @@ class ParameterPanelParameterStateMixin:
         if self.current_card_id is not None:
             self.parameters_changed.emit(self.current_card_id, dict(real_changes))
         if refresh_conditional:
-            self._refresh_conditional_widgets()
+            self._refresh_conditional_widgets(changes)
 
     def _apply_parameters(self, auto_close=True):
+        if self.current_task_type == "脚本卡片":
+            self._plugin_parameter_controller.apply(auto_close)
+            return
         if self._apply_favorites_parameters(auto_close):
             return
 
@@ -369,7 +376,7 @@ class ParameterPanelParameterStateMixin:
             if collect_changed_parameters(real_time_params, new_parameters):
                 self.parameters_changed.emit(self.current_card_id, new_parameters)
         if auto_close:
-            self.hide_panel()
+            self._finish_hiding_panel()
 
     def _validate_script_parameters(self, parameters: Dict[str, Any]) -> bool:
         if str(getattr(self, "current_task_type", "") or "").strip() != "自定义脚本":
@@ -396,55 +403,30 @@ class ParameterPanelParameterStateMixin:
         return True
 
     def _get_real_time_card_parameters(self) -> dict:
-        """
-        从卡片实时读取最新参数
-
-        这个方法确保获取卡片的实时参数，而不是使用缓存的 current_parameters
-        这样可以捕获在参数面板打开期间，通过其他方式（如删除连线）修改的参数
-
-        Returns:
-            dict: 卡片的实时参数，如果无法获取则返回缓存的参数
-        """
-        try:
-            # 首先尝试从主窗口获取当前的workflow_view
-            current_workflow_view = None
-            if hasattr(self, 'main_window') and self.main_window:
-                # 尝试从标签页系统获取
-                if hasattr(self.main_window, 'workflow_tab_widget') and self.main_window.workflow_tab_widget:
-                    current_task_id = self.main_window.workflow_tab_widget.get_current_task_id()
-                    if current_task_id is not None and current_task_id in self.main_window.workflow_tab_widget.task_views:
-                        current_workflow_view = self.main_window.workflow_tab_widget.task_views[current_task_id]
-                        logger.debug("[实时参数] 从主窗口标签页获取workflow_view")
-
-                # 回退到旧系统
-                if current_workflow_view is None and hasattr(self.main_window, 'workflow_view'):
-                    current_workflow_view = self.main_window.workflow_view
-                    logger.debug("[实时参数] 从主窗口旧系统获取workflow_view")
-
-            # 在获取的workflow_view中查找卡片
-            if current_workflow_view and hasattr(current_workflow_view, 'cards'):
-                if self.current_card_id in current_workflow_view.cards:
-                    card = current_workflow_view.cards[self.current_card_id]
-                    if hasattr(card, 'parameters'):
-                        logger.debug(f"[实时参数] 从卡片 {self.current_card_id} 读取实时参数成功")
-                        return card.parameters.copy()
-
-            # 如果无法获取实时参数，回退到缓存参数
-            logger.debug(f"[实时参数] 无法读取卡片 {self.current_card_id} 的实时参数，使用缓存参数")
+        """独立面板使用自身状态；挂接主窗口时只从现行标签页读取卡片。"""
+        if self.main_window is None or self.current_card_id is None:
             return self.current_parameters.copy()
-
-        except Exception as e:
-            logger.warning(f"[实时参数] 读取实时参数失败: {e}，使用缓存参数")
-            return self.current_parameters.copy()
+        tab_widget = self.main_window.workflow_tab_widget
+        task_id = tab_widget.get_current_task_id()
+        view = tab_widget.task_views.get(task_id)
+        if view is None or self.current_card_id not in view.cards:
+            raise ValueError(f"当前工作流中不存在卡片 {self.current_card_id}，无法读取参数")
+        if self._runtime_workflow_identity != (id(self.main_window), task_id):
+            raise ValueError("参数面板所属工作流已切换，请重新打开卡片")
+        return view.cards[self.current_card_id].parameters.copy()
 
     def cache_runtime_parameter(self, card_id: int, param_name: str, value: Any) -> None:
         """缓存运行时参数值（仅用于显示，不写入工作流文件）。"""
         if card_id is None or not param_name:
             return
-        self.runtime_parameters[(card_id, param_name)] = value
+        key = (card_id, param_name)
+        self.runtime_parameters.pop(key, None)
+        self.runtime_parameters[key] = value
+        while len(self.runtime_parameters) > 512:
+            self.runtime_parameters.pop(next(iter(self.runtime_parameters)))
 
     def _get_runtime_parameter(self, card_id: int, param_name: str) -> Any:
-        """获取运行时参数值，优先使用任务模块，必要时回退到模块缓存。"""
+        """从当前任务模块读取运行时显示值。"""
         runtime_value = None
         if self.task_module and hasattr(self.task_module, 'get_runtime_parameter'):
             try:
@@ -489,312 +471,39 @@ class ParameterPanelParameterStateMixin:
             if self.current_card_id == card_id:
                 self.update_parameter_value(param_name, runtime_value)
 
-    def _reset_widget_to_default(self, widget, default_value, param_def):
-        if isinstance(widget, QCheckBox):
-            widget.setChecked(bool(default_value) if default_value is not None else False)
-        elif isinstance(widget, QSpinBox):
-            widget.setValue(int(default_value) if default_value is not None else 0)
-        elif isinstance(widget, QDoubleSpinBox):
-            widget.setValue(float(default_value) if default_value is not None else 0.0)
-        elif isinstance(widget, QLineEdit):
-            widget.clear() if (default_value is None or default_value == "") else widget.setText(str(default_value))
-        elif isinstance(widget, (QPlainTextEdit, QTextEdit)):
-            widget.clear() if (default_value is None or default_value == "") else widget.setPlainText(str(default_value))
-        elif isinstance(widget, QComboBox):
-            self._reset_combobox_to_default(widget, default_value, param_def)
-        elif isinstance(widget, QSlider):
-            widget.setValue(int(default_value) if default_value is not None else 0)
-        elif isinstance(widget, QListWidget):
-            widget.clear()
-            if widget.property("raw_color_data") is not None:
-                widget.setProperty("raw_color_data", "")
-        elif hasattr(widget, 'button_group'):
-            if default_value is not None:
-                for button in widget.button_group.buttons():
-                    if button.text() == str(default_value):
-                        button.setChecked(True)
-                        break
-        elif hasattr(widget, 'clear_colors'):
-            widget.clear_colors()
-        elif hasattr(widget, 'clear'):
-            try:
-                widget.clear()
-            except Exception:
-                pass
-
-    def _reset_combobox_to_default(self, combo_widget, default_value, param_def):
-        current_count = combo_widget.count()
-        initial_options = param_def.get('options', [])
-        if initial_options and current_count != len(initial_options):
-            combo_widget.clear()
-            combo_widget.addItems(initial_options)
-
-        if default_value is not None:
-            index = combo_widget.findData(default_value)
-            if index >= 0:
-                combo_widget.setCurrentIndex(index)
-            else:
-                idx = combo_widget.findText(str(default_value))
-                combo_widget.setCurrentIndex(idx if idx >= 0 else 0)
-        else:
-            combo_widget.setCurrentIndex(0)
-
     def _reset_parameters(self):
+        if self.current_task_type == "脚本卡片":
+            from ui.panels.card_plugin_state import reset_card_plugin_parameters
+            reset_card_plugin_parameters(self)
+            return
         if not self.param_definitions:
             return
-
-        logger.info("Start resetting parameters")
-        tool_position_params = self._get_reset_tool_position_params()
-        extra_hidden_params = self._get_reset_extra_hidden_params()
-
-        self._reinitialize_reset_parameter_values(tool_position_params)
-        reset_count = self._reset_parameter_widgets(tool_position_params)
-        logger.info(f"Reset {reset_count} UI widgets")
-
-        self._run_reset_cleanup_pipeline(tool_position_params, extra_hidden_params)
-        self._emit_reset_parameter_state()
-        logger.info("Parameter reset finished")
-
-    def _get_reset_tool_position_params(self) -> Set[str]:
-        return {
-            'scroll_start_position',
-            'drag_start_position', 'drag_end_position',
-            'move_start_position', 'move_end_position',
+        self._release_panel_runtime()
+        values = {
+            name: copy.deepcopy(definition['default'])
+            for name, definition in self.param_definitions.items()
+            if 'default' in definition and definition.get('save_to_workflow', True)
         }
-
-    def _get_reset_extra_hidden_params(self) -> List[str]:
-        return [
-            'recorded_actions',
-            'minimap_x', 'minimap_y', 'minimap_width', 'minimap_height',
-            'region_x', 'region_y', 'region_width', 'region_height',
-            'region_hwnd', 'region_window_title', 'region_window_class', 'region_client_width', 'region_client_height',
-            'region_x1', 'region_y1', 'region_x2', 'region_y2',
-            'target_supports_counter',
-            'recognition_region_x', 'recognition_region_y', 'recognition_region_width', 'recognition_region_height',
-            'search_region_x', 'search_region_y', 'search_region_width', 'search_region_height',
-            'connected_targets',
-            'motion_detection_region',
-            'region_coordinates',
-            'combo_mouse_x', 'combo_mouse_y',
-            'combo_seq_mouse_x', 'combo_seq_mouse_y',
-            'anchor_point',
-        ]
-
-    def _reinitialize_reset_parameter_values(self, tool_position_params: Set[str]) -> None:
-        self.current_parameters.clear()
-        for name, param_def in self.param_definitions.items():
-            param_type = param_def.get('type', 'text')
-            if param_type in ('hidden', 'separator'):
-                continue
-            if name in tool_position_params:
-                self.current_parameters[name] = ""
-            else:
-                self.current_parameters[name] = param_def.get('default')
-
-    def _reset_parameter_widgets(self, tool_position_params: Set[str]) -> int:
-        reset_count = 0
-        for name, param_def in self.param_definitions.items():
-            param_type = param_def.get('type', 'text')
-            if param_type in ('hidden', 'separator'):
-                continue
-            if name not in self.widgets:
-                continue
-
-            widget = self.widgets[name]
-            default_value = param_def.get('default')
-            try:
-                if name in tool_position_params:
-                    if isinstance(widget, QLineEdit):
-                        widget.clear()
-                    reset_count += 1
-                    continue
-                self._reset_widget_to_default(widget, default_value, param_def)
-                reset_count += 1
-            except Exception as e:
-                logger.error(f"重置控件失败 {name}：{e}")
-        return reset_count
-
-    def _run_reset_cleanup_pipeline(self, tool_position_params: Set[str], extra_hidden_params: List[str]) -> None:
-        self._clear_image_previews()
-        self._cleanup_keyboard_parameters()
-        self._cleanup_extra_hidden_params(extra_hidden_params)
-        self._cleanup_all_card_parameters()
-        self._ensure_tool_position_params_cleared(tool_position_params)
-        self._cleanup_workflow_context()
-        self._reset_action_control_buttons()
-
-    def _ensure_tool_position_params_cleared(self, tool_position_params: Set[str]) -> None:
-        for param_name in tool_position_params:
-            if param_name in self.current_parameters and self.current_parameters[param_name] != "":
-                self.current_parameters[param_name] = ""
-                logger.debug(f"Tool position parameter cleared: {param_name}")
-
-    def _emit_reset_parameter_state(self) -> None:
+        for name, definition in self.param_definitions.items():
+            if definition.get('type') == 'hidden' and 'default' not in definition and name in self.current_parameters:
+                values[name] = copy.deepcopy(self.current_parameters[name])
+        if '_random_connections' in self.current_parameters:
+            values['_random_connections'] = copy.deepcopy(self.current_parameters['_random_connections'])
+        self.current_parameters = values
+        self.runtime_parameters = {key: value for key, value in self.runtime_parameters.items() if key[0] != self.current_card_id}
+        self._rebuild_parameter_widgets(preserve_scroll=False)
+        self._check_and_register_record_hotkey()
         if self.current_card_id is not None:
-            logger.info(f"Emit reset parameter signal: card_id={self.current_card_id}")
-            self.parameters_changed.emit(self.current_card_id, self.current_parameters.copy())
-        QTimer.singleShot(100, self._refresh_conditional_widgets)
-
-    def _clear_image_previews(self):
-        for widget_name, widget in list(self.widgets.items()):
-            if widget_name.endswith('_preview') and isinstance(widget, QLabel):
-                widget.setText("未选择图片")
-                widget.setPixmap(QPixmap())
-                widget.setProperty("image_path", "")
-
-    def _cleanup_keyboard_parameters(self):
-        keyboard_params = [
-            'key', 'hotkey', 'key_combination', 'combo_keys', 'combo_seq_keys',
-            'record_hotkey', 'replay_hotkey', 'trigger_key', 'stop_key',
-        ]
-        cleared_count = 0
-        for param_name in keyboard_params:
-            if param_name in self.current_parameters:
-                self.current_parameters[param_name] = ""
-                cleared_count += 1
-            if param_name in self.widgets:
-                widget = self.widgets[param_name]
-                try:
-                    self._reset_widget_to_default(widget, self.param_definitions.get(param_name, {}).get('default'), self.param_definitions.get(param_name, {}))
-                except Exception as e:
-                    logger.debug(f"重置键盘控件失败 {param_name}：{e}")
-        if cleared_count > 0:
-            logger.info(f"Cleared {cleared_count} keyboard-related parameters")
-
-    def _cleanup_extra_hidden_params(self, extra_hidden_params):
-        cleared_count = 0
-        for param_name in extra_hidden_params:
-            if param_name in self.current_parameters:
-                del self.current_parameters[param_name]
-                cleared_count += 1
-            if param_name in self.widgets:
-                widget = self.widgets[param_name]
-                if isinstance(widget, QLineEdit):
-                    widget.clear()
-        if cleared_count > 0:
-            logger.info(f"Cleared {cleared_count} extra hidden parameters")
-
-    def _cleanup_all_card_parameters(self):
-        if self.current_card_id is None:
-            return
-        try:
-            main_window = None
-            current_widget = self.parent()
-            level = 0
-            while current_widget and level < 10:
-                if hasattr(current_widget, 'cards') or hasattr(current_widget, 'workflow_data'):
-                    main_window = current_widget
-                    break
-                current_widget = current_widget.parent()
-                level += 1
-            if not main_window:
-                logger.debug("未找到主窗口，跳过卡片参数清理")
-                return
-            card_id = self.current_card_id
-            if hasattr(main_window, 'workflow_data') and isinstance(main_window.workflow_data, dict):
-                if 'cards' in main_window.workflow_data:
-                    cards = main_window.workflow_data['cards']
-                    if isinstance(cards, list):
-                        for card in cards:
-                            if isinstance(card, dict) and card.get('id') == card_id:
-                                if 'parameters' in card:
-                                    old_param_count = len(card['parameters'])
-                                    card['parameters'].clear()
-                                    logger.info(f"Cleared {old_param_count} stored parameters for card {card_id}")
-                                break
-            elif hasattr(main_window, 'cards') and isinstance(main_window.cards, dict):
-                if card_id in main_window.cards:
-                    card = main_window.cards[card_id]
-                    if 'parameters' in card:
-                        old_param_count = len(card['parameters'])
-                        card['parameters'].clear()
-                        logger.info(f"Cleared {old_param_count} stored parameters for card {card_id}")
-        except Exception as e:
-            logger.debug(f"Non-fatal error during stored parameter cleanup: {e}")
-
-    def _cleanup_workflow_context(self):
-        if self.current_card_id is None:
-            return
-        try:
-            from task_workflow.workflow_context import get_workflow_context
-            context = get_workflow_context()
-            card_id = self.current_card_id
-            logger.info(f"Start clearing workflow context for card {card_id}")
-
-            cleared_stats = {
-                'card_data_keys': 0,
-                'ocr_results': 0,
-                'image_results': False,
-            }
-
-            self._cleanup_context_card_data(context, card_id, cleared_stats)
-            self._cleanup_context_ocr_results(context, card_id, cleared_stats)
-            self._cleanup_context_image_results(context, card_id, cleared_stats)
-            self._log_context_cleanup_result(context, card_id, cleared_stats)
-        except Exception as e:
-            logger.error(f"工作流上下文清理失败：{e}", exc_info=True)
-
-    def _cleanup_context_card_data(self, context, card_id: int, cleared_stats: Dict[str, Any]) -> None:
-        if card_id not in context.card_data:
-            return
-        card_data = context.card_data[card_id]
-        cleared_stats['card_data_keys'] = len(card_data)
-        card_data_keys = list(card_data.keys())
-        logger.info(f"Card {card_id} card_data keys: {card_data_keys}")
-        function_related_keys = [k for k in card_data_keys if any(kw in k.lower() for kw in ['multi', 'group', 'function', 'state', 'index'])]
-        if function_related_keys:
-            logger.info(f"Detected multi-function related keys: {function_related_keys}")
-        del context.card_data[card_id]
-        logger.info(f"Removed context.card_data for card {card_id}, total keys: {len(card_data_keys)}")
-
-    def _cleanup_context_ocr_results(self, context, card_id: int, cleared_stats: Dict[str, Any]) -> None:
-        if card_id not in context.ocr_results:
-            return
-        cleared_stats['ocr_results'] = len(context.ocr_results[card_id])
-        del context.ocr_results[card_id]
-        logger.info(f"Removed context.ocr_results for card {card_id}, count: {cleared_stats['ocr_results']}")
-
-    def _cleanup_context_image_results(self, context, card_id: int, cleared_stats: Dict[str, Any]) -> None:
-        if card_id not in context.image_results:
-            return
-        cleared_stats['image_results'] = True
-        del context.image_results[card_id]
-        logger.info(f"Removed context.image_results for card {card_id}")
-
-    def _log_context_cleanup_result(self, context, card_id: int, cleared_stats: Dict[str, Any]) -> None:
-        all_cleared = (
-            card_id not in context.card_data and
-            card_id not in context.ocr_results and
-            card_id not in context.image_results
-        )
-        if all_cleared:
-            cleared_summary = []
-            if cleared_stats['card_data_keys'] > 0:
-                cleared_summary.append(f"card_data({cleared_stats['card_data_keys']} keys)")
-            if cleared_stats['ocr_results'] > 0:
-                cleared_summary.append(f"ocr_results({cleared_stats['ocr_results']} items)")
-            if cleared_stats['image_results']:
-                cleared_summary.append("image_results")
-            if cleared_summary:
-                logger.info(f"Context cleanup verified for card {card_id}: {', '.join(cleared_summary)}")
-            else:
-                logger.info(f"Card {card_id} has no context data to clear")
-            return
-        remaining = []
-        if card_id in context.card_data:
-            remaining_keys = list(context.card_data[card_id].keys())
-            remaining.append(f"card_data({remaining_keys})")
-        if card_id in context.ocr_results:
-            remaining.append(f"ocr_results({len(context.ocr_results[card_id])})")
-        if card_id in context.image_results:
-            remaining.append("image_results")
-        logger.warning(f"Context cleanup incomplete for card {card_id}: {remaining}")
+            self.parameters_changed.emit(self.current_card_id, copy.deepcopy(self.current_parameters))
 
     def _collect_current_parameters(self) -> Dict[str, Any]:
+        if self.current_task_type == "脚本卡片":
+            return self._plugin_parameter_controller.collect()
         parameters = {}
         self._collect_hidden_saved_parameters(parameters)
         self._collect_visible_workflow_parameters(parameters)
         self._fill_missing_workflow_parameters(parameters)
+        self._normalize_operation_mode_parameter(parameters=parameters)
         return parameters
 
     def _collect_hidden_saved_parameters(self, parameters: Dict[str, Any]) -> None:
@@ -811,7 +520,6 @@ class ParameterPanelParameterStateMixin:
                 handled, value = self._extract_parameter_value_from_widget(
                     name,
                     widget,
-                    normalize_operation_mode=False,
                     convert_image_paths=False,
                     prefer_existing_on_empty=True,
                     prefer_existing_on_invalid=True,
@@ -830,8 +538,7 @@ class ParameterPanelParameterStateMixin:
                     parameters[name] = value
             except Exception as e:
                 logger.error(f"收集参数失败 {name}：{e}")
-                param_def = self.param_definitions.get(name, {})
-                parameters[name] = param_def.get('default')
+                raise
 
     def _fill_missing_workflow_parameters(self, parameters: Dict[str, Any]) -> None:
         for name, param_def in self.param_definitions.items():
@@ -843,3 +550,16 @@ class ParameterPanelParameterStateMixin:
                 parameters[name] = self.current_parameters[name]
             else:
                 parameters[name] = param_def.get('default')
+
+    def _apply_parameters_from_ui(self):
+        try:
+            self._apply_parameters(auto_close=True)
+        except (ValueError, TypeError) as error:
+            QMessageBox.warning(self, "参数无效", str(error))
+
+    def _reset_parameters_from_ui(self):
+        try:
+            self._reset_parameters()
+        except Exception as error:
+            logger.error("重置参数失败：%s", error, exc_info=True)
+            QMessageBox.warning(self, "重置失败", str(error))

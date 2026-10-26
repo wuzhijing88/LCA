@@ -9,6 +9,7 @@
 import logging
 from typing import Optional, List, Dict
 from PySide6.QtWidgets import QWidget
+from shiboken6 import isValid
 
 from utils.window.window_activation_utils import show_and_raise_widget
 
@@ -168,6 +169,8 @@ class WindowHider:
         for name, info in self._windows.items():
             widget = info['widget']
             was_visible = info['was_visible']
+            if not isValid(widget) or widget.property("parameterDisposed"):
+                continue
 
             should_restore = bool(info.get('hidden_by_us')) or bool(was_visible)
             if not should_restore:
@@ -230,24 +233,3 @@ def create_hider_from_parent(parent: Optional[QWidget]) -> WindowHider:
 
 
 # 示例用法
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-
-    logger.info("=" * 60)
-    logger.info("窗口隐藏管理器示例")
-    logger.info("=" * 60)
-
-    # 模拟示例
-    logger.info("\n创建WindowHider:")
-    hider = WindowHider()
-
-    logger.info(f"当前管理的窗口数量: {hider.get_window_count()}")
-
-    # 在实际使用中，这里会传入真实的QWidget对象
-    # hider.add_window(main_window, "主窗口")
-    # hider.add_window(param_panel, "参数面板")
-    # hider.hide_all()
-    # ... 工具操作 ...
-    # hider.restore_all()
-
-    logger.info("\n示例完成")

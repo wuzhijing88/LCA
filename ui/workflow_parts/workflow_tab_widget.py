@@ -8,6 +8,7 @@
 import logging
 import os
 import json
+import copy
 from functools import partial
 from pathlib import Path
 from app_core.lca_format.constants import LCA_FILE_FILTER, LCA_SAVE_FILTER
@@ -784,31 +785,33 @@ class WorkflowTabWidget(QTabWidget):
                 blank_workflow_data,
                 new_workflow_filepath,
             )
-            from utils.app_paths import get_workflows_dir
-
             workspace_root = str(workspace_dir or "").strip()
+            tasks = self.task_manager.get_all_tasks()
+            reserved_names = {_strip_workflow_suffix(task.name) for task in tasks}
+            reserved_dirs = {
+                os.path.normcase(os.path.dirname(os.path.abspath(task.filepath)))
+                for task in tasks
+                if task.filepath
+            }
             # 如果没有提供名称，使用默认名称
             if not name:
                 # 生成默认名称：未命名工作流1, 未命名工作流2, ...
                 count = 1
                 while True:
                     name = f"未命名工作流{count}"
-                    # 检查是否已存在同名任务
-                    exists = False
-                    for task in self.task_manager.get_all_tasks():
-                        if task.name == name or task.name == f"{name}.lca":
-                            exists = True
-                            break
-                    if os.path.exists(new_workflow_filepath(name, workspace_root)):
-                        exists = True
-                    if (not workspace_root) and os.path.exists(os.path.join(get_workflows_dir(), f"{name}.lca")):
-                        exists = True
-                    if not exists:
+                    project_dir = os.path.dirname(new_workflow_filepath(name, workspace_root))
+                    if (
+                        name not in reserved_names
+                        and os.path.normcase(project_dir) not in reserved_dirs
+                        and not os.path.lexists(project_dir)
+                    ):
                         break
                     count += 1
 
             default_filepath = new_workflow_filepath(name, workspace_root)
             project_dir = os.path.dirname(os.path.abspath(default_filepath))
+            if os.path.lexists(project_dir) or os.path.normcase(project_dir) in reserved_dirs:
+                raise ValueError(f"工作流名称或目录已存在：{name}\n{project_dir}")
             # 新建只在内存中预留路径，保存或实际导入资源时再创建目录。
             workflow_data = blank_workflow_data(project_dir)
 
@@ -1264,22 +1267,18 @@ class WorkflowTabWidget(QTabWidget):
             )
 
             if reply == QMessageBox.StandardButton.Save:
-                # 更新工作流数据
-                if task_id in self.task_views:
-                    workflow_view = self.task_views[task_id]
-                    workflow_data = workflow_view.serialize_workflow()
-                    task.update_workflow_data(workflow_data)
+                if not self._collect_task_save_data(task):
+                    QMessageBox.warning(self, "保存失败", f"工作流：{task.name}\n{task.last_save_error}")
+                    return False
 
                 # 如果任务没有文件路径（新建的空白工作流），使用另存为
                 if not task.filepath:
-                    self._save_task_as(task_id)
-                    # 检查是否保存成功（用户可能取消）
-                    if not task.filepath:
+                    if not self._save_task_as(task_id):
                         logger.info("用户取消了另存为，不关闭标签页")
                         return False
                 else:
                     if not self._persist_task(task):
-                        QMessageBox.warning(self, "保存失败", f"无法保存任务 '{task.name}'")
+                        QMessageBox.warning(self, "保存失败", f"工作流：{task.name}\n{task.last_save_error}")
                         return False
             elif reply == QMessageBox.StandardButton.Cancel:
                 return False
@@ -1641,21 +1640,38 @@ class WorkflowTabWidget(QTabWidget):
                 task.lca_session = session
                 task.lca_session_path = os.path.abspath(host)
 
+    def _collect_task_save_data(self, task) -> bool:
+        task.last_save_error = ""
+        task.last_save_file_written = False
+        try:
+            if task.task_id not in self.task_views:
+                raise RuntimeError("工作流画布未初始化，无法读取当前编辑内容")
+            workflow_view = self.task_views[task.task_id]
+            task.update_workflow_data(workflow_view.serialize_workflow())
+            return True
+        except Exception as exc:
+            return task.record_save_failure("读取画布数据", exc)
+
     def _persist_task(self, task, *, old_filepath: str | None = None, workflow_data=None) -> bool:
         previous = old_filepath if old_filepath is not None else (task.filepath or "")
-        if not task.save_and_backup(workflow_data=workflow_data):
-            return False
-        self._sync_host_package_session(task)
-        host = self.window()
-        if host is not None and hasattr(host, "_sync_saved_task_resources"):
-            host._sync_saved_task_resources(task, workflow_data)
-        new_filepath = task.filepath or ""
-        if previous and new_filepath:
-            from task_workflow.workspace import favorite_path_key
+        stage = "保存并备份工程"
+        try:
+            if not task.save_and_backup(workflow_data=workflow_data):
+                return False
+            stage = "同步保存后的界面与资源"
+            self._sync_host_package_session(task)
+            host = self.window()
+            if host is not None and hasattr(host, "_sync_saved_task_resources"):
+                host._sync_saved_task_resources(task, workflow_data)
+            new_filepath = task.filepath or ""
+            if previous and new_filepath:
+                from task_workflow.workspace import favorite_path_key
 
-            if favorite_path_key(previous) != favorite_path_key(new_filepath):
-                self.workflow_renamed.emit(task.task_id, previous, new_filepath, task.name)
-        return True
+                if favorite_path_key(previous) != favorite_path_key(new_filepath):
+                    self.workflow_renamed.emit(task.task_id, previous, new_filepath, task.name)
+            return True
+        except Exception as exc:
+            return task.record_save_failure(stage, exc)
 
     def _save_task(self, task_id: int):
         """保存任务"""
@@ -1663,12 +1679,9 @@ class WorkflowTabWidget(QTabWidget):
         if not task:
             return
 
-        # 更新任务的工作流数据
-        if task_id in self.task_views:
-                workflow_view = self.task_views[task_id]
-                # 使用 serialize_workflow() 而不是 save_workflow(filepath)
-                workflow_data = workflow_view.serialize_workflow()
-                task.update_workflow_data(workflow_data)
+        if not self._collect_task_save_data(task):
+            QMessageBox.warning(self, "保存失败", f"工作流：{task.name}\n{task.last_save_error}")
+            return
 
         # 如果任务没有文件路径（新建的空白工作流），使用另存为
         if not task.filepath:
@@ -1680,7 +1693,7 @@ class WorkflowTabWidget(QTabWidget):
             QMessageBox.information(self, "保存成功", f"任务 '{task.name}' 已保存")
             self._update_tab_status(task_id)
         else:
-            QMessageBox.warning(self, "保存失败", f"无法保存任务 '{task.name}'")
+            QMessageBox.warning(self, "保存失败", f"工作流：{task.name}\n{task.last_save_error}")
 
     def _save_task_as(self, task_id: int):
         """任务另存为"""
@@ -1689,20 +1702,19 @@ class WorkflowTabWidget(QTabWidget):
             return
         old_filepath = task.filepath or ""
         old_name = task.name
+        old_host = task.host_workflow_filepath
+        old_logical = task.host_logical_path
 
-        # 更新任务的工作流数据
-        if task_id in self.task_views:
-            workflow_view = self.task_views[task_id]
-            # 使用 serialize_workflow() 而不是 save_workflow(filepath)
-            workflow_data = workflow_view.serialize_workflow()
-            task.update_workflow_data(workflow_data)
+        if not self._collect_task_save_data(task):
+            QMessageBox.warning(self, "保存失败", f"工作流：{task.name}\n{task.last_save_error}")
+            return False
 
         # 选择保存路径
         from task_workflow.workspace import (
             default_new_workflow_filepath,
             prepare_exclusive_workflow_save,
         )
-        default_save_path = task.filepath or default_new_workflow_filepath(task.name or "workflow")
+        default_save_path = task.filepath or default_new_workflow_filepath(task.name or "工作流")
         default_save_path = os.path.splitext(default_save_path)[0] + ".lca"
         filepath, _ = QFileDialog.getSaveFileName(
             self,
@@ -1716,16 +1728,19 @@ class WorkflowTabWidget(QTabWidget):
         if not filepath.lower().endswith(".lca"):
             filepath += ".lca"
 
-        workflow_data = task.workflow_data if isinstance(task.workflow_data, dict) else {}
-        filepath = prepare_exclusive_workflow_save(
-            workflow_data,
-            filepath,
-            source_filepath=old_filepath,
-        )
+        old_workflow_data = task.workflow_data
+        try:
+            workflow_data = copy.deepcopy(old_workflow_data)
+            filepath = prepare_exclusive_workflow_save(
+                workflow_data, filepath, source_filepath=old_filepath,
+            )
+        except Exception as exc:
+            task.record_save_failure("准备另存为路径与资源", exc, filepath=filepath)
+            QMessageBox.warning(self, "保存失败", f"工作流：{task.name}\n{task.last_save_error}")
+            return False
         task.update_workflow_data(workflow_data)
         if task_id in self.task_views:
-            metadata = workflow_data.get("metadata") if isinstance(workflow_data, dict) else {}
-            self.task_views[task_id].workflow_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            self.task_views[task_id].workflow_metadata = dict(workflow_data["metadata"])
 
         # 更新任务文件路径
         task.filepath = filepath
@@ -1736,10 +1751,18 @@ class WorkflowTabWidget(QTabWidget):
         if self._persist_task(task, old_filepath=old_filepath, workflow_data=workflow_data):
             QMessageBox.information(self, "保存成功", f"任务已另存为: {filepath}")
             self._update_tab_status(task_id)
+            return True
         else:
-            task.filepath = old_filepath
-            task.name = old_name
-            QMessageBox.warning(self, "保存失败", f"无法保存到: {filepath}")
+            if not task.last_save_file_written:
+                task.filepath = old_filepath
+                task.name = old_name
+                task.host_workflow_filepath = old_host
+                task.host_logical_path = old_logical
+                task.update_workflow_data(old_workflow_data)
+                self.task_views[task_id].workflow_metadata = dict(old_workflow_data["metadata"])
+            self._update_tab_status(task_id)
+            QMessageBox.warning(self, "保存失败", f"工作流：{task.name}\n{task.last_save_error}")
+            return False
 
     def _rename_task(self, task_id: int):
         """重命名任务"""

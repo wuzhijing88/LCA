@@ -20,6 +20,7 @@ from task_workflow.process_proxy import (
     ProcessWorkflowThreadHandle,
 )
 from task_workflow.thread_start import THREAD_START_TASK_TYPE, is_thread_start_task_type
+from task_workflow.save_diagnostics import format_save_failure
 from utils.window.hwnd_utils import as_hwnd
 from utils.window.window_binding_utils import get_bound_windows_for_mode
 from utils.window.window_identity import (
@@ -99,6 +100,8 @@ class WorkflowTask(QObject):
         self._status = 'idle'  # 'idle', 'running', 'completed', 'failed', 'stopped'
         self.enabled = True  # 是否启用
         self.modified = False  # 是否已修改
+        self.last_save_error = ""
+        self.last_save_file_written = False
 
         # 执行器相关
         self.executor: Optional[ProcessWorkflowExecutorProxy] = None
@@ -908,12 +911,27 @@ class WorkflowTask(QObject):
         self.modified = True
         logger.debug(f"任务 '{self.name}' 工作流数据已更新")
 
+    def record_save_failure(
+        self, stage: str, error: BaseException | str, *, filepath: Optional[str] = None,
+    ) -> bool:
+        self.last_save_error = format_save_failure(
+            stage,
+            self.filepath if filepath is None else filepath,
+            error,
+            file_written=self.last_save_file_written,
+        )
+        logger.error(
+            "任务 '%s' 保存未完成\n%s", self.name, self.last_save_error,
+            exc_info=isinstance(error, BaseException),
+        )
+        return False
+
     def _save_into_host_package(self, workflow_data: dict = None) -> bool:
-        host = str(getattr(self, "host_workflow_filepath", "") or "").strip()
-        logical = str(getattr(self, "host_logical_path", "") or "").strip()
+        host = str(self.host_workflow_filepath or "").strip()
+        logical = str(self.host_logical_path or "").strip()
         if not host or not logical:
-            logger.error("子工作流未绑定父工程，无法保存")
-            return False
+            return self.record_save_failure("校验父工程绑定", "子工作流未绑定父工程，无法保存")
+        stage = "整理子工作流数据"
         try:
             save_data = (workflow_data if workflow_data is not None else self.workflow_data).copy()
             from task_workflow.workflow_sanitize import sanitize_workflow_data
@@ -939,6 +957,7 @@ class WorkflowTask(QObject):
             from app_core.lca_format.session import activate, get_active_path, get_for_path, register
             from task_workflow.workspace import extract_workflow_resource_path
 
+            stage = "校验子工作流工程会话"
             nested_path = str(self.lca_session_path or "").strip()
             source_session = get_for_path(nested_path) if nested_path else None
             if source_session is None:
@@ -946,11 +965,7 @@ class WorkflowTask(QObject):
             self.lca_session = source_session
 
             source_dir = extract_workflow_resource_path(save_data)
-            if not source_dir:
-                images_dir = str(getattr(self, "images_dir", "") or "").strip()
-                if images_dir:
-                    source_dir = os.path.dirname(os.path.abspath(images_dir))
-
+            stage = "写回父工程中的子工作流"
             write_nested_workflow(
                 host,
                 logical,
@@ -959,13 +974,19 @@ class WorkflowTask(QObject):
                 display_name=os.path.splitext(os.path.basename(logical))[0],
                 source_dir=source_dir,
             )
+            self.last_save_file_written = True
+            stage = "重新加载已保存子工作流"
             host_session = get_for_path(host)
             nested_bytes = host_session.get_bytes(logical) if host_session is not None else None
             if nested_bytes is None:
                 raise FileNotFoundError(f"写回后未找到子工作流: {logical}")
             _nested_data, nested_session = load_lca_from_bytes(nested_bytes)
             was_active = get_active_path() == nested_path
-            register(nested_path, nested_session)
+            try:
+                register(nested_path, nested_session)
+            except Exception:
+                nested_session.close()
+                raise
             self.lca_session = nested_session
             if was_active:
                 activate(nested_path)
@@ -973,8 +994,7 @@ class WorkflowTask(QObject):
             logger.info("子工作流已写回父工程: %s -> %s", logical, host)
             return True
         except Exception as exc:
-            logger.error("子工作流写回父工程失败: %s", exc, exc_info=True)
-            return False
+            return self.record_save_failure(stage, exc, filepath=f"{host}\n子工作流：{logical}")
 
     def save(self, workflow_data: dict = None) -> bool:
         """
@@ -983,16 +1003,18 @@ class WorkflowTask(QObject):
         Args:
             workflow_data: 可选的工作流数据，如果提供则使用此数据，否则使用self.workflow_data
         """
-        # 如果没有文件路径（新建的空白工作流），返回False
+        self.last_save_error = ""
+        self.last_save_file_written = False
         if not self.filepath:
-            logger.warning(f"任务 '{self.name}' 没有保存路径，需要先另存为")
-            return False
+            return self.record_save_failure("校验保存路径", "没有保存路径，请先另存为")
 
         if str(self.filepath).startswith("memory://"):
             return self._save_into_host_package(workflow_data)
 
         restore_active_path = ""
         temporarily_activated = False
+        save_success = False
+        stage = "准备保存目录"
         try:
             # 确保文件路径是绝对路径
             abs_filepath = os.path.abspath(self.filepath)
@@ -1008,6 +1030,7 @@ class WorkflowTask(QObject):
                 extract_workflow_resource_path,
             )
 
+            stage = "准备资源目录"
             resource_root = extract_workflow_resource_path(
                 workflow_data if workflow_data is not None else self.workflow_data
             )
@@ -1016,6 +1039,7 @@ class WorkflowTask(QObject):
 
             # 创建保存数据，包含工作流和跳转配置
             # 如果提供了workflow_data，使用它；否则使用self.workflow_data
+            stage = "整理工作流数据"
             save_data = (workflow_data if workflow_data is not None else self.workflow_data).copy()
             from task_workflow.workflow_sanitize import sanitize_workflow_data
 
@@ -1054,6 +1078,7 @@ class WorkflowTask(QObject):
                 register,
             )
 
+            stage = "校验工程会话"
             if self.lca_session is not None and self.lca_session_path:
                 current_session = get_for_path(self.lca_session_path)
                 if current_session is None:
@@ -1069,7 +1094,10 @@ class WorkflowTask(QObject):
 
             logger.debug(f"写入文件: {abs_filepath}")
             old_filepath = self.filepath
-            saved_path = save_workflow_file(abs_filepath, save_data)
+            stage = "封装资源并写入工程"
+            saved_path = save_workflow_file(abs_filepath, save_data, source_session=self.lca_session)
+            self.last_save_file_written = True
+            stage = "重新加载已保存工程"
             self.filepath = str(saved_path)
             from task_workflow.workspace import favorite_path_key, workflow_path_keys
 
@@ -1078,13 +1106,17 @@ class WorkflowTask(QObject):
             ):
                 self.source_ref = self.filepath
             from app_core.lca_format.project_io import load_lca_project
-            from app_core.lca_format.session import deactivate, get_active
+            from app_core.lca_format.session import get_active
 
             previous_session = self.lca_session
             previous_was_active = get_active() is previous_session
             previous_session_path = self.lca_session_path
             _saved_data, saved_session = load_lca_project(saved_path)
-            register(saved_path, saved_session)
+            try:
+                register(saved_path, saved_session)
+            except Exception:
+                saved_session.close()
+                raise
             if (
                 previous_session_path
                 and os.path.normcase(os.path.abspath(previous_session_path))
@@ -1095,19 +1127,16 @@ class WorkflowTask(QObject):
                 clear_path(previous_session_path)
             self.lca_session = saved_session
             self.lca_session_path = os.path.abspath(saved_path)
-            if temporarily_activated:
-                if restore_active_path:
-                    activate(restore_active_path)
-                else:
-                    deactivate()
-            elif previous_was_active:
+            if previous_was_active and not temporarily_activated:
                 activate(saved_path)
             self.modified = False
             logger.info(f"✓ 任务 '{self.name}' 已保存到: {saved_path}")
             logger.debug(f"  跳转配置: enabled={self.jump_enabled}, rules={self.jump_rules}, delay={self.jump_delay}秒, first_execute={self.first_execute}")
-            return True
+            save_success = True
 
         except Exception as e:
+            self.record_save_failure(stage, e)
+        finally:
             if temporarily_activated:
                 try:
                     from app_core.lca_format.session import activate, deactivate
@@ -1116,22 +1145,28 @@ class WorkflowTask(QObject):
                         activate(restore_active_path)
                     else:
                         deactivate()
-                except Exception:
-                    pass
-            logger.error(f"✗ 保存任务 '{self.name}' 失败: {e}", exc_info=True)
-            return False
+                except Exception as restore_error:
+                    restore_details = format_save_failure("恢复原工程会话", restore_active_path, restore_error)
+                    if self.last_save_error:
+                        self.last_save_error += f"\n\n{restore_details}"
+                    else:
+                        self.record_save_failure("恢复原工程会话", restore_error, filepath=restore_active_path)
+                    logger.error("恢复原工程会话失败\n%s", restore_details, exc_info=True)
+                    save_success = False
+        return save_success
 
-    def backup(self) -> bool:
+    def backup(self, *, file_written: bool = False) -> bool:
         """
         备份任务到 backups 目录
 
         Returns:
             是否备份成功
         """
+        self.last_save_error = ""
+        self.last_save_file_written = file_written
         try:
             if not self.filepath:
-                logger.warning(f"任务 '{self.name}' 没有文件路径，无法备份")
-                return False
+                return self.record_save_failure("备份工程", "没有文件路径，无法备份")
 
             from task_workflow.workspace import backup_workflow_file
 
@@ -1142,8 +1177,7 @@ class WorkflowTask(QObject):
             return True
 
         except Exception as e:
-            logger.error(f"✗ 备份任务 '{self.name}' 失败: {e}", exc_info=True)
-            return False
+            return self.record_save_failure("备份工程", e)
 
     def save_and_backup(self, workflow_data: dict = None) -> bool:
         """
@@ -1157,28 +1191,30 @@ class WorkflowTask(QObject):
         Returns:
             是否全部成功
         """
+        self.last_save_error = ""
+        self.last_save_file_written = False
         if str(self.filepath).startswith("memory://"):
             host = str(self.host_workflow_filepath or "").strip()
             if not host:
-                logger.error("子工作流未绑定父工程，无法保存和备份")
-                return False
+                return self.record_save_failure("校验父工程绑定", "子工作流未绑定父工程，无法保存和备份")
             try:
                 from task_workflow.workspace import backup_workflow_file
 
                 backup_workflow_file(host)
             except Exception as exc:
-                logger.error("父工程备份失败，已取消子工作流保存: %s", exc, exc_info=True)
-                return False
+                return self.record_save_failure("备份父工程（未写入子工作流）", exc, filepath=host)
             return self.save(workflow_data=workflow_data)
         # 如果没有文件路径（新建的空白工作流），创建临时备份
         if not self.filepath:
             logger.info(f"任务 '{self.name}' 未保存，创建临时备份")
+            temp_filepath = ""
             try:
                 import tempfile
                 from datetime import datetime
 
                 # 创建临时备份目录
                 temp_dir = os.path.join(tempfile.gettempdir(), 'workflow_temp_backups')
+                temp_filepath = temp_dir
                 os.makedirs(temp_dir, exist_ok=True)
 
                 # 生成临时备份文件名
@@ -1216,8 +1252,7 @@ class WorkflowTask(QObject):
                 return True
 
             except Exception as e:
-                logger.error(f"任务 '{self.name}' 临时备份失败: {e}")
-                return False
+                return self.record_save_failure("创建未命名工作流临时备份", e, filepath=temp_filepath)
 
         # 已有文件先备份旧内容再覆盖；新文件则保存后再归档一份。
         existing_filepath = os.path.abspath(self.filepath)
@@ -1229,7 +1264,9 @@ class WorkflowTask(QObject):
             backup_success = True
         else:
             save_success = self.save(workflow_data=workflow_data)
-            backup_success = self.backup() if os.path.isfile(os.path.abspath(self.filepath)) else save_success
+            backup_success = False
+            if save_success:
+                backup_success = self.backup(file_written=True)
 
         if save_success and backup_success:
             logger.info(f"任务 '{self.name}' 保存和备份成功")

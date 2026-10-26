@@ -5,7 +5,7 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Set
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 
 from task_workflow.sub_workflow_path import resolve_sub_workflow_path
 from task_workflow.workflow_payload import workflow_body
@@ -247,13 +247,20 @@ def collect_workflow_package(
     images_dir: str = "",
     sounds_dir: str = "",
     preloaded_files: Optional[Mapping[str, bytes]] = None,
+    used_relpaths: Optional[Set[str]] = None,
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> CollectionResult:
+    if cancel_check:
+        cancel_check()
     package_files = _normalize_package_files(preloaded_files)
     if not package_files and str(parent_workflow_file or "").lower().endswith(".lca"):
         from app_core.lca_format.project_io import load_lca_project
 
         _loaded, session = load_lca_project(parent_workflow_file)
-        package_files = session.snapshot_files()
+        try:
+            package_files = session.snapshot_files()
+        finally:
+            session.close()
     result = CollectionResult(workflow_data=sanitize_workflow_data(json.loads(json.dumps(workflow_data))))
     resource_dirs = resolve_runtime_resource_dirs(
         result.workflow_data,
@@ -266,7 +273,8 @@ def collect_workflow_package(
     replays_root = str(resource_dirs.get("replays_dir") or "")
     plugins_root = str(resource_dirs.get("plugins_dir") or "")
     dicts_root = str(resource_dirs.get("dicts_dir") or "")
-    used_relpaths: Set[str] = set()
+    if used_relpaths is None:
+        used_relpaths = set()
     visited_workflows: Set[str] = set()
     _collect_workflow(
         result,
@@ -281,6 +289,7 @@ def collect_workflow_package(
         used_relpaths=used_relpaths,
         visited_workflows=visited_workflows,
         package_files=package_files,
+        cancel_check=cancel_check,
     )
     return result
 
@@ -299,17 +308,22 @@ def _collect_disk_gallery(
     used_relpaths: Set[str],
     *,
     dicts_tree: bool,
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> None:
     base = str(root or "").strip()
     if not base or not os.path.isdir(base):
         return
     for dirpath, dirnames, filenames in os.walk(base):
+        if cancel_check:
+            cancel_check()
         dirnames[:] = [
             name
             for name in dirnames
             if name not in {"__pycache__", ".git", ".idea", ".vscode", "backups"}
         ]
         for filename in filenames:
+            if cancel_check:
+                cancel_check()
             ext = os.path.splitext(filename)[1].lower()
             abs_path = os.path.abspath(os.path.join(dirpath, filename))
             is_dict = dicts_tree or "dicts" in Path(dirpath).parts or ext == ".dict"
@@ -330,8 +344,11 @@ def _collect_gallery_tree(
     used_relpaths: Set[str],
     package_files: Mapping[str, bytes],
     dicts_dir: str = "",
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> None:
     for logical_path, data in package_files.items():
+        if cancel_check:
+            cancel_check()
         normalized = logical_path.replace("\\", "/").lstrip("/")
         if not normalized.startswith(("assets/images/", "images/", "assets/dicts/", "dicts/")):
             continue
@@ -352,7 +369,7 @@ def _collect_gallery_tree(
             content=data,
         )
     images_root = str(images_dir or "").strip()
-    _collect_disk_gallery(result, images_root, used_relpaths, dicts_tree=False)
+    _collect_disk_gallery(result, images_root, used_relpaths, dicts_tree=False, cancel_check=cancel_check)
     dicts_root = str(dicts_dir or "").strip()
     if not dicts_root or not os.path.isdir(dicts_root):
         return
@@ -360,7 +377,7 @@ def _collect_gallery_tree(
     dicts_key = os.path.normcase(os.path.abspath(dicts_root))
     if images_key and (dicts_key == images_key or dicts_key.startswith(images_key + os.sep)):
         return
-    _collect_disk_gallery(result, dicts_root, used_relpaths, dicts_tree=True)
+    _collect_disk_gallery(result, dicts_root, used_relpaths, dicts_tree=True, cancel_check=cancel_check)
 
 
 def _collect_workflow(
@@ -377,6 +394,7 @@ def _collect_workflow(
     replays_dir: str = "",
     plugins_dir: str = "",
     dicts_dir: str = "",
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> None:
     body = workflow_body(workflow_data)
     resource_dirs = resolve_runtime_resource_dirs(
@@ -406,6 +424,8 @@ def _collect_workflow(
         return
 
     for card in cards:
+        if cancel_check:
+            cancel_check()
         if not isinstance(card, Mapping):
             continue
         task_type = str(card.get("task_type") or "").strip()
@@ -414,6 +434,13 @@ def _collect_workflow(
         parameters = card.get("parameters")
         if not isinstance(parameters, dict):
             continue
+        plugin_file_keys = set()
+        if task_type == "脚本卡片":
+            plugin_file_keys = _collect_card_plugin_inputs(
+                result, parameters, used_relpaths=used_relpaths, package_files=package_files,
+                images_dir=local_images, sounds_dir=local_sounds, yolo_dir=local_yolo,
+                replays_dir=local_replays, plugins_dir=local_plugins, dicts_dir=local_dicts,
+            )
         if task_type == SCRIPT_TASK_TYPE:
             _collect_script_resources(
                 result,
@@ -453,7 +480,7 @@ def _collect_workflow(
             plugins_dir=local_plugins,
             dicts_dir=local_dicts,
             used_relpaths=used_relpaths,
-            skip_keys={"workflow_file"} if task_type == SUB_WORKFLOW_TASK_TYPE else set(),
+            skip_keys=plugin_file_keys | ({"workflow_file"} if task_type == SUB_WORKFLOW_TASK_TYPE else set()),
             package_files=package_files,
         )
         if task_type in YOLO_TASK_TYPES and not str(parameters.get("model_path") or "").strip():
@@ -479,7 +506,45 @@ def _collect_workflow(
         used_relpaths,
         package_files,
         dicts_dir=local_dicts,
+        cancel_check=cancel_check,
     )
+
+
+
+def _collect_card_plugin_inputs(result, parameters, *, used_relpaths, package_files, **resource_dirs):
+    from app_core.card_plugins import bundle_from_parameters, MAX_CONTENT_BYTES, input_parameter_key
+    from app_core.card_plugin_conditions import prepare_parameter_storage
+    from task_workflow.card_plugin_runtime import read_bound_resource
+    from task_workflow.expr import contains_interpolation
+    import hashlib
+
+    bundle = bundle_from_parameters(parameters)
+    definitions = bundle.manifest["parameters"]
+    states = prepare_parameter_storage(definitions, parameters)
+    file_keys = set()
+    total = 0
+    for name, definition in bundle.manifest["parameters"].items():
+        if definition["type"] != "file":
+            continue
+        storage_key = input_parameter_key(name)
+        file_keys.add(storage_key)
+        if states[name].active is False:
+            continue
+        kind = definition["resource_kind"]
+        if kind == "model":
+            result.has_yolo = True
+        value = parameters[storage_key]
+        if not isinstance(value, str):
+            raise ValueError(f"脚本卡片文件参数必须是文本：{name}")
+        if contains_interpolation(value) or not value:
+            continue
+        data = read_bound_resource(value, kind, resource_dirs, files=package_files if package_files else None, limit=MAX_CONTENT_BYTES - total)
+        total += len(data)
+        package_kind = "audio" if kind == "sound" else kind
+        identity = "plugin-input://" + hashlib.sha256(data).hexdigest() + "/" + Path(value.replace("\\", "/")).name
+        relpath = _register_asset(result, package_kind, identity, used_relpaths, content=data)
+        parameters[storage_key] = relpath
+    return file_keys
 
 
 def _collect_script_resources(
@@ -607,7 +672,8 @@ def _collect_sub_workflow(
                 load_lca_from_bytes,
             )
 
-            nested, _nested_session = load_lca_from_bytes(package_data)
+            nested, nested_session = load_lca_from_bytes(package_data)
+            nested_session.close()
         except LcaFormatError as exc:
             result.errors.append(f"无法读取{label}的工作流 {raw_path}: {exc}")
             return
@@ -650,19 +716,22 @@ def _collect_sub_workflow(
             result.errors.append(f"{label}的工作流必须是 .lca 工程: {raw_path}")
             return
         nested, nested_session = load_lca_project(real)
-        if not isinstance(nested, dict):
-            result.errors.append(f"{label}的工作流格式无效: {raw_path}")
-            return
-        if _workflow_contains_sub_workflow(nested):
-            result.errors.append(f"{label}不允许再嵌套子工作流")
-            return
-        sealed = seal_workflow_package(
-            nested,
-            source_session=nested_session,
-            display_name=Path(real).stem,
-            source_dir=str(Path(real).parent),
-            workflow_filepath=real,
-        )
+        try:
+            if not isinstance(nested, dict):
+                result.errors.append(f"{label}的工作流格式无效: {raw_path}")
+                return
+            if _workflow_contains_sub_workflow(nested):
+                result.errors.append(f"{label}不允许再嵌套子工作流")
+                return
+            sealed = seal_workflow_package(
+                nested,
+                source_session=nested_session,
+                display_name=Path(real).stem,
+                source_dir=str(Path(real).parent),
+                workflow_filepath=real,
+            )
+        finally:
+            nested_session.close()
     except (OSError, ValueError, TypeError, json.JSONDecodeError, LcaFormatError) as exc:
         result.errors.append(f"无法读取{label}的工作流 {raw_path}: {exc}")
         return

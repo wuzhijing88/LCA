@@ -1,107 +1,35 @@
-"""Typed task execution contract with legacy tuple compatibility."""
+"""卡片执行结果的唯一协议与校验。"""
 
-from __future__ import annotations
-
-from dataclasses import dataclass
-from enum import Enum
 from typing import Any, Optional
 
 
-class TransitionKind(str, Enum):
-    NEXT = "next"
-    JUMP = "jump"
-    RETRY = "retry"
-    CONTINUE = "continue"
-    STOP = "stop"
+STEP_ACTIONS = frozenset(("执行下一步", "跳转到步骤", "继续执行本步骤", "停止工作流"))
 
 
-_ACTION_TO_KIND = {
-    "": TransitionKind.NEXT,
-    "执行下一步": TransitionKind.NEXT,
-    "下一步": TransitionKind.NEXT,
-    "跳转到步骤": TransitionKind.JUMP,
-    "跳转到指定步骤": TransitionKind.JUMP,
-    "继续执行本步骤": TransitionKind.RETRY,
-    "继续本步骤": TransitionKind.RETRY,
-    "停止工作流": TransitionKind.STOP,
-    "stop_workflow": TransitionKind.STOP,
-}
-
-_KIND_TO_ACTION = {
-    TransitionKind.NEXT: "执行下一步",
-    TransitionKind.JUMP: "跳转到步骤",
-    TransitionKind.RETRY: "继续执行本步骤",
-    TransitionKind.CONTINUE: "继续执行本步骤",
-    TransitionKind.STOP: "停止工作流",
-}
+def validate_step_action(action: Any) -> str:
+    if not isinstance(action, str) or action not in STEP_ACTIONS:
+        raise ValueError(f"无效的步骤动作: {action!r}")
+    return action
 
 
-@dataclass(frozen=True)
-class Transition:
-    kind: TransitionKind = TransitionKind.NEXT
-    target_card_id: Optional[int] = None
-
-    @classmethod
-    def from_legacy(cls, action: Any, target_card_id: Any = None) -> "Transition":
-        if isinstance(action, Transition):
-            return action
-        if isinstance(action, TransitionKind):
-            return cls(action, _normalize_card_id(target_card_id))
-        normalized = str(action or "").strip()
-        kind = _ACTION_TO_KIND.get(normalized, TransitionKind.NEXT)
-        return cls(kind, _normalize_card_id(target_card_id))
-
-    def legacy_action(self) -> str:
-        return _KIND_TO_ACTION[self.kind]
+def validate_card_target(value: Any) -> Optional[int]:
+    if value is not None and (type(value) is not int or value < 0):
+        raise ValueError(f"卡片目标必须是非负整数或空值: {value!r}")
+    return value
 
 
-@dataclass(frozen=True)
-class TaskResult:
-    success: bool
-    transition: Transition = Transition()
-    detail: str = ""
-
-    def as_legacy_tuple(self) -> tuple[bool, str, Optional[int], str]:
-        return (
-            bool(self.success),
-            self.transition.legacy_action(),
-            self.transition.target_card_id,
-            str(self.detail or ""),
-        )
-
-    @classmethod
-    def from_legacy(cls, result: Any) -> "TaskResult":
-        if isinstance(result, TaskResult):
-            return result
-        if not isinstance(result, (tuple, list)):
-            raise TypeError(f"task result must be TaskResult or tuple, got {type(result).__name__}")
-        if len(result) < 3:
-            raise ValueError(f"task result must contain at least 3 values, got {len(result)}")
-        success, action, target = result[:3]
-        detail = result[3] if len(result) >= 4 else ""
-        return cls(
-            success=bool(success),
-            transition=Transition.from_legacy(action, target),
-            detail=str(detail or ""),
-        )
-
-
-def _normalize_card_id(value: Any) -> Optional[int]:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def normalize_task_result(result: Any) -> TaskResult:
-    return TaskResult.from_legacy(result)
-
-
-__all__ = [
-    "TaskResult",
-    "Transition",
-    "TransitionKind",
-    "normalize_task_result",
-]
+def validate_task_result(result: Any) -> tuple[bool, str, Optional[int], str]:
+    """接收 (success, action, target[, detail])，只补齐可选说明字段。"""
+    if not isinstance(result, tuple) or len(result) not in (3, 4):
+        raise TypeError("任务结果必须是包含 3 或 4 项的元组")
+    success, action, target = result[:3]
+    if type(success) is not bool:
+        raise TypeError("任务结果的成功状态必须是布尔值")
+    validate_step_action(action)
+    validate_card_target(target)
+    if action == "跳转到步骤" and target is None:
+        raise ValueError("跳转到步骤必须指定目标卡片")
+    detail = result[3] if len(result) == 4 else ""
+    if not isinstance(detail, str):
+        raise TypeError("任务结果的说明必须是文本")
+    return success, action, target, detail

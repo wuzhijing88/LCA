@@ -15,15 +15,19 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app_core.app_config import APP_SOURCE_REPOSITORY, app_source_url
+from app_core.ai_stream import AIRequestCancelled
 
 REPO_CHECK_SECONDS = 6 * 3600
 REPO_HTTP_TIMEOUT = 20
 MAX_REPO_ZIP_BYTES = 40 * 1024 * 1024
 MAX_REPO_FILE_BYTES = 512 * 1024
+MAX_REPO_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_REPO_FILES = 10000
 MAX_READ_CHARS = 12000
 MAX_SEARCH_PATHS = 30
 MAX_SEARCH_FILES = 24
@@ -45,15 +49,27 @@ _GITHUB_HEADERS = {
 def _cache_root() -> Path:
     from utils.app_paths import get_user_data_dir
 
-    return Path(get_user_data_dir()) / "ai_repo_cache"
+    parent = Path(get_user_data_dir()).resolve()
+    target = (parent / "ai_repo_cache").resolve()
+    if target.parent != parent:
+        raise RuntimeError("开源仓库缓存目录越界")
+    return target
+
+
+def _cache_child(name: str) -> Path:
+    root = _cache_root()
+    target = (root / name).resolve()
+    if target.parent != root:
+        raise RuntimeError("开源仓库缓存文件路径越界")
+    return target
 
 
 def _stamp_path() -> Path:
-    return _cache_root() / "stamp.json"
+    return _cache_child("stamp.json")
 
 
 def _snapshot_dir() -> Path:
-    return _cache_root() / "snapshot"
+    return _cache_child("snapshot")
 
 
 def clear_ai_repo_cache() -> None:
@@ -65,7 +81,7 @@ def clear_ai_repo_cache() -> None:
         _MEMORY_FILES = {}
         root = _cache_root()
         if root.is_dir():
-            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(root)
 
 
 def _repo_owner_name() -> Tuple[str, str]:
@@ -95,8 +111,11 @@ def _http_get(
     try:
         with post(request, timeout=max(5, int(timeout))) as response:
             data = response.read()
+    except AIRequestCancelled:
+        raise
     except urllib.error.HTTPError as exc:
         code = int(getattr(exc, "code", 0) or 0)
+        exc.close()
         if code == 403:
             raise RuntimeError("开源仓库暂时无法访问：GitHub 限流") from exc
         if code == 404:
@@ -232,18 +251,23 @@ def cached_snapshot_id() -> str:
     return str(_load_stamp().get("sha") or "")
 
 
-def _read_snapshot_files(root: Path) -> Dict[str, str]:
+def _read_snapshot_files(root: Path, *, cancel=None) -> Dict[str, str]:
     files: Dict[str, str] = {}
-    root_key = os.path.normcase(str(root.resolve()))
+    resolved_root = root.resolve()
+    total_bytes = 0
     for current, dirnames, filenames in os.walk(root):
+        if cancel is not None:
+            cancel.check()
         dirnames[:] = [name for name in dirnames if name not in _SKIP_DIR_NAMES]
         for filename in filenames:
+            if cancel is not None:
+                cancel.check()
             full = Path(current) / filename
             try:
-                resolved = str(full.resolve())
+                resolved = full.resolve()
             except OSError:
                 continue
-            if not os.path.normcase(resolved).startswith(root_key):
+            if not resolved.is_relative_to(resolved_root):
                 continue
             relative = full.relative_to(root).as_posix()
             ext = os.path.splitext(relative)[1].lower()
@@ -255,6 +279,9 @@ def _read_snapshot_files(root: Path) -> Dict[str, str]:
                 continue
             if size <= 0 or size > MAX_REPO_FILE_BYTES:
                 continue
+            total_bytes += size
+            if total_bytes > MAX_REPO_TOTAL_BYTES or len(files) >= MAX_REPO_FILES:
+                raise RuntimeError("开源仓库缓存超过文件数或总大小上限")
             try:
                 text = full.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
@@ -263,12 +290,21 @@ def _read_snapshot_files(root: Path) -> Dict[str, str]:
     return files
 
 
-def _extract_zip(blob: bytes, destination: Path) -> None:
+def _extract_zip(blob: bytes, destination: Path, *, cancel=None) -> None:
     try:
         archive = zipfile.ZipFile(io.BytesIO(blob))
     except zipfile.BadZipFile as exc:
         raise RuntimeError("开源仓库源码压缩包无效") from exc
+    try:
+        _extract_archive(archive, destination, cancel=cancel)
+    finally:
+        archive.close()
+
+
+def _extract_archive(archive, destination: Path, *, cancel=None) -> None:
     names = archive.namelist()
+    if len(names) > MAX_REPO_FILES:
+        raise RuntimeError("开源仓库压缩包文件数超过上限")
     prefix = ""
     if names:
         first = str(names[0] or "").replace("\\", "/")
@@ -276,8 +312,11 @@ def _extract_zip(blob: bytes, destination: Path) -> None:
         if head and all(str(item or "").replace("\\", "/").startswith(head + "/") or str(item or "").replace("\\", "/") == head for item in names):
             prefix = head + "/"
     destination.mkdir(parents=True, exist_ok=True)
-    dest_key = os.path.normcase(str(destination.resolve()))
+    resolved_destination = destination.resolve()
+    total_bytes = 0
     for info in archive.infolist():
+        if cancel is not None:
+            cancel.check()
         if info.is_dir():
             continue
         relative = _safe_extract_name(info.filename, prefix)
@@ -285,8 +324,11 @@ def _extract_zip(blob: bytes, destination: Path) -> None:
             continue
         if info.file_size > MAX_REPO_FILE_BYTES:
             continue
+        total_bytes += info.file_size
+        if total_bytes > MAX_REPO_TOTAL_BYTES:
+            raise RuntimeError("开源仓库解压后超过总大小上限")
         target = (destination / relative).resolve()
-        if not os.path.normcase(str(target)).startswith(dest_key):
+        if not target.is_relative_to(resolved_destination):
             raise RuntimeError("开源仓库压缩包路径无效")
         target.parent.mkdir(parents=True, exist_ok=True)
         with archive.open(info, "r") as source:
@@ -309,14 +351,14 @@ def _remember(files: Dict[str, str], branch: str, sha: str, stamp: float) -> Dic
     return dict(_MEMORY_FILES)
 
 
-def _disk_files() -> Dict[str, str]:
+def _disk_files(*, cancel=None) -> Dict[str, str]:
     root = _snapshot_dir()
     if not root.is_dir():
         return {}
-    return _read_snapshot_files(root)
+    return _read_snapshot_files(root, cancel=cancel)
 
 
-def _refresh_snapshot(*, opener: Optional[Callable[..., Any]] = None) -> Tuple[str, str, Dict[str, str]]:
+def _refresh_snapshot(*, opener: Optional[Callable[..., Any]] = None, cancel=None) -> Tuple[str, str, Dict[str, str]]:
     owner, name = _repo_owner_name()
     branch = _default_branch(opener=opener)
     sha = _head_sha(branch, opener=opener)
@@ -333,32 +375,47 @@ def _refresh_snapshot(*, opener: Optional[Callable[..., Any]] = None) -> Tuple[s
         raise RuntimeError("开源仓库源码过大")
     root = _cache_root()
     root.mkdir(parents=True, exist_ok=True)
-    incoming = root / "snapshot.tmp"
+    incoming = _cache_child("snapshot.tmp")
     current = _snapshot_dir()
     if incoming.exists():
-        shutil.rmtree(incoming, ignore_errors=True)
+        shutil.rmtree(incoming)
     try:
-        _extract_zip(blob, incoming)
-        files = _read_snapshot_files(incoming)
+        _extract_zip(blob, incoming, cancel=cancel)
+        files = _read_snapshot_files(incoming, cancel=cancel)
+        if cancel is not None:
+            cancel.check()
         if not files:
             raise RuntimeError("开源仓库里没有可阅读的源码")
         if current.exists():
-            shutil.rmtree(current, ignore_errors=True)
+            shutil.rmtree(current)
         os.replace(incoming, current)
         _write_stamp(branch, sha, fetched=True)
     finally:
         if incoming.exists():
-            shutil.rmtree(incoming, ignore_errors=True)
+            shutil.rmtree(incoming)
     return branch, sha, files
 
 
-def ensure_source_repository(*, opener: Optional[Callable[..., Any]] = None) -> Dict[str, str]:
+@contextmanager
+def _repository_lock(cancel):
+    while not _CACHE_LOCK.acquire(timeout=0.05):
+        if cancel is not None:
+            cancel.check()
+    try:
+        if cancel is not None:
+            cancel.check()
+        yield
+    finally:
+        _CACHE_LOCK.release()
+
+
+def ensure_source_repository(*, opener: Optional[Callable[..., Any]] = None, cancel=None) -> Dict[str, str]:
     now = time.time()
-    with _CACHE_LOCK:
+    with _repository_lock(cancel):
         stamp = _load_stamp()
         if _MEMORY_FILES and _check_is_fresh({"repo": APP_SOURCE_REPOSITORY, "checked_at": _MEMORY_STAMP}):
             return dict(_MEMORY_FILES)
-        disk = dict(_MEMORY_FILES) if _MEMORY_FILES else _disk_files()
+        disk = dict(_MEMORY_FILES) if _MEMORY_FILES else _disk_files(cancel=cancel)
         stamp_ok = str(stamp.get("repo") or "") == APP_SOURCE_REPOSITORY and bool(disk)
         if stamp_ok and _check_is_fresh(stamp):
             return _remember(
@@ -369,18 +426,13 @@ def ensure_source_repository(*, opener: Optional[Callable[..., Any]] = None) -> 
             )
         if stamp_ok:
             branch = str(stamp.get("branch") or "")
-            try:
-                if not branch:
-                    branch = _default_branch(opener=opener)
-                sha = _head_sha(branch, opener=opener)
-            except Exception:
-                sha = str(stamp.get("sha") or "")
-                _write_stamp(branch, sha, fetched=False)
-                return _remember(disk, branch, sha, now)
+            if not branch:
+                raise RuntimeError("开源仓库缓存缺少默认分支，请清除缓存后重新下载")
+            sha = _head_sha(branch, opener=opener)
             if sha == str(stamp.get("sha") or ""):
                 _write_stamp(branch, sha, fetched=False)
                 return _remember(disk, branch, sha, now)
-        branch, sha, files = _refresh_snapshot(opener=opener)
+        branch, sha, files = _refresh_snapshot(opener=opener, cancel=cancel)
         return _remember(files, branch, sha, now)
 
 
@@ -388,9 +440,9 @@ def list_source_repository_files(*, opener: Optional[Callable[..., Any]] = None)
     return sorted(ensure_source_repository(opener=opener))
 
 
-def read_source_repository_file(path: str, *, opener: Optional[Callable[..., Any]] = None) -> str:
+def read_source_repository_file(path: str, *, opener: Optional[Callable[..., Any]] = None, cancel=None) -> str:
     normalized = _normalize_repo_path(path)
-    files = ensure_source_repository(opener=opener)
+    files = ensure_source_repository(opener=opener, cancel=cancel)
     text = files.get(normalized)
     if text is None:
         raise FileNotFoundError(f"开源仓库中没有这个文件：{normalized}")
@@ -399,14 +451,14 @@ def read_source_repository_file(path: str, *, opener: Optional[Callable[..., Any
     return text[:MAX_READ_CHARS] + "\n…（已截断）"
 
 
-def search_source_repository(keyword: str, *, opener: Optional[Callable[..., Any]] = None) -> str:
+def search_source_repository(keyword: str, *, opener: Optional[Callable[..., Any]] = None, cancel=None) -> str:
     query = " ".join(str(keyword or "").split())
     if not query:
         raise ValueError("搜索词不能为空")
     terms = [item for item in query.lower().split() if item]
     if not terms:
         raise ValueError("搜索词不能为空")
-    files = ensure_source_repository(opener=opener)
+    files = ensure_source_repository(opener=opener, cancel=cancel)
     path_hits = [path for path in files if all(term in path.lower() for term in terms)]
     if path_hits:
         fetch_paths = path_hits[:MAX_SEARCH_FILES]

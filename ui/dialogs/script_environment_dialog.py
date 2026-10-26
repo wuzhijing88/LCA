@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from app_core.script_environments import EnvironmentError, EnvironmentManager, normalize_environment
 from themes import ThemedComboBox
+from ui.panels.managed_resources import PanelResources
 
 
 class _EnvironmentWorker(QThread):
@@ -25,6 +26,9 @@ class _EnvironmentWorker(QThread):
         super().__init__()
         self.settings, self.operation = settings, operation
         self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
 
     def run(self):
         try:
@@ -55,10 +59,8 @@ def _dispose_worker(state):
     if worker is not None:
         worker.progress.disconnect()
         worker.result.disconnect()
-        worker.finished.disconnect()
         worker.stop_event.set()
-        worker.wait()
-        worker.deleteLater()
+        worker.wait(20)
         state[0] = None
 
 
@@ -69,6 +71,7 @@ class ScriptEnvironmentDialog(QDialog):
         self.setWindowTitle("脚本运行环境")
         self.resize(760, 680)
         self._state = [None]
+        self._resources = PanelResources()
         self._closed = False
         self.destroyed.connect(lambda _=None, state=self._state: _dispose_worker(state))
         settings = normalize_environment(settings)
@@ -257,6 +260,7 @@ class ScriptEnvironmentDialog(QDialog):
         self._clear_packages("正在读取" if operation == "inspect" else "等待环境任务完成")
         self.status.setText({"prepare": "正在准备环境", "delete": "正在删除脚本环境", "inspect": "正在读取已安装库"}[operation])
         worker = _EnvironmentWorker(settings, operation)
+        self._resources.own_thread(worker)
         worker.progress.connect(self.output.appendPlainText)
         worker.result.connect(self._on_result)
         worker.finished.connect(self._finished)
@@ -268,8 +272,6 @@ class ScriptEnvironmentDialog(QDialog):
         worker = self.sender()
         if self._state[0] is worker:
             self._state[0] = None
-        if worker is not None:
-            worker.deleteLater()
         self._update_enabled()
 
     def _on_result(self, ok, message, snapshot):

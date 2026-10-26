@@ -298,8 +298,9 @@ def grab_overlay_input(overlay, *, log_prefix: str = '覆盖层', activate: bool
                 overlay.setFocus(Qt.FocusReason.OtherFocusReason)
         overlay.grabMouse()
         overlay.grabKeyboard()
-        overlay._is_ready_for_input = True
-        return True
+        from PySide6.QtWidgets import QWidget
+        overlay._is_ready_for_input = QWidget.mouseGrabber() is overlay and QWidget.keyboardGrabber() is overlay
+        return overlay._is_ready_for_input
     except RuntimeError:
         return False
     except Exception as error:
@@ -308,14 +309,17 @@ def grab_overlay_input(overlay, *, log_prefix: str = '覆盖层', activate: bool
 
 
 def release_overlay_input(overlay) -> None:
-    try:
+    from shiboken6 import isValid
+    timers = getattr(overlay, '_overlay_callbacks', [])
+    overlay._overlay_callbacks = []
+    for timer in timers:
+        if isValid(timer):
+            timer.stop()
+            timer.deleteLater()
+    if isValid(overlay):
         overlay.releaseMouse()
-    except Exception:
-        pass
-    try:
         overlay.releaseKeyboard()
-    except Exception:
-        pass
+    overlay._is_ready_for_input = False
 
 
 def overlay_can_receive_input(overlay) -> bool:
@@ -359,123 +363,68 @@ def show_and_activate_overlay(
     return activate_overlay_widget(overlay, log_prefix=log_prefix, focus=focus)
 
 
-def schedule_overlay_activation_boost(
-    overlay,
-    *,
-    log_prefix: str = '覆盖层',
-    intervals_ms: tuple[int, ...] = (50, 150, 300),
-    focus: bool = True,
-) -> None:
+def schedule_overlay_callback(overlay, delay_ms: int, callback) -> None:
+    """延迟输入操作归覆盖层所有，关闭时由 release_overlay_input 取消。"""
     from PySide6.QtCore import QTimer
+    timer = QTimer(overlay)
+    timer.setSingleShot(True)
+    timers = getattr(overlay, '_overlay_callbacks', None)
+    if timers is None:
+        timers = []
+        overlay._overlay_callbacks = timers
+    timers.append(timer)
+    def run():
+        if timer in timers:
+            timers.remove(timer)
+        timer.deleteLater()
+        if overlay_is_activatable(overlay) and overlay.isVisible():
+            callback()
+    timer.timeout.connect(run)
+    timer.start(delay_ms)
 
-    def _boost():
-        try:
-            if not overlay_is_activatable(overlay) or not overlay.isVisible():
-                return
-            if overlay_is_interacting(overlay):
-                return
-            overlay.raise_()
-            grab_overlay_input(overlay, log_prefix=log_prefix, activate=False)
-        except RuntimeError:
-            return
-        _ = focus
 
+def schedule_overlay_activation_boost(
+    overlay, *, log_prefix: str = '覆盖层',
+    intervals_ms: tuple[int, ...] = (50, 150, 300), focus: bool = True,
+) -> None:
+    def boost():
+        if not overlay_is_interacting(overlay):
+            grab_overlay_input(overlay, log_prefix=log_prefix, activate=focus)
     for delay in intervals_ms:
-        QTimer.singleShot(int(delay), _boost)
+        schedule_overlay_callback(overlay, int(delay), boost)
 
 
 def ensure_overlay_ready_for_input(
-    overlay,
-    *,
-    log_prefix: str,
-    ready_message: str,
-    retry_message: str,
-    exhausted_message: str,
-    max_attempts: int = 3,
-    retry_delay_ms: int = 200,
-    auto_show: bool = False,
-    allow_closed_skip: bool = False,
-) -> None:
-    from PySide6.QtCore import QTimer
-
-    _ = allow_closed_skip
-    if not overlay_is_activatable(overlay):
-        return
+    overlay, *, log_prefix: str, ready_message: str, retry_message: str,
+    exhausted_message: str, max_attempts: int = 3, retry_delay_ms: int = 200,
+) -> bool:
+    if not overlay_is_activatable(overlay) or not overlay.isVisible():
+        return False
     if overlay_is_interacting(overlay):
-        overlay._is_ready_for_input = True
-        return
-
-    try:
-        if not overlay.isVisible():
-            if not auto_show:
-                return
-            logger.warning(f'[{log_prefix}] 覆盖层不可见，强制显示')
-            overlay.show()
-            if not overlay_is_activatable(overlay) or not overlay.isVisible():
-                return
-
-        if overlay_can_receive_input(overlay) or getattr(overlay, '_is_ready_for_input', False):
-            grab_overlay_input(overlay, log_prefix=log_prefix, activate=False)
-            overlay._is_ready_for_input = True
-            logger.info(ready_message)
-            return
-
-        grabbed = grab_overlay_input(overlay, log_prefix=log_prefix, activate=False)
-        if overlay_can_receive_input(overlay) or grabbed:
-            overlay._is_ready_for_input = True
-            logger.info(ready_message)
-            return
-
-        activate_overlay_widget(overlay, log_prefix=log_prefix, focus=True)
-        grabbed = grab_overlay_input(overlay, log_prefix=log_prefix, activate=False)
-
-        if overlay_can_receive_input(overlay) or grabbed:
-            overlay._is_ready_for_input = True
-            logger.info(ready_message)
-            return
-
-        attempts = int(getattr(overlay, '_activation_attempts', 0)) + 1
-        overlay._activation_attempts = attempts
-        logger.warning(retry_message.format(attempt=attempts, max_attempts=max_attempts))
-
-        if attempts < max_attempts:
-            QTimer.singleShot(int(retry_delay_ms), overlay._ensure_ready_for_input)
-            return
-
-        grab_overlay_input(overlay, log_prefix=log_prefix)
-        overlay._is_ready_for_input = True
-        logger.warning(exhausted_message)
-    except RuntimeError:
-        return
-    except Exception as error:
-        logger.error(f'[{log_prefix}] 确保窗口就绪时出错: {error}')
-        if overlay_is_activatable(overlay):
-            overlay._is_ready_for_input = True
+        return overlay_can_receive_input(overlay)
+    if grab_overlay_input(overlay, log_prefix=log_prefix, activate=True):
+        logger.info(ready_message)
+        return True
+    overlay._is_ready_for_input = False
+    overlay._activation_attempts = int(getattr(overlay, '_activation_attempts', 0)) + 1
+    if overlay._activation_attempts < max_attempts:
+        logger.warning(retry_message.format(attempt=overlay._activation_attempts, max_attempts=max_attempts))
+        schedule_overlay_callback(overlay, retry_delay_ms, overlay._ensure_ready_for_input)
+    else:
+        logger.error(exhausted_message)
+        overlay.close()
+    return False
 
 
 def resolve_window_client_rect(hwnd: int, log_prefix: str = '') -> Tuple[int, int, int, int]:
-    import win32gui
-
-    try:
-        window_info = build_window_info(hwnd)
-        native_rect = window_info.get('client_native_rect') if window_info else None
-        if not native_rect or len(native_rect) != 4:
-            raise ValueError('客户区原生矩形不可用')
-
-        left, top, right, bottom = [int(value) for value in native_rect]
-        window_rect = (left, top, right - left, bottom - top)
-        prefix = f'[{log_prefix}] ' if log_prefix else ''
-        logger.info(
-            f'{prefix}使用客户区坐标: '
-            f'位置=({window_rect[0]}, {window_rect[1]}), '
-            f'尺寸=({window_rect[2]}, {window_rect[3]})'
-        )
-        return window_rect
-    except Exception as error:
-        prefix = f'[{log_prefix}] ' if log_prefix else ''
-        logger.warning(f'{prefix}获取客户区失败，使用窗口矩形: {error}')
-        rect = win32gui.GetWindowRect(hwnd)
-        return rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]
+    window_info = build_window_info(hwnd)
+    native_rect = window_info['client_native_rect'] if window_info else None
+    if not native_rect or len(native_rect) != 4:
+        raise ValueError('客户区原生矩形不可用')
+    left, top, right, bottom = native_rect
+    if right <= left or bottom <= top:
+        raise ValueError('窗口客户区尺寸无效')
+    return left, top, right - left, bottom - top
 
 
 def resolve_window_client_offset(hwnd: int, log_prefix: str = '') -> Tuple[int, int]:

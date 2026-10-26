@@ -8,11 +8,11 @@
 import logging
 from typing import Optional, Tuple, List
 from PySide6.QtWidgets import QWidget, QPushButton, QVBoxLayout, QMessageBox
-from PySide6.QtCore import Signal, QPoint, QPointF, QRect, Qt, QTimer
+from PySide6.QtCore import Signal, QPoint, QPointF, QRect, Qt, QTimer, QEvent, QObject
+from shiboken6 import isValid
 from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
 from themes import theme_color
 
-from utils.window.window_finder import resolve_unique_window_hwnd
 from utils.window.window_coordinate_common import (
     build_window_info,
     client_relative_to_qt_global,
@@ -36,11 +36,9 @@ from utils.window.window_overlay_utils import (
 )
 from utils.window.window_activation_utils import (
     activate_window,
-    ensure_overlay_ready_for_input,
     grab_overlay_input,
     release_overlay_input,
     show_and_activate_overlay,
-    schedule_overlay_activation_boost,
 )
 from .multi_coordinate_text import (
     MULTI_COORDINATE_BUTTON_TEXT,
@@ -56,8 +54,34 @@ from .multi_coordinate_text import (
 logger = logging.getLogger(__name__)
 
 
-def _picker_qcolor(key: str, default: str, alpha: int = 255) -> QColor:
-    color = QColor(theme_color(key, default))
+def _get_global_bound_window(widget):
+    current = widget.parent()
+    while current is not None:
+        host = getattr(current, "main_window", None)
+        if host is None and hasattr(current, "bound_windows"):
+            host = current
+        if host is not None:
+            windows = getattr(host, "bound_windows", None)
+            if not isinstance(windows, list) or any(not isinstance(item, dict) or type(item.get("enabled")) is not bool for item in windows):
+                logger.error("全局窗口绑定尚未就绪")
+                return None
+            enabled = [item for item in windows if item["enabled"]]
+            if len(enabled) != 1:
+                logger.error("请在全局设置中仅启用一个目标窗口")
+                return None
+            hwnd = enabled[0].get("hwnd")
+            if type(hwnd) is not int or hwnd <= 0:
+                logger.error("全局绑定窗口句柄无效")
+                return None
+            return hwnd
+        current = current.parent()
+    logger.error("未找到全局窗口绑定的所有者")
+    return None
+
+
+
+def _picker_qcolor(key: str, alpha: int = 255) -> QColor:
+    color = QColor(theme_color(key))
     color.setAlpha(max(0, min(255, int(alpha))))
     return color
 
@@ -94,12 +118,7 @@ def build_smooth_route_path(points) -> QPainterPath:
         path.cubicTo(control_out, control_in, nxt)
     return path
 
-try:
-    import win32gui
-    PYWIN32_AVAILABLE = True
-except ImportError:
-    PYWIN32_AVAILABLE = False
-    logger.warning("pywin32 not available, coordinate selector may not work properly")
+import win32gui
 
 class CoordinateSelectorOverlay(QWidget):
     """坐标选择器覆盖层"""
@@ -108,13 +127,27 @@ class CoordinateSelectorOverlay(QWidget):
     selection_closed = Signal()
 
     def __init__(self, target_window_hwnd: int, parent=None):
-        super().__init__(None)  # 独立窗口
+        super().__init__(parent)  # 顶层窗口归创建者所有
         self.target_window_hwnd = target_window_hwnd  # 目标窗口句柄
         self.target_hwnd = None
         self.window_info = None
         self.target_window_title = ""  # 从句柄获取的窗口标题，仅用于显示
         self.backdrop_pixmap = None
         self.desktop_pixmap = None
+        self._composed_backdrop = None
+        self._composed_backdrop_key = None
+        self._capture_released = False
+        self._activation_timers = []
+        for delay in (50, 150, 300):
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(delay)
+            timer.timeout.connect(self._ensure_ready_for_input)
+            self._activation_timers.append(timer)
+        self._preview_close_timer = QTimer(self)
+        self._preview_close_timer.setSingleShot(True)
+        self._preview_close_timer.setInterval(300)
+        self._preview_close_timer.timeout.connect(self._close_after_preview)
 
         # 选择状态
         self.selecting = False
@@ -125,18 +158,21 @@ class CoordinateSelectorOverlay(QWidget):
         self._activation_attempts = 0
 
         configure_opaque_picker_overlay(self)
-        
+        if parent is not None:
+            parent.destroyed.connect(self._release_capture)
+
         logger.info("创建坐标选择器覆盖层")
 
-        # 初始化
-        self.setup_target_window()
+        # 初始化失败的独立窗口也必须销毁。
+        try:
+            self.setup_target_window()
+        except Exception:
+            self._release_capture()
+            self.deleteLater()
+            raise
     
     def setup_target_window(self):
         """设置目标窗口"""
-        if not PYWIN32_AVAILABLE:
-            logger.error("需要安装pywin32库")
-            return False
-
         target_hwnd = int(self.target_window_hwnd or 0)
         if not target_hwnd:
             logger.error(f"无效的窗口句柄: {target_hwnd}")
@@ -232,17 +268,10 @@ class CoordinateSelectorOverlay(QWidget):
             return None
 
     def _activate_target_window(self, hwnd: int):
-        """激活并置顶目标窗口。"""
-        try:
-            activation_hwnd = activate_window(hwnd, log_prefix='坐标选择')
-            if not activation_hwnd:
-                return
-
-            logger.info(f"已激活并置顶目标窗口: {self.target_window_title}")
-
-        except Exception as e:
-            logger.warning(f"激活目标窗口失败: {e}")
-            # 即使激活失败也继续执行，不影响坐标选择功能
+        """激活失败必须停止采集，不能继续使用未确认的目标窗口。"""
+        if not activate_window(hwnd, log_prefix='坐标选择'):
+            raise RuntimeError("无法激活目标窗口，不能启动坐标采集")
+        logger.info(f"已激活并置顶目标窗口：{self.target_window_title}")
 
     def _setup_overlay_geometry(self):
         """Set overlay geometry."""
@@ -257,20 +286,13 @@ class CoordinateSelectorOverlay(QWidget):
         return get_target_window_overlay_rect(self, self.window_info)
 
     def _get_relative_coordinates(self, qt_screen_pos: QPoint) -> QPoint:
-        """Convert Qt screen coordinates to client-relative coordinates."""
+        """只返回客户区坐标，转换失败不得用屏幕坐标替代。"""
         if not self.window_info:
-            return qt_screen_pos
-
-        try:
-            target_rect = self._get_target_window_rect()
-            if target_rect.isEmpty():
-                logger.warning("Target window rect is empty; cannot convert coordinates")
-                return qt_screen_pos
-
-            return overlay_point_to_client_qpoint(self.window_info, target_rect, qt_screen_pos)
-        except Exception as e:
-            logger.error(f"Coordinate conversion error: {e}")
-            return qt_screen_pos
+            raise ValueError("目标窗口信息缺失，无法转换坐标")
+        target_rect = self._get_target_window_rect()
+        if target_rect.isEmpty():
+            raise ValueError("目标窗口客户区为空，无法转换坐标")
+        return overlay_point_to_client_qpoint(self.window_info, target_rect, qt_screen_pos)
 
     def _is_point_in_target_window(self, qt_screen_pos: QPoint) -> bool:
         """Check whether a point is inside the target window in Qt logical coordinates."""
@@ -281,6 +303,8 @@ class CoordinateSelectorOverlay(QWidget):
         return overlay_rect_contains_point(target_rect, qt_screen_pos)
 
     def paintEvent(self, event):
+        if self._capture_released:
+            return
         """Paint overlay."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
@@ -304,7 +328,7 @@ class CoordinateSelectorOverlay(QWidget):
             cross_size = 15  # 减小十字光标大小
 
             # 绘制白色外边框（增强可见性）
-            pen_outline = QPen(QColor(255, 255, 255), 3)  # 减小外边框粗细
+            pen_outline = QPen(QColor(theme_color('selection_text')), 3)  # 减小外边框粗细
             painter.setPen(pen_outline)
             painter.drawLine(self.click_pos.x() - cross_size, self.click_pos.y(),
                            self.click_pos.x() + cross_size, self.click_pos.y())
@@ -312,7 +336,7 @@ class CoordinateSelectorOverlay(QWidget):
                            self.click_pos.x(), self.click_pos.y() + cross_size)
 
             # 绘制红色内部十字
-            pen_inner = QPen(QColor(255, 0, 0), 1)  # 减小内部线条粗细
+            pen_inner = QPen(QColor(theme_color('selection_marker')), 1)  # 减小内部线条粗细
             painter.setPen(pen_inner)
             painter.drawLine(self.click_pos.x() - cross_size, self.click_pos.y(),
                            self.click_pos.x() + cross_size, self.click_pos.y())
@@ -320,7 +344,7 @@ class CoordinateSelectorOverlay(QWidget):
                            self.click_pos.x(), self.click_pos.y() + cross_size)
 
             # 绘制中心点
-            painter.setBrush(QBrush(QColor(255, 0, 0)))
+            painter.setBrush(QBrush(QColor(theme_color('selection_marker'))))
             painter.drawEllipse(self.click_pos, 2, 2)  # 减小中心点大小
 
             # 显示坐标信息（带背景）
@@ -334,7 +358,7 @@ class CoordinateSelectorOverlay(QWidget):
                 bg_rect = text_rect.translated(text_pos)
                 bg_rect.adjust(-5, -2, 5, 2)
 
-                painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
+                painter.setBrush(QBrush(QColor(theme_color('selection_backdrop'))))
                 apply_overlay_text_style(painter)
                 painter.drawRect(bg_rect)
                 painter.drawText(text_pos, coord_text)
@@ -343,31 +367,30 @@ class CoordinateSelectorOverlay(QWidget):
         """窗口显示事件 - 先抓输入，再补一次激活。"""
         super().showEvent(event)
         grab_overlay_input(self, log_prefix='坐标选择覆盖层')
-        QTimer.singleShot(50, self._ensure_ready_for_input)
+        for timer in self._activation_timers:
+            timer.start()
 
     def _ensure_ready_for_input(self):
-        """确保覆盖层准备好接收输入"""
-        ensure_overlay_ready_for_input(
-            self,
-            log_prefix='坐标选择覆盖层',
-            ready_message='坐标选择器已就绪，可以接收输入',
-            retry_message='坐标选择器未能激活（尝试 {attempt}/{max_attempts}），用户首次点击可能需要激活窗口',
-            exhausted_message='已达到最大激活尝试次数，继续执行（用户首次操作将用于激活窗口）',
+        """只有成功抓取输入后才标记就绪。"""
+        if self._closing or not self.isVisible() or getattr(self, "dragging", False):
+            return
+        self._is_ready_for_input = grab_overlay_input(
+            self, log_prefix='坐标选择覆盖层', activate=True,
         )
 
     def mousePressEvent(self, event):
         """鼠标按下事件。第一次点击直接选点，不拿来激活窗口。"""
         if event.button() == Qt.MouseButton.LeftButton:
             # 检查是否在目标窗口内
-            if self._is_point_in_target_window(event.pos()):
-                self.click_pos = event.pos()
+            if self._is_point_in_target_window(event.position().toPoint()):
+                self.click_pos = event.position().toPoint()
                 logger.info(f"设置点击位置: {self.click_pos}")
                 self.update()  # 立即更新显示十字光标
 
                 # 转换为相对坐标
-                relative_pos = self._get_relative_coordinates(event.pos())
+                relative_pos = self._get_relative_coordinates(event.position().toPoint())
 
-                logger.info(f"坐标选择完成: 屏幕({event.pos().x()}, {event.pos().y()}) -> 客户区({relative_pos.x()}, {relative_pos.y()})")
+                logger.info(f"坐标选择完成: 屏幕({event.position().toPoint().x()}, {event.position().toPoint().y()}) -> 客户区({relative_pos.x()}, {relative_pos.y()})")
 
                 # 验证坐标转换是否正确
                 if self.window_info:
@@ -386,9 +409,8 @@ class CoordinateSelectorOverlay(QWidget):
                         logger.debug(f"坐标验证失败: {e}")
 
                 # 直接发射坐标信号（不使用通用坐标系统标准化）
+                self._preview_close_timer.start()
                 self.coordinate_selected.emit(relative_pos.x(), relative_pos.y())
-
-                QTimer.singleShot(300, self._close_after_preview)
             else:
                 logger.warning("点击位置不在目标窗口内")
 
@@ -403,18 +425,39 @@ class CoordinateSelectorOverlay(QWidget):
             self.close()
 
     def _close_after_preview(self):
-        if getattr(self, "_closing", False):
-            return
-        try:
+        if not self._capture_released:
             self.close()
-        except RuntimeError:
-            return
+
+    def _release_capture(self):
+        if self._capture_released:
+            return False
+        self._capture_released = True
+        self._closing = True
+        self._is_ready_for_input = False
+        for timer in self._activation_timers:
+            timer.stop()
+        self._preview_close_timer.stop()
+        release_overlay_input(self)
+        self.backdrop_pixmap = None
+        self.desktop_pixmap = None
+        self._composed_backdrop = None
+        self._composed_backdrop_key = None
+        return True
 
     def closeEvent(self, event):
-        self._closing = True
-        release_overlay_input(self)
-        self.selection_closed.emit()
+        if self._release_capture():
+            self.selection_closed.emit()
         super().closeEvent(event)
+
+    def hideEvent(self, event):
+        if self._release_capture():
+            self.selection_closed.emit()
+        super().hideEvent(event)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._release_capture()
+        return super().event(event)
 
 class OffsetSelectorOverlay(CoordinateSelectorOverlay):
     """偏移选择覆盖层（拖拽选择偏移）"""
@@ -442,8 +485,7 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
             )
             return self.mapFromGlobal(QPoint(qt_x, qt_y))
         except Exception as e:
-            logger.warning(f"转换偏移基准点失败: {e}")
-            return None
+            raise ValueError(f"转换偏移基准点失败：{e}") from e
 
     def _get_base_rect_qt(self) -> Optional[QRect]:
         if not (self.window_info and self.base_rect):
@@ -464,14 +506,16 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
             bottom_right_local = self.mapFromGlobal(QPoint(right, bottom))
             return QRect(top_left_local, bottom_right_local).normalized()
         except Exception as e:
-            logger.warning(f"转换偏移基准区域失败: {e}")
-            return None
+            raise ValueError(f"转换偏移基准区域失败：{e}") from e
 
     def mousePressEvent(self, event):
+        if self._capture_released:
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             if self.window_info and self._is_point_in_target_window(event.pos()):
                 self.dragging = True
-                self.drag_start = self._get_base_point_qt() or event.pos()
+                base_point = self._get_base_point_qt()
+                self.drag_start = base_point if base_point is not None else event.pos()
                 self.drag_end = event.pos()
                 self.click_pos = self.drag_start
                 self.update()
@@ -482,16 +526,20 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
             self.close()
 
     def mouseMoveEvent(self, event):
+        if self._capture_released:
+            return
         if self.dragging:
             self.drag_end = event.pos()
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._capture_released:
+            return
         if self.dragging and event.button() == Qt.MouseButton.LeftButton:
             self.dragging = False
             self.drag_end = event.pos()
 
-            if self.window_info and self.drag_start and self.drag_end:
+            if self.window_info and self.drag_start is not None and self.drag_end is not None:
                 start_rel = self._get_relative_coordinates(self.drag_start)
                 end_rel = self._get_relative_coordinates(self.drag_end)
                 dx = end_rel.x() - start_rel.x()
@@ -503,7 +551,7 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
                 self.offset_selected.emit(dx, dy)
 
             self.update()
-            QTimer.singleShot(300, self._close_after_preview)
+            self._preview_close_timer.start()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -514,7 +562,7 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
         if self.window_info:
             target_rect = self._get_target_window_rect()
             if not target_rect.isEmpty():
-                painter.setPen(QPen(QColor(0, 255, 0), 4))
+                painter.setPen(QPen(QColor(theme_color('selection_target')), 4))
                 painter.drawRect(target_rect)
                 apply_overlay_text_style(painter)
                 painter.drawText(target_rect.topLeft() + QPoint(10, 25), f"目标窗口: {self.target_window_title}")
@@ -523,24 +571,24 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
         # 绘制基准区域
         base_rect = self._get_base_rect_qt()
         if base_rect:
-            painter.setPen(QPen(QColor(0, 200, 255), 2))
-            painter.setBrush(QBrush(QColor(0, 200, 255, 40)))
+            painter.setPen(QPen(QColor(theme_color('selection_anchor')), 2))
+            painter.setBrush(QBrush(QColor(theme_color('selection_anchor_fill'))))
             painter.drawRect(base_rect)
 
         # 绘制基准点
         base_point = self._get_base_point_qt()
-        if base_point:
-            painter.setPen(QPen(QColor(255, 255, 255), 2))
-            painter.setBrush(QBrush(QColor(0, 200, 255)))
+        if base_point is not None:
+            painter.setPen(QPen(QColor(theme_color('selection_text')), 2))
+            painter.setBrush(QBrush(QColor(theme_color('selection_anchor'))))
             painter.drawEllipse(base_point, 8, 8)
-            painter.setPen(QPen(QColor(0, 90, 140), 2))
+            painter.setPen(QPen(QColor(theme_color('selection_anchor_edge')), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(base_point, 11, 11)
 
         if not (self.drag_start and self.drag_end):
             return
 
-        painter.setPen(QPen(QColor(255, 200, 0), 2))
+        painter.setPen(QPen(QColor(theme_color('selection_route')), 2))
         painter.drawLine(self.drag_start, self.drag_end)
 
         if self.window_info:
@@ -554,7 +602,7 @@ class OffsetSelectorOverlay(CoordinateSelectorOverlay):
             text_pos = self.drag_end + QPoint(12, -8)
             bg_rect = text_rect.translated(text_pos)
             bg_rect.adjust(-4, -2, 4, 2)
-            painter.setBrush(QBrush(QColor(0, 0, 0, 180)))
+            painter.setBrush(QBrush(QColor(theme_color('selection_backdrop'))))
             painter.drawRect(bg_rect)
             painter.drawText(text_pos, text)
 
@@ -573,7 +621,11 @@ class OffsetSelectorWidget(QWidget):
         self.base_point = None
         self.base_rect = None
         self._current_overlay = None
-        self._selection_result_delivered = False
+        self._pending_offset = None
+        self._overlay_connections = []
+        self._result_timer = QTimer(self)
+        self._result_timer.setSingleShot(True)
+        self._result_timer.timeout.connect(self._deliver_selection)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -591,108 +643,102 @@ class OffsetSelectorWidget(QWidget):
         self.base_rect = (x, y, w, h)
 
     def start_selection(self):
-        if self._current_overlay:
-            if self._current_overlay.isVisible():
-                logger.info("偏移选择正在进行，忽略重复启动")
-                return
-            self._cleanup_previous_overlay()
-
+        """取坐标期间不重复创建窗口，结果在预览关闭后提交。"""
+        if self._current_overlay is not None and isValid(self._current_overlay) and self._current_overlay.isVisible():
+            return
         self._cleanup_previous_overlay()
-        self._selection_result_delivered = False
         self.selection_started.emit()
-
-        if not self.target_window_hwnd:
-            self.target_window_hwnd = self._get_bound_window_hwnd()
-            if not self.target_window_hwnd:
-                QMessageBox.warning(self, "错误", "未找到绑定窗口，请先绑定窗口")
-                self.selection_finished.emit()
-                return
-
-        overlay = OffsetSelectorOverlay(
-            self.target_window_hwnd,
-            base_client=self.base_point,
-            base_rect=self.base_rect,
-        )
-        overlay.offset_selected.connect(self._on_offset_selected)
-        overlay.selection_closed.connect(self._on_overlay_closed)
-        self._current_overlay = overlay
-
-        if overlay.setup_target_window():
-            if show_and_activate_overlay(overlay, log_prefix='偏移选择覆盖层启动'):
-                logger.info("已使用统一覆盖层激活链启动偏移选择覆盖层")
-            grab_overlay_input(overlay, log_prefix='偏移选择覆盖层')
-            schedule_overlay_activation_boost(
-                overlay,
-                log_prefix='偏移选择覆盖层',
-                intervals_ms=(50, 150, 300),
-                focus=True,
-            )
-        else:
-            self._cleanup_previous_overlay()
+        hwnd = self.target_window_hwnd
+        if hwnd is None:
+            hwnd = self._get_bound_window_hwnd()
+        if not hwnd or not self._validate_hwnd_silent(hwnd):
+            QMessageBox.warning(self, "警告", "没有可用的绑定窗口，请先在全局设置中绑定窗口")
             self.selection_finished.emit()
-            QMessageBox.critical(self, "错误", "启动偏移选择失败")
+            return
+        try:
+            self.target_window_hwnd = hwnd
+            overlay = OffsetSelectorOverlay(hwnd, base_client=self.base_point, base_rect=self.base_rect, parent=self)
+            self._current_overlay = overlay
+            if not overlay.window_info:
+                raise ValueError("无法设置目标窗口")
+            self._overlay_connections = [
+                overlay.offset_selected.connect(self._on_offset_selected),
+                overlay.selection_closed.connect(self._on_overlay_closed),
+            ]
+            if not show_and_activate_overlay(overlay, log_prefix='坐标选择覆盖层启动'):
+                raise RuntimeError("无法显示坐标采集窗口")
+            grab_overlay_input(overlay, log_prefix='坐标选择覆盖层')
+        except Exception as error:
+            self._cleanup_previous_overlay()
+            logger.exception("启动坐标选择失败")
+            QMessageBox.critical(self, "错误", f"启动坐标选择失败：{error}")
+            self.selection_finished.emit()
+
+    def _on_offset_selected(self, x: int, y: int):
+        self._pending_offset = (x, y)
 
     def _on_overlay_closed(self):
-        selection_delivered = self._selection_result_delivered
-        if self._current_overlay:
-            self._cleanup_previous_overlay()
-        if not selection_delivered:
+        result = self._pending_offset
+        self._cleanup_previous_overlay(close_overlay=False)
+        self._pending_offset = result
+        self._result_timer.start(0)
+
+    def _deliver_selection(self):
+        result = self._pending_offset
+        self._pending_offset = None
+        if result is not None:
+            self.current_offset = result
+            self.offset_selected.emit(*result)
+        if isValid(self) and self._current_overlay is None:
             self.selection_finished.emit()
-        self._selection_result_delivered = False
 
-    def _on_offset_selected(self, dx: int, dy: int):
-        self.current_offset = (dx, dy)
-        self._selection_result_delivered = True
-        self.offset_selected.emit(dx, dy)
-        self.selection_finished.emit()
+    def _cleanup_previous_overlay(self, *, close_overlay=True):
+        self._result_timer.stop()
+        self._pending_offset = None
+        overlay = self._current_overlay
+        self._current_overlay = None
+        for connection in self._overlay_connections:
+            QObject.disconnect(connection)
+        self._overlay_connections.clear()
+        if overlay is not None and isValid(overlay):
+            if close_overlay:
+                overlay.close()
+            overlay.hide()
+            overlay.deleteLater()
 
-    def _cleanup_previous_overlay(self):
-        if self._current_overlay:
-            try:
-                self._current_overlay.offset_selected.disconnect()
-            except Exception:
-                pass
-            try:
-                self._current_overlay.selection_closed.disconnect()
-            except Exception:
-                pass
-            self._current_overlay._closing = True
-            self._current_overlay.hide()
-            self._current_overlay.deleteLater()
-            self._current_overlay = None
+    def closeEvent(self, event):
+        self._cleanup_previous_overlay()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):
+        self._cleanup_previous_overlay()
+        super().hideEvent(event)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._cleanup_previous_overlay()
+        return super().event(event)
 
     def _get_bound_window_hwnd(self) -> Optional[int]:
+        return _get_global_bound_window(self)
+
+    def _validate_hwnd_silent(self, hwnd):
         try:
-            current_widget = self.parent()
-            level = 0
-            max_levels = 10
-
-            while current_widget and level < max_levels:
-                if hasattr(current_widget, 'config'):
-                    config = current_widget.config
-                    if hasattr(config, 'target_window_title') and config.target_window_title:
-                        return resolve_unique_window_hwnd(config.target_window_title)
-                    if hasattr(config, 'bound_windows') and config.bound_windows:
-                        enabled_windows = [w for w in config.bound_windows if w.get('enabled', True)]
-                        if enabled_windows:
-                            return enabled_windows[0].get('hwnd')
-
-                if hasattr(current_widget, 'runner') and hasattr(current_widget.runner, 'config'):
-                    config = current_widget.runner.config
-                    if hasattr(config, 'target_window_title') and config.target_window_title:
-                        return resolve_unique_window_hwnd(config.target_window_title)
-                    if hasattr(config, 'bound_windows') and config.bound_windows:
-                        enabled_windows = [w for w in config.bound_windows if w.get('enabled', True)]
-                        if enabled_windows:
-                            return enabled_windows[0].get('hwnd')
-
-                current_widget = current_widget.parent()
-                level += 1
-
-            return None
-        except Exception as e:
-            logger.error(f"获取绑定窗口失败: {e}")
-            return None
+            current = self.parent()
+            while current is not None:
+                host = getattr(current, "main_window", None)
+                if host is None and hasattr(current, "is_hwnd_bound"):
+                    host = current
+                if host is not None:
+                    if type(hwnd) is int and hwnd > 0 and host.is_hwnd_bound(hwnd):
+                        return hwnd
+                    logger.error("目标窗口未绑定，不能启动坐标采集")
+                    return None
+                current = current.parent()
+            logger.error("未找到主窗口，不能验证目标窗口绑定")
+        except Exception as error:
+            logger.error(f"验证目标窗口绑定失败：{error}")
+        return None
 
 class CoordinateSelectorWidget(QWidget):
     """坐标选择器控件"""
@@ -706,10 +752,18 @@ class CoordinateSelectorWidget(QWidget):
         self.target_window_hwnd = None  # 目标窗口句柄
         self.current_coordinate = (0, 0)
         self._current_overlay = None
-        self._selection_result_delivered = False
+        self._pending_coordinate = None
+        self._overlay_connections = []
+        self._result_timer = QTimer(self)
+        self._result_timer.setSingleShot(True)
+        self._result_timer.timeout.connect(self._deliver_selection)
 
-        self.setup_ui()
-        self._update_button_text()
+        try:
+            self.setup_ui()
+            self._update_button_text()
+        except Exception:
+            self.deleteLater()
+            raise
     
     def setup_ui(self):
         """设置UI"""
@@ -737,298 +791,103 @@ class CoordinateSelectorWidget(QWidget):
         self._update_button_text()
         logger.info(f"坐标选择器坐标已设置为: ({x}, {y})")
     
-    def _get_bound_window_from_editor(self) -> Optional[str]:
-        """从编辑器获取绑定的窗口（支持多窗口模式）"""
-        try:
-            logger.info("搜索 开始获取绑定的窗口标题...")
-
-            # 向上查找主窗口，直到找到有config或runner属性的窗口
-            current_widget = self.parent()
-            level = 0
-
-            while current_widget and level < 10:  # 最多向上查找10层
-                logger.info(f"搜索 第{level}层窗口: {current_widget}")
-                logger.info(f"搜索 第{level}层窗口类型: {type(current_widget)}")
-
-                # 检查是否有bound_windows属性（多窗口模式）
-                if hasattr(current_widget, 'bound_windows'):
-                    bound_windows = current_widget.bound_windows
-                    if bound_windows and len(bound_windows) > 0:
-                        # 获取第一个启用的窗口
-                        for window_info in bound_windows:
-                            if window_info.get('enabled', True):
-                                window_title = window_info.get('title')
-                                if window_title:
-                                    logger.info(f"搜索 从多窗口绑定列表获取第一个启用窗口: {window_title}")
-                                    return window_title
-
-                        # 如果没有启用的窗口，使用第一个窗口
-                        first_window = bound_windows[0]
-                        window_title = first_window.get('title')
-                        if window_title:
-                            logger.info(f"搜索 从多窗口绑定列表获取第一个窗口: {window_title}")
-                            return window_title
-
-                # 检查是否是主窗口（任务编辑器）
-                if hasattr(current_widget, 'config'):
-                    logger.info(f"搜索 第{level}层窗口有config属性")
-                    config = current_widget.config
-                    target_window_title = config.get('target_window_title')
-                    if target_window_title:
-                        logger.info(f"搜索 从第{level}层窗口配置获取目标窗口: {target_window_title}")
-                        return target_window_title
-                    else:
-                        logger.info(f"搜索 第{level}层窗口config中没有target_window_title")
-
-                # 检查是否有runner属性
-                if hasattr(current_widget, 'runner'):
-                    logger.info(f"搜索 第{level}层窗口有runner属性")
-                    runner = current_widget.runner
-                    if hasattr(runner, 'target_window_title'):
-                        target_window_title = runner.target_window_title
-                        logger.info(f"搜索 从第{level}层窗口runner获取目标窗口: {target_window_title}")
-                        if target_window_title:
-                            return target_window_title
-                    else:
-                        logger.info(f"搜索 第{level}层窗口runner没有target_window_title属性")
-
-                # 检查是否有直接的target_window_title属性
-                if hasattr(current_widget, 'target_window_title'):
-                    target_window_title = current_widget.target_window_title
-                    logger.info(f"搜索 从第{level}层窗口属性获取目标窗口: {target_window_title}")
-                    if target_window_title:
-                        return target_window_title
-
-                # 向上查找父窗口
-                current_widget = current_widget.parent()
-                level += 1
-
-            logger.info(f"搜索 查找了{level}层窗口，未找到绑定的目标窗口")
-            return None
-
-        except Exception as e:
-            logger.exception(f"获取编辑器绑定窗口时出错: {e}")
-            return None
-    
     def start_selection(self):
-        """开始坐标选择"""
-        # 检查是否已经有活动的覆盖层
-        if hasattr(self, '_current_overlay') and self._current_overlay:
-            try:
-                if self._current_overlay.isVisible():
-                    logger.info("已有活动的坐标选择覆盖层，跳过重复创建")
-                    return
-            except RuntimeError:
-                self._current_overlay = None
-
-        # 清理之前的覆盖层（如果存在）
+        """取坐标期间不重复创建窗口，结果在预览关闭后提交。"""
+        if self._current_overlay is not None and isValid(self._current_overlay) and self._current_overlay.isVisible():
+            return
         self._cleanup_previous_overlay()
-        self._selection_result_delivered = False
-
-        # 发出选择开始信号
-        logger.info("发出坐标选择开始信号")
         self.selection_started.emit()
-
-        # 如果没有设置目标窗口句柄，尝试自动获取绑定的窗口
-        if not self.target_window_hwnd:
-            self.target_window_hwnd = self._get_bound_window_hwnd()
-            if not self.target_window_hwnd:
-                QMessageBox.warning(self, "警告", "未找到绑定的窗口，请先绑定目标窗口")
-                self.selection_finished.emit()
-                return
-
-            # 获取窗口标题用于显示
-            try:
-                import win32gui
-                window_title = win32gui.GetWindowText(self.target_window_hwnd)
-                self.select_button.setText(f"获取坐标 (已绑定: {window_title})")
-                logger.info(f"自动获取绑定的窗口句柄: {self.target_window_hwnd}, 标题: {window_title}")
-            except Exception as e:
-                logger.error(f"从句柄获取窗口标题失败: {e}")
-                self.select_button.setText(f"获取坐标 (已绑定: 窗口{self.target_window_hwnd})")
-
-        # 【新增】验证句柄是否在全局绑定列表中（静默处理）
-        validated_hwnd = self._validate_hwnd_silent(self.target_window_hwnd)
-        if not validated_hwnd:
+        hwnd = self.target_window_hwnd
+        if hwnd is None:
+            hwnd = self._get_bound_window_hwnd()
+        if not hwnd or not self._validate_hwnd_silent(hwnd):
             QMessageBox.warning(self, "警告", "没有可用的绑定窗口，请先在全局设置中绑定窗口")
             self.selection_finished.emit()
             return
-
-        # 创建选择覆盖层，使用验证后的句柄
-        overlay = CoordinateSelectorOverlay(validated_hwnd)
-        # 直接连接到内部处理方法，避免重复发射信号
-        overlay.coordinate_selected.connect(self._on_coordinate_selected)
-        overlay.selection_closed.connect(self._on_overlay_closed)
-
-        # 保存覆盖层引用
-        self._current_overlay = overlay
-        
-        if overlay.setup_target_window():
-            if show_and_activate_overlay(overlay, log_prefix='坐标选择覆盖层启动'):
-                logger.info("已使用统一覆盖层激活链启动坐标选择覆盖层")
+        try:
+            self.target_window_hwnd = hwnd
+            overlay = CoordinateSelectorOverlay(hwnd, self)
+            self._current_overlay = overlay
+            if not overlay.window_info:
+                raise ValueError("无法设置目标窗口")
+            self._overlay_connections = [
+                overlay.coordinate_selected.connect(self._on_coordinate_selected),
+                overlay.selection_closed.connect(self._on_overlay_closed),
+            ]
+            if not show_and_activate_overlay(overlay, log_prefix='坐标选择覆盖层启动'):
+                raise RuntimeError("无法显示坐标采集窗口")
             grab_overlay_input(overlay, log_prefix='坐标选择覆盖层')
-            schedule_overlay_activation_boost(
-                overlay,
-                log_prefix='坐标选择覆盖层',
-                intervals_ms=(50, 150, 300),
-                focus=True,
-            )
-        else:
+        except Exception as error:
             self._cleanup_previous_overlay()
+            logger.exception("启动坐标选择失败")
+            QMessageBox.critical(self, "错误", f"启动坐标选择失败：{error}")
             self.selection_finished.emit()
-            QMessageBox.critical(self, "错误", "无法设置目标窗口")
-
-    def _clear_overlay_reference(self):
-        """清理覆盖层引用"""
-        if hasattr(self, '_current_overlay'):
-            logger.info("清理覆盖层引用")
-            self._current_overlay = None
-
-    def _cleanup_previous_overlay(self):
-        """清理之前的覆盖层"""
-        if hasattr(self, '_current_overlay') and self._current_overlay:
-            overlay = self._current_overlay
-            logger.info("清理之前的坐标选择覆盖层")
-            # 断开信号连接，避免触发不必要的信号
-            try:
-                overlay.coordinate_selected.disconnect()
-                logger.info("已断开坐标选择覆盖层信号连接")
-            except Exception as e:
-                logger.warning(f"断开信号连接失败: {e}")
-            try:
-                overlay.selection_closed.disconnect()
-            except Exception:
-                pass
-
-            overlay._closing = True
-            overlay.hide()
-            overlay.deleteLater()
-            logger.info("坐标选择覆盖层已隐藏并标记删除")
-
-            # 清理引用
-            self._current_overlay = None
-
-    def _on_overlay_closed(self):
-        selection_delivered = self._selection_result_delivered
-        self._cleanup_previous_overlay()
-        if not selection_delivered:
-            self.selection_finished.emit()
-        self._selection_result_delivered = False
 
     def _on_coordinate_selected(self, x: int, y: int):
-        """坐标选择完成（直接使用客户区坐标）"""
-        logger.info(f"坐标选择完成: ({x}, {y})")
+        self._pending_coordinate = (x, y)
 
-        try:
-            # 保存原始坐标
-            self.set_coordinate(x, y)
-            self._selection_result_delivered = True
+    def _on_overlay_closed(self):
+        result = self._pending_coordinate
+        self._cleanup_previous_overlay(close_overlay=False)
+        self._pending_coordinate = result
+        self._result_timer.start(0)
 
-            # 发射原始坐标信号
-            self.coordinate_selected.emit(x, y)
-
-            # 发出选择结束信号
+    def _deliver_selection(self):
+        result = self._pending_coordinate
+        self._pending_coordinate = None
+        if result is not None:
+            self.set_coordinate(*result)
+            self.coordinate_selected.emit(*result)
+        if isValid(self) and self._current_overlay is None:
             self.selection_finished.emit()
 
-            logger.info(f"坐标处理完成: ({x}, {y})")
+    def _cleanup_previous_overlay(self, *, close_overlay=True):
+        self._result_timer.stop()
+        self._pending_coordinate = None
+        overlay = self._current_overlay
+        self._current_overlay = None
+        for connection in self._overlay_connections:
+            QObject.disconnect(connection)
+        self._overlay_connections.clear()
+        if overlay is not None and isValid(overlay):
+            if close_overlay:
+                overlay.close()
+            overlay.hide()
+            overlay.deleteLater()
 
-        except Exception as e:
-            logger.error(f"处理坐标选择失败: {e}")
-            # 确保即使出错也发射信号
-            try:
-                self._selection_result_delivered = True
-                self.coordinate_selected.emit(x, y)
-                self.selection_finished.emit()
-            except Exception:
-                pass
+    def closeEvent(self, event):
+        self._cleanup_previous_overlay()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):
+        self._cleanup_previous_overlay()
+        super().hideEvent(event)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._cleanup_previous_overlay()
+        return super().event(event)
 
     def _get_bound_window_hwnd(self) -> Optional[int]:
-        """获取当前绑定的窗口句柄"""
-        try:
-            # 向上查找主窗口，获取绑定的窗口信息
-            current_widget = self.parent()
-            level = 0
-            max_levels = 10
-
-            while current_widget and level < max_levels:
-                # 检查是否有config属性（主窗口）
-                if hasattr(current_widget, 'config'):
-                    config = current_widget.config
-
-                    # 单窗口模式
-                    if hasattr(config, 'target_window_title') and config.target_window_title:
-                        return resolve_unique_window_hwnd(config.target_window_title)
-
-                    # 多窗口模式
-                    if hasattr(config, 'bound_windows') and config.bound_windows:
-                        enabled_windows = [w for w in config.bound_windows if w.get('enabled', True)]
-                        if enabled_windows:
-                            return enabled_windows[0].get('hwnd')
-
-                # 检查是否有runner属性
-                if hasattr(current_widget, 'runner') and hasattr(current_widget.runner, 'config'):
-                    config = current_widget.runner.config
-
-                    if hasattr(config, 'target_window_title') and config.target_window_title:
-                        return resolve_unique_window_hwnd(config.target_window_title)
-
-                    if hasattr(config, 'bound_windows') and config.bound_windows:
-                        enabled_windows = [w for w in config.bound_windows if w.get('enabled', True)]
-                        if enabled_windows:
-                            return enabled_windows[0].get('hwnd')
-
-                current_widget = current_widget.parent()
-                level += 1
-
-            return None
-
-        except Exception as e:
-            logger.error(f"获取绑定窗口句柄失败: {e}")
-            return None
+        return _get_global_bound_window(self)
 
     def _validate_hwnd_silent(self, hwnd):
-        """
-        静默验证句柄是否在全局绑定列表中
-        如果无效，返回第一个有效句柄，不弹窗，不修改self.target_window_hwnd
-
-        Args:
-            hwnd: 要验证的窗口句柄
-
-        Returns:
-            验证后的有效句柄，如果没有可用窗口则返回None
-        """
         try:
-            # 查找主窗口
-            main_window = None
-            current_widget = self.parent()
-            while current_widget:
-                if hasattr(current_widget, 'is_hwnd_bound'):
-                    main_window = current_widget
-                    break
-                current_widget = current_widget.parent()
-
-            if not main_window:
-                logger.warning("未找到主窗口，无法验证句柄")
-                return hwnd
-
-            # 验证句柄
-            if hwnd and main_window.is_hwnd_bound(hwnd):
-                return hwnd
-
-            # 句柄无效，静默获取第一个有效句柄
-            logger.warning(f"句柄 {hwnd} 不在绑定列表中，静默切换到第一个有效句柄")
-            validated_hwnd, is_original = main_window.validate_hwnd_or_get_first(hwnd)
-
-            if validated_hwnd:
-                logger.info(f"已静默切换到有效句柄: {validated_hwnd}（不修改原句柄 {hwnd}）")
-            else:
-                logger.error(f"句柄 {hwnd} 无效且没有其他可用窗口")
-
-            return validated_hwnd
-
-        except Exception as e:
-            logger.error(f"验证句柄失败: {e}")
-            return hwnd  # 出错时返回原句柄
+            current = self.parent()
+            while current is not None:
+                host = getattr(current, "main_window", None)
+                if host is None and hasattr(current, "is_hwnd_bound"):
+                    host = current
+                if host is not None:
+                    if type(hwnd) is int and hwnd > 0 and host.is_hwnd_bound(hwnd):
+                        return hwnd
+                    logger.error("目标窗口未绑定，不能启动坐标采集")
+                    return None
+                current = current.parent()
+            logger.error("未找到主窗口，不能验证目标窗口绑定")
+        except Exception as error:
+            logger.error(f"验证目标窗口绑定失败：{error}")
+        return None
 
     def get_coordinate(self) -> Tuple[int, int]:
         """获取当前坐标"""
@@ -1041,7 +900,7 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
     selection_closed = Signal()
 
     def __init__(self, target_window_hwnd: int, parent=None):
-        super().__init__(None)  # 独立窗口
+        super().__init__(parent)  # 顶层覆盖层仍归采集工具所有
         self.target_window_hwnd = target_window_hwnd
         self.target_hwnd = None
         self.window_info = None
@@ -1055,17 +914,34 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         self._drawing = False
         self._stroke_moved = False
         self._hover_pos = None
+        self._closing = False
+        self._finishing = False
+        self._activation_timers = []
+        for delay in (50, 150, 300):
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(delay)
+            timer.timeout.connect(self._ensure_ready_for_input)
+            self._activation_timers.append(timer)
 
         # 窗口激活状态标志
         self._is_ready_for_input = False
         self._activation_attempts = 0
         self.backdrop_pixmap = None
         self.desktop_pixmap = None
+        self._composed_backdrop = None
+        self._composed_backdrop_key = None
 
-        self._setup_overlay()
-        if not self._setup_target_window():
-            logger.error("设置目标窗口失败")
-            return
+        try:
+            self._setup_overlay()
+            if parent is not None:
+                parent.destroyed.connect(self._release_capture)
+            if not self._setup_target_window():
+                logger.error("设置目标窗口失败")
+        except Exception:
+            self._release_capture()
+            self.deleteLater()
+            raise
 
     def _setup_overlay(self):
         """设置覆盖层为不透明顶层窗，避免 Windows 点穿。"""
@@ -1074,10 +950,6 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
 
     def _setup_target_window(self):
         """设置目标窗口"""
-        if not PYWIN32_AVAILABLE:
-            logger.error("需要安装pywin32库")
-            return False
-
         target_hwnd = int(self.target_window_hwnd or 0)
         if not target_hwnd:
             logger.error(f"无效的窗口句柄: {target_hwnd}")
@@ -1122,9 +994,6 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
     def _get_window_info(self, hwnd: int) -> dict:
         """获取窗口信息"""
         try:
-            if not PYWIN32_AVAILABLE:
-                return None
-
             import win32gui
             if not win32gui.IsWindow(hwnd):
                 return None
@@ -1167,17 +1036,10 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         return get_target_window_overlay_rect(self, self.window_info)
 
     def _activate_target_window(self, hwnd: int):
-        """激活并置顶目标窗口。"""
-        try:
-            activation_hwnd = activate_window(hwnd, log_prefix='多点坐标选择')
-            if not activation_hwnd:
-                return
-
-            logger.info(f"已激活并置顶目标窗口: {self.target_window_title}")
-
-        except Exception as e:
-            logger.warning(f"激活目标窗口失败: {e}")
-            # 即使激活失败也继续执行，不影响坐标选择功能
+        """激活失败必须停止采集，不能继续使用未确认的目标窗口。"""
+        if not activate_window(hwnd, log_prefix='多点坐标选择'):
+            raise RuntimeError("无法激活目标窗口，不能启动坐标采集")
+        logger.info(f"已激活并置顶目标窗口：{self.target_window_title}")
 
     def _is_point_in_target_window(self, pos: QPoint) -> bool:
         """Check whether a point is inside the target window."""
@@ -1188,20 +1050,13 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         return overlay_rect_contains_point(target_rect, pos)
 
     def _get_relative_coordinates(self, qt_screen_pos: QPoint) -> QPoint:
-        """Convert Qt screen coordinates to client-relative coordinates."""
+        """只返回客户区坐标，转换失败不得用屏幕坐标替代。"""
         if not self.window_info:
-            return qt_screen_pos
-
-        try:
-            target_rect = self._get_target_window_rect()
-            if target_rect.isEmpty():
-                logger.warning("Target window rect is empty; cannot convert multi-point coordinates")
-                return qt_screen_pos
-
-            return overlay_point_to_client_qpoint(self.window_info, target_rect, qt_screen_pos)
-        except Exception as e:
-            logger.error(f"Coordinate conversion error: {e}")
-            return qt_screen_pos
+            raise ValueError("目标窗口信息缺失，无法转换坐标")
+        target_rect = self._get_target_window_rect()
+        if target_rect.isEmpty():
+            raise ValueError("目标窗口客户区为空，无法转换坐标")
+        return overlay_point_to_client_qpoint(self.window_info, target_rect, qt_screen_pos)
 
     def _append_route_point(self, overlay_pos: QPoint) -> bool:
         """追加一个路线点。"""
@@ -1255,7 +1110,7 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         return True
 
     def _paint_route_marker(self, painter: QPainter, center: QPoint, label: str) -> None:
-        accent = _picker_qcolor("accent", "#0078d4")
+        accent = _picker_qcolor("accent")
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(accent))
         painter.drawEllipse(center, 3, 3)
@@ -1270,7 +1125,7 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         path = build_smooth_route_path(points)
         if len(points) > 1:
-            stroke = QPen(_picker_qcolor("accent", "#0078d4"), 2)
+            stroke = QPen(_picker_qcolor("accent"), 2)
             stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
             stroke.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(stroke)
@@ -1286,6 +1141,8 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
 
     def paintEvent(self, event):
         """Paint overlay."""
+        if self._closing:
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
 
@@ -1326,36 +1183,39 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
             painter.drawText(20, 70, MULTI_COORDINATE_EMPTY_HINT_LINES[2])
 
     def showEvent(self, event):
-        """窗口显示事件 - 先抓输入，再补一次激活。"""
         super().showEvent(event)
+        if self._closing:
+            return
         grab_overlay_input(self, log_prefix='多点坐标覆盖层')
-        QTimer.singleShot(50, self._ensure_ready_for_input)
+        for timer in self._activation_timers:
+            timer.start()
 
     def _ensure_ready_for_input(self):
-        """确保覆盖层准备好接收输入"""
-        ensure_overlay_ready_for_input(
-            self,
-            log_prefix='多点坐标覆盖层',
-            ready_message='多点坐标选择器已就绪，可以接收输入',
-            retry_message='多点坐标选择器未能激活（尝试 {attempt}/{max_attempts}），用户首次点击可能需要激活窗口',
-            exhausted_message='已达到最大激活尝试次数，继续执行（用户首次操作将用于激活窗口）',
+        if self._closing or not self.isVisible() or self._drawing:
+            return
+        self._is_ready_for_input = grab_overlay_input(
+            self, log_prefix='多点坐标覆盖层', activate=True,
         )
 
     def mousePressEvent(self, event):
         """鼠标按下事件。"""
+        if self._closing or self._finishing:
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._drawing = True
             self._stroke_moved = False
-            self._hover_pos = event.pos()
-            self._append_route_point(event.pos())
+            self._hover_pos = event.position().toPoint()
+            self._append_route_point(event.position().toPoint())
         elif event.button() == Qt.MouseButton.RightButton:
             if not self._remove_last_route_point():
                 logger.info("当前没有可撤销的路线点")
 
     def mouseMoveEvent(self, event):
+        if self._closing or self._finishing:
+            return
         if not self._drawing:
             return
-        pos = event.pos()
+        pos = event.position().toPoint()
         self._hover_pos = pos
         last = self.click_positions[-1] if self.click_positions else None
         if last is not None and overlay_point_distance_sq(last, pos) > 0:
@@ -1366,6 +1226,8 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._closing or self._finishing:
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
         self._drawing = False
@@ -1379,13 +1241,17 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
         self.update()
 
     def mouseDoubleClickEvent(self, event):
+        if self._closing or self._finishing:
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
         if self.coordinate_points:
             self._finish_selection()
 
     def keyPressEvent(self, event):
-        """键盘事件"""
+        """键盘事件。"""
+        if self._closing or self._finishing:
+            return
         if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Enter):
             logger.info(f"完成路径选择，共 {len(self.coordinate_points)} 个坐标点")
             self._finish_selection()
@@ -1395,26 +1261,51 @@ class MultiPointCoordinateSelectorOverlay(QWidget):
                 logger.info("当前没有可撤销的路线点")
 
     def _finish_selection(self):
-        """完成坐标选择"""
-        if len(self.coordinate_points) >= 1:
-            # 发射坐标列表和时间戳列表信号
-            timestamps = self.click_timestamps.copy() if self.click_timestamps else []
-            self.coordinates_selected.emit(self.coordinate_points.copy(), timestamps)
+        """只记录一次结果；由工具在鼠标事件退出后提交给参数面板。"""
+        if self._closing or self._finishing:
+            return
+        self._finishing = True
+        if self.coordinate_points:
+            points = self.coordinate_points.copy()
+            timestamps = self.click_timestamps.copy()
+            logger.info(f"多点坐标选择完成：{len(points)} 个点")
+            self.coordinates_selected.emit(points, timestamps)
+        if isValid(self):
+            self.close()
 
-            total_duration = timestamps[-1] if timestamps else 0
-            logger.info(f"多点坐标选择完成: {len(self.coordinate_points)}个点, 总时长={total_duration:.3f}s")
-            logger.debug(f"坐标点: {self.coordinate_points}")
-            logger.debug(f"时间戳: {timestamps}")
-        else:
-            logger.warning("至少需要选择1个坐标点")
-
-        self.close()
+    def _release_capture(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._drawing = False
+        self._hover_pos = None
+        self._is_ready_for_input = False
+        for timer in self._activation_timers:
+            timer.stop()
+        release_overlay_input(self)
+        self.backdrop_pixmap = None
+        self.desktop_pixmap = None
+        self._composed_backdrop = None
+        self._composed_backdrop_key = None
+        self.coordinate_points.clear()
+        self.click_positions.clear()
+        self.click_timestamps.clear()
+        self.selection_start_time = None
+        self.selection_closed.emit()
 
     def closeEvent(self, event):
-        self._closing = True
-        release_overlay_input(self)
-        self.selection_closed.emit()
+        self._release_capture()
         super().closeEvent(event)
+
+    def hideEvent(self, event):
+        self._release_capture()
+        super().hideEvent(event)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._release_capture()
+        return super().event(event)
+
 
 class MultiPointCoordinateSelectorWidget(QWidget):
     """多点坐标选择器Widget - 支持连续获取多个坐标点"""
@@ -1426,11 +1317,18 @@ class MultiPointCoordinateSelectorWidget(QWidget):
         super().__init__(parent)
         self.target_window_hwnd = None
         self.coordinate_points = []
-        self.coordinate_timestamps = []  # 时间戳列表
+        self.coordinate_timestamps = []
         self.overlay = None
-        self._selection_result_delivered = False
-
-        self._setup_ui()
+        self._overlay_connections = []
+        self._pending_result = None
+        self._result_timer = QTimer(self)
+        self._result_timer.setSingleShot(True)
+        self._result_timer.timeout.connect(self._deliver_selection)
+        try:
+            self._setup_ui()
+        except Exception:
+            self.deleteLater()
+            raise
 
     def _setup_ui(self):
         """设置UI"""
@@ -1439,25 +1337,7 @@ class MultiPointCoordinateSelectorWidget(QWidget):
 
         # 选择按钮
         self.select_button = QPushButton(MULTI_COORDINATE_BUTTON_TEXT)
-        from themes import theme_color
-
-        self.select_button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {theme_color("accent", "#0078d4")};
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-                font-size: 12px;
-            }}
-            QPushButton:hover {{
-                background-color: {theme_color("accent_hover", "#1084d8")};
-            }}
-            QPushButton:pressed {{
-                background-color: {theme_color("accent_pressed", "#006cbe")};
-            }}
-        """)
+        self.select_button.setObjectName("parameterMultiCoordinateButton")
         self.select_button.clicked.connect(self.start_selection)
 
         layout.addWidget(self.select_button)
@@ -1465,74 +1345,36 @@ class MultiPointCoordinateSelectorWidget(QWidget):
         self._update_button_text()
 
     def start_selection(self):
-        """开始多点坐标选择"""
-        try:
-            if self.overlay:
-                try:
-                    if self.overlay.isVisible():
-                        logger.info("多点坐标选择覆盖层仍在活动，忽略重复启动")
-                        return
-                except RuntimeError:
-                    self.overlay = None
-                else:
-                    self._cleanup_overlay()
-
-            self._selection_result_delivered = False
-
-            # 如果没有设置目标窗口句柄，尝试自动获取编辑器绑定的窗口
-            if not self.target_window_hwnd:
-                # 优先直接获取窗口句柄
-                self.target_window_hwnd = self._get_bound_window_hwnd()
-                if not self.target_window_hwnd:
-                    QMessageBox.warning(self, "警告", "未找到绑定的窗口，请先绑定目标窗口")
-                    self.selection_finished.emit()
-                    return
-
-                # 获取窗口标题用于显示
-                try:
-                    import win32gui
-                    window_title = win32gui.GetWindowText(self.target_window_hwnd)
-                    logger.info(f"自动获取绑定的窗口句柄: {self.target_window_hwnd}, 标题: {window_title}")
-                except Exception as e:
-                    logger.warning(f"从句柄获取窗口标题失败: {e}")
-
-            logger.info(f"开始多点坐标选择，目标窗口句柄: {self.target_window_hwnd}")
-
-            # 【新增】验证句柄是否在全局绑定列表中（静默处理）
-            validated_hwnd = self._validate_hwnd_silent(self.target_window_hwnd)
-            if not validated_hwnd:
-                QMessageBox.warning(self, "警告", "没有可用的绑定窗口，请先在全局设置中绑定窗口")
-                self.selection_finished.emit()
-                return
-
-            # 创建多点坐标选择器覆盖层，使用验证后的句柄
-            self.overlay = MultiPointCoordinateSelectorOverlay(validated_hwnd, self)
-            if not getattr(self.overlay, 'window_info', None):
-                self._cleanup_overlay()
-                self.selection_finished.emit()
-                QMessageBox.critical(self, "错误", "无法设置目标窗口")
-                return
-            self.overlay.coordinates_selected.connect(self._on_coordinates_selected)
-            self.overlay.selection_closed.connect(self._on_overlay_closed)
-
-            # 显示覆盖层
-            if show_and_activate_overlay(self.overlay, log_prefix='多点坐标覆盖层启动'):
-                logger.info("已使用统一覆盖层激活链启动多点坐标选择覆盖层")
-            grab_overlay_input(self.overlay, log_prefix='多点坐标覆盖层')
-            schedule_overlay_activation_boost(
-                self.overlay,
-                log_prefix='多点坐标覆盖层',
-                intervals_ms=(50, 150, 300),
-                focus=True,
-            )
-
-        except Exception as e:
-            self._cleanup_overlay()
+        """同一工具同时只允许一轮采集。"""
+        if self.overlay is not None and isValid(self.overlay) and self.overlay.isVisible():
+            logger.info("多点坐标选择覆盖层仍在活动，忽略重复启动")
+            return
+        self._cleanup_previous_overlay()
+        hwnd = self.target_window_hwnd
+        if hwnd is None:
+            hwnd = self._get_bound_window_hwnd()
+        if not hwnd or not self._validate_hwnd_silent(hwnd):
+            QMessageBox.warning(self, "警告", "没有可用的绑定窗口，请先在全局设置中绑定窗口")
             self.selection_finished.emit()
-            logger.error(f"启动多点坐标选择失败: {e}")
-            import traceback
-            logger.error(f"错误详情: {traceback.format_exc()}")
-            QMessageBox.critical(self, "错误", f"启动坐标选择失败: {e}")
+            return
+        try:
+            self.target_window_hwnd = hwnd
+            overlay = MultiPointCoordinateSelectorOverlay(hwnd, self)
+            self.overlay = overlay
+            if not overlay.window_info:
+                raise ValueError("无法设置目标窗口")
+            self._overlay_connections = [
+                overlay.coordinates_selected.connect(self._on_coordinates_selected),
+                overlay.selection_closed.connect(self._on_overlay_closed),
+            ]
+            if not show_and_activate_overlay(overlay, log_prefix='多点坐标覆盖层启动'):
+                raise RuntimeError("无法显示坐标采集窗口")
+            grab_overlay_input(overlay, log_prefix='多点坐标覆盖层')
+        except Exception as error:
+            self._cleanup_previous_overlay()
+            logger.exception("启动多点坐标选择失败")
+            QMessageBox.critical(self, "错误", f"启动坐标选择失败：{error}")
+            self.selection_finished.emit()
 
     def _update_button_text(self):
         """更新按钮文本以显示当前坐标点数量"""
@@ -1550,255 +1392,75 @@ class MultiPointCoordinateSelectorWidget(QWidget):
         logger.info(f"多点坐标选择器坐标已设置: {len(coordinates)} 个点")
 
     def _on_coordinates_selected(self, coordinates: List[Tuple[int, int]], timestamps: List[float]):
-        """多点坐标选择完成"""
-        logger.info(f"多点坐标选择完成: {len(coordinates)} 个点")
-
-        try:
-            # 保存坐标点和时间戳
-            self.coordinate_points = coordinates.copy()
-            self.coordinate_timestamps = timestamps.copy()
-            self._update_button_text()
-            self._selection_result_delivered = True
-
-            # 发射坐标和时间戳信号
-            self.coordinates_selected.emit(coordinates, timestamps)
-
-            # 发出选择结束信号
-            self.selection_finished.emit()
-
-            total_duration = timestamps[-1] if timestamps else 0
-            logger.info(f"多点坐标处理完成: {len(coordinates)}个点, 总时长={total_duration:.3f}s")
-
-        except Exception as e:
-            logger.error(f"处理多点坐标选择失败: {e}")
-            # 确保即使出错也发射信号
-            try:
-                self._selection_result_delivered = True
-                self.coordinates_selected.emit(coordinates, timestamps if timestamps else [])
-                self.selection_finished.emit()
-            except Exception:
-                pass
-
-    def _cleanup_overlay(self):
-        if not self.overlay:
-            return
-
-        overlay = self.overlay
-        self.overlay = None
-
-        try:
-            overlay.coordinates_selected.disconnect()
-        except Exception:
-            pass
-        try:
-            overlay.selection_closed.disconnect()
-        except Exception:
-            pass
-        overlay._closing = True
-        try:
-            overlay.hide()
-        except Exception:
-            pass
-        try:
-            overlay.deleteLater()
-        except Exception:
-            pass
+        # 覆盖层还在鼠标事件中，此处不能刷新面板或向外发射信号。
+        if len(coordinates) != len(timestamps):
+            raise ValueError("采集坐标与时间戳数量不一致")
+        self._pending_result = (coordinates.copy(), timestamps.copy())
 
     def _on_overlay_closed(self):
-        selection_delivered = self._selection_result_delivered
-        self._cleanup_overlay()
-        if not selection_delivered:
-            self.selection_finished.emit()
-        self._selection_result_delivered = False
+        result = self._pending_result
+        self._cleanup_previous_overlay(close_overlay=False)
+        self._pending_result = result
+        self._result_timer.start(0)
+
+    def _deliver_selection(self):
+        result = self._pending_result
+        self._pending_result = None
+        if result is not None:
+            self.coordinate_points, self.coordinate_timestamps = result
+            self._update_button_text()
+        self.selection_finished.emit()
+        # 结束通知可能销毁工具；结果通知必须是本轮最后一次访问。
+        if result is not None and isValid(self):
+            self.coordinates_selected.emit(*result)
+
+    def _cleanup_previous_overlay(self, *, close_overlay=True):
+        self._result_timer.stop()
+        self._pending_result = None
+        overlay = self.overlay
+        self.overlay = None
+        for connection in self._overlay_connections:
+            QObject.disconnect(connection)
+        self._overlay_connections.clear()
+        if overlay is not None and isValid(overlay):
+            if close_overlay:
+                overlay.close()
+            overlay.hide()
+            overlay.deleteLater()
+
+    def closeEvent(self, event):
+        self._cleanup_previous_overlay()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):
+        self._cleanup_previous_overlay()
+        super().hideEvent(event)
+
+    def event(self, event):
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._cleanup_previous_overlay()
+        return super().event(event)
 
     def _get_bound_window_hwnd(self) -> Optional[int]:
-        """获取当前绑定的窗口句柄"""
-        try:
-            # 向上查找主窗口，获取绑定的窗口信息
-            current_widget = self.parent()
-            level = 0
-            max_levels = 10
-
-            while current_widget and level < max_levels:
-                logger.debug(f"检查父级窗口 {level}: {type(current_widget).__name__}")
-
-                # 检查是否有config属性（主窗口）
-                if hasattr(current_widget, 'config') and hasattr(current_widget.config, 'bound_windows'):
-                    config = current_widget.config
-                    if config.bound_windows:
-                        # 获取第一个启用的窗口
-                        enabled_windows = [w for w in config.bound_windows if w.get('enabled', True)]
-                        if enabled_windows:
-                            hwnd = enabled_windows[0].get('hwnd')
-                            logger.info(f"从主窗口config获取窗口句柄: {hwnd}")
-                            return hwnd
-
-                # 检查是否有runner属性（参数面板）
-                if hasattr(current_widget, 'runner') and hasattr(current_widget.runner, 'config'):
-                    config = current_widget.runner.config
-                    if hasattr(config, 'bound_windows') and config.bound_windows:
-                        # 获取第一个启用的窗口
-                        enabled_windows = [w for w in config.bound_windows if w.get('enabled', True)]
-                        if enabled_windows:
-                            hwnd = enabled_windows[0].get('hwnd')
-                            logger.info(f"从runner config获取窗口句柄: {hwnd}")
-                            return hwnd
-
-                # 检查是否有bound_windows属性（主窗口直接属性）
-                if hasattr(current_widget, 'bound_windows') and current_widget.bound_windows:
-                    enabled_windows = [w for w in current_widget.bound_windows if w.get('enabled', True)]
-                    if enabled_windows:
-                        hwnd = enabled_windows[0].get('hwnd')
-                        logger.info(f"从主窗口bound_windows获取窗口句柄: {hwnd}")
-                        return hwnd
-
-                # 检查是否有current_target_hwnd属性
-                if hasattr(current_widget, 'current_target_hwnd') and current_widget.current_target_hwnd:
-                    hwnd = current_widget.current_target_hwnd
-                    logger.info(f"从主窗口current_target_hwnd获取窗口句柄: {hwnd}")
-                    return hwnd
-
-                current_widget = current_widget.parent()
-                level += 1
-
-            logger.warning("未找到任何绑定的窗口句柄")
-            return None
-
-        except Exception as e:
-            logger.error(f"获取绑定窗口句柄失败: {e}")
-            import traceback
-            logger.error(f"错误详情: {traceback.format_exc()}")
-            return None
-
-    def _get_bound_window_from_editor(self) -> Optional[str]:
-        """从编辑器获取绑定的窗口（支持多窗口模式）"""
-        try:
-            logger.info("搜索 开始获取绑定的窗口标题...")
-
-            # 向上查找主窗口，直到找到有config或runner属性的窗口
-            current_widget = self.parent()
-            level = 0
-
-            while current_widget and level < 10:  # 最多向上查找10层
-                logger.info(f"搜索 第{level}层窗口: {current_widget}")
-                logger.info(f"搜索 第{level}层窗口类型: {type(current_widget)}")
-
-                # 检查是否有bound_windows属性（多窗口模式）
-                if hasattr(current_widget, 'bound_windows'):
-                    bound_windows = current_widget.bound_windows
-                    if bound_windows and len(bound_windows) > 0:
-                        # 获取第一个启用的窗口
-                        for window_info in bound_windows:
-                            if window_info.get('enabled', True):
-                                window_title = window_info.get('title')
-                                if window_title:
-                                    logger.info(f"搜索 从多窗口绑定列表获取第一个启用窗口: {window_title}")
-                                    return window_title
-
-                        # 如果没有启用的窗口，使用第一个窗口
-                        first_window = bound_windows[0]
-                        window_title = first_window.get('title')
-                        if window_title:
-                            logger.info(f"搜索 从多窗口绑定列表获取第一个窗口: {window_title}")
-                            return window_title
-
-                # 检查是否是主窗口（任务编辑器）
-                if hasattr(current_widget, 'config'):
-                    logger.info(f"搜索 第{level}层窗口有config属性")
-                    config = current_widget.config
-                    target_window_title = config.get('target_window_title')
-                    if target_window_title:
-                        logger.info(f"搜索 从第{level}层窗口配置获取目标窗口: {target_window_title}")
-                        return target_window_title
-                    else:
-                        logger.info(f"搜索 第{level}层窗口config中没有target_window_title")
-
-                # 检查是否有runner属性
-                if hasattr(current_widget, 'runner'):
-                    logger.info(f"搜索 第{level}层窗口有runner属性")
-                    runner = current_widget.runner
-                    if hasattr(runner, 'target_window_title'):
-                        target_window_title = runner.target_window_title
-                        logger.info(f"搜索 从第{level}层窗口runner获取目标窗口: {target_window_title}")
-                        if target_window_title:
-                            return target_window_title
-                    else:
-                        logger.info(f"搜索 第{level}层窗口runner没有target_window_title属性")
-
-                # 检查是否有直接的target_window_title属性
-                if hasattr(current_widget, 'target_window_title'):
-                    target_window_title = current_widget.target_window_title
-                    logger.info(f"搜索 从第{level}层窗口属性获取目标窗口: {target_window_title}")
-                    if target_window_title:
-                        return target_window_title
-
-                # 向上查找父窗口
-                current_widget = current_widget.parent()
-                level += 1
-
-            logger.info(f"搜索 查找了{level}层窗口，未找到绑定的目标窗口")
-            return None
-
-        except Exception as e:
-            logger.exception(f"获取编辑器绑定窗口时出错: {e}")
-            return None
-
-    def _find_window_by_title(self, window_title: str) -> Optional[int]:
-        """通过窗口标题查找窗口句柄"""
-        try:
-            normalized_hwnd = resolve_unique_window_hwnd(window_title)
-            if normalized_hwnd:
-                logger.info(f"通过标题找到窗口句柄: {window_title} -> {normalized_hwnd}")
-                return normalized_hwnd
-            logger.warning(f"无法通过标题找到窗口: {window_title}")
-            return None
-        except Exception as e:
-            logger.error(f"查找窗口句柄失败: {e}")
-            return None
+        return _get_global_bound_window(self)
 
     def _validate_hwnd_silent(self, hwnd):
-        """
-        静默验证句柄是否在全局绑定列表中
-        如果无效，返回第一个有效句柄，不弹窗，不修改self.target_window_hwnd
-
-        Args:
-            hwnd: 要验证的窗口句柄
-
-        Returns:
-            验证后的有效句柄，如果没有可用窗口则返回None
-        """
         try:
-            # 查找主窗口
-            main_window = None
-            current_widget = self.parent()
-            while current_widget:
-                if hasattr(current_widget, 'is_hwnd_bound'):
-                    main_window = current_widget
-                    break
-                current_widget = current_widget.parent()
-
-            if not main_window:
-                logger.warning("未找到主窗口，无法验证句柄")
-                return hwnd
-
-            # 验证句柄
-            if hwnd and main_window.is_hwnd_bound(hwnd):
-                return hwnd
-
-            # 句柄无效，静默获取第一个有效句柄
-            logger.warning(f"句柄 {hwnd} 不在绑定列表中，静默切换到第一个有效句柄")
-            validated_hwnd, is_original = main_window.validate_hwnd_or_get_first(hwnd)
-
-            if validated_hwnd:
-                logger.info(f"已静默切换到有效句柄: {validated_hwnd}（不修改原句柄 {hwnd}）")
-            else:
-                logger.error(f"句柄 {hwnd} 无效且没有其他可用窗口")
-
-            return validated_hwnd
-
-        except Exception as e:
-            logger.error(f"验证句柄失败: {e}")
-            return hwnd  # 出错时返回原句柄
+            current = self.parent()
+            while current is not None:
+                host = getattr(current, "main_window", None)
+                if host is None and hasattr(current, "is_hwnd_bound"):
+                    host = current
+                if host is not None:
+                    if type(hwnd) is int and hwnd > 0 and host.is_hwnd_bound(hwnd):
+                        return hwnd
+                    logger.error("目标窗口未绑定，不能启动坐标采集")
+                    return None
+                current = current.parent()
+            logger.error("未找到主窗口，不能验证目标窗口绑定")
+        except Exception as error:
+            logger.error(f"验证目标窗口绑定失败：{error}")
+        return None
 
     def get_coordinates(self) -> List[Tuple[int, int]]:
         """获取当前坐标点列表"""

@@ -41,7 +41,7 @@ def _focused_input_hwnd(root: int) -> int:
 
 
 def resolve_background_key_targets(root: int, hierarchy_broadcast: bool, control_hwnd=None) -> list[int]:
-    """关闭广播时直接使用绑定主窗口；开启后只解析它的直属祖先链。"""
+    """关闭广播时使用主窗口；开启后验证完整祖先链，只返回接收控件。"""
     root = int(root)
     if not win32gui.IsWindow(root):
         raise RuntimeError("后台输入主窗口已失效")
@@ -54,7 +54,7 @@ def resolve_background_key_targets(root: int, hierarchy_broadcast: bool, control
             raise RuntimeError("后台输入窗口层级已失效")
         chain.append(current)
         if current == root:
-            return list(reversed(chain))
+            return [chain[0]]
         current = int(win32gui.GetParent(current) or 0)
     raise RuntimeError("无法确定后台输入的完整窗口层级")
 

@@ -21,6 +21,11 @@ class MainWindowWorkflowSwitchMixin:
         self._finish_current_workflow_view_switch(old_view)
 
     def _finish_current_workflow_view_switch(self, old_view):
+        if old_view is not self.workflow_view or self.workflow_view is None:
+            panel = getattr(self, "parameter_panel", None)
+            if panel is not None and not panel._favorites_mode:
+                panel.discard_workflow_context()
+                self._parameter_panel_visible = False
         if self.workflow_view is None:
             return
         if old_view is not None and old_view is not self.workflow_view:
@@ -55,18 +60,11 @@ class MainWindowWorkflowSwitchMixin:
             if manager is not None and task_id is not None:
                 current_task = manager.get_task(task_id)
         dirs = resource_dirs_from_mapping(current_task)
-        if not dirs.get("images_dir"):
-            dirs["images_dir"] = str(getattr(self, "images_dir", "") or "")
-        if not dirs.get("dicts_dir"):
-            images = str(dirs.get("images_dir") or "").strip()
-            if images:
-                dirs["dicts_dir"] = os.path.join(os.path.dirname(os.path.abspath(images)), "dicts")
         bind_resource_dirs(dirs)
         images_dir = dirs.get("images_dir") or ""
         sounds_dir = dirs.get("sounds_dir") or ""
         if hasattr(self, "parameter_panel") and self.parameter_panel:
-            if images_dir:
-                self.parameter_panel.images_dir = images_dir
+            self.parameter_panel.images_dir = images_dir
             self.parameter_panel.sounds_dir = sounds_dir
             self.parameter_panel.dicts_dir = dirs.get("dicts_dir") or ""
             self.parameter_panel.yolo_dir = dirs.get("yolo_dir") or ""
@@ -98,15 +96,8 @@ class MainWindowWorkflowSwitchMixin:
     def _is_qobject_alive(self, obj) -> bool:
         if obj is None:
             return False
-        try:
-            from shiboken6 import isValid
-            return bool(isValid(obj))
-        except ImportError:
-            try:
-                obj.metaObject()
-                return True
-            except RuntimeError:
-                return False
+        from shiboken6 import isValid
+        return bool(isValid(obj))
 
     def _on_task_count_changed(self, task_id: int = None):
         if self.task_manager.get_task_count() == 0 and self.workflow_view is not None:
@@ -131,7 +122,7 @@ class MainWindowWorkflowSwitchMixin:
 
                 from themes import theme_color
 
-                self._set_step_detail_style(text_color=theme_color("error", "#e81123"))
+                self._set_step_detail_style(text_color=theme_color("error"))
 
                 from PySide6.QtCore import QTimer
 
@@ -171,7 +162,7 @@ class MainWindowWorkflowSwitchMixin:
 
                 from themes import theme_color
 
-                self._set_step_detail_style(text_color=theme_color("error", "#e81123"))
+                self._set_step_detail_style(text_color=theme_color("error"))
 
                 from PySide6.QtCore import QTimer
 
@@ -181,7 +172,17 @@ class MainWindowWorkflowSwitchMixin:
 
             return
 
-        workspace_dir = self._prompt_workspace_for_new_workflow()
+        try:
+            workspace_dir = self._prompt_workspace_for_new_workflow()
+        except Exception as exc:
+            from PySide6.QtWidgets import QMessageBox
+
+            logger.exception("选择新建工作流的工作区失败")
+            QMessageBox.critical(self, "创建失败", f"无法确定新建工作流的工作区：\n{exc}")
+            return
+        if workspace_dir is None:
+            logger.info("已取消新建工作流")
+            return
         task_id = self.workflow_tab_widget.create_blank_workflow(workspace_dir=workspace_dir)
 
         if task_id is not None:
@@ -200,50 +201,90 @@ class MainWindowWorkflowSwitchMixin:
 
         return [path for path in workspace_dirs_from_main(self) if not is_default_app_workspace(path)]
 
-    def _prompt_workspace_for_new_workflow(self) -> str:
-        """没有用户工作区时询问是否添加。已有则返回第一个；取消则走默认目录。"""
-        from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+    def _prompt_workspace_for_new_workflow(self) -> Optional[str]:
+        """跟随当前工作流所属工作区；归属不明时明确选择，取消返回 None。"""
+        from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox
+        from task_workflow.workspace import resolve_favorite_workspace_dir
+        from themes import apply_rounded_popup
 
         existing = self._configured_user_workspace_dirs()
         if existing:
-            return existing[0]
+            workspace_dir = ""
+            task_id = self.workflow_tab_widget.get_current_task_id()
+            if task_id is not None:
+                task = self.workflow_tab_widget.task_manager.get_task(task_id)
+                if task is None:
+                    raise ValueError("当前工作流不存在")
+                workspace_dir = resolve_favorite_workspace_dir(task.filepath, existing)
+            if not workspace_dir:
+                if len(existing) == 1:
+                    workspace_dir = existing[0]
+                else:
+                    picker = QInputDialog(self)
+                    try:
+                        picker.setWindowTitle("选择工作区")
+                        picker.setLabelText("请选择新建工作流的保存工作区：")
+                        picker.setComboBoxItems(existing)
+                        picker.setComboBoxEditable(False)
+                        picker.setOption(QInputDialog.InputDialogOption.UseListViewForComboBoxItems)
+                        picker.setMinimumWidth(min(
+                            max(picker.fontMetrics().horizontalAdvance(path) for path in existing) + 64,
+                            picker.screen().availableGeometry().width() - 48,
+                        ))
+                        picker.setOkButtonText("确定")
+                        picker.setCancelButtonText("取消")
+                        apply_rounded_popup(picker, frameless=False)
+                        if picker.exec() != QDialog.DialogCode.Accepted or not self._is_qobject_alive(picker):
+                            return None
+                        workspace_dir = picker.textValue()
+                        if workspace_dir not in existing:
+                            raise ValueError("所选目录不在当前工作区列表中")
+                    finally:
+                        if self._is_qobject_alive(picker):
+                            picker.deleteLater()
+            if not os.path.isdir(workspace_dir):
+                raise ValueError(f"工作区目录不存在：{workspace_dir}")
+            return workspace_dir
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("添加工作区")
-        box.setText(
-            "还没有工作区。新建的工作流会保存在软件默认目录，之后可能不好找。\n\n是否现在添加工作区？"
-        )
-        box.setStandardButtons(QMessageBox.StandardButton.NoButton)
-        add_button = box.addButton("添加", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("暂不添加", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(add_button)
-        box.exec()
-        clicked = box.clickedButton()
-        clicked_text = str(clicked.text() or "").replace("&", "") if clicked is not None else ""
-        if clicked_text != "添加":
-            return ""
-        panel = getattr(self, "parameter_panel", None)
-        if panel is not None and hasattr(panel, "show_favorites"):
-            try:
-                panel.show_favorites()
-                self._parameter_panel_visible = True
-                QApplication.processEvents()
-            except Exception:
-                logger.error("打开工作区面板失败", exc_info=True)
+        try:
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("添加工作区")
+            box.setText(
+                "还没有工作区。新建的工作流会保存在软件默认目录，之后可能不好找。\n\n是否现在添加工作区？"
+            )
+            box.setStandardButtons(QMessageBox.StandardButton.NoButton)
+            add_button = box.addButton("添加", QMessageBox.ButtonRole.AcceptRole)
+            skip_button = box.addButton("暂不添加", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(add_button)
+            apply_rounded_popup(box, frameless=False)
+            box.exec()
+            if not self._is_qobject_alive(box):
+                return None
+            clicked = box.clickedButton()
+            if clicked is skip_button:
+                return ""
+            if clicked is not add_button:
+                return None
+        finally:
+            if self._is_qobject_alive(box):
+                box.deleteLater()
+        panel = self.parameter_panel
+        panel.show_favorites()
+        self._parameter_panel_visible = True
+        QApplication.processEvents()
         folder = QFileDialog.getExistingDirectory(
-            panel if panel is not None else self,
+            panel,
             "选择工作区目录",
             "",
         )
         if not folder:
-            return ""
-        if panel is not None and hasattr(panel, "_add_favorite_workspace_dir"):
-            added = str(panel._add_favorite_workspace_dir(folder) or "")
-            if added and hasattr(panel, "show_favorites"):
-                panel.show_favorites()
-                self._parameter_panel_visible = True
-            return added
-        return os.path.abspath(os.path.normpath(folder))
+            return None
+        added = panel._add_favorite_workspace_dir(folder)
+        if not added:
+            raise ValueError(f"添加工作区失败：{folder}")
+        panel.show_favorites()
+        self._parameter_panel_visible = True
+        return added
 
     def _offer_workspace_if_missing(self) -> None:
         if self._configured_user_workspace_dirs():

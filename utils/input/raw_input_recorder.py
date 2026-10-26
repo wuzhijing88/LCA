@@ -537,39 +537,3 @@ class OptimizedMouseReplayer:
 
 
 # ==================== 使用示例 ====================
-if __name__ == "__main__":
-    # 配置日志
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
-    logger.info("=" * 60)
-    logger.info("Raw Input 鼠标录制测试")
-    logger.info("=" * 60)
-    logger.info("按Enter开始录制...")
-    input()
-
-    recorder = RawInputRecorder()
-    recorder.start_recording()
-
-    logger.info("✓ 录制已开始，移动鼠标进行测试")
-    logger.info("按Enter停止录制...")
-    input()
-
-    data = recorder.stop_recording()
-
-    logger.info(f"\n录制完成！共记录 {len(data)} 个移动事件")
-
-    if data:
-        logger.info("\n前5个事件:")
-        for i, event in enumerate(data[:5]):
-            logger.info(f"  {i+1}. 时间:{event['time']:.4f}s, dx:{event['dx']}, dy:{event['dy']}")
-
-        logger.info("\n按Enter开始回放...")
-        input()
-
-        replayer = OptimizedMouseReplayer()
-        replayer.replay_relative_movements(data, speed=1.0)
-
-        logger.info("✓ 回放完成")

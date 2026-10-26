@@ -12,10 +12,6 @@ def main_window_safe_stop_tasks(ctx):
 
     logger.warning("=== safe_stop_tasks 被调用 ===")
 
-    # 停止运行时窗口监控
-
-    self._stop_window_monitor()
-
     # 防止重复停止
 
     if not hasattr(self, '_is_stopping_tasks'):

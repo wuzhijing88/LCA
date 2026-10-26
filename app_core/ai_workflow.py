@@ -15,6 +15,8 @@ from task_workflow.thread_window_binding import is_valid_thread_window_limit_con
 LINE_TYPES = frozenset({"sequential", "success", "failure", "random"})
 _NO_INPUT_TASK_TYPES = frozenset({"附加条件", "线程窗口限制"})
 _RANDOM_ONLY_TASK_TYPES = frozenset({"随机跳转"})
+_AI_CARD_WIDTH = 200
+_AI_CARD_HEIGHT = 60
 _SEQUENTIAL_ONLY_TASK_TYPES = frozenset(
     {
         "延迟",
@@ -265,6 +267,7 @@ def apply_workflow_ops(
     ops: Sequence[Mapping[str, Any]],
     *,
     known_task_types: Iterable[str],
+    layout_excluded_ids: Optional[Set[int]] = None,
 ) -> Dict[str, Any]:
     """Return a new workflow dict after applying ops. Current canvas is not mutated."""
     source = _require_mapping(workflow, "当前工作流数据必须是字典")
@@ -291,7 +294,15 @@ def apply_workflow_ops(
         connections[key]
         for key in sorted(connections, key=lambda item: (item[0], item[1], item[2]))
     ]
-    _validate_result_workflow(result, known)
+    added_card_ids = {
+        int(item["id"]) for item in ops if str(item.get("op") or "") == "add_card"
+    }
+    _validate_result_workflow(
+        result,
+        known,
+        layout_card_ids=added_card_ids,
+        layout_excluded_ids=layout_excluded_ids,
+    )
     return result
 
 
@@ -367,7 +378,13 @@ def _apply_one_op(
     raise ValueError(f"未知操作: {op_name!r}")
 
 
-def _validate_result_workflow(workflow: Mapping[str, Any], known: Set[str]) -> None:
+def _validate_result_workflow(
+    workflow: Mapping[str, Any],
+    known: Set[str],
+    *,
+    layout_card_ids: Optional[Set[int]] = None,
+    layout_excluded_ids: Optional[Set[int]] = None,
+) -> None:
     cards = workflow.get("cards")
     connections = workflow.get("connections")
     if not isinstance(cards, list) or not isinstance(connections, list):
@@ -386,6 +403,7 @@ def _validate_result_workflow(workflow: Mapping[str, Any], known: Set[str]) -> N
         custom_name = card.get("custom_name")
         if custom_name is not None and not isinstance(custom_name, str):
             raise ValueError(f"卡片 {card.get('id')} 的 custom_name 必须是字符串或 null")
+    _validate_ai_card_layout(indexed, layout_card_ids or set(), layout_excluded_ids or set())
     seen: Set[Tuple[int, int, str]] = set()
     for item in connections:
         if not isinstance(item, dict):
@@ -406,6 +424,34 @@ def _validate_result_workflow(workflow: Mapping[str, Any], known: Set[str]) -> N
         if key in seen:
             raise ValueError(f"工作流存在重复连线: {start_id} -> {end_id} ({line_type})")
         seen.add(key)
+
+
+def _validate_ai_card_layout(
+    cards: Mapping[int, Mapping[str, Any]], added_ids: Set[int], excluded_ids: Set[int],
+) -> None:
+    """Reject overlapping AI additions and layouts collapsed onto one axis."""
+    added = [cards[card_id] for card_id in sorted(added_ids.intersection(cards))]
+    if len(added) > 1:
+        if len({card["pos_x"] for card in added}) == 1:
+            raise ValueError("AI 新增的多张卡片不能排成一条竖线，请错开横坐标和纵坐标")
+        if len({card["pos_y"] for card in added}) == 1:
+            raise ValueError("AI 新增的多张卡片不能排成一条横线，请错开横坐标和纵坐标")
+
+    for index, card in enumerate(added):
+        for other_id, other in cards.items():
+            if other_id in added_ids or other_id in excluded_ids or other_id == card["id"]:
+                continue
+            if (
+                abs(card["pos_x"] - other["pos_x"]) < _AI_CARD_WIDTH
+                and abs(card["pos_y"] - other["pos_y"]) < _AI_CARD_HEIGHT
+            ):
+                raise ValueError(f"AI 新增的卡片 {card['id']} 与卡片 {other_id} 重叠")
+        for other in added[index + 1 :]:
+            if (
+                abs(card["pos_x"] - other["pos_x"]) < _AI_CARD_WIDTH
+                and abs(card["pos_y"] - other["pos_y"]) < _AI_CARD_HEIGHT
+            ):
+                raise ValueError(f"AI 新增的卡片 {card['id']} 与卡片 {other['id']} 重叠")
 
 
 def bind_proposal_camera(workflow: Mapping[str, Any], current: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -486,7 +532,17 @@ def apply_editor_workflow(
             raise ValueError("上传的工作流数据不是字典")
         base = copy.deepcopy(dict(source_workflow))
 
-    proposed = apply_workflow_ops(base, ops, known_task_types=modules.keys())
+    layout_excluded_ids = None
+    if mode == "append" and isinstance(base.get("cards"), list):
+        layout_excluded_ids = {
+            card["id"] for card in base["cards"] if isinstance(card, dict) and "id" in card
+        }
+    proposed = apply_workflow_ops(
+        base,
+        ops,
+        known_task_types=modules.keys(),
+        layout_excluded_ids=layout_excluded_ids,
+    )
     if mode == "append":
         from app_core.ai_workflow_merge import append_workflow_result
 

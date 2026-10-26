@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from functools import partial
 from typing import Any, Callable, Dict, Optional
 
 from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer, QObject, QThread, Signal
@@ -70,6 +71,11 @@ def _discard_orphan_debug_thread(thread) -> None:
         _ORPHAN_DEBUG_THREADS.discard(thread)
 
 
+def _dispose_finished_debug_thread(thread):
+    _discard_orphan_debug_thread(thread)
+    thread.deleteLater()
+
+
 def _drain_orphan_debug_threads() -> None:
     # 退出前必须等阻塞调用返回并完成收尾，不能超时后带着运行中的 QThread 析构。
     # 先处理仍挂在编辑器上的线程，退出信号各接收者的连接顺序不能决定是否漏收尾。
@@ -107,12 +113,35 @@ def _orphan_debug_thread(thread, controller) -> None:
     thread._debug_controller = controller
     with _ORPHAN_LOCK:
         _ORPHAN_DEBUG_THREADS.add(thread)
-    # 线程结束时（直接的 finished 发射，早于 deleteLater 的延迟删除）摘除引用。
-    thread.finished.connect(lambda t=thread: _discard_orphan_debug_thread(t))
+    if not thread.isRunning():
+        _discard_orphan_debug_thread(thread)
 
 
 class _DebugBridge(QObject):
     event = Signal(str, dict)
+
+
+class _EditorDebugLifetime:
+    def __init__(self, controller):
+        self.controller = controller
+        self.thread = None
+
+    def close(self):
+        thread, self.thread = self.thread, None
+        self.controller.set_callback(None)
+        self.controller.stop()
+        if thread is None or not isValid(thread):
+            return
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(20)
+            if not thread.isRunning():
+                thread.deleteLater()
+                return
+            thread.setParent(None)
+            _orphan_debug_thread(thread, self.controller)
+        else:
+            thread.deleteLater()
 
 
 class _ScriptDebugWorker(QObject):
@@ -261,37 +290,54 @@ class ScriptEditorDialog(QDialog):
         debug_context_provider: Optional[Callable[[], dict]] = None,
         parent=None,
         environment=None,
+        plugin_mode: bool = False,
     ):
+        from ui.panels.managed_resources import dispose_partial_widget
+        if type(plugin_mode) is not bool:
+            raise ValueError("脚本插件模式必须是真或假")
+        if QApplication.instance() is None:
+            raise RuntimeError("创建参数界面前必须创建应用程序")
         super().__init__(parent)
-        self._card_id = card_id
-        self._initial_source = source if source else DEFAULT_SCRIPT_SOURCE
-        self._saved_source = self._initial_source
-        self._applied_source: Optional[str] = None
-        self._on_applied = on_applied
-        self._debug_context_provider = debug_context_provider
-        from app_core.script_environments import normalize_environment
+        try:
+            self._card_id = card_id
+            self._initial_source = source if source else DEFAULT_SCRIPT_SOURCE
+            self._saved_source = self._initial_source
+            self._applied_source: Optional[str] = None
+            self._on_applied = on_applied
+            self._debug_context_provider = debug_context_provider
+            from app_core.script_environments import normalize_environment
 
-        self._environment = normalize_environment(environment)
-        self._saved_environment = dict(self._environment)
-        self._find_message = ""
-        self._custom_name = str(custom_name or "").strip() or None
-        self._help_visible = _load_help_visible()
-        self._resource_visible = _load_resource_visible()
-        self._debug_visible = _load_debug_visible()
-        self._syntax_ok = True
-        self._syntax_text = ""
-        self._leave_confirmed = False
-        self._debugger = ScriptDebugController()
-        self._debug_bridge = _DebugBridge(self)
-        self._debug_bridge.event.connect(self._on_debug_event)
-        self._debugger.set_callback(lambda event, payload: self._debug_bridge.event.emit(event, payload))
-        self._debug_thread = None
-        self._debug_worker = None
-        self._build_ui()
-        self.editor.setPlainText(self._initial_source)
-        self._refresh_syntax_status()
-        self._refresh_resources()
-        self._register_theme_callback()
+            self._environment = normalize_environment(environment)
+            self._saved_environment = dict(self._environment)
+            self._find_message = ""
+            self._custom_name = str(custom_name or "").strip() or None
+            self._help_visible = _load_help_visible()
+            self._resource_visible = _load_resource_visible()
+            self._debug_visible = _load_debug_visible()
+            self._plugin_mode = plugin_mode
+            self._saved_plugin_mode = plugin_mode
+            self._plugin_publication = None
+            self._syntax_ok = True
+            self._syntax_text = ""
+            self._leave_confirmed = False
+            self._debugger = ScriptDebugController()
+            self._debug_lifetime = _EditorDebugLifetime(self._debugger)
+            self.destroyed.connect(self._debug_lifetime.close)
+            self._debug_bridge = _DebugBridge(self)
+            self._debug_bridge.event.connect(self._on_debug_event)
+            self._debugger.set_callback(self._debug_bridge.event.emit)
+            self._debug_thread = None
+            self._debug_worker = None
+            self._build_ui()
+            self._plugin_mode_toggle.setChecked(plugin_mode)
+            self.editor.setPlainText(self._initial_source)
+            self._refresh_syntax_status()
+            self._refresh_resources()
+            self._register_theme_callback()
+
+        except Exception:
+            dispose_partial_widget(self, parent)
+            raise
 
     def _on_debug_event(self, event: str, payload: dict) -> None:
         panel = getattr(self, "_debug_panel", None)
@@ -329,7 +375,11 @@ class ScriptEditorDialog(QDialog):
 
     def is_dirty(self) -> bool:
         return (self.editor.toPlainText() != self._saved_source
-                or self.environment_settings() != self._saved_environment)
+                or self.environment_settings() != self._saved_environment
+                or self._plugin_mode != self._saved_plugin_mode)
+
+    def is_plugin_mode(self) -> bool:
+        return self._plugin_mode
 
     def environment_settings(self):
         return dict(self._environment)
@@ -345,10 +395,22 @@ class ScriptEditorDialog(QDialog):
         finally:
             dialog.deleteLater()
 
-    def reload_source(self, source: str) -> None:
+    def reload_source(self, source: str, environment, plugin_mode: bool) -> None:
+        if type(plugin_mode) is not bool:
+            raise ValueError("脚本插件模式必须是真或假")
+        from app_core.script_environments import normalize_environment
+
         text = str(source or "")
-        if text == self.editor.toPlainText():
+        incoming_environment = normalize_environment(environment)
+        same_state = (
+            text == self.editor.toPlainText()
+            and incoming_environment == self.environment_settings()
+            and plugin_mode == self._plugin_mode
+        )
+        if same_state:
             self._saved_source = text
+            self._saved_environment = dict(incoming_environment)
+            self._saved_plugin_mode = plugin_mode
             return
         if self.is_dirty():
             choice = QMessageBox.question(
@@ -362,7 +424,12 @@ class ScriptEditorDialog(QDialog):
                 return
         self.editor.replace_document_text(text)
         self._initial_source = text
+        self._environment = incoming_environment
+        self._plugin_mode_toggle.setChecked(plugin_mode)
         self._saved_source = text
+        self._saved_environment = dict(incoming_environment)
+        self._saved_plugin_mode = plugin_mode
+        self._plugin_publication = None
         self._refresh_syntax_status()
         self._refresh_resources()
 
@@ -456,7 +523,7 @@ class ScriptEditorDialog(QDialog):
         debug_toggle.setFixedWidth(28)
         debug_toggle.setMinimumHeight(72)
         debug_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        debug_toggle.toggled.connect(lambda visible: self._set_debug_visible(visible))
+        debug_toggle.toggled.connect(self._set_debug_visible)
         editor_layout.addWidget(debug_toggle, 0, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         editor_layout.addWidget(debug_panel, 0, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         debug_toggle.raise_()
@@ -522,11 +589,14 @@ class ScriptEditorDialog(QDialog):
         panel.set_breakpoint_state(line in self.editor.breakpoint_lines())
 
     def _start_debug_run(self) -> None:
+        if self._plugin_mode:
+            self._set_status("插件源码请先导出插件，再在工作流中填写参数运行。", ok=False)
+            return
         if self._debug_thread is not None and self._debug_thread.isRunning():
             return
         source = self._normalize_editor_source()
         try:
-            validate_script_source(source)
+            self._validate_editor_mode(source)
         except Exception as exc:
             self._syntax_ok = False; self._syntax_text = str(exc); self._refresh_status_bar(); self._jump_error_line(str(exc)); return
         # 先清理上次状态，再启动控制器；否则 started 事件会被 clear() 立刻覆盖，
@@ -561,8 +631,9 @@ class ScriptEditorDialog(QDialog):
         worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._debug_thread_done)
-        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(partial(_dispose_finished_debug_thread, thread), Qt.ConnectionType.QueuedConnection)
         self._debug_thread, self._debug_worker = thread, worker
+        self._debug_lifetime.thread = thread
         self._set_status(
             self._status_text("调试运行使用运行时存储的副本：可读取上次运行的卡片结果，写入不会影响正式运行"),
             ok=True,
@@ -581,6 +652,7 @@ class ScriptEditorDialog(QDialog):
         if self.sender() is self._debug_thread:
             self._debug_thread = None
             self._debug_worker = None
+            self._debug_lifetime.thread = None
 
     def _build_find_bar(self) -> QWidget:
         bar = QWidget()
@@ -594,7 +666,7 @@ class ScriptEditorDialog(QDialog):
         field = QLineEdit()
         field.setObjectName("scriptFindInput")
         field.setPlaceholderText("在当前脚本中查找")
-        field.returnPressed.connect(lambda: self._find_in_editor(False))
+        field.returnPressed.connect(self._find_next)
         layout.addWidget(field, 1)
         case_box = QCheckBox("区分大小写")
         case_box.setObjectName("scriptFindCase")
@@ -602,11 +674,11 @@ class ScriptEditorDialog(QDialog):
         layout.addWidget(case_box)
         next_btn = QPushButton("下一个")
         next_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        next_btn.clicked.connect(lambda: self._find_in_editor(False))
+        next_btn.clicked.connect(self._find_next)
         layout.addWidget(next_btn)
         prev_btn = QPushButton("上一个")
         prev_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        prev_btn.clicked.connect(lambda: self._find_in_editor(True))
+        prev_btn.clicked.connect(self._find_previous)
         layout.addWidget(prev_btn)
         close_btn = QPushButton("关闭")
         close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -642,7 +714,14 @@ class ScriptEditorDialog(QDialog):
         return editor
 
     def _build_help_panel(self) -> QWidget:
-        panel = ScriptCommandPanel(self._insert_command)
+        import weakref
+        owner = weakref.ref(self)
+        def insert(item):
+            dialog = owner()
+            if dialog is None:
+                raise RuntimeError("脚本编辑器已经关闭")
+            dialog._insert_command(item)
+        panel = ScriptCommandPanel(insert)
         panel.can_insert_changed.connect(self._sync_insert_enabled)
         self._help_panel = panel
         return panel
@@ -663,11 +742,17 @@ class ScriptEditorDialog(QDialog):
         footer.setSpacing(8)
         footer.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
+        self._plugin_mode_toggle = QCheckBox("插件模式")
+        self._plugin_mode_toggle.setObjectName("scriptPluginModeToggle")
+        self._plugin_mode_toggle.setToolTip("普通脚本不能导出插件；插件模式只导出脚本和参数，资源必须通过参数传入。")
+        self._plugin_mode_toggle.toggled.connect(self._on_plugin_mode_changed)
+        footer.addWidget(self._plugin_mode_toggle)
+
         self.status_label = QLabel()
         self.status_label.setObjectName("scriptEditorStatus")
         self.status_label.setWordWrap(True)
         self.status_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.status_label.mousePressEvent = self._on_status_clicked  # type: ignore[method-assign]
+        self.status_label.installEventFilter(self)
         footer.addWidget(self.status_label, 1)
 
         insert_btn = self._make_action_button("插入", "scriptActionButton")
@@ -680,9 +765,16 @@ class ScriptEditorDialog(QDialog):
         self._help_toggle = toggle
         footer.addWidget(toggle)
 
+        export_btn = self._make_action_button("导出插件", "scriptActionButton")
+        export_btn.clicked.connect(self._export_card_plugin)
+        self._export_plugin_btn = export_btn
+        export_btn.setVisible(False)
+        footer.addWidget(export_btn)
+
         apply_btn = self._make_action_button("应用", "scriptActionButton")
         apply_btn.setProperty("primary", True)
         apply_btn.clicked.connect(self._on_apply_and_close)
+        self._apply_btn = apply_btn
         footer.addWidget(apply_btn)
 
         reset_btn = self._make_action_button("重置", "scriptActionButton")
@@ -692,15 +784,56 @@ class ScriptEditorDialog(QDialog):
 
         return footer
 
+    def _on_plugin_mode_changed(self, enabled: bool) -> None:
+        self._plugin_mode = bool(enabled)
+        if self._plugin_mode:
+            self._shutdown_debug_thread()
+            self._apply_debug_visible(False)
+        self._debug_toggle.setEnabled(not self._plugin_mode)
+        self._capture_bar.set_plugin_mode(self._plugin_mode)
+        self._apply_btn.setText("保存" if self._plugin_mode else "应用")
+        self._apply_btn.setToolTip("保存源码、插件模式和运行环境到当前卡片；不会导出或运行插件。" if self._plugin_mode else "")
+        self._resource_panel.setVisible(self._resource_visible and not self._plugin_mode)
+        self._export_plugin_btn.setVisible(self._plugin_mode)
+        self._refresh_syntax_status()
+
+    def _validate_editor_mode(self, source: str) -> None:
+        validate_script_source(source)
+        from app_core.card_plugins import extract_plugin_declarations, plugin_command_paths
+        if self._plugin_mode:
+            extract_plugin_declarations(source)
+        elif plugin_command_paths(source):
+            raise ValueError("当前含插件专属命令，请打开插件模式；普通脚本不能使用插件接口。")
+
+    def _export_card_plugin(self) -> bool:
+        if not self._plugin_mode:
+            raise RuntimeError("普通脚本模式不支持导出插件，请先打开插件模式")
+        from ui.dialogs.card_plugin_export_dialog import CardPluginExportDialog
+
+        source = self.editor.toPlainText()
+        try:
+            self._validate_editor_mode(source)
+            dialog = CardPluginExportDialog(source, self._environment, parent=self, suggested_name=self._custom_name or "", publication=self._plugin_publication)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法导出插件", str(exc))
+            return False
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+            self._plugin_publication = dialog.publication_record()
+            return True
+        finally:
+            dialog.deleteLater()
+
     def _bind_shortcuts(self) -> None:
         find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
         find_shortcut.activated.connect(self._show_find_bar)
         save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
-        save_shortcut.activated.connect(lambda: self._on_apply())
+        save_shortcut.activated.connect(self._on_apply)
         find_next = QShortcut(QKeySequence.StandardKey.FindNext, self)
-        find_next.activated.connect(lambda: self._find_in_editor(False))
+        find_next.activated.connect(self._find_next)
         find_prev = QShortcut(QKeySequence.StandardKey.FindPrevious, self)
-        find_prev.activated.connect(lambda: self._find_in_editor(True))
+        find_prev.activated.connect(self._find_previous)
 
     def _show_find_bar(self) -> None:
         self._find_bar.setVisible(True)
@@ -724,7 +857,7 @@ class ScriptEditorDialog(QDialog):
         if not self.editor.find_text(query, backward=backward, case_sensitive=case) and query:
             self._find_message = f"未找到：{query}"
             self._refresh_status_bar()
-            QTimer.singleShot(2500, self._clear_find_message)
+            QTimer.singleShot(2500, self, self._clear_find_message)
         else:
             self._clear_find_message()
 
@@ -745,7 +878,7 @@ class ScriptEditorDialog(QDialog):
 
     def _apply_resources_visible(self, visible: bool, persist: bool) -> None:
         self._resource_visible = bool(visible)
-        self._resource_panel.setVisible(self._resource_visible)
+        self._resource_panel.setVisible(self._resource_visible and not self._plugin_mode)
         self._capture_bar.set_resources_visible(self._resource_visible)
         if persist:
             _save_resource_visible(self._resource_visible)
@@ -841,7 +974,7 @@ class ScriptEditorDialog(QDialog):
             self._refresh_status_bar()
             return
         try:
-            validate_script_source(source)
+            self._validate_editor_mode(source)
             from app_core.script_environments import normalize_environment
 
             self._environment = normalize_environment(self.environment_settings())
@@ -851,13 +984,16 @@ class ScriptEditorDialog(QDialog):
             self._refresh_status_bar()
             return
         self._syntax_ok = True
-        self._syntax_text = "语法通过。"
+        self._syntax_text = "插件声明通过，可导出插件。" if self._plugin_mode else "语法通过。"
         try:
             from task_workflow.script_sandbox import script_warnings
 
             warnings = script_warnings(source)
-        except Exception:
-            warnings = []
+        except Exception as exc:
+            self._syntax_ok = False
+            self._syntax_text = f"命令检查失败：{exc}"
+            self._refresh_status_bar()
+            return
         if warnings:
             self._syntax_text = f"语法通过。{' '.join(warnings[:2])}"
         self._refresh_status_bar()
@@ -865,7 +1001,7 @@ class ScriptEditorDialog(QDialog):
     def _refresh_status_bar(self) -> None:
         message = self._find_message or self._syntax_text
         ok = self._syntax_ok and not self._find_message
-        extra = "  未应用" if self.is_dirty() else ""
+        extra = ("  未保存" if self._plugin_mode else "  未应用") if self.is_dirty() else ""
         self._set_status(self._status_text(message) + extra, ok=ok)
 
     def _status_text(self, message: str) -> str:
@@ -880,6 +1016,12 @@ class ScriptEditorDialog(QDialog):
         line = self._error_line(text)
         if line:
             self.editor.goto_line(line)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseButtonPress and obj is self.status_label:
+            self._on_status_clicked(event)
+            return True
+        return super().eventFilter(obj, event)
 
     def _on_status_clicked(self, event) -> None:
         if not self._syntax_ok:
@@ -925,15 +1067,18 @@ class ScriptEditorDialog(QDialog):
         return source
 
     def _on_apply(self) -> bool:
+        if self._plugin_mode and not callable(self._on_applied):
+            QMessageBox.warning(self, "插件未保存", "未绑定可保存的脚本卡片，无法保存插件源码。")
+            return False
         source = self._normalize_editor_source()
         if not source.strip():
             self._syntax_ok = False
             self._syntax_text = "内容为空，运行时会失败。"
             self._refresh_status_bar()
-            QMessageBox.warning(self, "语法检查", "内容为空，不能应用。")
+            QMessageBox.warning(self, "语法检查", f"内容为空，不能{'保存' if self._plugin_mode else '应用'}。")
             return False
         try:
-            validate_script_source(source)
+            self._validate_editor_mode(source)
             from app_core.script_environments import normalize_environment
 
             self._environment = normalize_environment(self.environment_settings())
@@ -944,17 +1089,24 @@ class ScriptEditorDialog(QDialog):
             QMessageBox.warning(self, "语法检查", str(exc))
             self._jump_error_line(str(exc))
             return False
+        if callable(self._on_applied):
+            try:
+                self._on_applied(source)
+            except Exception as error:
+                action = "保存" if self._plugin_mode else "应用"
+                self._set_status(f"{action}失败：{error}", ok=False)
+                QMessageBox.warning(self, f"脚本未{action}", str(error))
+                return False
         self._applied_source = source
         self._saved_source = source
         self._saved_environment = dict(self._environment)
+        self._saved_plugin_mode = self._plugin_mode
         logger.info("自定义脚本已应用: 卡片=%s, 长度=%s", self._card_id, len(source))
-        if callable(self._on_applied):
-            self._on_applied(source)
         self._syntax_ok = True
-        self._syntax_text = "已同步到卡片。"
+        self._syntax_text = "插件源码已保存到卡片。" if self._plugin_mode else "已同步到卡片。"
         self._refresh_syntax_status()
         if self._syntax_ok:
-            self._syntax_text = "已同步到卡片。"
+            self._syntax_text = "插件源码已保存到卡片。" if self._plugin_mode else "已同步到卡片。"
             self._refresh_status_bar()
         return True
 
@@ -969,18 +1121,19 @@ class ScriptEditorDialog(QDialog):
             self._leave_confirmed = True
             return True
         box = QMessageBox(self)
-        box.setWindowTitle("脚本未应用")
-        box.setText("有改动还没应用到卡片。")
-        apply_btn = box.addButton("应用并关闭", QMessageBox.ButtonRole.AcceptRole)
+        box.setWindowTitle("插件未保存" if self._plugin_mode else "脚本未应用")
+        box.setText("插件源码、模式或运行环境有改动还没保存到卡片。" if self._plugin_mode else "有改动还没应用到卡片。")
+        apply_btn = box.addButton("保存并关闭" if self._plugin_mode else "应用并关闭", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("不保存", QMessageBox.ButtonRole.DestructiveRole)
         cancel_btn = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(apply_btn)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is cancel_btn:
+        from ui.dialogs.dialog_manager import exec_dialog
+        choice = exec_dialog(box, read_result=lambda result: "cancel" if box.clickedButton() is cancel_btn else "apply" if box.clickedButton() is apply_btn else "discard")
+        if choice == "cancel":
             return False
-        if clicked is apply_btn:
-            if not self._on_apply():
+        if choice == "apply":
+            saved = self._on_apply()
+            if not saved:
                 return False
         self._leave_confirmed = True
         return True
@@ -993,10 +1146,12 @@ class ScriptEditorDialog(QDialog):
     def done(self, result: int) -> None:
         # accept() 和 reject() 都经由 done()；关闭前先安全停下调试线程。
         self._shutdown_debug_thread()
+        self._plugin_publication = None
         super().done(result)
 
     def _shutdown_debug_thread(self) -> None:
         thread = self._debug_thread
+        self._debug_lifetime.thread = None
         worker = self._debug_worker
         if thread is None:
             try:
@@ -1013,7 +1168,7 @@ class ScriptEditorDialog(QDialog):
             except Exception:
                 pass
             thread.quit()
-            thread.wait(1500)
+            thread.wait(20)
             if thread.isRunning():
                 # 线程还卡在阻塞调用里：从对话框上摘下来，避免对话框销毁时连带析构
                 # 仍在运行的 QThread 触发 qFatal。setParent(None) 把 C++ 所有权交还
@@ -1049,6 +1204,7 @@ class ScriptEditorDialog(QDialog):
 
     def event(self, event) -> bool:
         if event.type() == QEvent.Type.DeferredDelete:
+            self._plugin_publication = None
             self._shutdown_debug_thread()
             param_bar = getattr(self, "_param_bar", None)
             if param_bar is not None:
@@ -1058,3 +1214,9 @@ class ScriptEditorDialog(QDialog):
                 if timer is not None:
                     timer.stop()
         return super().event(event)
+
+    def _find_next(self):
+        self._find_in_editor(False)
+
+    def _find_previous(self):
+        self._find_in_editor(True)

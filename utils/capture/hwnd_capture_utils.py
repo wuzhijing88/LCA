@@ -51,27 +51,68 @@ class CaptureTargetInfo:
     is_child_window: bool
 
 
+class GDICaptureResources:
+    """持有一轮截图的GDI资源；关闭失败的句柄保留供显式清理。"""
+
+    def __init__(self, hwnd, source_dc, source_wrapper, memory_dc, bitmap, old_bitmap):
+        self.hwnd = hwnd
+        self.source_dc = source_dc
+        self.source_wrapper = source_wrapper
+        self.memory_dc = memory_dc
+        self.bitmap = bitmap
+        self.old_bitmap = old_bitmap
+
+    @property
+    def closed(self):
+        return self.memory_dc is None and self.bitmap is None and self.source_dc is None
+
+    def close(self):
+        errors = []
+        if self.memory_dc is not None and self.old_bitmap is not None:
+            try:
+                self.memory_dc.SelectObject(self.old_bitmap)
+                self.old_bitmap = None
+            except Exception as exc:
+                errors.append(f"恢复位图失败：{exc}")
+        if self.memory_dc is not None:
+            try:
+                self.memory_dc.DeleteDC()
+                self.memory_dc = None
+                self.old_bitmap = None
+            except Exception as exc:
+                errors.append(f"删除内存DC失败：{exc}")
+        if self.bitmap is not None and self.old_bitmap is None:
+            try:
+                win32gui.DeleteObject(self.bitmap.GetHandle())
+                self.bitmap = None
+            except Exception as exc:
+                errors.append(f"删除位图失败：{exc}")
+        if self.source_dc is not None:
+            try:
+                # GetDC/GetWindowDC的借用句柄只配对ReleaseDC，不能DeleteDC。
+                if not win32gui.ReleaseDC(self.hwnd, self.source_dc):
+                    raise RuntimeError("ReleaseDC未释放句柄")
+                self.source_dc = None
+                self.source_wrapper = None
+            except Exception as exc:
+                errors.append(f"释放窗口DC失败：{exc}")
+        if errors:
+            raise RuntimeError("GDI资源清理未完成：" + "；".join(errors))
+
+
 def resolve_capture_target(hwnd: int) -> CaptureTargetInfo:
     """解析截图目标句柄。子窗口统一映射到顶层父窗口。"""
     target_hwnd = as_hwnd(hwnd)
-    capture_hwnd = target_hwnd
-    is_child_window = False
-
     if not target_hwnd:
-        return CaptureTargetInfo(target_hwnd=target_hwnd, capture_hwnd=capture_hwnd, is_child_window=False)
-
-    try:
-        root_hwnd = as_hwnd(win32gui.GetAncestor(target_hwnd, 2))
-        if root_hwnd and root_hwnd != target_hwnd:
-            capture_hwnd = root_hwnd
-            is_child_window = True
-    except Exception as exc:
-        logger.debug(f"解析顶层窗口失败: hwnd={target_hwnd}, error={exc}")
+        raise ValueError("截图窗口句柄无效")
+    capture_hwnd = as_hwnd(win32gui.GetAncestor(target_hwnd, 2))
+    if not capture_hwnd:
+        raise RuntimeError("无法解析截图目标的顶层窗口")
 
     return CaptureTargetInfo(
         target_hwnd=target_hwnd,
         capture_hwnd=capture_hwnd,
-        is_child_window=is_child_window,
+        is_child_window=capture_hwnd != target_hwnd,
     )
 
 

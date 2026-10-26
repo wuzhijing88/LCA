@@ -1,3 +1,5 @@
+from functools import partial
+
 from ..parameter_panel_support import *
 from utils.window.window_binding_utils import get_active_bound_window_hwnd
 
@@ -45,8 +47,6 @@ class ParameterPanelActionsMixin:
     def _create_panel_context_menu(self) -> QMenu:
         """创建参数面板统一的右键菜单样式（与主窗口右键菜单保持一致）"""
         return apply_unified_menu_style(QMenu(self), frameless=True)
-
-    _DEFAULT_DYNAMIC_OPTIONS = ["全部类别"]
 
     def _handle_refresh_dynamic_options(self, param_def: Dict[str, Any]):
         """Refresh dynamic options."""
@@ -140,45 +140,64 @@ class ParameterPanelActionsMixin:
                 return label
         return "源参数"
 
-    def _get_default_dynamic_options(self, param_def: Dict[str, Any]) -> List[str]:
-        raw_options = param_def.get("default_options")
-        if isinstance(raw_options, (list, tuple, set)):
-            normalized = [str(item or "").strip() for item in raw_options if str(item or "").strip()]
-            if normalized:
-                return normalized
-        return list(self._DEFAULT_DYNAMIC_OPTIONS)
-
     def _load_dynamic_options(self, source_value: str, options_func_name: str, param_def: Dict[str, Any]) -> List[str]:
-        fallback_options = self._get_default_dynamic_options(param_def)
         func = self._resolve_dynamic_options_func(options_func_name)
         if func is None:
-            return fallback_options
-        try:
-            if options_func_name == 'list_map_options':
-                options = func(source_value or None)
-            else:
-                options = func(source_value)
-            if isinstance(options, (list, tuple, set)):
-                normalized = [str(item or "").strip() for item in options if str(item or "").strip()]
-                if normalized or options_func_name == 'list_map_options':
-                    return normalized
-            return fallback_options
-        except Exception as e:
-            logger.error(f"调用 {options_func_name} 失败: {e}")
-            return fallback_options
+            raise ValueError(f"动态选项接口不存在：{options_func_name}")
+        options = func(source_value or None) if options_func_name == 'list_map_options' else func(source_value)
+        if not isinstance(options, (list, tuple, set)):
+            raise TypeError(f"动态选项接口返回了无效结果：{options_func_name}")
+        return [str(item).strip() for item in options if str(item).strip()]
 
     def _resolve_dynamic_options_func(self, options_func_name: str):
-        if hasattr(self, 'task_module') and self.task_module and hasattr(self.task_module, options_func_name):
-            return getattr(self.task_module, options_func_name)
-        try:
-            from tasks import get_task_module
-            if hasattr(self, 'current_task_type') and self.current_task_type:
-                task_module = get_task_module(self.current_task_type)
-                if task_module and hasattr(task_module, options_func_name):
-                    return getattr(task_module, options_func_name)
-        except Exception:
-            pass
-        return None
+        if self.task_module is None:
+            raise ValueError("当前卡片没有任务模块，无法读取动态选项")
+        func = getattr(self.task_module, options_func_name, None)
+        if not callable(func):
+            raise ValueError(f"当前卡片不提供动态选项接口：{options_func_name}")
+        return func
+
+    def _initial_dynamic_options(self, name, param_def, current_value):
+        options = list(self.current_parameters.get(f'_{name}_dynamic_options', param_def.get('options', [])))
+        if current_value is not None and current_value not in options:
+            options.append(current_value)
+        return options
+
+    def _schedule_dynamic_options(self, name, param_def, widget):
+        source_param = param_def.get('source_param', '')
+        source = str(self._get_dynamic_source_value(source_param) or self.current_parameters.get(source_param, '')).strip()
+        if not source:
+            return
+        func = self._resolve_dynamic_options_func(param_def['options_func'])
+        widget.setEnabled(False)
+        widget.setProperty("dynamic_loading", True)
+        widget.setProperty("dynamic_error", False)
+        widget.setToolTip("正在读取选项…")
+
+        def ready(options):
+            widget.setProperty("dynamic_loading", False)
+            current = self.current_parameters.get(name, param_def.get('default'))
+            widget.blockSignals(True)
+            try:
+                widget.clear()
+                widget.addItems(options)
+                index = widget.findText(str(current)) if current is not None else -1
+                widget.setCurrentIndex(index)
+            finally:
+                widget.blockSignals(False)
+            widget.setEnabled(True)
+            widget.setToolTip("当前值不在可选列表中，请重新选择" if index < 0 else "")
+            self.param_definitions[name]['options'] = list(options)
+            self.current_parameters[f'_{name}_dynamic_options'] = list(options)
+
+        def failed(error):
+            widget.setProperty("dynamic_loading", False)
+            widget.setProperty("dynamic_error", True)
+            widget.setEnabled(False)
+            widget.setToolTip(f"读取选项失败：{error}")
+            logger.error("读取参数 %s 的动态选项失败：%s", name, error)
+
+        self._background_jobs.submit('options:' + name, partial(_read_dynamic_options, func, source), ready, failed)
 
     def _apply_dynamic_options(self, target_widgets: Dict[str, QComboBox], new_options: List[str]) -> Dict[str, Any]:
         changed_payload: Dict[str, Any] = {}
@@ -217,29 +236,12 @@ class ParameterPanelActionsMixin:
         if self.current_card_id is not None and changed_payload:
             self.parameters_changed.emit(self.current_card_id, changed_payload)
 
-    def _refresh_selects_using_source(self, source_param: str) -> None:
-        source_name = str(source_param or "").strip()
-        if not source_name:
-            return
-        definitions = getattr(self, "param_definitions", {}) or {}
-        source_value = str(self._get_dynamic_source_value(source_name) or "").strip()
-        if not source_value:
-            source_value = str((getattr(self, "current_parameters", {}) or {}).get(source_name) or "").strip()
-        changed: Dict[str, Any] = {}
-        for name, param_def in definitions.items():
-            if not isinstance(param_def, dict):
-                continue
-            if str(param_def.get("source_param") or "").strip() != source_name:
-                continue
-            if param_def.get("type") not in ("select", "choice", "combo"):
-                continue
-            widget = self._get_value_widget(name)
-            if not isinstance(widget, QComboBox):
-                continue
-            options = self._load_dynamic_options(source_value, param_def.get("options_func", ""), param_def)
-            changed.update(self._apply_dynamic_options({name: widget}, options))
-        if changed:
-            self._emit_dynamic_options_changed(changed)
+    def _refresh_selects_using_source(self, source_param):
+        for name, definition in self.param_definitions.items():
+            if definition.get('source_param') == source_param and definition.get('options_func'):
+                widget = self._get_value_widget(name)
+                if widget is not None:
+                    self._schedule_dynamic_options(name, definition, widget)
 
     _BACKGROUND_ACTIONS = {
         'test_ocr_output',
@@ -250,39 +252,33 @@ class ParameterPanelActionsMixin:
 
     _HIDE_WINDOW_ACTIONS = {'preview_image_recognition', 'preview_color_recognition'}
 
-    def _handle_button_click(self, name: str, param_def: Dict[str, Any]):
-        """Handle button click."""
-        widget_hint = param_def.get('widget_hint', '')
-        action = param_def.get('action', '')
-
-        if widget_hint == 'refresh_dynamic_options':
-            self._handle_refresh_dynamic_options(param_def)
-            return
-
-        if not action:
-            logger.warning(f"未处理的按钮点击: {name}, widget_hint: {widget_hint}")
-            return
-
-        logger.info(f"执行按钮action: {action}")
-        action_func = self._resolve_button_action(action)
-        if action_func is None:
-            logger.debug(f"任务模块中未找到action函数: {action}")
-            return
-
+    def _handle_button_click(self, name, param_def):
         try:
+            if param_def.get('widget_hint') == 'refresh_dynamic_options':
+                self._handle_refresh_dynamic_options(param_def)
+                return
+            action = param_def.get('action')
+            if not action:
+                raise ValueError(f'参数按钮没有配置动作：{name}')
+            action_func = self._resolve_button_action(action)
             current_params = self._collect_current_parameters()
             target_hwnd = self._get_button_action_target_hwnd()
             if self._should_run_action_in_background(action):
                 self._start_background_action(action, action_func, current_params, target_hwnd)
                 return
-
             result = self._invoke_button_action(action_func, current_params, target_hwnd)
+            if action == "toggle_combo_key_sequence_record":
+                self._resources.forget_cleanup("combo-recording")
+                if getattr(self, "_combo_seq_recording_hook", None) is not None or getattr(self, "_combo_seq_recording_mouse_hooks", []):
+                    import keyboard
+                    import mouse
+                    from tasks.keyboard_input import _cleanup_combo_sequence_recording
+                    self._resources.bind_cleanup("combo-recording", partial(_cleanup_combo_sequence_recording, self, keyboard, mouse))
             if result is False:
-                logger.warning(f"执行action失败: {action}")
-                return
-            logger.info(f"成功执行action: {action}")
-        except Exception as e:
-            logger.error(f"执行action失败: {action}, 错误: {e}", exc_info=True)
+                raise RuntimeError('按钮动作执行失败')
+        except Exception as error:
+            logger.error('参数按钮执行失败：%s', error, exc_info=True)
+            QMessageBox.warning(self, '执行失败', str(error))
 
     def _resolve_button_action(self, action: str):
         from ui.panels.actions.ui_button_actions import resolve_ui_button_action
@@ -290,28 +286,12 @@ class ParameterPanelActionsMixin:
         ui_action = resolve_ui_button_action(action)
         if ui_action is not None:
             return ui_action
-
-        if hasattr(self, 'task_module') and self.task_module and hasattr(self.task_module, action):
-            return getattr(self.task_module, action)
-
-        if not hasattr(self, 'current_task_type') or not self.current_task_type:
-            return None
-
-        try:
-            from tasks import get_task_module
-
-            logger.debug(f"从 TASK_MODULES 查找 action: {action}，任务类型: {self.current_task_type}")
-            task_module = get_task_module(self.current_task_type)
-            if task_module is None:
-                logger.debug(f"未找到任务类型 {self.current_task_type} 对应的模块")
-                return None
-            logger.debug(f"找到任务模块: {task_module}, 检查是否有 {action} 属性")
-            if hasattr(task_module, action):
-                logger.debug(f"成功找到 action 函数: {action}")
-                return getattr(task_module, action)
-        except Exception as e:
-            logger.debug(f"从 TASK_MODULES 获取 action 时出错: {e}")
-        return None
+        if self.task_module is None:
+            raise ValueError("当前卡片没有任务模块，无法执行按钮动作")
+        action_func = getattr(self.task_module, action, None)
+        if not callable(action_func):
+            raise ValueError(f"当前卡片不提供按钮动作：{action}")
+        return action_func
 
     def _get_button_action_target_hwnd(self):
         if not hasattr(self, 'main_window') or not self.main_window:
@@ -332,39 +312,48 @@ class ParameterPanelActionsMixin:
     def _should_run_action_in_background(self, action: str) -> bool:
         return action in self._BACKGROUND_ACTIONS
 
-    def _start_background_action(self, action: str, action_func, current_params: Dict[str, Any], target_hwnd) -> None:
-        import threading
-        from contextvars import copy_context
+    def _start_background_action(self, action: str, action_func, current_params: Dict[str, Any], target_hwnd):
+        from copy import deepcopy
+        from ui.panels.action_context import ActionWindowContext
+        from task_workflow.resource_context import resource_dirs_from_mapping
 
         self._prepare_background_action_ui(action)
-        ctx = copy_context()
+        directories = resource_dirs_from_mapping(self)
+        panel_context = ActionWindowContext(self, directories, self.current_card_id, self)
+        main_context = ActionWindowContext(self.main_window, directories, self.current_card_id, self)
+        resource_key = f'action:{action}'
+        self._cancel_background_actions()
+        self._action_contexts = (panel_context, main_context)
+        self._resources.bind_cleanup(resource_key, self._cancel_background_actions)
+        values = deepcopy(current_params)
 
-        def run_action_in_background():
-            try:
-                result = self._invoke_button_action(action_func, current_params, target_hwnd)
-                if result is False:
-                    logger.warning(f"后台执行action失败: {action}")
-                    return
-                logger.info(f"后台执行action成功: {action}")
-            except Exception as e:
-                logger.error(f"后台执行action失败: {action}, 错误: {e}", exc_info=True)
+        def work(cancelled, progress):
+            if cancelled.is_set() or panel_context._cancelled.is_set():
+                return False
+            return action_func(values, target_hwnd=target_hwnd, main_window=main_context, parameter_panel=panel_context)
 
-        thread = threading.Thread(target=ctx.run, args=(run_action_in_background,), daemon=True)
-        thread.start()
-        logger.info(f"已启动后台线程执行action: {action}")
+        def failed(error):
+            logger.error("按钮动作 %s 执行失败：%s", action, error)
+            panel_context.show()
+            main_context.show()
+            QMessageBox.warning(self, "执行失败", f"按钮动作执行失败：{error}")
 
-    def _prepare_background_action_ui(self, action: str) -> None:
-        if action not in self._HIDE_WINDOW_ACTIONS:
-            return
-        import time
+        self._background_jobs.submit(resource_key, work, lambda result: None, failed)
 
-        try:
+    def _cancel_background_actions(self):
+        for context in getattr(self, '_action_contexts', ()):
+            context.cancel()
+            context.deleteLater()
+        self._action_contexts = ()
+        for key in list(self._resources.cleanups):
+            if key.startswith('action:'):
+                self._resources.forget_cleanup(key)
+
+    def _prepare_background_action_ui(self, action: str):
+        if action in self._HIDE_WINDOW_ACTIONS:
             self.hide()
-            if self.main_window:
+            if self.main_window is not None:
                 self.main_window.hide()
-            time.sleep(0.2)
-        except Exception as e:
-            logger.warning(f"隐藏窗口失败: {e}")
 
     def _invoke_button_action(self, action_func, current_params: Dict[str, Any], target_hwnd):
         return action_func(
@@ -373,3 +362,12 @@ class ParameterPanelActionsMixin:
             main_window=self.main_window,
             parameter_panel=self,
         )
+
+
+def _read_dynamic_options(func, source, cancelled, progress):
+    if cancelled.is_set():
+        return []
+    options = func(source)
+    if not isinstance(options, (list, tuple, set)):
+        raise TypeError("动态选项接口必须返回列表")
+    return [str(item).strip() for item in options if str(item).strip()]

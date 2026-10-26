@@ -34,7 +34,6 @@ from ..widgets.custom_widgets import CustomDropdown as QComboBox
 from ..system_parts.menu_style import apply_unified_menu_style
 
 # 导入截图工具
-from ..selectors.screenshot_tool import QuickScreenshotButton
 
 # 统一下拉框样式
 

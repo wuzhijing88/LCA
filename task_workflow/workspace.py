@@ -368,18 +368,21 @@ def default_new_workflow_filepath(name: str) -> str:
 
 
 def new_workflow_filepath(name: str, workspace_dir: str = "") -> str:
+    """新建工程固定独占工作区下的同名目录；这里只计算路径，不创建工程目录。"""
     text = str(name or "").strip()
+    if text.lower().endswith(".lca"):
+        text = text[:-4]
     if not text:
         raise ValueError("工作流名称不能为空")
-    stem, extension = os.path.splitext(text)
-    if extension.lower() in _WORKFLOW_FILE_EXTENSIONS:
-        text = stem
-    if not text:
-        raise ValueError("工作流名称不能为空")
-    root = normalize_workspace_dir(workspace_dir)
-    if root:
-        return exclusive_workflow_filepath(os.path.join(root, f"{text}.lca"))
-    return os.path.join(get_workflows_dir(), text, f"{text}.lca")
+    if (
+        text in {".", ".."}
+        or any(char in text for char in '\\/:*?"<>|')
+        or text.endswith((".", " "))
+        or any(ord(char) < 32 for char in text)
+    ):
+        raise ValueError("工作流名称不能包含路径或文件名非法字符")
+    root = normalize_workspace_dir(workspace_dir) or get_workflows_dir()
+    return os.path.join(root, text, f"{text}.lca")
 
 
 def apply_resource_dirs_to_task(task: Any, dirs: Dict[str, Any], default_images_dir: str = "") -> None:
@@ -409,7 +412,6 @@ def apply_updated_workflow_resource_dir(
         if not isinstance(metadata, dict):
             metadata = {}
             data["metadata"] = metadata
-        metadata.pop("custom_gallery_path", None)
         metadata["custom_resource_path"] = normalized
         dirs = project_resource_dirs(normalized)
     else:
@@ -471,7 +473,6 @@ def prepare_exclusive_workflow_save(
     if not isinstance(metadata, dict):
         metadata = {}
         workflow_data["metadata"] = metadata
-    metadata.pop("custom_gallery_path", None)
     metadata["custom_resource_path"] = root
     return filepath
 
@@ -1595,7 +1596,6 @@ def update_workflow_resource_path(filepath: str, resource_dir: str) -> Dict[str,
         workflow_data["metadata"] = metadata
 
     ensure_workflow_resource_subdirs(normalized_resource)
-    metadata.pop("custom_gallery_path", None)
     migrate_result = migrate_workflow_resources_to_dir(
         workflow_data,
         normalized_resource,

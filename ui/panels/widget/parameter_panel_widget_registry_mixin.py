@@ -1,4 +1,5 @@
 from ..parameter_panel_support import *
+from ..media.image_preview import ImagePreviewLabel
 
 
 class ParameterPanelWidgetRegistryMixin:
@@ -23,6 +24,7 @@ class ParameterPanelWidgetRegistryMixin:
 
     def _register_widget(self, name: str, widget: QWidget, *, stores_value: bool = True) -> None:
         """统一注册面板控件，区分真实参数控件与辅助控件。"""
+        self._watch_parameter_widget(widget)
         self.widgets[name] = widget
         if stores_value:
             self.value_widgets[name] = widget
@@ -85,21 +87,29 @@ class ParameterPanelWidgetRegistryMixin:
 
     def _clear_content(self):
         """清除内容区域的所有控件"""
+        from ui.panels.card_plugin_conditions import release_plugin_parameters
+        release_plugin_parameters(self)
+        from ui.panels.parameter_editors import ParameterEditor
+        for editor in self.findChildren(ParameterEditor):
+            editor.close()
         logger.debug(f"清除参数面板内容 - card_id: {self.current_card_id}")
+        if hasattr(self, '_update_timer'):
+            self._update_timer.stop()
+        self._cancel_background_actions()
+        self._background_jobs.cancel_all()
+        self._picking_active = False
+        self._resources.close_tools()
         self._stop_combo_key_sequence_recording()
         self._clear_favorites_runtime_refs()
         if hasattr(self, "_clear_ai_runtime_refs"):
             self._clear_ai_runtime_refs()
 
-        # 【修复】先断开所有文件输入框的信号连接，防止图片预览混入其他任务
-        for name, widget in list(self.value_widgets.items()):
-            if isinstance(widget, QLineEdit):
-                try:
-                    # 尝试断开所有信号连接
-                    widget.textChanged.disconnect()
-                    logger.debug(f"已断开 {name} 的textChanged信号")
-                except Exception:
-                    pass  # 如果没有连接，忽略错误
+        for widget in self.widgets.values():
+            widget.blockSignals(True)
+            widget.deleteLater()
+
+        for preview in self.findChildren(ImagePreviewLabel):
+            preview.cancel_loading()
 
         while self.content_layout.count():
             child = self.content_layout.takeAt(0)

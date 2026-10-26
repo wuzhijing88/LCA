@@ -1,4 +1,6 @@
 from ..parameter_panel_support import *
+from ..thread_target_selector import ThreadTargetSelector
+from task_workflow.thread_start import validate_thread_target
 
 class ParameterPanelWorkflowSelectorMixin:
 
@@ -85,57 +87,18 @@ class ParameterPanelWorkflowSelectorMixin:
 
     @staticmethod
     def _parse_thread_start_id_from_target(target_value: Any) -> Optional[int]:
-        if target_value is None or isinstance(target_value, bool):
+        validate_thread_target(target_value)
+        if isinstance(target_value, list) or target_value in {'当前线程', '全部线程'}:
             return None
-        if isinstance(target_value, int):
-            return target_value if target_value >= 0 else None
-
-        text = str(target_value).strip()
-        if not text or text in {'当前线程', '全部线程'}:
-            return None
-
-        try:
-            value = int(text)
-            return value if value >= 0 else None
-        except Exception:
-            pass
-
-        match = re.search(r'ID\s*[:?]\s*(-?\d+)', text)
-        if not match:
-            match = re.search(r'\(\s*ID\s*[:?]\s*(-?\d+)\s*\)', text)
-        if not match:
-            return None
-        try:
-            value = int(match.group(1))
-            return value if value >= 0 else None
-        except Exception:
-            return None
+        return int(target_value)
 
     @staticmethod
     def _parse_card_id_from_value(value: Any) -> Optional[int]:
-        if value is None or isinstance(value, bool):
+        if value is None:
             return None
-        if isinstance(value, int):
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
-
-        text = str(value).strip()
-        if not text:
-            return None
-        if text in {'使用线程默认起点', '默认起点', 'None', 'none', '-1'}:
-            return None
-
-        try:
-            return int(text)
-        except Exception:
-            match = re.search(r'ID\s*[:?]\s*(-?\d+)', text)
-            if not match:
-                match = re.search(r'\(\s*ID\s*[:?]\s*(-?\d+)\s*\)', text)
-            if match:
-                try:
-                    return int(match.group(1))
-                except Exception:
-                    return None
-        return None
+        raise ValueError('指定卡片必须是非负整数编号或空值')
 
     def _resolve_current_thread_start_card_id(
         self,
@@ -165,10 +128,23 @@ class ParameterPanelWorkflowSelectorMixin:
             card_id for card_id, task_type, _ in all_cards if is_thread_start_task_type(task_type)
         ]
         if not start_card_ids:
-            return all_cards
+            return []
+
+        if isinstance(target_value, list):
+            if not target_value:
+                return []
+            validate_thread_target(target_value)
+            adjacency = self._build_workflow_adjacency_for_selector()
+            allowed_ids = {item[0] for item in all_cards}
+            for target in target_value:
+                start_id = int(target)
+                if start_id not in start_card_ids:
+                    return []
+                allowed_ids.intersection_update(self._collect_reachable_card_ids(start_id, adjacency))
+            return [item for item in all_cards if item[0] in allowed_ids]
 
         target_text = '' if target_value is None else str(target_value).strip()
-        if not target_text or target_text == '全部线程':
+        if target_text == '全部线程':
             return all_cards
 
         adjacency = self._build_workflow_adjacency_for_selector()
@@ -180,18 +156,17 @@ class ParameterPanelWorkflowSelectorMixin:
             selected_start_id = self._resolve_current_thread_start_card_id(start_card_ids, adjacency)
 
         if selected_start_id is None:
-            return all_cards
+            return []
 
         allowed_ids = self._collect_reachable_card_ids(selected_start_id, adjacency)
         filtered_cards = [item for item in all_cards if item[0] in allowed_ids]
-        return filtered_cards if filtered_cards else all_cards
+        return filtered_cards
 
     def _refresh_workflow_card_selector_options(self) -> None:
         target_value: Any = self.current_parameters.get('target_thread')
         target_widget = self._get_value_widget('target_thread')
-        if isinstance(target_widget, QComboBox):
-            current_data = target_widget.currentData()
-            target_value = current_data if current_data is not None else target_widget.currentText()
+        if isinstance(target_widget, ThreadTargetSelector):
+            target_value = target_widget.value()
             self.current_parameters['target_thread'] = target_value
 
         card_options = self._collect_workflow_cards_for_target_thread(target_value)
@@ -206,7 +181,8 @@ class ParameterPanelWorkflowSelectorMixin:
             widget.blockSignals(True)
             try:
                 widget.clear()
-                widget.addItem('使用线程默认起点', None)
+                widget.addItem('请选择指定卡片', None)
+                widget.setProperty('invalid_value', None)
                 for card_id, task_type, custom_name in card_options:
                     if custom_name:
                         display_text = f'{custom_name} [{task_type}] (ID: {card_id})'
@@ -216,15 +192,16 @@ class ParameterPanelWorkflowSelectorMixin:
 
                 if selected_card_id is not None and selected_card_id >= 0:
                     index = widget.findData(int(selected_card_id))
-                    if index >= 0:
-                        widget.setCurrentIndex(index)
+                    if index < 0:
+                        widget.addItem(f'指定卡片不可用 (ID: {selected_card_id})', selected_card_id)
+                        widget.setProperty('invalid_value', selected_card_id)
+                        index = widget.count() - 1
+                    widget.setCurrentIndex(index)
             finally:
                 widget.blockSignals(False)
 
-    def _on_thread_target_selection_changed(self, param_name: str, widget: QComboBox) -> None:
-        selected_value = widget.currentData()
-        if selected_value is None:
-            selected_value = widget.currentText()
+    def _on_thread_target_selection_changed(self, param_name: str, widget: ThreadTargetSelector) -> None:
+        selected_value = widget.value()
         self._apply_live_parameter_changes(
             {param_name: selected_value},
             refresh_conditional=False,
@@ -269,190 +246,24 @@ class ParameterPanelWorkflowSelectorMixin:
             token = token.replace("__", "_")
         return token[:max_len]
 
-    def _extract_workflow_name_token_from_task(self, task_obj: Optional[object]) -> str:
-        """优先从工作流文件名提取 token，失败时回退任务显示名。"""
-        if task_obj is None:
-            return ""
 
-        try:
-            filepath = str(getattr(task_obj, "filepath", "") or "").strip()
-            if filepath:
-                stem = os.path.splitext(os.path.basename(filepath))[0]
-                token = self._sanitize_workflow_name_token(stem)
-                if token:
-                    return token
-        except Exception:
-            pass
-
-        try:
-            task_name = str(getattr(task_obj, "name", "") or "").strip()
-            token = self._sanitize_workflow_name_token(task_name)
-            if token:
-                return token
-        except Exception:
-            pass
-
-        return ""
 
     def _get_active_workflow_file_token(self) -> Optional[str]:
-        """获取当前工作流名称标识，用于截图命名。"""
-        tab_widget = None
-        try:
-            if self.main_window and hasattr(self.main_window, "workflow_tab_widget"):
-                tab_widget = self.main_window.workflow_tab_widget
-        except Exception:
-            tab_widget = None
-
-        if tab_widget:
-            current_task_id = None
-            try:
-                current_task_id = tab_widget.get_current_task_id()
-            except Exception:
-                current_task_id = None
-
-            if current_task_id is not None:
-                try:
-                    task_manager = getattr(tab_widget, "task_manager", None)
-                    task_obj = task_manager.get_task(current_task_id) if task_manager else None
-                except Exception:
-                    task_obj = None
-
-                token = self._extract_workflow_name_token_from_task(task_obj)
-                if token:
-                    return token
-
-                try:
-                    if hasattr(tab_widget, "_get_current_workflow_filepath"):
-                        workflow_path = tab_widget._get_current_workflow_filepath()
-                        path_token = self._sanitize_workflow_name_token(
-                            os.path.splitext(os.path.basename(str(workflow_path or "").strip()))[0]
-                        )
-                        if path_token:
-                            return path_token
-                except Exception:
-                    pass
-
-                fallback_token = self._sanitize_workflow_name_token(f"workflow_{int(current_task_id)}")
-                if fallback_token:
-                    return fallback_token
-
-        workflow_view = self._get_active_workflow_view()
-        if workflow_view is None:
+        if self.main_window is None:
             return None
+        tabs = self.main_window.workflow_tab_widget
+        path = tabs._get_current_workflow_filepath()
+        if path:
+            return self._sanitize_workflow_name_token(os.path.splitext(os.path.basename(path))[0]) or None
+        task_id = tabs.get_current_task_id()
+        return self._sanitize_workflow_name_token(f'workflow_{task_id}') if task_id is not None else None
 
-        try:
-            fallback_task_id = getattr(workflow_view, "task_id", None)
-            if fallback_task_id is None:
-                return None
-            return self._sanitize_workflow_name_token(f"workflow_{int(fallback_task_id)}") or None
-        except Exception:
-            return None
-
-    _LEGACY_OPERATION_MODE_BY_INDEX = [
-        "找图功能",
-        "坐标点击",
-        "文字点击",
-        "找色功能",
-        "元素点击",
-        "鼠标滚轮",
-        "鼠标拖拽",
-        "鼠标移动",
-    ]
-
-    _OPERATION_MODE_ALIAS = {
-        "图片点击": "找图功能",
-        "找图点击": "找图功能",
-        "找色点击": "找色功能",
-    }
-
-    _LEGACY_IMAGE_TASK_TYPES = {"图片点击", "查找图片并点击", "找图点击", "找图功能"}
-
-    def _normalize_operation_mode_value(self, value: Any, fallback_task_type: str = "") -> str:
-        """归一化 operation_mode，兼容旧文案和旧索引值。"""
-        mode = ""
-
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            idx = int(value)
-            if 0 <= idx < len(self._LEGACY_OPERATION_MODE_BY_INDEX):
-                mode = self._LEGACY_OPERATION_MODE_BY_INDEX[idx]
-            else:
-                mode = str(value).strip()
-        else:
-            mode = str(value or "").strip()
-            if mode.isdigit():
-                idx = int(mode)
-                if 0 <= idx < len(self._LEGACY_OPERATION_MODE_BY_INDEX):
-                    mode = self._LEGACY_OPERATION_MODE_BY_INDEX[idx]
-
-        mode = self._OPERATION_MODE_ALIAS.get(mode, mode)
-        if mode:
-            return mode
-
-        task_type_candidates = [
-            str(fallback_task_type or "").strip(),
-            str(self.current_task_type or "").strip(),
-            str(self.current_parameters.get("task_type", "") or "").strip(),
-        ]
-        if any(task_type in self._LEGACY_IMAGE_TASK_TYPES for task_type in task_type_candidates if task_type):
-            return "找图功能"
-        return ""
-
-    def _normalize_operation_mode_parameter(self, param_definitions: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
-        """在参数面板初始化阶段统一修正 operation_mode。"""
-        definitions = param_definitions or self.param_definitions
-        if "operation_mode" not in definitions:
+    def _normalize_operation_mode_parameter(self, param_definitions=None, *, parameters=None) -> None:
+        """只接受参数定义中的现行操作模式；缺省值由统一填充流程提供。"""
+        definitions = self.param_definitions if param_definitions is None else param_definitions
+        values = self.current_parameters if parameters is None else parameters
+        if "operation_mode" not in definitions or "operation_mode" not in values:
             return
-
-        raw_value = self.current_parameters.get("operation_mode")
-        normalized = self._normalize_operation_mode_value(raw_value, fallback_task_type=self.current_task_type or "")
-        if normalized:
-            self.current_parameters["operation_mode"] = normalized
-
-    def _prune_obsolete_params_in_workflow(self, obsolete_params: list) -> None:
-        if getattr(self, "_loading_parameter_panel", False):
-            return
-        if not obsolete_params or self.current_card_id is None:
-            return
-
-        current_workflow_view = None
-        try:
-            if self.main_window and hasattr(self.main_window, "workflow_tab_widget") and self.main_window.workflow_tab_widget:
-                current_task_id = self.main_window.workflow_tab_widget.get_current_task_id()
-                if current_task_id is not None and current_task_id in self.main_window.workflow_tab_widget.task_views:
-                    current_workflow_view = self.main_window.workflow_tab_widget.task_views[current_task_id]
-            if current_workflow_view is None and self.main_window and hasattr(self.main_window, "workflow_view"):
-                current_workflow_view = self.main_window.workflow_view
-        except Exception as exc:
-            logger.debug(f"[废弃参数] 解析 workflow_view 失败：{exc}")
-            return
-
-        if not current_workflow_view or not hasattr(current_workflow_view, "cards"):
-            return
-
-        card = current_workflow_view.cards.get(self.current_card_id)
-        if not card or not hasattr(card, "parameters"):
-            return
-
-        removed = []
-        for name in obsolete_params:
-            if name in card.parameters:
-                removed.append(name)
-                card.parameters.pop(name, None)
-
-        if not removed:
-            return
-
-        try:
-            card.parameters = card.parameters.copy()
-        except Exception:
-            pass
-        try:
-            card.update()
-        except Exception:
-            pass
-        if getattr(self, "_loading_parameter_panel", False):
-            logger.debug(f"[obsolete params] removed from workflow during panel load: {removed}")
-            return
-        if self.main_window and hasattr(self.main_window, "_mark_unsaved_changes"):
-            self.main_window._mark_unsaved_changes()
-        logger.debug(f"[obsolete params] removed from workflow: {removed}")
+        value = values["operation_mode"]
+        if value not in definitions["operation_mode"]["options"]:
+            raise ValueError(f"无效的鼠标操作模式: {value!r}，请先转换为现行工程格式")
