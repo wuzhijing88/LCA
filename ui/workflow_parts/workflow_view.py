@@ -1,4 +1,6 @@
 from contextlib import ExitStack
+import weakref
+from PySide6.QtCore import Slot
 
 from .workflow_view_common import *
 from .workflow_view_card_layout_mixin import WorkflowViewCardLayoutMixin
@@ -7,6 +9,7 @@ from .workflow_view_connection_mixin import WorkflowViewConnectionMixin
 from .workflow_view_canvas_mixin import WorkflowViewCanvasMixin
 from .connection_controller import ConnectionController
 from .connection_gesture import ConnectionGesture
+from .connection_line import batch_line_display_updates
 from .workflow_view_delete_edit_mixin import WorkflowViewDeleteEditMixin
 from .workflow_view_identity_mixin import WorkflowViewIdentityMixin
 from .workflow_view_io_mixin import WorkflowViewIoMixin
@@ -80,7 +83,7 @@ class WorkflowView(
 
         # 场景索引优化
         if self.scene:
-            self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
+            self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.BspTreeIndex)
 
         # 禁用默认拖拽，手动实现平移以提升流畅度
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
@@ -122,6 +125,7 @@ class WorkflowView(
 
         # Store cards for easy access
         self.cards: Dict[int, TaskCard] = {}
+        self._viewport_cards = weakref.WeakSet()
         self._cache_policy_cache_disabled: Optional[bool] = None
         self._cache_policy_shadow_disabled: Optional[bool] = None
         self._card_cache_zoom: Optional[float] = None
@@ -185,16 +189,19 @@ class WorkflowView(
     def clear_workflow(self):
         if not self._loading_workflow and self._is_workflow_running():
             return False
-        self._cancel_deferred_view_position()
-        self._cancel_canvas_panning()
-        self._cleanup_drag_state()
-        self._clear_all_snap_guide_lines(commit=False)
-        self.set_canvas_drag_paused(False)
-        result = WorkflowViewCardLayoutMixin.clear_workflow(self)
-        self.flashing_card_ids.clear()
-        self._sync_scene_rect_to_content()
+        with batch_line_display_updates():
+            self._cancel_deferred_view_position()
+            self._cancel_canvas_panning()
+            self._cleanup_drag_state()
+            self._clear_all_snap_guide_lines(commit=False)
+            self.set_canvas_drag_paused(False)
+            result = WorkflowViewCardLayoutMixin.clear_workflow(self)
+            self._viewport_cards.clear()
+            self.flashing_card_ids.clear()
+            self._sync_scene_rect_to_content()
         return result
 
+    @Slot()
     def dispose_resources(self):
         """关闭与清空共用资源卸载入口，关闭时不受运行状态限制。"""
         if self._resources_cleaned_up:

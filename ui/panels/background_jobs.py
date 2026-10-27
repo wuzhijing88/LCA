@@ -94,6 +94,7 @@ class PanelBackgroundJobs(QObject):
         self._callbacks = {}
         self._generation = 0
         self.destroyed.connect(self._state.cancel)
+        self.destroyed.connect(self._callbacks.clear)
 
     def submit(self, key, work, on_success, on_error, on_progress=None):
         self.cancel(key)

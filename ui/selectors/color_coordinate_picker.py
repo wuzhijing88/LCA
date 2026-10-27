@@ -9,6 +9,7 @@
 import logging
 import time
 import ctypes
+import win32gui
 from ctypes import wintypes
 from typing import Optional, Tuple, List
 from PySide6.QtWidgets import (QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -25,7 +26,6 @@ from utils.window.window_coordinate_common import (
     client_relative_to_qt_global,
     get_window_client_physical_size,
     get_window_client_qt_global_rect,
-    normalize_window_hwnd,
 )
 from utils.window.window_overlay_utils import (
     apply_overlay_text_style,
@@ -43,7 +43,6 @@ from utils.window.window_overlay_utils import (
 from utils.window.window_activation_utils import (
     activate_overlay_widget,
     activate_window,
-    ensure_overlay_ready_for_input,
     grab_overlay_input,
     release_overlay_input,
     schedule_overlay_activation_boost,
@@ -294,6 +293,8 @@ class ColorCoordinatePickerOverlay(QWidget):
         self.magnifier_enabled = True  # 放大镜功能开关
         self.selected_points: List[Tuple[int, int, int, int, int]] = []
         self.selected_points = [tuple(point) for point in points]
+        # 已有颜色串不含原始屏幕位置，覆盖层只标记本轮实际点击的点。
+        self._initial_point_count = len(points)
         if points:
             self.selected_color = tuple(points[-1][2:])
 
@@ -320,7 +321,7 @@ class ColorCoordinatePickerOverlay(QWidget):
 
         # 窗口激活状态标志
         self._is_ready_for_input = False
-        self._activation_attempts = 0
+        self._input_ready_deadline = None
 
         # 超时保护：30秒后自动关闭，避免长时间占用资源
         self.timeout_timer = QTimer(self)
@@ -366,11 +367,18 @@ class ColorCoordinatePickerOverlay(QWidget):
             self._capture_static_screenshot()
             if self.static_screenshot is None:
                 raise RuntimeError("窗口截图失败")
+            window_pixmap = self._get_static_screenshot_pixmap()
+            if window_pixmap is None or window_pixmap.isNull():
+                raise RuntimeError("取色截图无法生成预览")
             self.desktop_pixmap = capture_virtual_desktop_pixmap()
+            if self.desktop_pixmap is None or self.desktop_pixmap.isNull():
+                raise RuntimeError("无法截取取色覆盖层底图")
             self._setup_overlay_geometry()
+            target_rect = self._get_target_window_rect()
+            if target_rect.isEmpty() or not self.rect().intersects(target_rect):
+                raise RuntimeError("取色目标客户区不在当前屏幕内")
             prime_picker_backdrop(self, desktop_pixmap=self.desktop_pixmap,
-                window_pixmap=self._get_static_screenshot_pixmap(),
-                target_rect=self._get_target_window_rect())
+                window_pixmap=window_pixmap, target_rect=target_rect)
             return True
         except Exception:
             logger.exception("无法拍摄取色画面")
@@ -379,32 +387,21 @@ class ColorCoordinatePickerOverlay(QWidget):
 
     def setup_target_window(self):
         """设置目标窗口"""
-        target_hwnd = int(self.target_window_hwnd or 0)
-        if not target_hwnd:
+        target_hwnd = self.target_window_hwnd
+        if type(target_hwnd) is not int or target_hwnd <= 0 or not win32gui.IsWindow(target_hwnd):
             logger.error(f"无效的窗口句柄: {target_hwnd}")
             return False
 
-        normalized_hwnd, normalized_title = normalize_window_hwnd(target_hwnd)
-        if not normalized_hwnd:
-            logger.error(f"窗口句柄无效或不可用: {target_hwnd}")
-            return False
-
-        if normalized_hwnd != target_hwnd:
-            logger.info(f"窗口句柄已修正: {target_hwnd} -> {normalized_hwnd}")
-
-        target_hwnd = normalized_hwnd
-        self.target_window_hwnd = normalized_hwnd
-        self.target_window_title = normalized_title or f"窗口{target_hwnd}"
+        self.target_window_title = win32gui.GetWindowText(target_hwnd)
         logger.info(f"使用窗口句柄: {target_hwnd}, 标题: {self.target_window_title}")
 
-        # 获取窗口信息
+        # 激活可能还原最小化窗口并改变客户区位置，必须先激活再读取几何。
+        self._activate_target_window(target_hwnd)
         self.window_info = self._get_window_info(target_hwnd)
         if not self.window_info:
             logger.error("无法获取窗口信息")
             return False
 
-        # 激活目标窗口。全屏几何必须等截图完成后再设，否则不透明覆盖层会把画面盖成黑的。
-        self._activate_target_window(target_hwnd)
         return True
 
     def _get_window_info(self, hwnd: int):
@@ -473,8 +470,8 @@ class ColorCoordinatePickerOverlay(QWidget):
         try:
             img_h, img_w = screenshot.shape[:2]
             physical_width, physical_height = get_window_client_physical_size(self.window_info)
-            physical_width = max(1, int(physical_width or img_w))
-            physical_height = max(1, int(physical_height or img_h))
+            if physical_width <= 0 or physical_height <= 0:
+                raise ValueError("取色目标客户区尺寸无效")
 
             px = int(round(int(x) * (img_w / float(physical_width))))
             py = int(round(int(y) * (img_h / float(physical_height))))
@@ -507,7 +504,7 @@ class ColorCoordinatePickerOverlay(QWidget):
             return int(self._aim_client_pos[0]), int(self._aim_client_pos[1])
 
         pos = mouse_pos if mouse_pos is not None else self.mouse_pos
-        if pos is None or pos.isNull() or not self.window_info:
+        if pos is None or not self.window_info or not self._is_point_in_target_window(pos):
             return None
         relative_pos = self._get_relative_coordinates(pos)
         return int(relative_pos.x()), int(relative_pos.y())
@@ -520,7 +517,7 @@ class ColorCoordinatePickerOverlay(QWidget):
         )
 
     def _get_aim_marker_repaint_rect(self, overlay_pos: QPoint) -> QRect:
-        if overlay_pos is None or overlay_pos.isNull():
+        if overlay_pos is None:
             return QRect()
         return QRect(int(overlay_pos.x()) - 14, int(overlay_pos.y()) - 14, 28, 28)
 
@@ -561,8 +558,6 @@ class ColorCoordinatePickerOverlay(QWidget):
 
     def _get_magnifier_repaint_rect(self, mouse_pos: QPoint) -> QRect:
         """获取放大镜需要重绘的脏区域。"""
-        if mouse_pos.isNull():
-            return QRect()
         if not self._is_point_in_target_window(mouse_pos):
             return QRect()
 
@@ -680,13 +675,10 @@ class ColorCoordinatePickerOverlay(QWidget):
         overlay_rect = self.rect()
         if overlay_rect.isEmpty() or target_rect.isEmpty():
             return False
-        try:
-            from utils.window.window_identity import is_desktop_window
+        from utils.window.window_identity import is_desktop_window
 
-            if is_desktop_window(self.target_window_hwnd):
-                return True
-        except Exception:
-            pass
+        if is_desktop_window(self.target_window_hwnd):
+            return True
         overlay_area = max(1, overlay_rect.width() * overlay_rect.height())
         target_area = max(0, target_rect.width() * target_rect.height())
         return (target_area / overlay_area) >= 0.85
@@ -701,7 +693,7 @@ class ColorCoordinatePickerOverlay(QWidget):
         overlay_rect = self.rect()
         target_rect = self._get_target_window_rect()
         if target_rect.isEmpty():
-            target_rect = overlay_rect
+            return
 
         total_w = self.finish_button.width() + self.cancel_button.width() + gap
         btn_h = self.finish_button.height()
@@ -800,21 +792,39 @@ class ColorCoordinatePickerOverlay(QWidget):
             return None
 
     def _draw_selected_points(self, painter: QPainter):
-        """绘制已选择的全部颜色点。"""
-        if not self.selected_points:
+        """只绘制本轮实际采到且位于目标客户区内的点。"""
+        if not self.window_info:
             return
+        target_rect = self._get_target_window_rect()
+        if target_rect.isEmpty():
+            return
+        width, height = get_window_client_physical_size(self.window_info)
+        located_points = []
+        for index in range(self._initial_point_count, len(self.selected_points)):
+            values = self.selected_points[index]
+            x, y = values[:2]
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+            point = self._relative_to_overlay_point(x, y)
+            if point is not None and target_rect.contains(point):
+                located_points.append((index, values, point))
+        if not located_points:
+            return
+        painter.save()
+        try:
+            painter.setClipRect(target_rect, Qt.ClipOperation.IntersectClip)
+            self._paint_selected_point_markers(painter, located_points, target_rect)
+        finally:
+            painter.restore()
 
+    def _paint_selected_point_markers(self, painter, located_points, target_rect):
         crosshair_outer_color = self._get_picker_color('picker_crosshair_outer')
         crosshair_inner_color = self._get_picker_color('picker_crosshair_inner')
         text_color = self._get_picker_color('picker_text')
         text_bg_color = self._get_picker_color('picker_text_bg')
 
-        for idx, (x, y, r, g, b) in enumerate(self.selected_points):
-            point = self._relative_to_overlay_point(x, y)
-            if point is None:
-                continue
-
-            is_last = idx == len(self.selected_points) - 1
+        for idx, (x, y, r, g, b), point in located_points:
+            is_last = idx == located_points[-1][0]
             cross_size = 15 if is_last else 10
 
             pen_outline = QPen(crosshair_outer_color, 3 if is_last else 2)
@@ -835,19 +845,26 @@ class ColorCoordinatePickerOverlay(QWidget):
             idx_pos = point + QPoint(10, -10)
             idx_bg = idx_rect.translated(idx_pos)
             idx_bg.adjust(-4, -2, 4, 2)
+            original_pos = idx_bg.topLeft()
+            idx_bg.moveLeft(max(target_rect.left(), min(idx_bg.left(), target_rect.right() - idx_bg.width() + 1)))
+            idx_bg.moveTop(max(target_rect.top(), min(idx_bg.top(), target_rect.bottom() - idx_bg.height() + 1)))
+            idx_pos += idx_bg.topLeft() - original_pos
             painter.setBrush(QBrush(QColor(text_bg_color.red(), text_bg_color.green(), text_bg_color.blue(), 180)))
             painter.setPen(QPen(text_color, 1))
             painter.drawRect(idx_bg)
             painter.drawText(idx_pos, index_text)
 
-        last_x, last_y, last_r, last_g, last_b = self.selected_points[-1]
-        last_point = self._relative_to_overlay_point(last_x, last_y)
+        _, (last_x, last_y, last_r, last_g, last_b), last_point = located_points[-1]
         if last_point is not None:
             info_text = f"坐标: ({last_x}, {last_y})  颜色: RGB({last_r},{last_g},{last_b})"
             text_rect = painter.fontMetrics().boundingRect(info_text)
             text_pos = last_point + QPoint(35, -10)
             bg_rect = text_rect.translated(text_pos)
             bg_rect.adjust(-5, -2, 5, 2)
+            original_pos = bg_rect.topLeft()
+            bg_rect.moveLeft(max(target_rect.left(), min(bg_rect.left(), target_rect.right() - bg_rect.width() + 1)))
+            bg_rect.moveTop(max(target_rect.top(), min(bg_rect.top(), target_rect.bottom() - bg_rect.height() + 1)))
+            text_pos += bg_rect.topLeft() - original_pos
             painter.setBrush(QBrush(QColor(text_bg_color.red(), text_bg_color.green(), text_bg_color.blue(), 180)))
             painter.setPen(QPen(text_color, 1))
             painter.drawRect(bg_rect)
@@ -866,12 +883,17 @@ class ColorCoordinatePickerOverlay(QWidget):
         inner = self._get_picker_color('picker_crosshair_inner')
         gap = 2
         arm = 10
-        for pen in (QPen(outer, 3), QPen(inner, 1)):
-            painter.setPen(pen)
-            painter.drawLine(point.x() - arm, point.y(), point.x() - gap, point.y())
-            painter.drawLine(point.x() + gap, point.y(), point.x() + arm, point.y())
-            painter.drawLine(point.x(), point.y() - arm, point.x(), point.y() - gap)
-            painter.drawLine(point.x(), point.y() + gap, point.x(), point.y() + arm)
+        painter.save()
+        try:
+            painter.setClipRect(self._get_target_window_rect(), Qt.ClipOperation.IntersectClip)
+            for pen in (QPen(outer, 3), QPen(inner, 1)):
+                painter.setPen(pen)
+                painter.drawLine(point.x() - arm, point.y(), point.x() - gap, point.y())
+                painter.drawLine(point.x() + gap, point.y(), point.x() + arm, point.y())
+                painter.drawLine(point.x(), point.y() - arm, point.x(), point.y() - gap)
+                painter.drawLine(point.x(), point.y() + gap, point.x(), point.y() + arm)
+        finally:
+            painter.restore()
 
     def _get_picker_color(self, color_key):
         return QColor(theme_color(color_key))
@@ -941,7 +963,7 @@ class ColorCoordinatePickerOverlay(QWidget):
         self._draw_live_aim_marker(painter)
 
         # 绘制放大镜预览
-        if self.magnifier_enabled and not self.mouse_pos.isNull() and self.window_info:
+        if self.magnifier_enabled and self.window_info:
             if self._is_point_in_target_window(self.mouse_pos):
                 self._draw_magnifier(painter, self.mouse_pos)
 
@@ -993,8 +1015,6 @@ class ColorCoordinatePickerOverlay(QWidget):
 
             # 坐标与颜色文本
             center_color = self._get_pixel_color_from_screenshot(center_x, center_y)
-            if center_color is None:
-                center_color = self._get_pixel_color_at_position(center_x, center_y)
 
             if center_color:
                 r, g, b = center_color
@@ -1046,6 +1066,11 @@ class ColorCoordinatePickerOverlay(QWidget):
         hidden_count = self.window_hider.hide_all()
         logger.info(f"已隐藏 {hidden_count} 个窗口以避免颜色干扰找色")
 
+        # 首帧直接读取当前光标，不依赖首次 mouseMoveEvent。
+        self.mouse_pos = self.mapFromGlobal(QCursor.pos())
+        self._sync_aim_from_mouse(self.mouse_pos)
+        self._last_magnifier_mouse_pos = QPoint(self.mouse_pos)
+        self._input_ready_deadline = time.monotonic() + 3.0
         self.input_monitor.start()
 
     def _on_monitor_ready(self):
@@ -1090,14 +1115,23 @@ class ColorCoordinatePickerOverlay(QWidget):
             self.original_mouse_pos = None
 
     def _ensure_ready_for_input(self):
-        """确保覆盖层准备好接收输入"""
-        ensure_overlay_ready_for_input(
-            self,
-            log_prefix='颜色取点覆盖层',
-            ready_message='颜色坐标选择器已就绪，可以接收输入',
-            retry_message='颜色坐标选择器未能激活（尝试 {attempt}/{max_attempts}），用户首次点击可能需要激活窗口',
-            exhausted_message='无法取得输入焦点，取色已取消',
-        )
+        """首次原生窗口可能尚未曝光，在有界期限内等待真实输入就绪。"""
+        if self._closing or not self.isVisible():
+            return False
+        if self._is_ready_for_input:
+            self._input_ready_deadline = None
+            return True
+        window = self.windowHandle()
+        if window is not None and window.isExposed():
+            if grab_overlay_input(self, log_prefix='颜色取点覆盖层', activate=True):
+                self._is_ready_for_input = True
+                self._input_ready_deadline = None
+                return True
+        if self._input_ready_deadline is None or time.monotonic() >= self._input_ready_deadline:
+            self._on_monitor_failed("取色覆盖层未能完成显示或取得输入焦点，请重新取色")
+            return False
+        schedule_overlay_callback(self, 50, self._ensure_ready_for_input)
+        return False
 
     def mouseMoveEvent(self, event):
         """鼠标移动事件 - 仅局部刷新放大镜区域，避免全屏重绘卡顿"""
@@ -1116,12 +1150,16 @@ class ColorCoordinatePickerOverlay(QWidget):
         event.accept()
 
     def _update_magnifier(self):
-        """定时更新放大镜（仅在鼠标位置变化时局部刷新）"""
+        """读取真实光标，仅在位置变化时刷新，避免首次输入事件缺失。"""
         if getattr(self, "_closing", False):
             return
-        if not self.magnifier_enabled or self.mouse_pos.isNull():
+        if not self.magnifier_enabled:
             return
 
+        cursor_pos = self.mapFromGlobal(QCursor.pos())
+        if cursor_pos != self.mouse_pos:
+            self.mouse_pos = cursor_pos
+            self._sync_aim_from_mouse(cursor_pos)
         if self.mouse_pos == self._last_magnifier_mouse_pos:
             return
 
@@ -1167,6 +1205,7 @@ class ColorCoordinatePickerOverlay(QWidget):
             if self._is_point_in_target_window(event.pos()):
                 logger.info("[鼠标事件] 点击位置在目标窗口内")
                 self.click_pos = event.pos()
+                self._sync_aim_from_mouse(self.click_pos)
 
                 # 键盘微调后以瞄准像素为准，避免高 DPI 下点击坐标被量化偏移
                 aim = self._resolve_aim_client_pos(event.pos())
@@ -1202,6 +1241,9 @@ class ColorCoordinatePickerOverlay(QWidget):
 
     def _sync_aim_from_mouse(self, overlay_pos: QPoint):
         """鼠标移动时更新瞄准点；若仍停在键盘微调的同一视觉像素上则保持客户区坐标。"""
+        if not self._is_point_in_target_window(overlay_pos):
+            self._aim_client_pos = self._aim_overlay_pos = None
+            return
         locked = self._aim_overlay_pos
         if locked is not None and self._aim_client_pos is not None:
             if abs(int(overlay_pos.x()) - int(locked.x())) <= 1 and abs(int(overlay_pos.y()) - int(locked.y())) <= 1:
@@ -1256,7 +1298,7 @@ class ColorCoordinatePickerOverlay(QWidget):
         logger.debug("找色瞄准微调: (%s, %s) -> (%s, %s)", aim[0], aim[1], next_x, next_y)
 
     def keyPressEvent(self, event):
-        """键盘事件。方向键由全局钩子优先处理；钩子未生效时这里兜底。"""
+        """处理覆盖层收到的取消与方向键事件。"""
         logger.info(f"[键盘事件] 接收到键盘事件: 键={event.key()}")
         if event.key() == Qt.Key.Key_Escape:
             logger.info("ESC键退出")
@@ -1284,6 +1326,7 @@ class ColorCoordinatePickerOverlay(QWidget):
             return
         self._resources_released = True
         self._closing = True
+        self._input_ready_deadline = None
         release_overlay_input(self)
         self.magnifier_timer.stop()
         self.timeout_timer.stop()
@@ -1304,6 +1347,7 @@ class ColorCoordinatePickerOverlay(QWidget):
         self._magnifier_cache_center = self._magnifier_cache_pixmap = None
         self._aim_client_pos = self._aim_overlay_pos = self.original_mouse_pos = None
         self.selected_points.clear()
+        self._initial_point_count = 0
         self.selected_color = None
 
     def _notify_closed(self):

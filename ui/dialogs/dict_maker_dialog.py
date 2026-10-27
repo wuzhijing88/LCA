@@ -8,7 +8,8 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
+from shiboken6 import isValid
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -143,18 +144,9 @@ class _SourceImageView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        self.apply_theme()
         self._rebuild_scene()
 
-    def apply_theme(self) -> None:
-        border = theme_color("border", "#3e3e3e")
-        background = theme_color("canvas", "#252525")
-        self.setStyleSheet(
-            f"QGraphicsView#dictSourceView {{ border: 1px solid {border}; background: {background}; border-radius: 4px; }}"
-        )
-
     def refresh_theme(self) -> None:
-        self.apply_theme()
         self._rebuild_scene()
         if self._fitted:
             self.fit_image()
@@ -316,14 +308,14 @@ class _SourceImageView(QGraphicsView):
 
     def _show_placeholder(self) -> None:
         text = self._scene.addSimpleText(self._placeholder)
-        text.setBrush(QBrush(QColor(theme_color("text_secondary", "#888888"))))
+        text.setBrush(QBrush(QColor(theme_color("text_secondary"))))
         self._scene.setSceneRect(text.boundingRect())
         self.resetTransform()
 
     def _draw_exclusions(self) -> None:
         if self._item is None or not self._excluded:
             return
-        color = QColor(theme_color("error", "#e81123"))
+        color = QColor(theme_color("error"))
         color.setAlpha(180)
         brush = QBrush(color)
         pen = QPen(Qt.PenStyle.NoPen)
@@ -457,6 +449,7 @@ class _SourceImageView(QGraphicsView):
 class _ClickImageLabel(QLabel):
     def __init__(self, on_click, placeholder: str, parent=None, on_right_click=None):
         super().__init__(parent)
+        self.setObjectName("dictBinaryPreview")
         self._on_click = on_click
         self._on_right_click = on_right_click
         self._image: Optional[np.ndarray] = None
@@ -467,15 +460,6 @@ class _ClickImageLabel(QLabel):
         self.setMinimumSize(240, 140)
         self.setText(placeholder)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        self.apply_theme()
-
-    def apply_theme(self) -> None:
-        border = theme_color("border", "#3e3e3e")
-        muted = theme_color("text_secondary", "#888888")
-        background = theme_color("canvas", "#252525")
-        self.setStyleSheet(
-            f"QLabel {{ border: 1px solid {border}; background: {background}; color: {muted}; border-radius: 4px; }}"
-        )
 
     def set_image(self, image: Optional[np.ndarray]) -> None:
         self._image = image
@@ -639,6 +623,9 @@ class DictMakerDialog(QDialog):
         self._loaded_library_count = 0
         self._syncing_labels = False
         self._selector = None
+        self._selector_connections = []
+        self._selection_snapshot: Optional[np.ndarray] = None
+        self._capture_generation = 0
         self.saved_dict_path = ""
         self.saved_color_format = ""
         self._build_ui()
@@ -847,19 +834,40 @@ class DictMakerDialog(QDialog):
         callback = self._on_theme_changed
         manager.register_theme_change_callback(callback)
         self.destroyed.connect(lambda: manager.unregister_theme_change_callback(callback))
+        self.destroyed.connect(lambda: self._release_capture_resources())
 
     def _forget_theme_callback(self, _=None) -> None:
         get_theme_manager().unregister_theme_change_callback(self._on_theme_changed)
 
     def done(self, result: int) -> None:
         self._forget_theme_callback()
-        self._release_sample()
+        self._release_capture_resources()
         super().done(int(result))
 
     def closeEvent(self, event) -> None:
         self._forget_theme_callback()
-        self._release_sample()
+        self._release_capture_resources()
         super().closeEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._release_region_selector()
+        super().hideEvent(event)
+
+    def _release_capture_resources(self) -> None:
+        self._release_region_selector()
+        self._release_sample()
+
+    def _release_region_selector(self) -> None:
+        self._capture_generation += 1
+        selector, self._selector = self._selector, None
+        connections, self._selector_connections = self._selector_connections, []
+        self._selection_snapshot = None
+        if selector is not None and isValid(selector):
+            for connection in connections:
+                QObject.disconnect(connection)
+            selector.close()
+            selector.hide()
+            selector.deleteLater()
 
     def _on_theme_changed(self, _theme=None) -> None:
         self._apply_styles()
@@ -876,33 +884,7 @@ class DictMakerDialog(QDialog):
         return wrap
 
     def _apply_styles(self) -> None:
-        muted = theme_color("text_secondary", "#888888")
-        hover = theme_color("hover", "#3a3a3a")
-        accent = theme_color("accent", "#0078d4")
-        preview_bg = "#111111"
-        self.label_box.setStyleSheet(
-            f"""
-            QFrame#dictGlyphRow {{
-                background: transparent;
-                border: 1px solid transparent;
-                border-radius: 6px;
-            }}
-            QFrame#dictGlyphRow:hover {{
-                background: {hover};
-            }}
-            QFrame#dictGlyphRow[selected="true"] {{
-                background: {hover};
-                border: 1px solid {accent};
-            }}
-            QLabel#dictGlyphPreview {{
-                background: {preview_bg};
-                border-radius: 4px;
-            }}
-            """
-        )
-        self.status_label.setStyleSheet(f"color: {muted};")
         self.source_view.refresh_theme()
-        self.binary_label.apply_theme()
         self.binary_label.update()
 
     def _load_initial_state(self) -> None:
@@ -1078,35 +1060,78 @@ class DictMakerDialog(QDialog):
         self._load_dict_glyphs()
 
     def _pick_region(self) -> None:
+        if self._selector is not None:
+            return
         if self._hwnd <= 0:
             QMessageBox.warning(self, "制作字库", "请先绑定目标窗口")
             return
         from ui.selectors.ocr_region_selector import OCRRegionSelectorWidget
 
-        self._selector = OCRRegionSelectorWidget(self)
-        self._selector.set_target_window_hwnd(self._hwnd)
-        self._selector.region_selected.connect(self._on_region_selected)
-        self._selector.start_selection()
+        generation = self._capture_generation
+        try:
+            image = self._capture_sample_frame()
+            if not isValid(self) or generation != self._capture_generation:
+                return
+            self._selection_snapshot = image.copy()
+            self._selector = OCRRegionSelectorWidget(self)
+            self._selector.set_target_window_hwnd(self._hwnd)
+            self._selector_connections = [
+                self._selector.region_selected.connect(self._on_region_selected),
+                self._selector.selection_finished.connect(self._release_region_selector),
+            ]
+            self._selector.start_selection()
+        except Exception as exc:
+            notify = isValid(self) and generation == self._capture_generation
+            self._release_region_selector()
+            logger.exception("字库框选取样失败")
+            if notify:
+                QMessageBox.warning(self, "制作字库", f"框选取样失败：{exc}")
 
     def _on_region_selected(self, x: int, y: int, width: int, height: int) -> None:
+        image = self._selection_snapshot
+        self._release_region_selector()
+        if image is None:
+            QMessageBox.warning(self, "制作字库", "框选原图已释放，请重新框选取样")
+            return
         self._region = (int(x), int(y), int(width), int(height))
-        self._capture_current_region()
+        self._apply_capture_region(image)
 
     def _capture_current_region(self) -> None:
+        if self._selector is not None:
+            QMessageBox.warning(self, "制作字库", "请先完成或取消当前框选取样")
+            return
         if self._hwnd <= 0:
             QMessageBox.warning(self, "制作字库", "请先绑定目标窗口")
             return
+        generation = self._capture_generation
+        try:
+            image = self._capture_sample_frame()
+            if isValid(self) and generation == self._capture_generation:
+                self._apply_capture_region(image)
+        except Exception as exc:
+            logger.exception("字库截图失败")
+            if isValid(self) and generation == self._capture_generation:
+                QMessageBox.warning(self, "制作字库", f"截图失败：{exc}")
+
+    def _capture_sample_frame(self) -> np.ndarray:
         from tasks.ocr_region_recognition import (
             _align_window_image_to_client_area,
             _capture_window_for_ocr,
-            _extract_effective_ocr_roi,
         )
 
         image = _capture_window_for_ocr(self._hwnd, timeout=4.0)
         if image is None:
-            QMessageBox.warning(self, "制作字库", "截图失败")
-            return
+            raise RuntimeError("截图失败，无法获取绑定目标画面")
         image = _align_window_image_to_client_area(image, self._hwnd)
+        if not isinstance(image, np.ndarray) or image.size == 0:
+            raise ValueError("截图原图为空")
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("截图原图必须是三通道 BGR 图像")
+        return image
+
+    def _apply_capture_region(self, image: np.ndarray) -> None:
+        from tasks.ocr_region_recognition import _extract_effective_ocr_roi
+
         x, y, width, height = self._region
         roi, final_x, final_y, final_w, final_h, desc = _extract_effective_ocr_roi(
             window_image=image,
@@ -1120,7 +1145,7 @@ class DictMakerDialog(QDialog):
             QMessageBox.warning(self, "制作字库", "截到的区域是空的")
             return
         self._region = (final_x, final_y, final_w, final_h)
-        self._set_sample_image(roi)
+        self._set_sample_image(roi.copy())
         self.status_label.setText(f"已截图 {desc}")
 
     def _set_sample_image(self, roi: np.ndarray) -> None:
@@ -1139,16 +1164,24 @@ class DictMakerDialog(QDialog):
     def _release_sample(self) -> None:
         self._split_lines.clear()
         self._horizontal_split_lines.clear()
-        self.source_view.clear_image()
-        self.binary_label.set_split_lines((), ())
-        self.binary_label.set_image(None)
+        if isValid(self.source_view):
+            self.source_view.clear_image()
+        else:
+            self.source_view._image = None
+            self.source_view._item = None
+        if isValid(self.binary_label):
+            self.binary_label.set_split_lines((), ())
+            self.binary_label.set_image(None)
+        else:
+            self.binary_label._image = None
         self._binary = None
         self._roi = None
         self._excluded_pixels.clear()
         self._glyphs.clear()
         self._library_ids.clear()
         self._rows.clear()
-        self._clear_glyph_list()
+        if isValid(self.glyph_list):
+            self._clear_glyph_list()
 
     def _sync_split_lines(self) -> None:
         self.source_view.set_split_lines(self._split_lines, self._horizontal_split_lines)

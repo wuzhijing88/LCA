@@ -1,11 +1,12 @@
 """连线图元与显示运行时。拓扑修改和轨道规划不属于绘制层。"""
 from collections import Counter
+from contextlib import contextmanager
 from enum import Enum
-from math import hypot, isfinite
+from math import hypot
 from time import perf_counter
 import weakref
 
-from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtCore import QObject, QPointF, Qt, QTimer, Slot
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPainterPathStroker, QPen
 from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsObject
 from shiboken6 import isValid
@@ -44,14 +45,18 @@ def painter_path_from_points(points):
     return path
 
 
-class _ConnectionDisplay:
+class _ConnectionDisplay(QObject):
     """可见连线共用一个计时器；悬停优先于点击选中的聚焦状态。"""
     def __init__(self):
+        super().__init__()
         self.mounted = weakref.WeakValueDictionary()
+        self.scenes = weakref.WeakKeyDictionary()
+        self.focused = weakref.WeakKeyDictionary()
+        self.dirty_scenes = weakref.WeakSet()
+        self.batch_depth = 0
         self.pauses = Counter()
         self.timer = None
         self.overview = False
-        self.zoom = 1.0
         self.theme_registered = False
         self.last_tick = None
         self.application_ref = None
@@ -64,11 +69,14 @@ class _ConnectionDisplay:
             app = QApplication.instance()
             if app is None:
                 raise RuntimeError("挂载连线前必须创建应用程序")
+            self.setParent(app)
             self.application_ref = weakref.ref(app)
             app.aboutToQuit.connect(self.shutdown)
             app.destroyed.connect(self.shutdown)
         self.mounted[id(line)] = line
-        line._mounted_scene_ref = weakref.ref(line.scene())
+        scene = line.scene()
+        line._mounted_scene_ref = weakref.ref(scene)
+        self.scenes.setdefault(scene, weakref.WeakSet()).add(line)
         if not self.theme_registered:
             get_theme_manager().register_theme_change_callback(self.theme_changed)
             self.theme_registered = True
@@ -84,6 +92,12 @@ class _ConnectionDisplay:
             if line._mounted_scene_ref is not None:
                 scene = line._mounted_scene_ref()
                 line._mounted_scene_ref = None
+                if scene in self.scenes:
+                    self.scenes[scene].discard(line)
+                    if not self.scenes[scene]:
+                        del self.scenes[scene]
+                        self.focused.pop(scene, None)
+                        self.dirty_scenes.discard(scene)
         return scene
 
     def detach(self, identity):
@@ -94,7 +108,7 @@ class _ConnectionDisplay:
         self.last_tick = None
         if timer is not None and isValid(timer):
             timer.stop()
-            timer.timeout.disconnect(animate_all_lines)
+            timer.timeout.disconnect(self.tick)
             timer.deleteLater()
 
     def release_callbacks(self):
@@ -108,12 +122,16 @@ class _ConnectionDisplay:
                 app.aboutToQuit.disconnect(self.shutdown)
                 app.destroyed.disconnect(self.shutdown)
 
+    @Slot()
     def shutdown(self):
         """退出先停止显示运行时，后续图元销毁只解除登记。"""
         self.stopping = True
         for identity in tuple(self.mounted):
             self.forget(identity)
         _animated_lines.clear()
+        self.scenes.clear()
+        self.focused.clear()
+        self.dirty_scenes.clear()
         self.pauses.clear()
         self.stop_timer()
         self.release_callbacks()
@@ -121,11 +139,20 @@ class _ConnectionDisplay:
     def focus_changed(self, scene):
         if self.stopping:
             return
-        if scene is not None and isValid(scene):
-            lines = [line for line in self.mounted.values()
-                     if isValid(line) and not line._disposed and line.scene() is scene]
-            self.apply_focus(lines)
+        if scene is not None and isValid(scene) and scene in self.scenes:
+            self.dirty_scenes.add(scene)
         self.refresh()
+
+    @contextmanager
+    def batch(self):
+        self.batch_depth += 1
+        self.stop_timer()
+        try:
+            yield
+        finally:
+            self.batch_depth -= 1
+            if not self.batch_depth:
+                self.refresh()
 
     @staticmethod
     def focused_lines(lines):
@@ -151,7 +178,7 @@ class _ConnectionDisplay:
                 line.set_line_color()
 
     @staticmethod
-    def visible(line, rects):
+    def visible(line, rects, *, animated=False):
         if not isValid(line) or not line.isVisible():
             return False
         scene = line.scene()
@@ -159,6 +186,8 @@ class _ConnectionDisplay:
             return False
         for view in scene.views():
             if not isValid(view) or not view.isVisible():
+                continue
+            if animated and abs(view.transform().m11()) < 0.45:
                 continue
             viewport = view.viewport()
             if viewport is None or not isValid(viewport) or not viewport.isVisible():
@@ -171,32 +200,40 @@ class _ConnectionDisplay:
         return False
 
     def refresh(self):
-        if self.stopping:
+        if self.stopping or self.batch_depth:
             return
-        rects = {}
         _animated_lines.clear()
-        scenes = {}
-        visible_lines = set()
-        cleared_hover_scenes = set()
-        for identity, line in tuple(self.mounted.items()):
-            if not isValid(line) or line._disposed:
-                self.forget(identity)
-            else:
-                scene = line.scene()
-                if scene is None or not isValid(scene):
-                    self.forget(identity)
+        for scene, registered in tuple(self.scenes.items()):
+            if not isValid(scene):
+                continue
+            if scene in self.dirty_scenes:
+                self.focused[scene] = weakref.WeakSet(self.apply_focus(registered))
+                self.dirty_scenes.discard(scene)
+            visible_lines, animatable = set(), set()
+            for view in scene.views():
+                if not isValid(view) or not view.isVisible() or not view.viewport().isVisible():
                     continue
-                scenes.setdefault(scene, []).append(line)
-                if self.visible(line, rects):
-                    visible_lines.add(line)
-                elif line._hovered:
+                rect = view.mapToScene(view.viewport().rect()).boundingRect().adjusted(-30, -30, 30, 30)
+                flowing = abs(view.transform().m11()) >= 0.45
+                for line in scene.items(rect, Qt.ItemSelectionMode.IntersectsItemBoundingRect):
+                    if not isinstance(line, ConnectionLine) or line._disposed:
+                        continue
+                    if line._shape.intersects(line.mapFromScene(rect).boundingRect()):
+                        visible_lines.add(line)
+                        if flowing:
+                            animatable.add(line)
+            focused = self.focused.get(scene, ())
+            cleared_hover = False
+            for line in tuple(focused):
+                if line._hovered and line not in visible_lines:
                     line._hovered = False
                     line.update()
-                    cleared_hover_scenes.add(scene)
-        for scene, lines in scenes.items():
-            focused = self.apply_focus(lines) if scene in cleared_hover_scenes else self.focused_lines(lines)
-            _animated_lines.update(line for line in lines if line in visible_lines and (not focused or line in focused))
-        running = bool(_animated_lines) and not self.pauses and not self.overview and self.zoom >= 0.45
+                    cleared_hover = True
+            if cleared_hover:
+                focused = self.apply_focus(registered)
+                self.focused[scene] = weakref.WeakSet(focused)
+            _animated_lines.update(line for line in animatable if not focused or line in focused)
+        running = bool(_animated_lines) and not self.pauses and not self.overview
         if running and self.timer is None:
             app = QApplication.instance()
             if app is None:
@@ -204,7 +241,7 @@ class _ConnectionDisplay:
             self.timer = QTimer(app)
             self.timer.setTimerType(Qt.TimerType.PreciseTimer)
             self.timer.setInterval(_ANIMATION_INTERVAL_MS)
-            self.timer.timeout.connect(animate_all_lines)
+            self.timer.timeout.connect(self.tick)
             self.last_tick = perf_counter()
             self.timer.start()
         elif not running and self.timer is not None:
@@ -212,10 +249,16 @@ class _ConnectionDisplay:
         if not self.mounted:
             self.release_callbacks()
 
+    @Slot()
     def tick(self):
-        self.refresh()
         if self.timer is None:
             return
+        rects = {}
+        if any(not isValid(line) or line._disposed or not self.visible(line, rects, animated=True)
+               for line in tuple(_animated_lines)):
+            self.refresh()
+            if self.timer is None:
+                return
         now = perf_counter()
         distance = min(now - self.last_tick, 0.1) * _DASH_SPEED
         self.last_tick = now
@@ -229,6 +272,10 @@ _display = _ConnectionDisplay()
 
 def refresh_line_animation_state():
     _display.refresh()
+
+
+def batch_line_display_updates():
+    return _display.batch()
 
 
 def clear_line_hover(scene):
@@ -260,20 +307,12 @@ def resume_line_animation(reason="default"):
     set_line_animation_paused(reason, False)
 
 
-def update_zoom_level(zoom_level):
-    if not isfinite(zoom_level) or zoom_level <= 0:
-        raise ValueError("连线缩放比例必须是正有限数")
-    _display.zoom = zoom_level
-    _display.refresh()
-
-
 def set_force_overview_mode(enabled):
     _display.overview = bool(enabled)
     _display.refresh()
 
 
 def get_line_animation_stats():
-    _display.refresh()
     return {"registered_lines": len(_display.mounted), "animatable_lines": len(_animated_lines),
             "paused": bool(_display.pauses), "pause_reasons": sorted(_display.pauses),
             "pause_counts": dict(_display.pauses), "timer_active": _display.timer is not None,

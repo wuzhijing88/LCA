@@ -696,42 +696,6 @@ class MainWindowRunWorkflowMixin:
 
                         single_card_data = copy.deepcopy(cards_dict[test_card_id])
 
-                        # 清除跳转相关参数，避免跳转到不存在的卡片
-
-                        params = single_card_data['parameters']
-
-                        # 列出所有可能包含卡片ID引用的参数键
-
-                        # 遍历所有参数，将值为整数且看起来像卡片ID的参数设置为None
-
-                        params_to_clear = []
-
-                        for key, value in list(params.items()):
-
-                            # 检查参数名是否包含跳转、目标、卡片等关键词
-
-                            key_lower = key.lower()
-
-                            if any(keyword in key_lower for keyword in ['jump', 'target', 'card_id', 'next', 'goto']):
-
-                                # 检查值是否像卡片ID（整数，包括0）
-
-                                # 注意：value >= 0 用于捕获跳转到ID为0的卡片的情况
-
-                                if isinstance(value, int) and value >= 0:
-
-                                    params_to_clear.append((key, value))
-
-                                    params[key] = None  # 设置为None，表示无跳转
-
-                        if params_to_clear:
-
-                            cleared_str = ', '.join([f"{k}={v}" for k, v in params_to_clear])
-
-                            logger.info(f"[单卡测试] 已清除跳转参数: {cleared_str}")
-
-                        single_card_data['parameters'] = params
-
                         # 只包含虚拟起点和测试卡片
 
                         cards_dict = {

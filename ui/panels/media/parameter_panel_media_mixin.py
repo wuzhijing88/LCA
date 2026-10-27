@@ -41,9 +41,13 @@ class ParameterPanelMediaMixin:
         else:
             file_filter = param_def.get('file_filter', '所有文件 (*)')
 
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "选择文件", self._resource_dialog_start_dir(param_def), file_filter
-        )
+        param_name = self._get_registered_widget_name(line_edit)
+        try:
+            start_dir = self._resource_dialog_start_dir({**param_def, "name": param_name})
+        except (ValueError, RuntimeError) as exc:
+            QMessageBox.critical(self, "导入失败", str(exc))
+            return
+        filename, _ = QFileDialog.getOpenFileName(self, "选择文件", start_dir, file_filter)
         if filename:
             if self._is_yolo_model_param(param_def) and not filename.lower().endswith('.onnx'):
                 ext = filename.rsplit('.', 1)[-1] if '.' in filename else ''
@@ -55,7 +59,6 @@ class ParameterPanelMediaMixin:
                 )
                 return
 
-            param_name = self._get_registered_widget_name(line_edit)
             kind = self._is_yolo_model_param(param_def)
             if "resource_kind" in param_def:
                 from app_core.card_plugins import RESOURCE_FOLDERS
@@ -94,6 +97,11 @@ class ParameterPanelMediaMixin:
 
     def _resource_dialog_start_dir(self, param_def: Optional[Dict[str, Any]] = None) -> str:
         param_def = param_def if isinstance(param_def, dict) else {}
+        if self.current_task_type == "子工作流" and param_def.get("name") == "workflow_file":
+            from app_core.lca_format.sub_workflow_project import SUB_WORKFLOW_DIRECTORY, require_main_workflow_path
+
+            parent = require_main_workflow_path(self._sub_workflow_parent_filepath())
+            return str(parent.parent / SUB_WORKFLOW_DIRECTORY)
         if "resource_kind" in param_def:
             from app_core.card_plugins import RESOURCE_FOLDERS
             return str(getattr(self, RESOURCE_FOLDERS[param_def["resource_kind"]][1]) or "")
@@ -106,8 +114,7 @@ class ParameterPanelMediaMixin:
                 bundled,
             )
         name = str(param_def.get("name") or "").strip().lower()
-        key = str(param_def.get("key") or "").strip().lower()
-        combined = f"{name} {key}"
+        combined = name
         if "replay" in combined:
             return str(getattr(self, "replays_dir", "") or "").strip()
         if "dict" in combined or "字库" in str(param_def.get("label") or ""):
@@ -124,14 +131,11 @@ class ParameterPanelMediaMixin:
             return
 
         try:
-            if self.main_window and hasattr(self.main_window, 'workflow_tab_widget'):
+            if self.main_window:
                 tab_widget = self.main_window.workflow_tab_widget
-                parent_workflow_file = None
-                if hasattr(tab_widget, "_get_current_workflow_filepath"):
-                    parent_workflow_file = tab_widget._get_current_workflow_filepath()
                 tab_widget.open_sub_workflow(
                     workflow_file,
-                    parent_workflow_file=parent_workflow_file,
+                    parent_workflow_file=tab_widget._get_current_workflow_filepath(),
                 )
                 logger.info(f"[子工作流] 已请求打开: {workflow_file}")
             else:
@@ -327,7 +331,16 @@ class ParameterPanelMediaMixin:
         self._current_screenshot_param_name = None
         self._screenshot_overlay = None
 
+    def _sub_workflow_parent_filepath(self) -> str:
+        if self.main_window is None:
+            raise ValueError("当前主工作流未绑定，无法导入子工作流")
+        return str(self.main_window.workflow_tab_widget._get_current_workflow_filepath() or "")
+
     def _store_resource_in_workspace(self, filepath: str, param_name: Optional[str] = None) -> str:
+        if self.current_task_type == "子工作流" and param_name == "workflow_file":
+            from app_core.lca_format.sub_workflow_project import import_sub_workflow
+
+            return import_sub_workflow(filepath, self._sub_workflow_parent_filepath())
         from task_workflow.script_resources import place_resource_file, resource_kind
 
         kind = ""

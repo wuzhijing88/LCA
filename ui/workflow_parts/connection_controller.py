@@ -1,5 +1,6 @@
 """画布连线控制器：拓扑登记、原子编辑、参数同步和局部路由。"""
 from collections import deque
+from PySide6.QtCore import QObject, Slot
 from shiboken6 import isValid
 
 from .connection_geometry import EdgeRequest, EdgeRoute, LINE_TYPES
@@ -13,11 +14,12 @@ def edge_data(line):
             "line_type": line.line_type}
 
 
-class ConnectionController:
+class ConnectionController(QObject):
     BRANCH_PARAMETER_KEYS = ("on_success", "success_jump_target_id",
                              "on_failure", "failure_jump_target_id")
 
     def __init__(self, view):
+        super().__init__(view)
         self.view = view
         self.router = OrthogonalRouter()
         view.destroyed.connect(self.dispose)
@@ -50,6 +52,7 @@ class ConnectionController:
         lines = list(view.connections)
         affected = lines if moving is None else [line for line in lines if line.start_item in moving or line.end_item in moving or not line.route_points()]
         if not affected:
+            view._refresh_viewport_animations()
             return
         changed = set(affected)
         retained = [line for line in lines if line not in changed]
@@ -63,6 +66,7 @@ class ConnectionController:
                 card._last_group_pos = card.pos()
         finally:
             view._rerouting_connections = False
+        view._refresh_viewport_animations()
 
     def validate_endpoints(self, source, target, kind):
         view = self.view
@@ -190,9 +194,10 @@ class ConnectionController:
     def add(self, source, target, kind):
         view = self.view
         self.validate_endpoints(source, target, kind)
-        errors = self.errors()
-        if errors:
-            raise RuntimeError("；".join(errors))
+        if not view._loading_workflow:
+            errors = self.errors()
+            if errors:
+                raise RuntimeError("；".join(errors))
         existing = [line for line in source.connections if line.start_item is source and line.line_type == kind]
         line = next((line for line in existing if line.end_item is target), None)
         # 加载、粘贴和撤销只还原既有拓扑；互斥规则用于本次连线编辑。
@@ -364,6 +369,7 @@ class ConnectionController:
             elif len(existing) != 1 or existing[0].end_item is not target:
                 self.add(card, target, kind)
 
+    @Slot()
     def dispose(self):
         view = self.view
         self.view = None
@@ -381,6 +387,7 @@ class ConnectionController:
             TaskCard._stop_gradient_timer_if_idle()
             view._cancel_canvas_panning()
             view.cards.clear()
+            view._viewport_cards.clear()
             view.connections.clear()
             view.undo_stack.clear()
             view.flashing_card_ids.clear()

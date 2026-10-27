@@ -1,7 +1,8 @@
 from .workflow_view_common import *
 from shiboken6 import isValid
+import weakref
 
-from .connection_line import get_line_animation_stats, refresh_line_animation_state, set_force_overview_mode, update_zoom_level
+from .connection_line import get_line_animation_stats, refresh_line_animation_state, set_force_overview_mode
 
 operation_logger = logging.getLogger("workflow.operations")
 
@@ -124,7 +125,7 @@ class WorkflowViewRenderMixin:
         根据卡片数量和是否在视口内调整缓存与阴影，画面外的卡片卸掉图形资源。
         """
         self._sync_render_cache_guard()
-        if self._resources_cleaned_up:
+        if self._resources_cleaned_up or self._loading_workflow:
             return
         card_count = len(self.cards)
 
@@ -141,10 +142,15 @@ class WorkflowViewRenderMixin:
         rebuild_cache = last_zoom is not None and abs(zoom - last_zoom) > 1e-4
         self._card_cache_zoom = zoom
 
-        viewport_rect_cache = {}
-        scene_views_cache = {}
-        for card in list(self.cards.values()):
-            in_view = TaskCard._is_card_in_viewport(card, viewport_rect_cache, scene_views_cache)
+        visible_cards = set()
+        if self.isVisible() and self.viewport().isVisible():
+            rect = self.mapToScene(self.viewport().rect()).boundingRect().adjusted(-30, -30, 30, 30)
+            visible_cards = {card for card in self.scene.items(rect, Qt.ItemSelectionMode.IntersectsItemBoundingRect)
+                             if isinstance(card, TaskCard) and self.cards.get(card.card_id) is card}
+        for card in visible_cards | set(self._viewport_cards):
+            if not isValid(card):
+                continue
+            in_view = card in visible_cards
             card_disable_shadow = disable_shadow or not in_view
             # 设备坐标缓存按当前像素烘焙，视图缩放不会自动重建；再叠阴影会裁切或看起来像另一种缩放。
             card_disable_cache = disable_cache or not in_view or not card_disable_shadow
@@ -158,6 +164,7 @@ class WorkflowViewRenderMixin:
             if shadow_changed:
                 card.set_shadow_rendering_enabled(target_shadow_enabled)
             self._apply_card_cache_mode(card, target_mode, rebuild=rebuild_cache or shadow_changed)
+        self._viewport_cards = weakref.WeakSet(visible_cards)
 
         should_clear_pixmap_cache = (
             (self._cache_policy_cache_disabled is False and disable_cache is True)
@@ -327,6 +334,7 @@ class WorkflowViewRenderMixin:
         else:
             # 注释已清理（原注释编码损坏）
             self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio) # Fit to initial rect or default
+        self._notify_zoom_level_changed()
 
     def _scene_alive_for_center(self):
         from shiboken6 import isValid
@@ -466,7 +474,6 @@ class WorkflowViewRenderMixin:
 
     def _notify_zoom_level_changed(self):
         """通知连线动画系统当前缩放级别。"""
-        update_zoom_level(self.transform().m11())
         self._refresh_viewport_animations()
 
     def refresh_all_cards_theme(self):
@@ -525,9 +532,9 @@ class WorkflowViewRenderMixin:
             return
         if not force and self._drag_preview_mode:
             return
-        TaskCard.sync_viewport_animations(self)
-        refresh_line_animation_state()
         self._update_card_render_cache_policy()
+        TaskCard.sync_viewport_animations(self, set(self._viewport_cards))
+        refresh_line_animation_state()
 
     def _handle_scroll_change(self, value: int):
         """滚动后同步场景范围，并按可见区域开关动画。"""

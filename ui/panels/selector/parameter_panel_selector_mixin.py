@@ -544,6 +544,9 @@ class ParameterPanelSelectorMixin:
         layout.addWidget(info_label)
 
         color_picker = ColorCoordinatePickerWidget(dialog)
+        # 取色会临时隐藏参数页，沿用工具启动保护，避免 hideEvent 卸载本轮对话框。
+        color_picker.select_button.clicked.disconnect(color_picker.start_selection)
+        color_picker.select_button.clicked.connect(partial(self._start_parameter_tool, color_picker))
         dialog.finished.connect(lambda: dialog.setProperty("parameterDisposed", True))
         dialog.finished.connect(color_picker.cleanup)
         dialog.destroyed.connect(color_picker.cleanup)
@@ -848,6 +851,9 @@ class ParameterPanelSelectorMixin:
         if self.offset_selector is None:
             self.offset_selector = self._own_parameter_tool(OffsetSelectorWidget(self))
             self.offset_selector.offset_selected.connect(self._handle_offset_selected)
+            self.offset_selector.selection_finished.connect(
+                self.offset_selector.close, Qt.ConnectionType.QueuedConnection,
+            )
         return self.offset_selector
 
     def _select_offset(self, param_name):

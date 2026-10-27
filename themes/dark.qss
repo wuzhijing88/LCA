@@ -294,6 +294,36 @@ QLineEdit, QTextEdit, QTextBrowser, QPlainTextEdit {
     selection-color: #ffffff;
 }
 
+QGraphicsView#dictSourceView, QLabel#dictBinaryPreview {
+    border: 1px solid #3e3e3e;
+    background: #252525;
+    border-radius: 4px;
+}
+
+QLabel#dictBinaryPreview, QLabel#dictStatusLabel {
+    color: #b0b0b0;
+}
+
+QFrame#dictGlyphRow {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+}
+
+QFrame#dictGlyphRow:hover {
+    background: #3a3a3a;
+}
+
+QFrame#dictGlyphRow[selected="true"] {
+    background: #3a3a3a;
+    border: 1px solid #0078d4;
+}
+
+QLabel#dictGlyphPreview {
+    background: #111111;
+    border-radius: 4px;
+}
+
 QLineEdit#dictGlyphTextEdit {
     padding-left: 6px;
     padding-right: 6px;

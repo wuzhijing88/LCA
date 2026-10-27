@@ -133,6 +133,7 @@ class ScriptCodeEdit(QPlainTextEdit):
             self.viewport().setMouseTracking(True)
             self.viewport().installEventFilter(self)
             self.cursorPositionChanged.connect(self._on_cursor_moved)
+            self.setTabStopDistance(4 * self.fontMetrics().horizontalAdvance(" "))
             self._update_line_number_width(0)
             self._highlight_current_line()
 
@@ -168,6 +169,10 @@ class ScriptCodeEdit(QPlainTextEdit):
                 lines.add(block.blockNumber() + 1)
             block = block.next()
         return lines
+
+    def has_breakpoint(self, line: int) -> bool:
+        block = self.document().findBlockByNumber(int(line) - 1)
+        return block.isValid() and self._block_has_breakpoint(block)
 
     def _publish_breakpoints(self, *, force: bool) -> None:
         lines = self.breakpoint_lines()
@@ -340,9 +345,12 @@ class ScriptCodeEdit(QPlainTextEdit):
             apply_transparent_popup_palette(viewport)
             viewport.setPalette(palette)
 
-    def setFont(self, font) -> None:
-        super().setFont(font)
-        self._update_line_number_width()
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange:
+            self.setTabStopDistance(4 * self.fontMetrics().horizontalAdvance(" "))
+            if getattr(self, "_line_area", None) is not None:
+                self._update_line_number_width()
 
     def cursor_location(self) -> Tuple[int, int]:
         cursor = self.textCursor()

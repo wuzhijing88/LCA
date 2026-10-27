@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import shutil
+import tempfile
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,7 @@ from utils.app_paths import (
 )
 
 WORKFLOW_RESOURCE_SUBDIRS = ("images", "sounds", "dicts", "yolo", "replays")
+SUB_WORKFLOW_DIRECTORY = "子工作流"
 _WORKFLOW_FILE_EXTENSIONS = {".json", ".lca"}
 
 WORKSPACE_FAVORITES_SCHEMA_VERSION = 3
@@ -230,7 +232,11 @@ def project_resource_dirs(resource_path: str) -> Dict[str, Any]:
         "dicts_dir": os.path.join(root, "dicts"),
         "yolo_dir": os.path.join(root, "yolo"),
         "replays_dir": os.path.join(root, "replays"),
-        "plugins_dir": get_plugin_dir(),
+        "plugins_dir": (
+            os.path.join(root, "plugins")
+            if os.path.basename(os.path.dirname(root)) == SUB_WORKFLOW_DIRECTORY
+            else get_plugin_dir()
+        ),
         "custom": True,
     }
 
@@ -529,13 +535,12 @@ def _normalize_workspace_entries(raw_workspaces: Any) -> List[str]:
     normalized_workspaces: List[str] = []
     seen = set()
     if not isinstance(raw_workspaces, list):
-        return normalized_workspaces
+        raise ValueError("工作区目录必须是字符串路径列表。")
 
     for item in raw_workspaces:
-        if isinstance(item, dict):
-            workspace_dir = normalize_workspace_dir(item.get("path"))
-        else:
-            workspace_dir = normalize_workspace_dir(item)
+        if not isinstance(item, str):
+            raise ValueError("工作区目录必须是字符串路径。")
+        workspace_dir = normalize_workspace_dir(item)
         if not workspace_dir or workspace_dir in seen:
             continue
         seen.add(workspace_dir)
@@ -546,13 +551,14 @@ def _normalize_workspace_entries(raw_workspaces: Any) -> List[str]:
 def _normalize_path_list(raw_paths: Any) -> List[str]:
     normalized: List[str] = []
     seen = set()
-    if not isinstance(raw_paths, list):
+    if raw_paths is None:
         return normalized
+    if not isinstance(raw_paths, list):
+        raise ValueError("工作流记录必须是字符串路径列表。")
     for item in raw_paths:
-        if isinstance(item, dict):
-            raw_path = str(item.get("filepath") or item.get("path") or "").strip()
-        else:
-            raw_path = str(item or "").strip()
+        if not isinstance(item, str):
+            raise ValueError("工作流记录必须是字符串路径。")
+        raw_path = item.strip()
         if not raw_path:
             continue
         abs_path = os.path.abspath(raw_path)
@@ -822,6 +828,8 @@ def load_workspace_favorites_snapshot(
     extra_paths = _normalize_path_list(data.get("extra_paths"))
 
     workspaces = _normalize_workspace_entries(raw_workspaces)
+    if len(workspaces) > 1:
+        raise ValueError("工作区记录无效：只允许保存一个工作区。")
     changed = False
 
     saved_favorites = raw_favorites if isinstance(raw_favorites, list) else []
@@ -869,6 +877,9 @@ def save_workspace_favorites_snapshot(
     excluded_paths: Optional[List[str]] = None,
     extra_paths: Optional[List[str]] = None,
 ) -> None:
+    normalized_workspaces = _normalize_workspace_entries(workspaces)
+    if len(workspaces) > 1:
+        raise ValueError("只允许保存一个工作区。")
     existing_excluded, existing_extras = _existing_snapshot_path_lists(config_path)
     if excluded_paths is None:
         excluded_paths = existing_excluded
@@ -876,14 +887,25 @@ def save_workspace_favorites_snapshot(
         extra_paths = existing_extras
     data = {
         "schema_version": WORKSPACE_FAVORITES_SCHEMA_VERSION,
-        "workspaces": [normalize_workspace_dir(path) for path in workspaces if normalize_workspace_dir(path)],
+        "workspaces": normalized_workspaces,
         "favorites": favorites,
         "excluded_paths": _normalize_path_list(excluded_paths),
         "extra_paths": _normalize_path_list(extra_paths),
     }
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    with open(config_path, "w", encoding="utf-8") as file_obj:
-        json.dump(data, file_obj, ensure_ascii=False, indent=2)
+    destination = os.path.abspath(config_path)
+    directory = os.path.dirname(destination)
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory, prefix=".workspace-", suffix=".tmp", delete=False,
+        ) as file_obj:
+            temporary_path = file_obj.name
+            json.dump(data, file_obj, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def _split_multi_image_value(raw_value: str) -> Tuple[List[str], str]:

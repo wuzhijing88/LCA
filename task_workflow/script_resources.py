@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from utils.app_paths import (
     get_app_root,
@@ -105,6 +105,17 @@ def strip_plugin_module_prefix(value: str) -> str:
     return "".join(out)
 
 
+def _call_name_before(text: str, end: int) -> str:
+    start = end - 1
+    while start >= 0:
+        current = text[start]
+        if current.isalnum() or current in "._" or "\u4e00" <= current <= "\u9fff":
+            start -= 1
+            continue
+        break
+    return text[start + 1 : end]
+
+
 def enclosing_call_name(source: str, pos: int) -> str:
     """字面量所在调用的命令名，例如 大漠内存.读取文本。"""
     text = str(source or "")
@@ -116,15 +127,7 @@ def enclosing_call_name(source: str, pos: int) -> str:
             depth += 1
         elif char == "(":
             if depth == 0:
-                end = index
-                start = index - 1
-                while start >= 0:
-                    current = text[start]
-                    if current.isalnum() or current in "._" or "\u4e00" <= current <= "\u9fff":
-                        start -= 1
-                        continue
-                    break
-                return text[start + 1 : end]
+                return _call_name_before(text, index)
             depth -= 1
         index -= 1
     return ""
@@ -159,6 +162,21 @@ def extract_string_literals(source: str) -> List[Tuple[str, int, int]]:
         else:
             break
     return items
+
+
+def _string_literals_with_calls(source: str) -> Iterator[Tuple[str, int, int, str]]:
+    text = str(source or "")
+    calls: List[str] = []
+    index = 0
+    for value, start, end in extract_string_literals(text):
+        while index < start:
+            char = text[index]
+            if char == "(":
+                calls.append(_call_name_before(text, index))
+            elif char == ")" and calls:
+                calls.pop()
+            index += 1
+        yield value, start, end, calls[-1] if calls else ""
 
 
 def resource_kind(path: str) -> str:
@@ -804,15 +822,19 @@ def place_resource_file(
     if is_direct_component_path(source, detected):
         return source.replace("\\", "/")
     folder_key = {
+        "image": ("images_dir", "images"),
         "model": ("yolo_dir", "yolo"),
         "replay": ("replays_dir", "replays"),
         "audio": ("sounds_dir", "sounds"),
         "component": ("plugins_dir", "plugins"),
         "dict": ("dicts_dir", "dicts"),
-    }.get(detected, ("images_dir", "images"))
-    dest_dir = os.path.abspath(str(dirs.get(folder_key[0]) or dirs["images_dir"] or ""))
-    if not dest_dir:
+    }.get(detected)
+    if folder_key is None:
+        raise ValueError(f"不支持的资源类型，不能导入图库：{source_path}")
+    root = str(dirs.get(folder_key[0]) or "").strip()
+    if not root:
         raise ValueError("未绑定资源目录")
+    dest_dir = os.path.abspath(root)
     os.makedirs(dest_dir, exist_ok=True)
     dest_prefix = os.path.normcase(dest_dir) + os.sep
     if os.path.normcase(source).startswith(dest_prefix) or os.path.normcase(source) == os.path.normcase(dest_dir):
@@ -852,8 +874,7 @@ def list_script_resources(
 ) -> List[Dict[str, Any]]:
     dirs = _current_dirs(images_dir, sounds_dir, dicts_dir, yolo_dir, replays_dir, plugins_dir)
     used: Dict[str, Dict[str, Any]] = {}
-    for value, start, end in extract_string_literals(source):
-        call = enclosing_call_name(source, start)
+    for value, start, end, call in _string_literals_with_calls(source):
         if call.startswith("大漠内存.") or call.startswith("大漠汇编."):
             continue
         kind = resource_kind(value)

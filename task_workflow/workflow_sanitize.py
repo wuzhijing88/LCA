@@ -17,7 +17,6 @@ DEAD_CARD_PARAM_KEYS = (
     "countdown_variable",
 )
 REMOVED_COORDINATE_SOURCE_MODES = ("通过变量",)
-DEFAULT_COORDINATE_SOURCE_MODE = "坐标工具获取坐标"
 YOLO_TASK_TYPE = "YOLO目标检测"
 YOLO_REMOVED_ACTION_PARAM_KEYS = (
     "---action---",
@@ -41,17 +40,17 @@ YOLO_REMOVED_ACTION_PARAM_KEYS = (
 
 
 def sanitize_card_parameters(parameters: Any, task_type: Any = "") -> Dict[str, Any]:
+    """校验现行参数；旧字段必须先经工程转换层迁移。"""
     if not isinstance(parameters, Mapping):
-        return {}
+        raise ValueError("卡片参数必须是对象")
     cleaned = dict(parameters)
-    for key in DEAD_CARD_PARAM_KEYS:
-        cleaned.pop(key, None)
+    removed = [key for key in DEAD_CARD_PARAM_KEYS if key in cleaned]
     if str(task_type or "").strip() == YOLO_TASK_TYPE:
-        for key in YOLO_REMOVED_ACTION_PARAM_KEYS:
-            cleaned.pop(key, None)
-    source_mode = str(cleaned.get("coordinate_source_mode") or "").strip()
-    if source_mode in REMOVED_COORDINATE_SOURCE_MODES:
-        cleaned["coordinate_source_mode"] = DEFAULT_COORDINATE_SOURCE_MODE
+        removed.extend(key for key in YOLO_REMOVED_ACTION_PARAM_KEYS if key in cleaned)
+    if removed:
+        raise ValueError(f"卡片参数含有旧字段：{'、'.join(removed)}，请先转换为现行工程格式")
+    if cleaned.get("coordinate_source_mode") in REMOVED_COORDINATE_SOURCE_MODES:
+        raise ValueError("旧坐标来源无法直接使用，请先转换为现行工程格式")
     return cleaned
 
 
@@ -59,8 +58,8 @@ def sanitize_workflow_data(workflow_data: Any) -> Any:
     if not isinstance(workflow_data, dict):
         return workflow_data
 
-    for key in DEAD_WORKFLOW_KEYS:
-        workflow_data.pop(key, None)
+    if any(key in workflow_data for key in DEAD_WORKFLOW_KEYS):
+        raise ValueError("工作流含有旧字段，请先转换为现行工程格式")
 
     nested = workflow_data.get("workflow")
     if isinstance(nested, dict) and nested is not workflow_data:

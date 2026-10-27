@@ -203,7 +203,7 @@ class MainWindowWorkflowSwitchMixin:
 
     def _prompt_workspace_for_new_workflow(self) -> Optional[str]:
         """跟随当前工作流所属工作区；归属不明时明确选择，取消返回 None。"""
-        from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox
+        from PySide6.QtWidgets import QDialog, QFileDialog, QInputDialog, QMessageBox
         from task_workflow.workspace import resolve_favorite_workspace_dir
         from themes import apply_rounded_popup
 
@@ -254,30 +254,27 @@ class MainWindowWorkflowSwitchMixin:
             )
             box.setStandardButtons(QMessageBox.StandardButton.NoButton)
             add_button = box.addButton("添加", QMessageBox.ButtonRole.AcceptRole)
-            skip_button = box.addButton("暂不添加", QMessageBox.ButtonRole.RejectRole)
+            box.addButton("暂不添加", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(add_button)
             apply_rounded_popup(box, frameless=False)
             box.exec()
             if not self._is_qobject_alive(box):
                 return None
-            clicked = box.clickedButton()
-            if clicked is skip_button:
+            # 全局事件过滤后按钮的 Python 引用可能失效，按当前按钮角色识别动作。
+            clicked_role = box.buttonRole(box.clickedButton())
+            if clicked_role == QMessageBox.ButtonRole.RejectRole:
                 return ""
-            if clicked is not add_button:
+            if clicked_role != QMessageBox.ButtonRole.AcceptRole:
                 return None
         finally:
             if self._is_qobject_alive(box):
+                box.close()
                 box.deleteLater()
         panel = self.parameter_panel
-        panel.show_favorites()
-        self._parameter_panel_visible = True
-        QApplication.processEvents()
-        folder = QFileDialog.getExistingDirectory(
-            panel,
-            "选择工作区目录",
-            "",
-        )
+        folder = QFileDialog.getExistingDirectory(self, "选择工作区目录", "")
         if not folder:
+            return None
+        if not self._is_qobject_alive(self):
             return None
         added = panel._add_favorite_workspace_dir(folder)
         if not added:

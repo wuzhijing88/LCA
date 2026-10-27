@@ -289,17 +289,17 @@ class WorkflowViewIoMixin:
 
     def load_workflow(self, workflow_data: Dict[str, Any]):
         """严格加载当前工作流数据格式。"""
-        from .connection_line import set_line_animation_paused
+        from .connection_line import batch_line_display_updates, set_line_animation_paused
 
-        self._loading_workflow = True
-        set_line_animation_paused("workflow_load", True)
-        try:
-            return self._load_current_workflow(workflow_data)
-        finally:
-            self._loading_workflow = False
-            set_line_animation_paused("workflow_load", False)
-            self._update_card_render_cache_policy()
-            self._refresh_viewport_animations()
+        with batch_line_display_updates():
+            self._loading_workflow = True
+            set_line_animation_paused("workflow_load", True)
+            try:
+                return self._load_current_workflow(workflow_data)
+            finally:
+                self._loading_workflow = False
+                set_line_animation_paused("workflow_load", False)
+                self._refresh_viewport_animations()
 
     @staticmethod
     def _validate_current_workflow_data(workflow_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -412,8 +412,6 @@ class WorkflowViewIoMixin:
             custom_name = card_data.get('custom_name')
             if custom_name:
                 card.set_custom_name(custom_name.strip())
-
-        self._update_card_render_cache_policy()
 
         for connection_data in actual_workflow['connections']:
             start_id = connection_data['start_card_id']

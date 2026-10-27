@@ -67,23 +67,11 @@ class MainWindowExecutionFlowMixin:
 
                 for key, value in card.parameters.items():
 
-                    # Check if the current value matches the failed path (or just its basename?)
-
-                    # Let's assume for now the stored original_path is what was in the param.
-
                     if value == original_path:
 
                          param_key_to_update = key
 
                          break 
-
-                    # Fallback: Check if basename matches if full path doesn't
-
-                    elif isinstance(value, str) and os.path.basename(value) == base_filename:
-
-                         param_key_to_update = key
-
-                         # Don't break here, maybe a more exact match exists
 
                 if param_key_to_update:
 
@@ -95,7 +83,7 @@ class MainWindowExecutionFlowMixin:
 
                 else:
 
-                     logger.warning(f"    Could not find parameter key in Card {card_id} matching original path '{original_path}' or basename '{base_filename}'. Cannot update.")
+                     logger.warning(f"卡片 {card_id} 中找不到与失败路径 '{original_path}' 完全一致的参数，未更新。")
 
                      still_failed.append((card_id, original_path)) # Treat as still failed
 
@@ -117,49 +105,12 @@ class MainWindowExecutionFlowMixin:
 
                                 f"仍有 {len(still_failed)} 个图片路径未能找到或更新。请手动检查这些卡片的参数。")
 
-    def _schedule_test_cleanup_if_not_started(self, reason: str):
-
-        """测试入口：若未真正启动执行器，兜底触发OCR清理。"""
-
-        from PySide6.QtCore import QTimer
-
-        def _do_cleanup_check():
-
-            try:
-
-                if getattr(self, '_execution_started_flag', False):
-
-                    return
-
-                thread = getattr(self, 'executor_thread', None)
-
-                if thread is not None:
-
-                    try:
-
-                        if thread.isRunning():
-
-                            return
-
-                    except Exception:
-
-                        # 线程状态不可读时按未启动处理
-
-                        pass
-
-                self._confirm_test_ocr_cleanup(reason)
-
-            except Exception:
-
-                self._confirm_test_ocr_cleanup(reason)
-
-        try:
-
-            QTimer.singleShot(200, _do_cleanup_check)
-
-        except Exception:
-
-            self._confirm_test_ocr_cleanup(reason)
+    def _confirm_test_cleanup_if_not_started(self, reason: str):
+        """试运行未启动时立即清理，不留下跨执行轮次的延迟回调。"""
+        thread = self.executor_thread
+        if thread is not None and thread.isRunning():
+            return
+        self._confirm_test_ocr_cleanup(reason)
 
     def _handle_test_card_execution(self, card_id: int):
 
@@ -211,17 +162,22 @@ class MainWindowExecutionFlowMixin:
 
             self.run_workflow(test_mode='single_card', test_card_id=card_id)
 
-            self._schedule_test_cleanup_if_not_started("测试卡片未进入执行")
+            self._confirm_test_cleanup_if_not_started("测试卡片未进入执行")
 
         except Exception as e:
 
             logger.error(f"测试卡片执行失败: {e}", exc_info=True)
 
-            self._confirm_test_ocr_cleanup("测试卡片异常中断")
+            error_message = str(e)
+            try:
+                self._confirm_test_cleanup_if_not_started("测试卡片异常中断")
+            except Exception as cleanup_error:
+                logger.error("测试卡片清理失败: %s", cleanup_error, exc_info=True)
+                error_message += f"\n资源清理失败：{cleanup_error}"
 
             from PySide6.QtWidgets import QMessageBox
 
-            QMessageBox.critical(self, "测试失败", f"测试卡片时发生错误：\n{str(e)}")
+            QMessageBox.critical(self, "测试失败", f"测试卡片时发生错误：\n{error_message}")
 
     def _handle_test_flow_execution(self, card_id: int):
 
@@ -247,29 +203,30 @@ class MainWindowExecutionFlowMixin:
 
             self.run_workflow(test_mode='flow', test_card_id=card_id)
 
-            self._schedule_test_cleanup_if_not_started("测试流程未进入执行")
+            self._confirm_test_cleanup_if_not_started("测试流程未进入执行")
 
         except Exception as e:
 
             logger.error(f"测试流程执行失败: {e}", exc_info=True)
 
-            self._confirm_test_ocr_cleanup("测试流程异常中断")
+            error_message = str(e)
+            try:
+                self._confirm_test_cleanup_if_not_started("测试流程异常中断")
+            except Exception as cleanup_error:
+                logger.error("测试流程清理失败: %s", cleanup_error, exc_info=True)
+                error_message += f"\n资源清理失败：{cleanup_error}"
 
             from PySide6.QtWidgets import QMessageBox
 
-            QMessageBox.critical(self, "测试失败", f"测试流程时发生错误：\n{str(e)}")
+            QMessageBox.critical(self, "测试失败", f"测试流程时发生错误：\n{error_message}")
 
     def _confirm_test_ocr_cleanup(self, reason: str = ""):
 
-        """测试链路兜底触发统一OCR清理。"""
+        """测试链路触发统一OCR清理，失败必须由调用方报告。"""
 
         from ..workflow_parts import workflow_lifecycle
 
-        manager = getattr(self, 'task_state_manager', None)
-
-        if not manager:
-
-            return
+        manager = self.task_state_manager
 
         success_log = "[测试清理] 已触发OCR清理"
 
@@ -277,27 +234,8 @@ class MainWindowExecutionFlowMixin:
 
             success_log = f"{success_log}（{reason}）"
 
-        try:
-
-            workflow_lifecycle.confirm_ocr_cleanup(
-
-                manager,
-
-                success_log=success_log,
-
-                suppress_errors=True
-
-            )
-
-        except Exception:
-
-            try:
-
-                manager.confirm_stopped()
-
-            except Exception:
-
-                pass
+        if not workflow_lifecycle.confirm_ocr_cleanup(manager, success_log=success_log):
+            raise RuntimeError("无法启动测试资源清理")
 
     def _show_warning_dialog(self, title: str, message: str):
 

@@ -9,7 +9,6 @@ from task_workflow.workspace import (
     favorite_path_key,
     forget_deleted_workspace_workflow,
     normalize_workspace_dir,
-    path_is_under_workspace,
     remove_workspace_workflow,
     resolve_existing_workflow_path,
     resolve_favorite_workspace_dir,
@@ -222,7 +221,12 @@ class ParameterPanelFavoritesMixin:
         action_buttons = [
             ("添加工作区", "添加工作流工作区目录", self._on_favorites_add, None),
             ("添加工作流", "把单个工作流加入当前工作区列表", self._on_favorites_add_workflow, None),
-            ("移除工作区", "移除当前选中行所属的工作区；左侧勾选仅用于启动", self._on_favorites_remove, None),
+            (
+                "删除工作区",
+                "只删除当前工作区记录，不删除目录或工作流文件",
+                self._on_favorites_delete_workspace,
+                None,
+            ),
         ]
         for text, tooltip, slot, width in action_buttons:
             toolbar_layout.addWidget(
@@ -491,7 +495,7 @@ class ParameterPanelFavoritesMixin:
             self.workflow_check_changed.emit(safe_path, bool(checked))
         return "added"
 
-    def _collect_selected_favorites_items(self, action_label: str = "移除工作区"):
+    def _collect_selected_favorites_items(self, action_label: str = "删除工作区"):
 
         """收集当前用于管理操作的列表项；未选中时给出明确提示。"""
 
@@ -584,29 +588,33 @@ class ParameterPanelFavoritesMixin:
     def _rebuild_workspace_favorites(self):
 
         self._favorites = build_workspace_favorites(
-            getattr(self, '_favorite_workspaces', []),
+            self._favorite_workspaces,
             self._favorites,
-            getattr(self, '_favorite_excluded', []),
-            getattr(self, '_favorite_extras', []),
+            self._favorite_excluded,
+            self._favorite_extras,
         )
 
     def _add_favorite_workspace_dir(self, workspace_dir: str) -> str:
-        """添加工作区目录并写入配置。已存在则直接返回规范化路径。"""
+        """保存唯一的工作区目录；新目录替换已有记录，同一目录不重复保存。"""
         normalized_workspace = os.path.abspath(os.path.normpath(str(workspace_dir or "").strip())) if workspace_dir else ""
         if not normalized_workspace or not os.path.isdir(normalized_workspace):
-            return ""
-        if not getattr(self, "_favorite_workspaces", None):
-            config_path = str(getattr(self, "_favorites_config_path", "") or "")
-            if config_path and os.path.exists(config_path):
-                try:
-                    self._sync_workspace_favorites_snapshot()
-                except Exception:
-                    logger.warning("读取工作区配置失败", exc_info=True)
-        workspaces = list(getattr(self, "_favorite_workspaces", []) or [])
-        if normalized_workspace not in workspaces:
-            workspaces.append(normalized_workspace)
-            self._favorite_workspaces = workspaces
+            raise ValueError(f"工作区目录不存在：{normalized_workspace}")
+        if not self._favorite_workspaces and os.path.exists(self._favorites_config_path):
+            _, self._favorites, _ = self._sync_workspace_favorites_snapshot()
+        workspaces = self._favorite_workspaces
+        if len(workspaces) > 1:
+            raise ValueError("工作区记录无效：只允许保存一个工作区。")
+        if workspaces and os.path.normcase(normalize_workspace_dir(workspaces[0])) == os.path.normcase(normalized_workspace):
+            return normalized_workspace
+        previous_workspaces = self._favorite_workspaces
+        previous_favorites = self._favorites
+        try:
+            self._favorite_workspaces = [normalized_workspace]
             self._commit_favorites_list()
+        except Exception:
+            self._favorite_workspaces = previous_workspaces
+            self._favorites = previous_favorites
+            raise
         return normalized_workspace
 
     def _on_favorites_add(self):
@@ -625,13 +633,10 @@ class ParameterPanelFavoritesMixin:
 
             return
 
-        if normalized_workspace in getattr(self, '_favorite_workspaces', []):
-
-            QMessageBox.information(self, "工作区已存在", f"该工作区已添加：\n{normalized_workspace}")
-
-            return
-
-        self._add_favorite_workspace_dir(normalized_workspace)
+        try:
+            self._add_favorite_workspace_dir(normalized_workspace)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "添加工作区失败", str(exc))
 
     def _on_favorites_add_workflow(self):
 
@@ -775,93 +780,49 @@ class ParameterPanelFavoritesMixin:
         except OSError as exc:
             QMessageBox.warning(self, "打开失败", f"无法打开所在文件夹：\n{exc}")
 
-    def _on_favorites_remove(self):
-
-        """移除选中工作流所属的工作区。"""
-
-        selected_items = self._collect_selected_favorites_items()
-
-        if not selected_items:
-
+    def _on_favorites_delete_workspace(self):
+        """只删除唯一工作区的保存记录，不改工作流记录、标签页或磁盘内容。"""
+        workspaces = self._favorite_workspaces
+        if not workspaces:
+            QMessageBox.information(
+                self,
+                "没有可删除的工作区",
+                "当前没有已保存的工作区。",
+            )
             return
 
-        workspace_dirs = set()
-
-        filepaths = []
-        extra_only = []
-
-        for item in selected_items:
-
-            filepath = item.data(Qt.ItemDataRole.UserRole)
-
-            if not filepath:
-
-                continue
-
-            filepaths.append(filepath)
-
-            matched_workspace = ""
-            for fav in self._favorites:
-
-                if favorite_path_key(fav.get('filepath')) != favorite_path_key(filepath):
-
-                    continue
-
-                matched_workspace = normalize_workspace_dir(fav.get('workspace_dir'))
-                if matched_workspace:
-                    workspace_dirs.add(matched_workspace)
-                break
-
-            if not matched_workspace:
-                extra_only.append(filepath)
-
-        if not filepaths:
-
+        if len(workspaces) != 1:
+            QMessageBox.warning(self, "无法删除工作区", "工作区记录无效：只允许保存一个工作区。")
+            return
+        workspace_dir = normalize_workspace_dir(workspaces[0])
+        if not workspace_dir:
+            QMessageBox.warning(self, "无法删除工作区", "工作区记录无效：目录为空。")
             return
 
-        if extra_only:
-            for filepath in extra_only:
-                self._favorite_excluded, self._favorite_extras = remove_workspace_workflow(
-                    filepath,
-                    getattr(self, '_favorite_workspaces', []),
-                    getattr(self, '_favorite_excluded', []),
-                    getattr(self, '_favorite_extras', []),
-                )
-
-        if not workspace_dirs:
-            self._commit_favorites_list(filepaths)
+        reply = QMessageBox.question(
+            self,
+            "删除工作区",
+            "确定删除当前工作区的记录吗？\n\n"
+            + workspace_dir
+            + "\n\n此操作只删除保存的工作区记录，不会删除目录或工作流文件。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
-        affected_filepaths = [
-            fav.get('filepath')
-            for fav in self._favorites
-            if normalize_workspace_dir(fav.get('workspace_dir')) in workspace_dirs
-        ]
-
-        extras_to_close = [
-            path
-            for path in getattr(self, '_favorite_extras', [])
-            if any(path_is_under_workspace(path, workspace) for workspace in workspace_dirs)
-        ]
-
-        self._favorite_workspaces = [
-            path
-            for path in getattr(self, '_favorite_workspaces', [])
-            if normalize_workspace_dir(path) not in workspace_dirs
-        ]
-
-        self._favorite_excluded = [
-            path
-            for path in getattr(self, '_favorite_excluded', [])
-            if not any(path_is_under_workspace(path, workspace) for workspace in workspace_dirs)
-        ]
-        self._favorite_extras = [
-            path
-            for path in getattr(self, '_favorite_extras', [])
-            if not any(path_is_under_workspace(path, workspace) for workspace in workspace_dirs)
-        ]
-
-        self._commit_favorites_list(affected_filepaths + extras_to_close + extra_only)
+        try:
+            save_workspace_favorites_snapshot(
+                self._favorites_config_path,
+                [],
+                self._favorites,
+                excluded_paths=self._favorite_excluded,
+                extra_paths=self._favorite_extras,
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "删除工作区记录失败", str(exc))
+            return
+        self._favorite_workspaces = []
 
     def _on_favorites_browse(self):
 
@@ -1173,21 +1134,22 @@ class ParameterPanelFavoritesMixin:
                 self._reset_favorites_state()
         except Exception as e:
             logger.error(f"加载工作流收藏数据失败: {e}")
-            self._reset_favorites_state()
+            raise
 
     def _save_favorites_config(self):
         """保存收藏配置"""
         try:
             save_workspace_favorites_snapshot(
                 self._favorites_config_path,
-                getattr(self, '_favorite_workspaces', []),
+                self._favorite_workspaces,
                 self._favorites,
-                excluded_paths=getattr(self, '_favorite_excluded', []),
-                extra_paths=getattr(self, '_favorite_extras', []),
+                excluded_paths=self._favorite_excluded,
+                extra_paths=self._favorite_extras,
             )
             logger.info(f"保存工作流收藏配置: {len(self._favorites)} 个")
         except Exception as e:
             logger.error(f"保存工作流收藏配置失败: {e}")
+            raise
 
     def update_favorite_name(self, filepath: str, custom_name: Optional[str]):
         """更新收藏列表中的工作流名称"""

@@ -386,18 +386,34 @@ def execute_task(params: Dict[str, Any], counters: Dict[str, int],
             nested_session.close()
 
 
-def _child_resource_dirs(workflow_data: Optional[Dict[str, Any]], workflow_filepath: Optional[str], nested_session: Any) -> Dict[str, str]:
-    from task_workflow.resource_context import current_resource_dirs
-    from task_workflow.workspace import resolve_runtime_resource_dirs, resource_runtime_kwargs
+def _child_resource_dirs(
+    workflow_data: Optional[Dict[str, Any]],
+    workflow_filepath: Optional[str],
+    nested_session: Any,
+    *,
+    parent_workflow_filepath: Optional[str] = None,
+) -> Dict[str, str]:
+    from task_workflow.workspace import project_resource_dirs, resolve_runtime_resource_dirs, resource_runtime_kwargs
 
     filepath = str(workflow_filepath or "").strip()
-    if filepath and not filepath.startswith("memory://") and os.path.isfile(filepath):
-        disk_dirs = resolve_runtime_resource_dirs(
-            workflow_data,
-            workflow_filepath=filepath,
-        )
-        return resource_runtime_kwargs(disk_dirs)
-    return current_resource_dirs()
+    if filepath.startswith("memory://"):
+        if nested_session is None:
+            raise RuntimeError("包内子工作流的工程会话不可用")
+        parent_filepath = str(parent_workflow_filepath or "").strip()
+        if not parent_filepath:
+            raise ValueError("包内子工作流缺少所属主工作流路径")
+        if parent_filepath.startswith("memory://"):
+            from task_workflow.resource_context import RESOURCE_DIR_KEYS
+
+            return dict.fromkeys(RESOURCE_DIR_KEYS, "")
+        from app_core.lca_format.sub_workflow_project import sub_workflow_project_path
+
+        project = sub_workflow_project_path(parent_filepath, filepath)
+        return resource_runtime_kwargs(project_resource_dirs(str(project.parent)))
+    if not filepath or not os.path.isfile(filepath):
+        raise FileNotFoundError(f"子工作流文件不存在：{filepath}")
+    disk_dirs = resolve_runtime_resource_dirs(workflow_data, workflow_filepath=filepath)
+    return resource_runtime_kwargs(disk_dirs)
 
 
 def _resolve_child_window(
@@ -545,7 +561,12 @@ def _execute_sub_workflow(cards: list, connections: list, counters: Dict,
             connections,
             start_card_id,
         )
-        child_dirs = _child_resource_dirs(workflow_data, workflow_filepath, nested_session)
+        child_dirs = _child_resource_dirs(
+            workflow_data,
+            workflow_filepath,
+            nested_session,
+            parent_workflow_filepath=_extract_parent_workflow_file(kwargs),
+        )
         bound_windows = kwargs.get("bound_windows")
         if bound_windows is None:
             bound_windows = getattr(parent_executor, "bound_windows", None)

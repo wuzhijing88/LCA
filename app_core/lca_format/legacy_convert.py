@@ -4,7 +4,7 @@
 - 旧 JSON 工作流
 - 旧整包加密 LCA1
 - 中间明文 zip 工程
-并写成现行包。
+并写成现行包。封装与卡片参数分别检查；现行封装中的旧参数也必须迁移。
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ from __future__ import annotations
 import copy
 import io
 import json
+import math
+import re
 import os
 import tempfile
 import zipfile
@@ -34,7 +36,13 @@ from app_core.lca_format.container import (
     seal_lca_bytes,
     unseal_lca_bytes,
 )
-from task_workflow.workflow_sanitize import sanitize_workflow_data
+from task_workflow.workflow_sanitize import (
+    DEAD_CARD_PARAM_KEYS,
+    DEAD_WORKFLOW_KEYS,
+    YOLO_REMOVED_ACTION_PARAM_KEYS,
+    YOLO_TASK_TYPE,
+    sanitize_workflow_data,
+)
 
 KIND_CURRENT = "current"
 KIND_LEGACY_LCA1 = "legacy_lca1"
@@ -114,8 +122,134 @@ def _manifest_bytes(display_name: str) -> bytes:
     )
 
 
+def _legacy_coordinate_pair(value: object) -> tuple[int, int]:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith(("{", "[")):
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError:
+                raise LcaFormatError("旧坐标无法转换：坐标 JSON 格式无效") from None
+        else:
+            value = re.split(r"[,，\s]+", text)
+    if isinstance(value, dict):
+        for x_key, y_key in (("x", "y"), ("X", "Y"), ("坐标X", "坐标Y")):
+            if x_key in value and y_key in value:
+                value = [value[x_key], value[y_key]]
+                break
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise LcaFormatError("旧坐标无法转换：需要明确的 X、Y 坐标")
+    coordinates = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (str, int, float)):
+            raise LcaFormatError("旧坐标无法转换：坐标必须是有限数值")
+        if isinstance(item, int):
+            coordinates.append(item)
+            continue
+        if isinstance(item, str) and not re.fullmatch(
+            r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", item.strip()
+        ):
+            raise LcaFormatError("旧坐标无法转换：坐标必须是有限数值")
+        try:
+            number = float(item)
+        except (ValueError, OverflowError):
+            raise LcaFormatError("旧坐标无法转换：坐标必须是有限数值") from None
+        if not math.isfinite(number):
+            raise LcaFormatError("旧坐标无法转换：坐标必须是有限数值")
+        coordinates.append(int(number))
+    return coordinates[0], coordinates[1]
+
+
+def _convert_mouse_parameters(parameters: dict) -> None:
+    for key in ("test_image_recognition", "test_color_recognition", "enable_parallel_recognition"):
+        parameters.pop(key, None)
+    source_mode = parameters.get("coordinate_source_mode")
+    had_value = "coordinate_value" in parameters
+    value = parameters.pop("coordinate_value", None)
+    if parameters.get("operation_mode", "坐标点击") != "坐标点击":
+        return
+    if source_mode == "无坐标":
+        return
+    has_x = "coordinate_x" in parameters
+    has_y = "coordinate_y" in parameters
+    if had_value and source_mode is None and has_x and has_y:
+        parameters["coordinate_source_mode"] = "坐标工具获取坐标"
+        return
+    if source_mode not in (None, "坐标工具获取坐标", "手动输入", "无坐标", "通过变量"):
+        if had_value:
+            raise LcaFormatError("旧坐标无法转换：坐标来源未知")
+        return
+    if source_mode != "通过变量" and has_x and has_y:
+        return
+    if source_mode == "通过变量" or (had_value and value not in (None, "")):
+        if source_mode != "通过变量" and has_x != has_y:
+            raise LcaFormatError("旧坐标无法转换：现行 X、Y 坐标不完整")
+        x, y = _legacy_coordinate_pair(value)
+        parameters.update(coordinate_x=x, coordinate_y=y, coordinate_source_mode="手动输入")
+
+
+def _convert_workflow_payload(payload: Mapping[str, object]) -> dict:
+    cleaned = copy.deepcopy(dict(payload))
+
+    def convert_body(workflow: dict) -> None:
+        for key in DEAD_WORKFLOW_KEYS:
+            workflow.pop(key, None)
+        nested = workflow.get("workflow")
+        if isinstance(nested, dict):
+            convert_body(nested)
+        cards = workflow.get("cards")
+        if not isinstance(cards, list):
+            return
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            parameters = card.get("parameters")
+            if parameters is None:
+                parameters = {}
+                card["parameters"] = parameters
+            if not isinstance(parameters, dict):
+                raise LcaFormatError("旧卡片参数无法转换：参数必须是对象")
+            task_type = card.get("task_type")
+            if task_type == "模拟鼠标操作":
+                try:
+                    _convert_mouse_parameters(parameters)
+                except LcaFormatError as exc:
+                    raise LcaFormatError(f"卡片 {card.get('id')}（{task_type}）：{exc}") from None
+            for key in DEAD_CARD_PARAM_KEYS:
+                parameters.pop(key, None)
+            if task_type == YOLO_TASK_TYPE:
+                for key in YOLO_REMOVED_ACTION_PARAM_KEYS:
+                    parameters.pop(key, None)
+
+    convert_body(cleaned)
+    try:
+        return sanitize_workflow_data(cleaned)
+    except ValueError as exc:
+        raise LcaFormatError(f"旧卡片参数无法转换：{exc}") from None
+
+
+def _convert_workflow_member(files: Mapping[str, bytes]) -> Dict[str, bytes]:
+    converted = dict(files)
+    try:
+        manifest = json.loads(files["manifest.json"].decode("utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("format") != "lca_editor":
+            raise ValueError
+        entry = manifest["entry_workflow"]
+        if not isinstance(entry, str) or not entry:
+            raise ValueError
+        workflow = json.loads(files[entry].decode("utf-8-sig"))
+        if not _is_workflow_payload(workflow):
+            raise ValueError
+    except (KeyError, UnicodeDecodeError, ValueError, TypeError):
+        raise LcaFormatError("旧工程无法转换：工程清单或入口工作流无效") from None
+    cleaned = _convert_workflow_payload(workflow)
+    if cleaned != workflow:
+        converted[entry] = _json_bytes(cleaned)
+    return converted
+
+
 def convert_json_payload(payload: Mapping[str, object], *, display_name: str = "") -> bytes:
-    cleaned = sanitize_workflow_data(copy.deepcopy(dict(payload)))
+    cleaned = _convert_workflow_payload(payload)
     files = {
         ENTRY_WORKFLOW: _json_bytes(cleaned),
         "manifest.json": _manifest_bytes(display_name),
@@ -289,25 +423,25 @@ def _relocate_dict_assets(files: Mapping[str, bytes]) -> Dict[str, bytes]:
 
 def convert_project_bytes(blob: bytes, *, display_name: str = "") -> bytes:
     kind = inspect_project_bytes(blob)
+    if kind == KIND_JSON:
+        payload = _parse_json_bytes(blob)
+        if payload is None:
+            raise LcaFormatError(USER_ERROR_CONVERT)
+        return convert_json_payload(payload, display_name=display_name)
     if kind == KIND_CURRENT:
         files = unseal_lca_bytes(blob)
-        from app_core.lca_format.project_io import inline_nested_workflow_assets
-
-        inlined = inline_nested_workflow_assets(files)
-        relocated = _relocate_dict_assets(inlined)
-        if inlined is files and relocated == dict(files):
-            return blob
-        return seal_lca_bytes(relocated)
-    if kind == KIND_LEGACY_LCA1:
+    elif kind == KIND_LEGACY_LCA1:
         files = _unseal_lca1_blob(blob)
-        return seal_lca_bytes(_relocate_dict_assets(_convert_nested_members(files)))
-    if kind == KIND_PLAIN_ZIP:
+    else:
         files = _zip_bytes_to_files(blob)
-        return seal_lca_bytes(_relocate_dict_assets(_convert_nested_members(files)))
-    payload = _parse_json_bytes(blob)
-    if payload is None:
-        raise LcaFormatError(USER_ERROR_CONVERT)
-    return convert_json_payload(payload, display_name=display_name)
+    converted = _convert_workflow_member(_convert_nested_members(files))
+    from app_core.lca_format.project_io import inline_nested_workflow_assets
+
+    converted = inline_nested_workflow_assets(converted)
+    relocated = _relocate_dict_assets(converted)
+    if kind == KIND_CURRENT and relocated == files:
+        return blob
+    return seal_lca_bytes(relocated)
 
 
 def _write_bytes(path: Path, data: bytes) -> None:
@@ -328,10 +462,7 @@ def _write_bytes(path: Path, data: bytes) -> None:
         os.replace(temporary_name, path)
     finally:
         if temporary_name:
-            try:
-                Path(temporary_name).unlink(missing_ok=True)
-            except OSError:
-                pass
+            Path(temporary_name).unlink(missing_ok=True)
 
 
 def convert_project_file(path: str | Path) -> Path:
@@ -349,10 +480,7 @@ def convert_project_file(path: str | Path) -> Path:
     if suffix == ".json":
         destination = source.with_suffix(LCA_EXTENSION)
         _write_bytes(destination, converted)
-        try:
-            if source.resolve() != destination.resolve():
-                source.unlink()
-        except OSError:
-            pass
+        if source.resolve() != destination.resolve():
+            source.unlink()
         return destination
     raise LcaFormatError(USER_ERROR_INVALID)

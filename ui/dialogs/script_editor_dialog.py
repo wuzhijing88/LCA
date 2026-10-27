@@ -9,9 +9,9 @@ import threading
 from functools import partial
 from typing import Any, Callable, Dict, Optional
 
-from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer, QObject, QThread, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer, QObject, QThread, Signal, Slot
 from shiboken6 import isValid
-from PySide6.QtGui import QFont, QFontMetrics, QKeySequence, QShortcut
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -121,11 +121,13 @@ class _DebugBridge(QObject):
     event = Signal(str, dict)
 
 
-class _EditorDebugLifetime:
+class _EditorDebugLifetime(QObject):
     def __init__(self, controller):
+        super().__init__()
         self.controller = controller
         self.thread = None
 
+    @Slot()
     def close(self):
         thread, self.thread = self.thread, None
         self.controller.set_callback(None)
@@ -242,8 +244,8 @@ def _load_help_visible() -> bool:
         from utils.instance_runtime import create_app_settings
 
         return bool(create_app_settings().value(HELP_VISIBLE_SETTING, True, type=bool))
-    except Exception:
-        return True
+    except Exception as error:
+        raise RuntimeError(f"读取命令列表显示状态失败：{error}") from error
 
 
 def _save_help_visible(visible: bool) -> None:
@@ -251,8 +253,8 @@ def _save_help_visible(visible: bool) -> None:
         from utils.instance_runtime import create_app_settings
 
         create_app_settings().setValue(HELP_VISIBLE_SETTING, bool(visible))
-    except Exception:
-        logger.debug("保存命令列表显示状态失败", exc_info=True)
+    except Exception as error:
+        raise RuntimeError(f"保存命令列表显示状态失败：{error}") from error
 
 
 def _load_resource_visible() -> bool:
@@ -260,8 +262,8 @@ def _load_resource_visible() -> bool:
         from utils.instance_runtime import create_app_settings
 
         return bool(create_app_settings().value(RESOURCE_VISIBLE_SETTING, True, type=bool))
-    except Exception:
-        return True
+    except Exception as error:
+        raise RuntimeError(f"读取资源栏显示状态失败：{error}") from error
 
 
 def _save_resource_visible(visible: bool) -> None:
@@ -269,8 +271,8 @@ def _save_resource_visible(visible: bool) -> None:
         from utils.instance_runtime import create_app_settings
 
         create_app_settings().setValue(RESOURCE_VISIBLE_SETTING, bool(visible))
-    except Exception:
-        logger.debug("保存资源栏显示状态失败", exc_info=True)
+    except Exception as error:
+        raise RuntimeError(f"保存资源栏显示状态失败：{error}") from error
 
 
 def _load_debug_visible() -> bool:
@@ -553,7 +555,7 @@ class ScriptEditorDialog(QDialog):
         self._resource_timer.setSingleShot(True)
         self._resource_timer.setInterval(200)
         self._resource_timer.timeout.connect(self._refresh_resources)
-        self.editor.textChanged.connect(self._resource_timer.start)
+        self.editor.textChanged.connect(self._schedule_resource_refresh)
         self._apply_resources_visible(self._resource_visible, persist=False)
         self._set_debug_visible(self._debug_visible)
         return column
@@ -586,7 +588,7 @@ class ScriptEditorDialog(QDialog):
         if panel is None:
             return
         line = int(self.editor.textCursor().blockNumber()) + 1
-        panel.set_breakpoint_state(line in self.editor.breakpoint_lines())
+        panel.set_breakpoint_state(self.editor.has_breakpoint(line))
 
     def _start_debug_run(self) -> None:
         if self._plugin_mode:
@@ -694,21 +696,12 @@ class ScriptEditorDialog(QDialog):
         editor.setPlaceholderText(SCRIPT_PLACEHOLDER)
         editor.setLineWrapMode(ScriptCodeEdit.LineWrapMode.NoWrap)
         editor.setTabChangesFocus(False)
-        font = QFont("Consolas")
-        if not font.exactMatch():
-            font = QFont("Cascadia Mono")
-        if not font.exactMatch():
-            font = QFont("Courier New")
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        font.setPointSize(11)
-        editor.setFont(font)
-        editor.setTabStopDistance(4 * QFontMetrics(font).horizontalAdvance(" "))
         editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._syntax_timer = QTimer(self)
         self._syntax_timer.setSingleShot(True)
         self._syntax_timer.setInterval(250)
         self._syntax_timer.timeout.connect(self._refresh_syntax_status)
-        editor.textChanged.connect(self._syntax_timer.start)
+        editor.textChanged.connect(self._schedule_syntax_check)
         editor.cursorPositionChanged.connect(self._refresh_status_bar)
         self.editor = editor
         return editor
@@ -911,6 +904,20 @@ class ScriptEditorDialog(QDialog):
             return
         self._bind_resource_panel(panel)
         panel.set_source(self.editor.toPlainText())
+
+    def _schedule_resource_refresh(self) -> None:
+        if self.isVisible():
+            self._resource_timer.start()
+
+    def _schedule_syntax_check(self) -> None:
+        if self.isVisible():
+            self._syntax_timer.start()
+
+    def _stop_editor_timers(self) -> None:
+        for name in ("_resource_timer", "_syntax_timer"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.stop()
 
     def _insert_resource(self, item: Dict[str, Any]) -> None:
         from ui.dialogs.script_resources import plan_insert_resource
@@ -1150,23 +1157,21 @@ class ScriptEditorDialog(QDialog):
         super().done(result)
 
     def _shutdown_debug_thread(self) -> None:
-        thread = self._debug_thread
-        self._debug_lifetime.thread = None
-        worker = self._debug_worker
+        debugger = getattr(self, "_debugger", None)
+        if debugger is None:
+            return
+        thread = getattr(self, "_debug_thread", None)
+        lifetime = getattr(self, "_debug_lifetime", None)
+        if lifetime is not None:
+            lifetime.thread = None
+        worker = getattr(self, "_debug_worker", None)
+        debugger.set_callback(None)
         if thread is None:
-            try:
-                self._debugger.set_callback(None)
-            except Exception:
-                pass
             return
         if thread.isRunning():
             self._debugger.stop()
             # 关闭流程开始后不再把事件投递到即将销毁的编辑器；线程仍会由
             # stop_checker/host.close 完成自己的资源收尾。
-            try:
-                self._debugger.set_callback(None)
-            except Exception:
-                pass
             thread.quit()
             thread.wait(20)
             if thread.isRunning():
@@ -1187,11 +1192,6 @@ class ScriptEditorDialog(QDialog):
                 # 登记为孤儿线程，保留强引用直到它结束；保留 thread.finished→
                 # deleteLater、worker.finished→(quit, deleteLater)，让线程自行清理。
                 _orphan_debug_thread(thread, self._debugger)
-        else:
-            try:
-                self._debugger.set_callback(None)
-            except Exception:
-                pass
         self._debug_thread = None
         self._debug_worker = None
 
@@ -1202,6 +1202,15 @@ class ScriptEditorDialog(QDialog):
         self._shutdown_debug_thread()
         super().closeEvent(event)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._schedule_resource_refresh()
+        self._schedule_syntax_check()
+
+    def hideEvent(self, event) -> None:
+        self._stop_editor_timers()
+        super().hideEvent(event)
+
     def event(self, event) -> bool:
         if event.type() == QEvent.Type.DeferredDelete:
             self._plugin_publication = None
@@ -1209,10 +1218,7 @@ class ScriptEditorDialog(QDialog):
             param_bar = getattr(self, "_param_bar", None)
             if param_bar is not None:
                 param_bar.bind_editor(None)
-            for name in ("_resource_timer", "_syntax_timer"):
-                timer = getattr(self, name, None)
-                if timer is not None:
-                    timer.stop()
+            self._stop_editor_timers()
         return super().event(event)
 
     def _find_next(self):

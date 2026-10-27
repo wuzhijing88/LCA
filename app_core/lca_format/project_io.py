@@ -439,12 +439,6 @@ class _ProjectCollector:
         from app_core.lca_format.session import _package_alias_paths
 
         candidates.extend(_package_alias_paths(normalized))
-        folder = self._asset_folder(kind)
-        name = Path(normalized).name
-        if name:
-            candidates.extend((f"{folder}/{name}", f"assets/{folder}/{name}"))
-            if folder == "yolo":
-                candidates.extend((f"models/{name}", f"assets/models/{name}"))
         seen = set()
         for candidate in candidates:
             logical = str(candidate or "").replace("\\", "/").lstrip("/")
@@ -454,8 +448,10 @@ class _ProjectCollector:
             data = source_session.get_bytes(logical)
             if data is not None:
                 canonical = logical
-                if name and folder != "misc":
-                    canonical = f"assets/{folder}/{name}"
+                for alias in _package_alias_paths(logical):
+                    if alias.startswith("assets/"):
+                        canonical = alias
+                        break
                 return ("session", id(source_session), canonical.casefold()), logical, bytes(data)
         return None
 
@@ -530,7 +526,7 @@ class _ProjectCollector:
                     return self._store_packaged_asset(raw_path, kind, data, source_key)
                 self._missing.add(raw_path)
                 return raw_path
-            from task_workflow.script_resources import place_resource_file, script_path_for_file
+            from task_workflow.script_resources import place_resource_file
 
             placed = place_resource_file(
                 str(resolved),
@@ -544,16 +540,7 @@ class _ProjectCollector:
             )
             if placed:
                 return placed
-            return script_path_for_file(
-                str(resolved),
-                kind=kind,
-                images_dir=str(images_dir or ""),
-                sounds_dir=str(sounds_dir or ""),
-                dicts_dir=str(dicts_dir or ""),
-                yolo_dir=str(yolo_dir or ""),
-                replays_dir=str(replays_dir or ""),
-                plugins_dir=str(plugins_dir or ""),
-            )
+            raise LcaFormatError(f"资源导入没有返回有效路径：{raw_path}")
 
         # 工作区文件不存在时，再从当前工程会话取包内资源。这样保存未
         # 预先落盘的工程时仍能保留资源，同时优先使用用户已经修改过的
@@ -607,9 +594,6 @@ class _ProjectCollector:
             f"{Path(name).stem}{LCA_EXTENSION}",
         )
         self._workflow_paths[identity] = logical_path
-        nested = sanitize_workflow_data(copy.deepcopy(nested))
-        if _workflow_contains_sub_workflow(nested):
-            raise LcaFormatError("子工作流不允许嵌套")
         nested_path = Path(nested_dir) if nested_dir is not None else None
         source_dir_text = ""
         nested_filepath = ""
@@ -619,6 +603,9 @@ class _ProjectCollector:
         elif nested_path is not None:
             source_dir_text = str(nested_path)
         try:
+            nested = sanitize_workflow_data(copy.deepcopy(nested))
+            if _workflow_contains_sub_workflow(nested):
+                raise LcaFormatError("子工作流不允许嵌套")
             self.files[logical_path] = seal_workflow_package(
                 nested,
                 source_session=nested_session,
@@ -708,41 +695,42 @@ class _ProjectCollector:
         text = str(raw_path or "").strip().strip("\"'")
         if not text or text.startswith("memory://"):
             return None
-        from task_workflow.script_resources import resolve_resource_path
-
-        resolved = resolve_resource_path(
-            text,
-            images_dir=str(images_dir or ""),
-            sounds_dir=str(sounds_dir or ""),
-            yolo_dir=str(yolo_dir or ""),
-            replays_dir=str(replays_dir or ""),
-            plugins_dir=str(plugins_dir or ""),
-            dicts_dir=str(dicts_dir or ""),
-            enforce_jail=False,
-        )
-        if resolved and Path(resolved).is_file():
-            return Path(resolved).resolve()
+        if kind == "workflow":
+            path = Path(text)
+            if not path.is_absolute():
+                if source_dir is None:
+                    return None
+                path = source_dir / path
+            return path.resolve() if path.is_file() else None
         path = Path(text).expanduser()
-        candidates = [path]
-        if source_dir is not None and not path.is_absolute():
-            candidates.insert(0, source_dir / path)
+        if path.is_absolute():
+            return path.resolve() if path.is_file() else None
         kind_roots = {
+            "image": images_dir,
             "audio": sounds_dir,
             "model": yolo_dir,
             "replay": replays_dir,
             "component": plugins_dir,
             "dict": dicts_dir,
         }
-        root = kind_roots.get(kind) or images_dir
-        if root:
-            candidates.extend((root / path.name, root / path))
+        root = kind_roots.get(kind)
+        if root is None:
+            return None
         normalized = text.replace("\\", "/")
-        if normalized.lower().startswith(("images/", "sounds/", "yolo/", "replays/", "plugins/", "dicts/")) and root:
-            candidates.append(root / normalized.split("/", 1)[1])
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate.resolve()
-        return None
+        folder = "plugins" if kind == "component" else self._asset_folder(kind)
+        prefixes = (f"assets/{self._asset_folder(kind)}/", f"{folder}/")
+        for prefix in prefixes:
+            if normalized.startswith(prefix):
+                path = root / normalized[len(prefix):]
+                break
+        else:
+            if "/" not in normalized:
+                path = root / normalized
+            elif source_dir is not None:
+                path = source_dir / normalized
+            else:
+                return None
+        return path.resolve() if path.is_file() else None
 
     def _unique_path(self, folder: str, filename: str) -> str:
         safe_name = Path(filename).name or "file"
@@ -873,7 +861,8 @@ def workflow_from_session(session: LcaPackageSession) -> dict:
 
 
 def workflow_from_embedded_bytes(data: bytes) -> dict:
-    workflow_data, _session = load_lca_from_bytes(data)
+    workflow_data, session = load_lca_from_bytes(data)
+    session.close()
     return workflow_data
 
 
@@ -917,34 +906,34 @@ def inline_nested_workflow_assets(files: Mapping[str, bytes]) -> Mapping[str, by
     for path, data in list(updated.items()):
         if not path.lower().endswith(LCA_EXTENSION) or not path.startswith("workflows/"):
             continue
+        nested_data, nested_session = load_lca_from_bytes(data)
         try:
-            nested_data, nested_session = load_lca_from_bytes(data)
-        except LcaFormatError:
-            continue
-        nested_files = dict(nested_session.snapshot_files())
-        nested_changed = False
-        for literal in _iter_resource_literals(nested_data):
-            logical = str(literal or "").replace("\\", "/").lstrip("/")
-            if logical.startswith("memory://"):
-                logical = logical[len("memory://") :]
-            if not logical or nested_session.get_bytes(logical) is not None:
+            nested_files = dict(nested_session.snapshot_files())
+            nested_changed = False
+            for literal in _iter_resource_literals(nested_data):
+                logical = str(literal or "").replace("\\", "/").lstrip("/")
+                if logical.startswith("memory://"):
+                    logical = logical[len("memory://") :]
+                if not logical or nested_session.get_bytes(logical) is not None:
+                    continue
+                parent_key = ""
+                parent_data = None
+                candidates = [logical, *_package_alias_paths(logical)]
+                for candidate in candidates:
+                    if candidate in updated and candidate != path:
+                        parent_key = candidate
+                        parent_data = updated[candidate]
+                        break
+                if parent_data is None or not parent_key:
+                    continue
+                nested_files[parent_key] = parent_data
+                nested_changed = True
+            if not nested_changed:
                 continue
-            parent_key = ""
-            parent_data = None
-            candidates = [logical, *_package_alias_paths(logical)]
-            for candidate in candidates:
-                if candidate in updated and candidate != path:
-                    parent_key = candidate
-                    parent_data = updated[candidate]
-                    break
-            if parent_data is None or not parent_key:
-                continue
-            nested_files[parent_key] = parent_data
-            nested_changed = True
-        if not nested_changed:
-            continue
-        updated[path] = seal_lca_bytes(nested_files)
-        changed = True
+            updated[path] = seal_lca_bytes(nested_files)
+            changed = True
+        finally:
+            nested_session.close()
     if not changed:
         return files
     return updated
@@ -1000,8 +989,12 @@ def write_nested_workflow(
             except OSError:
                 pass
     payload, session = load_lca_from_bytes(sealed)
-    _ = payload
-    session.bind_source(host)
+    try:
+        session.bind_source(host)
+        _materialize_loaded_project(host, payload, session)
+    except BaseException:
+        session.close()
+        raise
     from app_core.lca_format.session import activate, get_active_path
 
     previous = get_active_path()
@@ -1018,6 +1011,9 @@ def _materialize_loaded_project(
     session: LcaPackageSession,
 ) -> None:
     from task_workflow.workspace import extract_workflow_resource_path
+    from app_core.lca_format.sub_workflow_project import materialize_sub_workflow_projects
+
+    materialize_sub_workflow_projects(path, workflow_data, session)
 
     root = extract_workflow_resource_path(workflow_data)
     if not root:

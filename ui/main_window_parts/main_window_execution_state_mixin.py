@@ -673,8 +673,6 @@ class MainWindowExecutionStateMixin:
 
     def _convert_status_message_to_user_friendly(self, status_message: str) -> str:
         text = str(status_message or "")
-        if "STOP_WORKFLOW" in text:
-            return "工作流执行已停止"
         if "用户手动停止" in text:
             return "工作流已被用户停止"
         if "正常停止" in text:

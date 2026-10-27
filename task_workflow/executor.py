@@ -143,8 +143,14 @@ class WorkflowExecutor(QObject):
             raise TypeError("执行器任务模块必须是字典")
         if not isinstance(execution_mode, str) or not execution_mode.strip():
             raise ValueError("执行器必须指定有效的执行模式")
+        if test_mode not in (None, 'single_card', 'flow'):
+            raise ValueError(f"不支持的测试模式: {test_mode!r}")
         for card_id, card in cards_data.items():
-            parameters = card['parameters'] if isinstance(card, dict) else card.parameters
+            if not isinstance(card, dict):
+                raise TypeError(f"卡片 {card_id} 必须是现行序列化字典")
+            if not isinstance(card['task_type'], str) or not card['task_type'].strip():
+                raise ValueError(f"卡片 {card_id} 必须指定任务类型")
+            parameters = card['parameters']
             if not isinstance(parameters, dict):
                 raise TypeError(f"卡片 {card_id} 的参数必须是字典")
         super().__init__(parent)
@@ -315,31 +321,16 @@ class WorkflowExecutor(QObject):
 
     def _prepare_execution_context(self):
         context = self._get_workflow_context()
-        try:
-            context.executor = self
-        except Exception:
-            pass
-        try:
-            context.workflow_id = self.workflow_id
-        except Exception:
-            pass
-        try:
-            context.run_state = self.run_context
-            context._monitor_configs = self.run_context.monitor_configs
-        except Exception:
-            pass
-        try:
-            context._should_stop_workflow = self.run_context.should_stop_workflow
-        except Exception:
-            pass
+        context.executor = self
+        context.workflow_id = self.workflow_id
+        context.run_state = self.run_context
+        context._monitor_configs = self.run_context.monitor_configs
+        context._should_stop_workflow = self.run_context.should_stop_workflow
         return context
 
     def _resolve_runtime_params(self, card_id: int, card_params: Dict[str, Any]) -> Dict[str, Any]:
         context = self._get_workflow_context()
-        store = getattr(context, "get_runtime_store", None)
-        runtime_store = store() if callable(store) else getattr(context, "runtime_store", None)
-        if runtime_store is None:
-            return dict(card_params) if isinstance(card_params, dict) else {}
+        runtime_store = context.get_runtime_store()
         runtime_store.bind_counters(self._persistent_counters)
         runtime_store.set_current_card_id(card_id)
         from task_workflow.expr import resolve_params
@@ -359,13 +350,11 @@ class WorkflowExecutor(QObject):
         valid_connections = []
         for connection in self.connections_data:
             if not isinstance(connection, dict):
-                logger.warning(f"跳过无效连接数据: {type(connection)}")
-                continue
+                raise TypeError("执行器连接数据必须是字典")
             start_id = connection.get('start_card_id')
             end_id = connection.get('end_card_id')
             if start_id is None or end_id is None:
-                logger.warning("跳过缺少 start_card_id/end_card_id 的连接数据")
-                continue
+                raise ValueError("执行器连接数据缺少起点或终点")
             valid_connections.append(connection)
         self._graph_engine = GraphEngine(valid_connections)
         return self._graph_engine.as_connection_map()
@@ -378,13 +367,7 @@ class WorkflowExecutor(QObject):
 
         for card_id, card in self.cards_data.items():
             # 检查是否是附加条件卡片
-            if hasattr(card, 'task_type'):
-                task_type = card.task_type
-            elif isinstance(card, dict):
-                task_type = card.get('task_type', '')
-            else:
-                logger.warning(f"[附加条件映射] 跳过无效卡片数据: {type(card)}")
-                continue
+            task_type = card['task_type']
 
             # 只识别现行“附加条件”卡片。
             if task_type == '附加条件':
@@ -417,16 +400,13 @@ class WorkflowExecutor(QObject):
 
         registered_count = 0
         for card_id, card in self.cards_data.items():
-            task_type = card.task_type if hasattr(card, 'task_type') else card.get('task_type', '')
+            task_type = card['task_type']
 
             if task_type == '附加条件':
                 logger.info(f"[自动注册] 执行附加条件卡片 {card_id}")
 
                 # 获取卡片参数
-                if hasattr(card, 'parameters'):
-                    card_params = card.parameters
-                else:
-                    card_params = card['parameters']
+                card_params = card['parameters']
 
                 logger.info(f"[自动注册] 卡片 {card_id} 参数: monitor_type={card_params.get('monitor_type')}, count_threshold={card_params.get('count_threshold')}, monitor_mode={card_params.get('monitor_mode')}")
 
@@ -514,7 +494,7 @@ class WorkflowExecutor(QObject):
         clean_detail = str(task_detail or "").strip()
         if clean_detail:
             details = f"{details} | 结果：{clean_detail}"
-        if next_card_id not in (None, "STOP_WORKFLOW", "工作流执行完成"):
+        if next_card_id not in (None, "工作流执行完成"):
             details = f"{details} | 下一步：{next_card_id}"
         status_text = "执行成功" if success else "执行失败"
         self.emit_step_log(task_type, f"{status_text} | {details}", success)
@@ -932,15 +912,11 @@ class WorkflowExecutor(QObject):
         if not text or self._current_card_id is None:
             return
         card = self._get_card_object(self._current_card_id)
-        if isinstance(card, dict):
-            task_type = str(card.get("task_type") or "自定义脚本").strip()
-            card_params = card.get("parameters") or {}
-        else:
-            task_type = str(getattr(card, "task_type", "自定义脚本") or "自定义脚本").strip()
-            card_params = getattr(card, "parameters", {}) or {}
+        task_type = card['task_type']
+        card_params = card['parameters']
         details = self._build_step_log_details(
             self._current_card_id,
-            card_params if isinstance(card_params, dict) else {},
+            card_params,
             include_results=False,
         )
         self.emit_step_log(task_type, f"自定义日志：{text} | {details}", True)
@@ -1016,11 +992,7 @@ class WorkflowExecutor(QObject):
         if card_obj is None:
             return ""
 
-        if hasattr(card_obj, "task_type"):
-            return str(getattr(card_obj, "task_type") or "").strip()
-        if isinstance(card_obj, dict):
-            return str(card_obj.get("task_type", "") or "").strip()
-        return ""
+        return card_obj['task_type'].strip()
 
     @staticmethod
     def _is_same_card_id(left: Any, right: Any) -> bool:
@@ -1045,16 +1017,10 @@ class WorkflowExecutor(QObject):
         return cls._normalize_graph_card_id(value)
 
     def _get_card_params_for_graph(self, card_obj: Any) -> Dict[str, Any]:
-        if isinstance(card_obj, dict):
-            params = card_obj.get("parameters", {}) or {}
-        else:
-            params = getattr(card_obj, "parameters", {}) or {}
-        return params if isinstance(params, dict) else {}
+        return card_obj['parameters']
 
     def _get_card_type_for_graph(self, card_obj: Any) -> str:
-        if isinstance(card_obj, dict):
-            return str(card_obj.get("task_type", "") or "").strip()
-        return str(getattr(card_obj, "task_type", "") or "").strip()
+        return card_obj['task_type'].strip()
 
     def _build_card_id_lookup_for_graph(self) -> Dict[int, Any]:
         lookup: Dict[int, Any] = {}
@@ -1062,12 +1028,6 @@ class WorkflowExecutor(QObject):
             normalized_key = self._normalize_graph_card_id(raw_key)
             if normalized_key is not None:
                 lookup.setdefault(normalized_key, card_obj)
-            if isinstance(card_obj, dict):
-                normalized_id = self._normalize_graph_card_id(card_obj.get("id", raw_key))
-            else:
-                normalized_id = self._normalize_graph_card_id(getattr(card_obj, "card_id", raw_key))
-            if normalized_id is not None:
-                lookup[normalized_id] = card_obj
         return lookup
 
     def _build_connection_map_for_graph(self) -> Dict[int, List[Dict[str, Any]]]:
@@ -1389,7 +1349,8 @@ class WorkflowExecutor(QObject):
             normalized_mode = 'background'
         # 只在前台模式下激活窗口。
         if normalized_mode == 'foreground' and self.target_hwnd:
-            self._activate_target_window()
+            if not self._activate_target_window():
+                preflight_error = "目标窗口前台激活失败"
 
         # 可选窗口适配策略：部分目标需要在后台输入前发送一次点击激活。
         background_activation = str(
@@ -1403,9 +1364,11 @@ class WorkflowExecutor(QObject):
         ):
             try:
                 logger.info("[后台激活] WindowAdapter 请求点击激活")
-                self._send_background_click_activation()
+                if not self._send_background_click_activation():
+                    preflight_error = "目标窗口后台点击激活失败"
             except Exception as e:
-                logger.warning(f"[后台激活] 点击激活失败: {e}")
+                preflight_error = f"目标窗口后台点击激活失败: {e}"
+                logger.error(preflight_error)
 
         if preflight_error is None:
             try:
@@ -1761,45 +1724,8 @@ class WorkflowExecutor(QObject):
                 logger.info("WindowAdapter 已激活目标窗口: HWND=%s", self.target_hwnd)
                 return True
 
-            # 获取窗口标题用于日志
-            try:
-                window_title = win32gui.GetWindowText(self.target_hwnd)
-            except Exception:
-                window_title = f"HWND:{self.target_hwnd}"
-
-            logger.info(f"前台模式：激活目标窗口 {window_title} (HWND: {self.target_hwnd})")
-
-            # 检查窗口是否已经是前台窗口
-            current_foreground = win32gui.GetForegroundWindow()
-            if current_foreground == self.target_hwnd:
-                logger.info(f"窗口已是前台窗口，无需激活: {window_title}")
-                return True
-
-            # 检查窗口是否最小化
-            if win32gui.IsIconic(self.target_hwnd):
-                logger.info(f"窗口已最小化，正在恢复: {window_title}")
-                win32gui.ShowWindow(self.target_hwnd, 9)  # SW_RESTORE = 9
-                time.sleep(0.2)  # 等待窗口恢复
-
-            # 激活窗口
-            win32gui.SetForegroundWindow(self.target_hwnd)
-            time.sleep(0.1)  # 等待窗口激活
-
-            # 验证激活是否成功
-            new_foreground = win32gui.GetForegroundWindow()
-            if new_foreground == self.target_hwnd:
-                logger.info(f"窗口激活成功: {window_title}")
-                return True
-            else:
-                logger.warning(f"窗口激活可能失败: 期望={self.target_hwnd}, 实际={new_foreground}")
-                # 尝试备用方法
-                try:
-                    win32gui.BringWindowToTop(self.target_hwnd)
-                    logger.info(f"使用备用方法将窗口置顶: {window_title}")
-                    return True
-                except Exception as e:
-                    logger.error(f"备用激活方法失败: {e}")
-                    return False
+            logger.warning("目标窗口前台激活失败: HWND=%s", self.target_hwnd)
+            return False
 
         except Exception as e:
             logger.error(f"激活目标窗口时出错: {e}")
@@ -1830,14 +1756,9 @@ class WorkflowExecutor(QObject):
             logger.info(f"[后台激活] 发送点击激活消息 (HWND: {self.target_hwnd})")
 
             # 获取窗口中心坐标作为激活点击位置
-            try:
-                rect = win32gui.GetClientRect(self.target_hwnd)
-                center_x = rect[2] // 2
-                center_y = rect[3] // 2
-            except Exception:
-                # 如果获取失败，使用默认坐标
-                center_x, center_y = 100, 100
-                logger.debug(f"[后台激活] 无法获取窗口客户区，使用默认坐标: ({center_x}, {center_y})")
+            rect = win32gui.GetClientRect(self.target_hwnd)
+            center_x = rect[2] // 2
+            center_y = rect[3] // 2
 
             # 使用增强激活器发送点击激活
             try:
@@ -1965,23 +1886,8 @@ class WorkflowExecutor(QObject):
 
                 # 获取当前卡片信息
                 current_card = self.cards_data[current_card_id]
-                # 检查是否是 TaskCard 对象还是字典
-                if hasattr(current_card, 'task_type'):
-                    # TaskCard 对象
-                    task_type = current_card.task_type
-                    # 【修复闪退】安全获取 parameters，防止为 None 时调用 .copy() 失败
-                    params = current_card.parameters
-                    if not isinstance(params, dict):
-                        raise TypeError(f"卡片 {current_card_id} 的参数必须是字典")
-                    card_params = dict(params)
-                else:
-                    # 字典格式
-                    # 【修复闪退】确保 card_params 不为 None
-                    task_type = current_card.get('task_type', '未知')
-                    raw_parameters = current_card['parameters']
-                    if not isinstance(raw_parameters, dict):
-                        raise TypeError(f"卡片 {current_card_id} 的参数必须是字典")
-                    card_params = dict(raw_parameters)
+                task_type = current_card['task_type']
+                card_params = dict(current_card['parameters'])
 
                 if self._disallowed_task_types and str(task_type or "").strip() in self._disallowed_task_types:
                     error_msg = f"当前工作流禁止执行任务类型: {task_type}"
@@ -2045,6 +1951,20 @@ class WorkflowExecutor(QObject):
                     self._release_all_keys()
                     return True, "工作流被用户停止"
 
+                if self.test_mode == 'single_card' and current_card_id != self.start_card_id:
+                    logger.info(f"[测试卡片] 卡片 {current_card_id} 执行完成，测试结束")
+                    self.card_finished.emit(current_card_id, success)
+                    self._emit_step_result_log(
+                        current_card_id,
+                        task_type,
+                        card_params,
+                        success,
+                        task_detail,
+                    )
+                    if success:
+                        return True, "[测试卡片] 执行成功"
+                    return False, self._compose_failure_message("[测试卡片] 执行失败")
+
                 # 【关键修复】检查是否是停止工作流的特殊返回值
                 if next_card_id == '工作流执行完成':
                     logger.info("任务返回停止工作流")
@@ -2067,39 +1987,6 @@ class WorkflowExecutor(QObject):
                     logger.info("处理结果时检测到停止请求")
                     self._release_all_keys()
                     return True, "工作流被用户停止"
-
-                # 处理特殊返回值
-                if next_card_id == 'STOP_WORKFLOW':
-                    if not success:
-                        self._emit_step_result_log(
-                            current_card_id,
-                            task_type,
-                            card_params,
-                            False,
-                            task_detail,
-                            next_card_id,
-                        )
-                        return False, self._compose_failure_message(
-                            f"工作流在步骤 {current_card_id} ({task_type}) 处失败并停止"
-                        )
-                    return True, "工作流执行完成"
-
-                # 【测试卡片】单卡片测试模式：执行完当前卡片后立即返回，不执行任何跳转
-                # 注意：跳过虚拟起点（ID为负数），只在真正的测试卡片执行完后才停止
-                if self.test_mode == 'single_card' and current_card_id >= 0:
-                    logger.info(f"[测试卡片] 卡片 {current_card_id} 执行完成，测试结束")
-                    self.card_finished.emit(current_card_id, success)
-                    self._emit_step_result_log(
-                        current_card_id,
-                        task_type,
-                        card_params,
-                        success,
-                        task_detail,
-                    )
-                    # 【修复】等待一小段时间确保主线程能处理card_finished信号并更新UI
-                    time.sleep(0.05)  # 等待50ms让UI完成状态更新
-                    logger.info("[测试卡片] card_finished信号已发送并等待UI更新")
-                    return success, f"[测试卡片] 执行{'成功' if success else '失败'}"
 
                 # 【新架构】如果是附加条件触发的跳转，立即跳转，不走后续处理逻辑（包括UI信号）
                 if monitor_jump_triggered:
@@ -2540,6 +2427,9 @@ class WorkflowExecutor(QObject):
             if not success:
                 self._remember_failure(card_id, task_type, task_detail)
 
+            if self.test_mode == 'single_card' and card_id != self.start_card_id:
+                return success, None, str(task_detail or "").strip()
+
             # 【新架构】在处理action之前，先检查附加条件
             # 这样无论卡片返回什么action，附加条件都能立即触发
             if card_id in self._monitor_card_map:
@@ -2637,12 +2527,7 @@ class WorkflowExecutor(QObject):
         if random_connections:
             from tasks.random_jump import get_branch_weight
 
-            current_card = self.cards_data.get(current_card_id)
-            current_params = {}
-            if isinstance(current_card, dict):
-                current_params = current_card.get('parameters', {}) or {}
-            elif current_card is not None:
-                current_params = getattr(current_card, 'parameters', {}) or {}
+            current_params = self.cards_data[current_card_id]['parameters']
 
             weights_config = current_params.get('random_weights')
             next_card = self._graph_engine.next_card(

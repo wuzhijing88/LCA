@@ -2113,20 +2113,31 @@ class WorkflowTabWidget(QTabWidget):
             raise TypeError("recent_workflows 必须是列表")
 
         normalized_paths = []
+        retained_paths = []
         seen_paths = set()
+        removed_missing_paths = False
         for index, filepath in enumerate(recent_workflows):
             if not isinstance(filepath, str) or not filepath.strip():
                 raise TypeError(f"recent_workflows[{index}] 必须是非空字符串")
             if self._is_backup_path(filepath):
                 raise ValueError(f"最近工作流不能指向备份目录: {filepath}")
             absolute_path = os.path.abspath(os.path.normpath(filepath))
-            if not os.path.isfile(absolute_path):
-                raise FileNotFoundError(f"最近工作流不存在: {absolute_path}")
             dedup_key = os.path.normcase(absolute_path)
             if dedup_key in seen_paths:
                 raise ValueError(f"最近工作流存在重复路径: {absolute_path}")
             seen_paths.add(dedup_key)
+            if not os.path.isfile(absolute_path):
+                logger.warning("最近工作流记录对应文件不存在，已从列表移除: %s", absolute_path)
+                removed_missing_paths = True
+                continue
             normalized_paths.append(absolute_path)
+            retained_paths.append(filepath)
+
+        if removed_missing_paths:
+            config["recent_workflows"] = retained_paths
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
+
         return normalized_paths
 
     def auto_load_recent_workflows(self):

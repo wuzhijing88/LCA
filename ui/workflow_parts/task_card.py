@@ -86,47 +86,35 @@ class TaskCard(QGraphicsObject):
 
     @classmethod
     def _stop_gradient_timer_if_idle(cls):
-        try:
-            if cls._gradient_cards:
-                return
-            if cls._gradient_timer is not None and cls._gradient_timer.isActive():
-                cls._gradient_timer.stop()
-        except Exception:
-            pass
+        if not cls._gradient_cards and cls._gradient_timer is not None:
+            cls._gradient_timer.stop()
 
     @classmethod
     def refresh_gradient_animation_state(cls):
         if cls._force_overview_mode or not cls._gradient_cards:
-            try:
-                if cls._gradient_timer is not None and cls._gradient_timer.isActive():
-                    cls._gradient_timer.stop()
-            except Exception:
-                pass
+            if cls._gradient_timer is not None:
+                cls._gradient_timer.stop()
             return
         cls._ensure_gradient_timer()
 
     @classmethod
-    def sync_viewport_animations(cls, view) -> None:
+    def sync_viewport_animations(cls, view, visible_cards) -> None:
         """按当前视口装入/卸下卡片动画，视口外的卡片不跑动画。"""
-        cards_map = getattr(view, "cards", None)
-        if not isinstance(cards_map, dict):
-            cls.refresh_gradient_animation_state()
-            return
-        viewport_rect_cache: Dict[Any, Any] = {}
-        scene_views_cache: Dict[Any, Any] = {}
+        for card in tuple(cls._gradient_cards):
+            if card.view is view and card not in visible_cards:
+                card._unregister_gradient_animation()
         visible_idle = []
-        for card in list(cards_map.values()):
+        for card in visible_cards:
             try:
-                in_view = cls._is_card_in_viewport(card, viewport_rect_cache, scene_views_cache)
-                hovering = getattr(card, "hovered_port_side", None) is not None
-                executing = getattr(card, "execution_state", "idle") != "idle"
-                if hovering or executing:
-                    if in_view:
-                        card._register_gradient_animation()
-                    else:
-                        card._unregister_gradient_animation()
+                if not card._should_animate_by_zoom():
+                    card._unregister_gradient_animation()
                     continue
-                if in_view and card._should_animate_idle_ports():
+                hovering = card.hovered_port_side is not None
+                executing = card.execution_state != "idle"
+                if hovering or executing:
+                    card._register_gradient_animation()
+                    continue
+                if card._should_animate_idle_ports():
                     visible_idle.append(card)
                 else:
                     card._unregister_gradient_animation()
@@ -142,19 +130,9 @@ class TaskCard(QGraphicsObject):
 
     @classmethod
     def get_gradient_animation_stats(cls) -> Dict[str, Any]:
-        timer_active = False
-        if cls._gradient_timer is not None:
-            try:
-                timer_active = bool(cls._gradient_timer.isActive())
-            except Exception:
-                timer_active = False
-        try:
-            registered_cards = len(cls._gradient_cards)
-        except Exception:
-            registered_cards = 0
         return {
-            "registered_cards": int(registered_cards),
-            "timer_active": bool(timer_active),
+            "registered_cards": len(cls._gradient_cards),
+            "timer_active": cls._gradient_timer is not None and cls._gradient_timer.isActive(),
             "interval_ms": int(cls._gradient_interval_ms),
         }
 
@@ -164,23 +142,16 @@ class TaskCard(QGraphicsObject):
         if cls._force_overview_mode == enabled:
             return
         cls._force_overview_mode = enabled
-        try:
-            if enabled:
-                if cls._gradient_timer is not None and cls._gradient_timer.isActive():
-                    cls._gradient_timer.stop()
-            elif cls._gradient_cards:
-                cls._ensure_gradient_timer()
-        except Exception:
-            pass
-
-        try:
-            for card in list(cls._gradient_cards):
-                try:
-                    card.update()
-                except RuntimeError:
-                    cls._gradient_cards.discard(card)
-        except Exception:
-            pass
+        if enabled:
+            if cls._gradient_timer is not None:
+                cls._gradient_timer.stop()
+        elif cls._gradient_cards:
+            cls._ensure_gradient_timer()
+        for card in tuple(cls._gradient_cards):
+            if _qt_is_valid(card):
+                card.update()
+            else:
+                cls._gradient_cards.discard(card)
 
     @classmethod
     def _tick_gradient(cls):
@@ -204,16 +175,13 @@ class TaskCard(QGraphicsObject):
                 if not cls._is_card_in_viewport(card, viewport_rect_cache, scene_views_cache):
                     cls._gradient_cards.discard(card)
                     continue
-                allow_zoom_animation = True
-                should_animate_by_zoom = getattr(card, "_should_animate_by_zoom", None)
-                if callable(should_animate_by_zoom):
-                    allow_zoom_animation = bool(should_animate_by_zoom())
-                if not allow_zoom_animation:
+                if not card._should_animate_by_zoom():
+                    cls._gradient_cards.discard(card)
                     continue
 
                 has_ports = True
-                is_executing = getattr(card, "execution_state", "idle") != "idle"
-                is_hovering = getattr(card, "hovered_port_side", None) is not None
+                is_executing = card.execution_state != "idle"
+                is_hovering = card.hovered_port_side is not None
                 visible_cards.append((card, has_ports, is_executing, is_hovering))
                 if is_executing:
                     has_executing_visible_card = True
@@ -230,12 +198,7 @@ class TaskCard(QGraphicsObject):
                 if has_executing_visible_card:
                     continue
 
-                allow_idle_port_animation = True
-                should_animate_idle_ports = getattr(card, "_should_animate_idle_ports", None)
-                if callable(should_animate_idle_ports):
-                    allow_idle_port_animation = bool(should_animate_idle_ports())
-
-                if allow_idle_port_animation and has_ports and not card.isSelected():
+                if card._should_animate_idle_ports() and has_ports and not card.isSelected():
                     card.update()
             except RuntimeError:
                 cls._gradient_cards.discard(card)
@@ -243,18 +206,10 @@ class TaskCard(QGraphicsObject):
 
     @classmethod
     def _is_view_animatable(cls, view) -> bool:
-        try:
-            if view is None or not hasattr(view, "viewport"):
-                return False
-            if hasattr(view, "isVisible") and not view.isVisible():
-                return False
-            viewport = view.viewport()
-            if viewport is None or not viewport.isVisible():
-                return False
-            viewport_rect = viewport.rect()
-            return viewport_rect.width() > 0 and viewport_rect.height() > 0
-        except Exception:
+        if view is None or not _qt_is_valid(view) or not view.isVisible():
             return False
+        viewport = view.viewport()
+        return viewport.isVisible() and not viewport.rect().isEmpty()
 
     @classmethod
     def _is_card_in_viewport(
@@ -263,86 +218,47 @@ class TaskCard(QGraphicsObject):
         viewport_rect_cache: Dict[Any, Any],
         scene_views_cache: Optional[Dict[Any, Any]] = None,
     ) -> bool:
-        try:
-            scene = card.scene()
-            if scene is None:
-                return False
-
-            card_rect = card.sceneBoundingRect()
-            if card_rect.isEmpty():
-                return False
-
-            candidate_views = []
-            preferred_view = getattr(card, "view", None)
-            if preferred_view is not None:
-                candidate_views.append(preferred_view)
-
-            if scene_views_cache is not None:
-                scene_views = scene_views_cache.get(scene)
-                if scene_views is None:
-                    scene_views = list(scene.views())
-                    scene_views_cache[scene] = scene_views
-            else:
-                scene_views = list(scene.views())
-
-            for scene_view in scene_views:
-                if scene_view not in candidate_views:
-                    candidate_views.append(scene_view)
-
-            if not candidate_views:
-                return False
-
-            for view in candidate_views:
-                if not cls._is_view_animatable(view):
-                    continue
-
-                if view not in viewport_rect_cache:
-                    try:
-                        visible_rect = view.mapToScene(view.viewport().rect()).boundingRect()
-                        viewport_rect_cache[view] = visible_rect.adjusted(
-                            -CARD_ANIMATION_VIEWPORT_MARGIN,
-                            -CARD_ANIMATION_VIEWPORT_MARGIN,
-                            CARD_ANIMATION_VIEWPORT_MARGIN,
-                            CARD_ANIMATION_VIEWPORT_MARGIN,
-                        )
-                    except Exception:
-                        viewport_rect_cache[view] = None
-
-                cached_visible_rect = viewport_rect_cache.get(view)
-                if cached_visible_rect is None:
-                    continue
-
-                if card_rect.intersects(cached_visible_rect):
-                    return True
-
+        if not _qt_is_valid(card) or card.scene() is None or not card.isVisible():
             return False
-        except Exception:
-            return False
+        scene = card.scene()
+        card_rect = card.sceneBoundingRect()
+        if scene_views_cache is None:
+            views = scene.views()
+        else:
+            if scene not in scene_views_cache:
+                scene_views_cache[scene] = scene.views()
+            views = scene_views_cache[scene]
+        for view in views:
+            if not cls._is_view_animatable(view):
+                continue
+            if view not in viewport_rect_cache:
+                visible_rect = view.mapToScene(view.viewport().rect()).boundingRect()
+                viewport_rect_cache[view] = visible_rect.adjusted(
+                    -CARD_ANIMATION_VIEWPORT_MARGIN, -CARD_ANIMATION_VIEWPORT_MARGIN,
+                    CARD_ANIMATION_VIEWPORT_MARGIN, CARD_ANIMATION_VIEWPORT_MARGIN)
+            if card_rect.intersects(viewport_rect_cache[view]):
+                return True
+        return False
 
     def _is_animation_visible(self) -> bool:
         """Check whether the current card is inside the visible viewport."""
-        try:
-            if not self.isVisible():
-                return False
-            if not hasattr(self, "scene") or self.scene() is None:
-                return False
-            return TaskCard._is_card_in_viewport(self, {})
-        except Exception:
-            return False
+        return TaskCard._is_card_in_viewport(self, {})
 
     def _needs_gradient_animation(
         self,
         viewport_rect_cache: Optional[Dict[Any, Any]] = None,
         scene_views_cache: Optional[Dict[Any, Any]] = None,
     ) -> bool:
-        if self.scene() is None:
+        if self.scene() is None or self.view is None or self.view._loading_workflow:
+            return False
+        if not self._should_animate_by_zoom():
             return False
         cache = {} if viewport_rect_cache is None else viewport_rect_cache
         if not TaskCard._is_card_in_viewport(self, cache, scene_views_cache):
             return False
-        if getattr(self, "hovered_port_side", None) is not None:
+        if self.hovered_port_side is not None:
             return True
-        if getattr(self, "execution_state", "idle") != "idle":
+        if self.execution_state != "idle":
             return True
         return self._should_animate_idle_ports()
 
@@ -357,60 +273,30 @@ class TaskCard(QGraphicsObject):
         self._unregister_gradient_animation()
 
     def _register_gradient_animation(self):
-        try:
-            TaskCard._gradient_cards.add(self)
-            TaskCard._ensure_gradient_timer()
-        except Exception:
-            pass
+        if not self._needs_gradient_animation():
+            return
+        TaskCard._gradient_cards.add(self)
+        TaskCard._ensure_gradient_timer()
 
     def _unregister_gradient_animation(self):
-        try:
-            TaskCard._gradient_cards.discard(self)
-            TaskCard._stop_gradient_timer_if_idle()
-        except Exception:
-            pass
+        TaskCard._gradient_cards.discard(self)
+        TaskCard._stop_gradient_timer_if_idle()
 
     def _should_animate_idle_ports(self) -> bool:
         """Decide whether idle port animation should stay enabled."""
-        try:
-            if not self._should_animate_by_zoom():
-                return False
-            view = getattr(self, "view", None)
-            if view is None:
-                return True
-            cards_map = getattr(view, "cards", None)
-            if not isinstance(cards_map, dict):
-                return True
-            return len(cards_map) <= IDLE_PORT_ANIMATION_CARD_THRESHOLD
-        except Exception:
-            return False
+        return self._should_animate_by_zoom() and len(self.view.cards) <= IDLE_PORT_ANIMATION_CARD_THRESHOLD
 
     def _get_view_zoom_level(self) -> float:
         """Return the current view zoom level."""
-        try:
-            view = getattr(self, "view", None)
-            if view is None:
-                return 1.0
-            transform = view.transform()
-            return max(0.01, float(transform.m11()))
-        except Exception:
-            return 1.0
+        return abs(float(self.view.transform().m11()))
 
     def _should_animate_by_zoom(self) -> bool:
         """Disable animation when the zoom level is too low."""
-        try:
-            zoom_level = self._get_view_zoom_level()
-            return zoom_level >= CARD_ANIMATION_ZOOM_STOP_THRESHOLD
-        except Exception:
-            return False
+        return self._get_view_zoom_level() >= CARD_ANIMATION_ZOOM_STOP_THRESHOLD
 
     def _is_overview_mode(self) -> bool:
         """When zoomed out enough, switch to overview mode for performance."""
-        try:
-            zoom_level = self._get_view_zoom_level()
-            return zoom_level < CARD_OVERVIEW_MODE_ZOOM_THRESHOLD
-        except Exception:
-            return False
+        return self._get_view_zoom_level() < CARD_OVERVIEW_MODE_ZOOM_THRESHOLD
 
     
     def _get_theme_card_color(self):
@@ -499,55 +385,27 @@ class TaskCard(QGraphicsObject):
         }
     def _should_enable_shadow_on_init(self) -> bool:
         """Decide whether shadow creation should be delayed on init."""
-        try:
-            view = getattr(self, "view", None)
-            if view is not None and getattr(view, "_loading_workflow", False):
-                return False
-            if view is None:
-                return True
-            cards = getattr(view, "cards", None)
-            threshold_getter = getattr(view, "_get_card_shadow_disable_threshold", None)
-            if not isinstance(cards, dict) or not callable(threshold_getter):
-                return True
-            threshold = int(threshold_getter())
-            return len(cards) < threshold
-        except Exception:
-            return True
+        return not self.view._loading_workflow and len(self.view.cards) < self.view._get_card_shadow_disable_threshold()
 
     def _ensure_shadow_effect(self):
         if getattr(self, "shadow", None) is not None:
             return self.shadow
-        try:
-            shadow = QGraphicsDropShadowEffect()
-            shadow.setBlurRadius(self.default_shadow_blur)
-            shadow.setColor(QColor(self.default_shadow_color))
-            shadow.setOffset(0, self.default_shadow_offset)
-            shadow.setEnabled(True)
-            self.shadow = shadow
-            self.setGraphicsEffect(shadow)
-            return shadow
-        except Exception:
-            self.shadow = None
-            return None
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(self.default_shadow_blur)
+        shadow.setColor(QColor(self.default_shadow_color))
+        shadow.setOffset(0, self.default_shadow_offset)
+        shadow.setEnabled(True)
+        self.shadow = shadow
+        self.setGraphicsEffect(shadow)
+        return shadow
 
     def _release_shadow_effect(self) -> None:
         shadow = getattr(self, "shadow", None)
         if shadow is None:
             return
-        try:
-            shadow.setEnabled(False)
-        except Exception:
-            pass
-        try:
-            self.setGraphicsEffect(None)
-        except Exception:
-            pass
-        try:
-            if hasattr(shadow, "deleteLater"):
-                shadow.deleteLater()
-        except Exception:
-            pass
         self.shadow = None
+        if _qt_is_valid(self):
+            self.setGraphicsEffect(None)
 
     def _cleanup_timer_attr(self, attr_name: str, timeout_slot) -> None:
         timer = getattr(self, attr_name, None)

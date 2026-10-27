@@ -139,7 +139,17 @@ def load_workflow_package(
 
     path_text = str(path)
     if path_text.startswith("memory://"):
-        return load_lca_from_bytes(_memory_workflow_bytes(path_text, parent_workflow_file))
+        data, session = load_lca_from_bytes(_memory_workflow_bytes(path_text, parent_workflow_file))
+        try:
+            parent_text = str(parent_workflow_file or "")
+            if parent_text and not parent_text.startswith("memory://"):
+                from app_core.lca_format.sub_workflow_project import bind_sub_workflow_project, sub_workflow_project_path
+
+                bind_sub_workflow_project(data, sub_workflow_project_path(parent_text, path_text))
+            return data, session
+        except BaseException:
+            session.close()
+            raise
     return load_lca_project(path_text)
 
 
@@ -174,6 +184,8 @@ def load_workflow_file(
             raise ValueError("磁盘工程未提供现行文件路径")
         register(register_path, session)
         activate(register_path)
+    else:
+        session.close()
     return payload
 
 

@@ -42,7 +42,9 @@ class OffsetReferenceLookup:
         found, location, _detail = locate_image_in_window(params=params, target_hwnd=self.target_hwnd, card_id=self.card_id)
         if not found or location is None:
             raise ValueError('未识别到基准图片，无法自动定位偏移起点')
-        x, y, width, height = location
+        if not isinstance(location, (tuple, list)) or len(location) != 6:
+            raise ValueError('基准图片识别结果格式无效')
+        x, y, width, height, _screenshot_width, _screenshot_height = location
         if width <= 0 or height <= 0:
             raise ValueError('基准图片识别区域无效')
         return int(x + width / 2), int(y + height / 2), (int(x), int(y), int(width), int(height))

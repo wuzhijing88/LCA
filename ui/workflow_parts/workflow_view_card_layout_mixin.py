@@ -112,8 +112,8 @@ class WorkflowViewCardLayoutMixin:
         try:
             self.scene.addItem(card)
             self.cards[current_id] = card
-            self._update_card_render_cache_policy()
-            if not getattr(self, "_loading_workflow", False):
+            if not self._loading_workflow:
+                self._viewport_cards.add(card)
                 self._refresh_viewport_animations()
 
             card.delete_requested.connect(self.delete_card)
